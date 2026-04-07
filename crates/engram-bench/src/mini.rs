@@ -224,8 +224,40 @@ pub fn run_fts_baseline() -> Result<MiniReport, crate::error::BenchError> {
     Ok(MiniReport { metrics, per_question })
 }
 
+/// Path for the on-disk haystack/query embedding cache. Keyed by embedder name
+/// so different providers don't collide.
+fn cache_path(embedder_name: &str) -> std::path::PathBuf {
+    let dir = engram_storage::paths::cache_dir().join("bench-mini");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{embedder_name}.json"))
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct EmbedCache {
+    chunks: HashMap<String, Vec<f32>>,
+    queries: HashMap<String, Vec<f32>>,
+}
+
+impl EmbedCache {
+    fn load(path: &std::path::Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+    fn save(&self, path: &std::path::Path) {
+        if let Ok(b) = serde_json::to_vec(self) {
+            let _ = std::fs::write(path, b);
+        }
+    }
+}
+
 /// Run the mini benchmark using hybrid retrieval: FTS5 lexical + dense
 /// embeddings (Gemini) fused with RRF. This is the Phase 2 baseline.
+///
+/// Embeddings for both the haystack chunks and the questions are cached on
+/// disk per embedder so that autoresearch iterations after the first take
+/// <1 second instead of paying 30 round-trips to Gemini.
 pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
     embedder: &E,
     rrf_k: f32,
@@ -233,12 +265,23 @@ pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
     let store = SqliteStore::open_in_memory()?;
     let chunk_ids_by_text = seed_haystack(&store)?;
 
-    // Embed every chunk once.
+    let cache_p = cache_path(embedder.name());
+    let mut cache = EmbedCache::load(&cache_p);
+    let mut cache_dirty = false;
+
+    // Embed every chunk once, cached by content.
     let mut chunk_embeddings: HashMap<Uuid, Vec<f32>> = HashMap::new();
     for (id, text) in &chunk_ids_by_text {
-        let v = embedder
-            .embed_one(text, TaskMode::RetrievalDocument)
-            .await?;
+        let v = if let Some(cached) = cache.chunks.get(*text) {
+            cached.clone()
+        } else {
+            let fresh = embedder
+                .embed_one(text, TaskMode::RetrievalDocument)
+                .await?;
+            cache.chunks.insert((*text).to_string(), fresh.clone());
+            cache_dirty = true;
+            fresh
+        };
         chunk_embeddings.insert(*id, v);
     }
 
@@ -275,13 +318,29 @@ pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
             })
             .collect();
 
-        // Dense run
-        let q_emb = embedder.embed_one(question, TaskMode::RetrievalQuery).await?;
-        let mut dense_scored: Vec<(Uuid, f32)> = chunk_embeddings
+        // Dense run (cached). Iterate `chunk_ids_by_text` for deterministic
+        // order, then sort by (score DESC, chunk_id ASC) so ties never flip
+        // between runs even when HashMap iteration order differs.
+        let q_emb = if let Some(cached) = cache.queries.get(*question) {
+            cached.clone()
+        } else {
+            let fresh = embedder.embed_one(question, TaskMode::RetrievalQuery).await?;
+            cache.queries.insert((*question).to_string(), fresh.clone());
+            cache_dirty = true;
+            fresh
+        };
+        let mut dense_scored: Vec<(Uuid, f32)> = chunk_ids_by_text
             .iter()
-            .map(|(id, v)| (*id, cosine_sim(&q_emb, v)))
+            .map(|(id, _)| {
+                let emb = chunk_embeddings.get(id).expect("seeded");
+                (*id, cosine_sim(&q_emb, emb))
+            })
             .collect();
-        dense_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        dense_scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let dense_run: Vec<RankedHit> = dense_scored
             .iter()
             .take(20)
@@ -329,6 +388,10 @@ pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
             latency_ms,
             top_chunk_excerpt: top_excerpt.chars().take(80).collect(),
         });
+    }
+
+    if cache_dirty {
+        cache.save(&cache_p);
     }
 
     let n = QUESTIONS.len() as f32;
