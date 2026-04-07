@@ -37,20 +37,30 @@ crates/
 ## Status
 
 **Phase 1 (foundation) — DONE**
-- Workspace builds clean, all 17 unit tests pass
+- Workspace builds clean, 20/20 unit tests pass
 - `engram agent-info` returns valid JSON manifest
 - `engram remember` / `engram recall` work end-to-end via FTS5
-- Inline mini benchmark scores R@1 = 0.80, R@5 = 1.00 with FTS5 alone
-- Autoresearch loop configured against `cargo build && engram bench mini`
+- Mini benchmark fully deterministic (UUID v5 + stable fusion tiebreak)
+- Autoresearch loop configured
 
-**Phase 2 (autonomous) — autoresearch loop iterates here**
-- Wire Gemini Embed 2 into ingest + recall
-- Add LanceDB as the vector index
+**Phase 2a (hybrid retrieval) — DONE**
+- Gemini Embed 2 wired in (single + token-budgeted batch)
 - RRF fusion of dense + lexical
-- Cohere reranking on top-N
-- Real LongMemEval dataset download + harness
+- Embedding cache on disk
+- Mini bench: R@1 = 1.00 with hybrid_gemini
+- LongMemEval S split harness running with real dataset
 
-**Phase 3 (parity)** — match MemPalace's 98.4% R@5 on LongMemEval held-out
+**Phase 2b (LongMemEval) — IN PROGRESS**
+
+| Sample | R@1 | R@5 | R@10 | MRR | Notes |
+|---|---|---|---|---|---|
+| First 50 questions | 0.90 | **0.98** | 1.00 | 0.94 | First MemPalace-parity result |
+| First 100 questions | 0.89 | **0.98** | 1.00 | 0.94 | Holds at scale |
+| Full 500 | TBD | TBD | TBD | TBD | Background run in progress |
+
+**Reference: MemPalace hybrid_v4 published number is R@5 = 0.984.**
+
+**Phase 3 (push past parity)** — Cohere reranking, R@1 tuning, full 500
 **Phase 4 (beyond)** — AAAK compression, memory layers, temporal validity, graph expansion
 
 ## Quick start
