@@ -202,13 +202,13 @@ pub fn run_fts_baseline() -> Result<MiniReport, crate::error::BenchError> {
 }
 
 /// Convert a free-text query into FTS5 syntax. Strips punctuation, lowercases,
-/// drops short and stop-ish tokens, then ORs them with each token quoted so
-/// FTS5 cannot interpret hyphens, plus signs or numbers as syntax.
+/// drops short/stopword tokens, then builds a hybrid query: the top-3 longest
+/// (most discriminative) tokens are ANDed for precision; everything else is
+/// ORed in for recall fallback.
 pub fn build_fts_query(text: &str) -> String {
     const STOPWORDS: &[&str] = &[
         "the", "and", "for", "with", "that", "what", "which", "how",
         "does", "are", "was", "were", "from", "into", "this", "have",
-        // Experiment 1: also drop generic auxiliaries that match many chunks
         "has", "had", "been", "being", "shown", "show", "shows",
         "can", "could", "should", "would", "may", "might",
     ];
@@ -224,9 +224,23 @@ pub fn build_fts_query(text: &str) -> String {
         if STOPWORDS.contains(&lower.as_str()) {
             continue;
         }
-        tokens.push(format!("\"{}\"", lower));
+        tokens.push(lower);
     }
-    tokens.join(" OR ")
+    if tokens.is_empty() {
+        return String::new();
+    }
+    // Sort by length descending — longest tokens are most discriminative.
+    let mut by_len = tokens.clone();
+    by_len.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    let discriminators: Vec<String> =
+        by_len.iter().take(3).map(|t| format!("\"{}\"", t)).collect();
+    let recall_terms: Vec<String> =
+        tokens.iter().map(|t| format!("\"{}\"", t)).collect();
+
+    // Try precise AND first; FTS5 supports OR-of-AND-clauses.
+    let and_clause = discriminators.join(" AND ");
+    let or_clause = recall_terms.join(" OR ");
+    format!("({}) OR ({})", and_clause, or_clause)
 }
 
 #[cfg(test)]
