@@ -97,16 +97,28 @@ pub struct MiniQuestionResult {
     pub top_chunk_excerpt: String,
 }
 
+/// Stable UUID derived from content + a namespace, so the bench is fully
+/// reproducible across runs (no randomness in IDs → no nondeterministic
+/// tiebreaks).
+fn stable_id(prefix: &str, text: &str) -> Uuid {
+    // UUID v5 with the DNS namespace + a deterministic name.
+    let name = format!("{prefix}:{text}");
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
 fn seed_haystack(
     store: &SqliteStore,
 ) -> Result<Vec<(Uuid, &'static str)>, crate::error::BenchError> {
     use engram_core::types::{Memory, MemorySource};
+    use chrono::TimeZone;
+    let epoch = chrono::Utc.timestamp_opt(0, 0).single().unwrap();
     let mut chunk_ids_by_text: Vec<(Uuid, &'static str)> = Vec::new();
     for text in HAYSTACK {
+        let mem_id = stable_id("mem", text);
         let m = Memory {
-            id: Uuid::new_v4(),
+            id: mem_id,
             content: (*text).to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: epoch,
             event_time: None,
             importance: 5,
             emotional_weight: 0,
@@ -120,8 +132,8 @@ fn seed_haystack(
             tags: vec![],
         };
         store.insert_memory(&m)?;
-        let chunk_id = Uuid::new_v4();
-        store.insert_chunk(chunk_id, m.id, text, 0, None)?;
+        let chunk_id = stable_id("chunk", text);
+        store.insert_chunk(chunk_id, mem_id, text, 0, None)?;
         chunk_ids_by_text.push((chunk_id, text));
     }
     Ok(chunk_ids_by_text)

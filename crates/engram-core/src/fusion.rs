@@ -20,6 +20,11 @@ pub struct RankedHit {
 ///
 /// `k` is the smoothing constant (60 is the canonical value from Cormack et al.,
 /// but autoresearch can tune it).
+///
+/// Tie-break order: higher score first; on equal scores, smaller chunk id first.
+/// The deterministic tiebreak matters because HashMap iteration order is
+/// randomized — without this, the ranking flips between runs whenever two
+/// chunks share a fused score.
 pub fn reciprocal_rank_fusion(
     runs: &[Vec<RankedHit>],
     k: f32,
@@ -35,7 +40,7 @@ pub fn reciprocal_rank_fusion(
         .into_iter()
         .map(|(id, s)| (id, OrderedFloat(s)))
         .collect();
-    fused.sort_by(|a, b| b.1.cmp(&a.1));
+    fused.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     fused
 }
 

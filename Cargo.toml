@@ -78,7 +78,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 self_update = { version = "0.43", default-features = false, features = ["rustls", "compression-flate2", "archive-tar"] }
 
 # Hashing / IDs
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Numeric
 ordered-float = { version = "4", features = ["serde"] }
