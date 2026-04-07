@@ -14,9 +14,14 @@
 //! Each test has 1 relevant chunk in a haystack of distractors.
 
 use crate::metrics::{recall_at_k, reciprocal_rank, Metrics, Recall};
+use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
+use engram_core::types::RetrievalSource;
+use engram_embed::{Embedder, TaskMode};
 use engram_storage::SqliteStore;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Instant;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MiniQuestion {
@@ -92,16 +97,10 @@ pub struct MiniQuestionResult {
     pub top_chunk_excerpt: String,
 }
 
-/// Run the mini benchmark using FTS5 only (the v0 baseline). Returns full
-/// metrics that autoresearch can optimize against.
-pub fn run_fts_baseline() -> Result<MiniReport, crate::error::BenchError> {
-    let store = SqliteStore::open_in_memory()?;
-
-    // Seed the haystack as one memory per chunk so each is independently
-    // retrievable. The relevant content's chunk_id is what we score against.
+fn seed_haystack(
+    store: &SqliteStore,
+) -> Result<Vec<(Uuid, &'static str)>, crate::error::BenchError> {
     use engram_core::types::{Memory, MemorySource};
-    use uuid::Uuid;
-
     let mut chunk_ids_by_text: Vec<(Uuid, &'static str)> = Vec::new();
     for text in HAYSTACK {
         let m = Memory {
@@ -125,6 +124,30 @@ pub fn run_fts_baseline() -> Result<MiniReport, crate::error::BenchError> {
         store.insert_chunk(chunk_id, m.id, text, 0, None)?;
         chunk_ids_by_text.push((chunk_id, text));
     }
+    Ok(chunk_ids_by_text)
+}
+
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0f32;
+    let mut na = 0f32;
+    let mut nb = 0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
+/// Run the mini benchmark using FTS5 only (the v0 baseline). Returns full
+/// metrics that autoresearch can optimize against.
+pub fn run_fts_baseline() -> Result<MiniReport, crate::error::BenchError> {
+    let store = SqliteStore::open_in_memory()?;
+    let chunk_ids_by_text = seed_haystack(&store)?;
 
     let mut latencies = Vec::with_capacity(QUESTIONS.len());
     let mut r1_total = 0f32;
@@ -188,6 +211,132 @@ pub fn run_fts_baseline() -> Result<MiniReport, crate::error::BenchError> {
         at_1: r1_total / n,
         at_5: r5_total / n,
         at_10: r5_total / n, // collapses for k=10 in this set
+    };
+    metrics.mrr = mrr_total / n;
+    metrics.questions_evaluated = QUESTIONS.len();
+    let mean_lat = latencies.iter().sum::<u64>() as f32 / n;
+    metrics.mean_latency_ms = mean_lat;
+    let mut sorted = latencies.clone();
+    sorted.sort_unstable();
+    metrics.p50_latency_ms = sorted[sorted.len() / 2] as f32;
+    metrics.p95_latency_ms = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32;
+
+    Ok(MiniReport { metrics, per_question })
+}
+
+/// Run the mini benchmark using hybrid retrieval: FTS5 lexical + dense
+/// embeddings (Gemini) fused with RRF. This is the Phase 2 baseline.
+pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
+    embedder: &E,
+    rrf_k: f32,
+) -> Result<MiniReport, crate::error::BenchError> {
+    let store = SqliteStore::open_in_memory()?;
+    let chunk_ids_by_text = seed_haystack(&store)?;
+
+    // Embed every chunk once.
+    let mut chunk_embeddings: HashMap<Uuid, Vec<f32>> = HashMap::new();
+    for (id, text) in &chunk_ids_by_text {
+        let v = embedder
+            .embed_one(text, TaskMode::RetrievalDocument)
+            .await?;
+        chunk_embeddings.insert(*id, v);
+    }
+
+    let mut latencies = Vec::with_capacity(QUESTIONS.len());
+    let mut r1_total = 0f32;
+    let mut r5_total = 0f32;
+    let mut mrr_total = 0f32;
+    let mut per_question = Vec::with_capacity(QUESTIONS.len());
+
+    for (question, relevant_prefix) in QUESTIONS {
+        let target_id = chunk_ids_by_text
+            .iter()
+            .find(|(_, text)| text.starts_with(relevant_prefix))
+            .map(|(id, _)| *id)
+            .ok_or_else(|| {
+                crate::error::BenchError::InvalidDataset(format!(
+                    "no haystack entry starts with {relevant_prefix:?}"
+                ))
+            })?;
+
+        let start = Instant::now();
+
+        // Lexical run
+        let fts_query = build_fts_query(question);
+        let fts_hits = store.fts_search(&fts_query, 20)?;
+        let lexical_run: Vec<RankedHit> = fts_hits
+            .iter()
+            .enumerate()
+            .map(|(i, (id, score))| RankedHit {
+                chunk_id: *id,
+                rank: i + 1,
+                raw_score: *score,
+                source: RetrievalSource::Lexical,
+            })
+            .collect();
+
+        // Dense run
+        let q_emb = embedder.embed_one(question, TaskMode::RetrievalQuery).await?;
+        let mut dense_scored: Vec<(Uuid, f32)> = chunk_embeddings
+            .iter()
+            .map(|(id, v)| (*id, cosine_sim(&q_emb, v)))
+            .collect();
+        dense_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let dense_run: Vec<RankedHit> = dense_scored
+            .iter()
+            .take(20)
+            .enumerate()
+            .map(|(i, (id, score))| RankedHit {
+                chunk_id: *id,
+                rank: i + 1,
+                raw_score: *score,
+                source: RetrievalSource::Dense,
+            })
+            .collect();
+
+        // Fuse
+        let fused = reciprocal_rank_fusion(&[lexical_run, dense_run], rrf_k);
+        let retrieved: Vec<Uuid> = fused.iter().map(|(id, _)| *id).collect();
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+        latencies.push(latency_ms);
+
+        let relevant = vec![target_id];
+        let r1 = recall_at_k(&retrieved, &relevant, 1);
+        let r5 = recall_at_k(&retrieved, &relevant, 5);
+        let rr = reciprocal_rank(&retrieved, &relevant, 10);
+
+        r1_total += r1;
+        r5_total += r5;
+        mrr_total += rr;
+
+        let top_excerpt = retrieved
+            .first()
+            .and_then(|id| {
+                chunk_ids_by_text
+                    .iter()
+                    .find(|(cid, _)| cid == id)
+                    .map(|(_, text)| (*text).to_string())
+            })
+            .unwrap_or_default();
+
+        per_question.push(MiniQuestionResult {
+            question: question.to_string(),
+            relevant_prefix: relevant_prefix.to_string(),
+            recall_at_1: r1,
+            recall_at_5: r5,
+            reciprocal_rank: rr,
+            latency_ms,
+            top_chunk_excerpt: top_excerpt.chars().take(80).collect(),
+        });
+    }
+
+    let n = QUESTIONS.len() as f32;
+    let mut metrics = Metrics::default();
+    metrics.recall = Recall {
+        at_1: r1_total / n,
+        at_5: r5_total / n,
+        at_10: r5_total / n,
     };
     metrics.mrr = mrr_total / n;
     metrics.questions_evaluated = QUESTIONS.len();
