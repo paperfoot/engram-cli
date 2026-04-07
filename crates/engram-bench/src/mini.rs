@@ -208,6 +208,9 @@ pub fn build_fts_query(text: &str) -> String {
     const STOPWORDS: &[&str] = &[
         "the", "and", "for", "with", "that", "what", "which", "how",
         "does", "are", "was", "were", "from", "into", "this", "have",
+        // Experiment 1: also drop generic auxiliaries that match many chunks
+        "has", "had", "been", "being", "shown", "show", "shows",
+        "can", "could", "should", "would", "may", "might",
     ];
     let mut tokens: Vec<String> = Vec::new();
     for raw in text.split(|c: char| !c.is_alphanumeric()) {
