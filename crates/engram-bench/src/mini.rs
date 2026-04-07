@@ -460,7 +460,14 @@ mod tests {
     #[test]
     fn fts_query_builder_drops_short_tokens_and_ors() {
         let q = build_fts_query("of the rapamycin");
-        assert_eq!(q, "rapamycin");
+        // Stopwords + short tokens dropped, remaining tokens quoted for FTS5.
+        assert_eq!(q, "\"rapamycin\"");
+    }
+
+    #[test]
+    fn fts_query_builder_quotes_multiple_tokens() {
+        let q = build_fts_query("rapamycin lifespan extension");
+        assert_eq!(q, "\"rapamycin\" OR \"lifespan\" OR \"extension\"");
     }
 
     #[test]

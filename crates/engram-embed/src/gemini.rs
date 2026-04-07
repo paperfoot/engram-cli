@@ -148,8 +148,12 @@ impl Embedder for GeminiEmbedder {
         Ok(body.embedding.values)
     }
 
-    /// Override default loop with a real batch call. Gemini accepts up to 250
-    /// texts per `:batchEmbedContents` request.
+    /// Override default loop with a real batch call. Gemini's
+    /// `:batchEmbedContents` accepts up to 250 texts BUT enforces both a
+    /// 2,048 input-token-per-text cap and a 20,000 token-per-request cap.
+    /// We approximate tokens as `chars / 4` and pack each batch under 16,000
+    /// estimated tokens for safety. Inputs longer than ~8,000 chars are
+    /// truncated client-side so we don't even ship the bytes.
     async fn embed_batch(
         &self,
         texts: &[&str],
@@ -158,14 +162,51 @@ impl Embedder for GeminiEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        const BATCH: usize = 100;
+        const MAX_CHARS_PER_TEXT: usize = 7800; // ~1950 tokens, under the 2048 cap
+        const MAX_CHARS_PER_BATCH: usize = 60_000; // ~15000 tokens, under the 20K cap
+        const MAX_TEXTS_PER_BATCH: usize = 100;
+
+        let truncated: Vec<String> = texts
+            .iter()
+            .map(|t| {
+                if t.len() <= MAX_CHARS_PER_TEXT {
+                    (*t).to_string()
+                } else {
+                    // Truncate at a char boundary.
+                    let mut end = MAX_CHARS_PER_TEXT;
+                    while !t.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
+                    t[..end].to_string()
+                }
+            })
+            .collect();
+
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         let url = format!(
             "{}/{}:batchEmbedContents?key={}",
             ENDPOINT, self.model, self.api_key
         );
-        for chunk in texts.chunks(BATCH) {
-            let requests: Vec<EmbedRequest> = chunk
+
+        let mut idx = 0usize;
+        while idx < truncated.len() {
+            // Pack the next batch under both limits.
+            let mut end = idx;
+            let mut batch_chars = 0usize;
+            while end < truncated.len()
+                && (end - idx) < MAX_TEXTS_PER_BATCH
+                && batch_chars + truncated[end].len() <= MAX_CHARS_PER_BATCH
+            {
+                batch_chars += truncated[end].len();
+                end += 1;
+            }
+            // Always include at least one text per batch (in case a single
+            // text is bigger than the budget — we already truncated above).
+            if end == idx {
+                end = idx + 1;
+            }
+
+            let requests: Vec<EmbedRequest> = truncated[idx..end]
                 .iter()
                 .map(|t| EmbedRequest {
                     model: format!("models/{}", self.model),
@@ -187,10 +228,10 @@ impl Embedder for GeminiEmbedder {
                 return Err(EmbedError::RateLimited { provider: "gemini" });
             }
             if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body_text = resp.text().await.unwrap_or_default();
                 return Err(EmbedError::Api {
                     provider: "gemini",
-                    message: format!("status {}: {}", status, body),
+                    message: format!("status {}: {}", status, body_text),
                 });
             }
             let parsed: BatchEmbedResponse = resp
@@ -200,6 +241,7 @@ impl Embedder for GeminiEmbedder {
             for emb in parsed.embeddings {
                 out.push(emb.values);
             }
+            idx = end;
         }
         Ok(out)
     }
