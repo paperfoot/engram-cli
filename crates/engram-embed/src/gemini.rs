@@ -22,8 +22,10 @@ impl GeminiEmbedder {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(180))
+                .connect_timeout(std::time::Duration::from_secs(15))
                 .user_agent(concat!("engram/", env!("CARGO_PKG_VERSION")))
+                .pool_idle_timeout(std::time::Duration::from_secs(60))
                 .build()
                 .expect("failed to build reqwest client"),
             api_key: api_key.into(),
