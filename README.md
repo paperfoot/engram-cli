@@ -50,18 +50,30 @@ crates/
 - Mini bench: R@1 = 1.00 with hybrid_gemini
 - LongMemEval S split harness running with real dataset
 
-**Phase 2b (LongMemEval) — IN PROGRESS**
+**Phase 2b (LongMemEval) — DONE, BEAT MEMPALACE**
 
-| Sample | R@1 | R@5 | R@10 | MRR | Notes |
-|---|---|---|---|---|---|
-| First 50 questions | 0.90 | **0.98** | 1.00 | 0.94 | First MemPalace-parity result |
-| First 100 questions | 0.89 | **0.98** | 1.00 | 0.94 | Holds at scale |
-| Full 500 | TBD | TBD | TBD | TBD | Background run in progress |
+| Sample | R@1 | R@5 | R@10 | MRR |
+|---|---|---|---|---|
+| First 50 | 0.900 | 0.980 | 1.000 | 0.940 |
+| First 100 | 0.890 | 0.980 | 1.000 | 0.940 |
+| First 200 | 0.885 | 0.985 | 1.000 | 0.934 |
+| First 300 | 0.873 | 0.987 | 1.000 | 0.925 |
+| **Full 500** | **0.910** | **0.990** | **0.998** | **0.946** |
 
-**Reference: MemPalace hybrid_v4 published number is R@5 = 0.984.**
+**vs. MemPalace published R@5 = 0.984** — engram v2 beats it by 0.6 points
+on the same benchmark with:
 
-**Phase 3 (push past parity)** — Cohere reranking, R@1 tuning, full 500
-**Phase 4 (beyond)** — AAAK compression, memory layers, temporal validity, graph expansion
+- FTS5 lexical search
+- Gemini Embedding 2 dense vectors
+- Reciprocal Rank Fusion (k=60)
+- Nothing else
+
+No reranking, no graph traversal, no AAAK compression, no memory layers,
+no LLM triple extraction, no PageRank.
+
+**Phase 3 (push higher)** — Cohere reranking, RRF k tuning, R@1 improvements
+**Phase 4 (additional features)** — AAAK compression port, memory layers,
+temporal validity windows, graph expansion, mining modes, LanceDB persistence
 
 ## Quick start
 
