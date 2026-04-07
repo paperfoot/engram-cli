@@ -1,0 +1,19 @@
+[package]
+name = "engram-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite + LanceDB + FTS5 storage for engram v2"
+
+[dependencies]
+engram-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+directories.workspace = true
+tracing.workspace = true

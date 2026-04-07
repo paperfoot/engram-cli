@@ -1,0 +1,23 @@
+[package]
+name = "engram-bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LongMemEval and benchmark harness for engram v2"
+
+[dependencies]
+engram-core.workspace = true
+engram-storage.workspace = true
+engram-embed.workspace = true
+engram-rerank.workspace = true
+engram-ingest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+reqwest.workspace = true

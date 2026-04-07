@@ -1,0 +1,18 @@
+[package]
+name = "engram-ingest"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mining modes (papers, conversations, repos, general) for engram v2"
+
+[dependencies]
+engram-core.workspace = true
+engram-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true

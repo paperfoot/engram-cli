@@ -1,0 +1,40 @@
+[package]
+name = "engram-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "engram v2 — agent-native memory CLI"
+
+[[bin]]
+name = "engram"
+path = "src/main.rs"
+
+[dependencies]
+engram-core.workspace = true
+engram-storage.workspace = true
+engram-embed.workspace = true
+engram-rerank.workspace = true
+engram-ingest.workspace = true
+engram-graph.workspace = true
+engram-bench.workspace = true
+
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+comfy-table.workspace = true
+owo-colors.workspace = true
+directories.workspace = true
+figment.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true

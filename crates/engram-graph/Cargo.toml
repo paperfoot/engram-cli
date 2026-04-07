@@ -1,0 +1,16 @@
+[package]
+name = "engram-graph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Knowledge graph (deterministic edges + optional LLM triples) for engram v2"
+
+[dependencies]
+engram-core.workspace = true
+engram-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

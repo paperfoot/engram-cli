@@ -1,0 +1,17 @@
+[package]
+name = "engram-rerank"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reranking providers (Cohere Rerank 4 Pro, passthrough) for engram v2"
+
+[dependencies]
+engram-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait = "0.1"

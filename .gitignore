@@ -1,0 +1,7 @@
+target/
+data/longmemeval/raw/
+data/longmemeval/cache/
+.autoresearch/loop.lock
+*.swp
+.DS_Store
+.claude/

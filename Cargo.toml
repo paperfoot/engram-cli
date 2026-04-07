@@ -1,0 +1,95 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/engram-core",
+    "crates/engram-storage",
+    "crates/engram-embed",
+    "crates/engram-rerank",
+    "crates/engram-ingest",
+    "crates/engram-graph",
+    "crates/engram-bench",
+    "crates/engram-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Boris Djordjevic <5087259+longevityboris@users.noreply.github.com>"]
+license = "MIT"
+repository = "https://github.com/199-biotechnologies/engram-2"
+
+[workspace.dependencies]
+# Internal
+engram-core    = { path = "crates/engram-core" }
+engram-storage = { path = "crates/engram-storage" }
+engram-embed   = { path = "crates/engram-embed" }
+engram-rerank  = { path = "crates/engram-rerank" }
+engram-ingest  = { path = "crates/engram-ingest" }
+engram-graph   = { path = "crates/engram-graph" }
+engram-bench   = { path = "crates/engram-bench" }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+thiserror = "2"
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
+
+# Output
+comfy-table = "7"
+owo-colors  = "4"
+indicatif   = "0.17"
+
+# Paths
+directories = "5"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Testing
+assert_cmd = "2"
+predicates = "3"
+
+# Bench
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Self update
+self_update = { version = "0.43", default-features = false, features = ["rustls", "compression-flate2", "archive-tar"] }
+
+# Hashing / IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Numeric
+ordered-float = { version = "4", features = ["serde"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1
+opt-level = 3
