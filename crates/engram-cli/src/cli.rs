@@ -94,13 +94,17 @@ pub enum Command {
 
     /// Run a benchmark suite.
     Bench {
-        /// Benchmark name (longmemeval).
-        #[arg(default_value = "longmemeval")]
+        /// Benchmark name: mini | mini-fts | longmemeval
+        #[arg(default_value = "mini")]
         suite: String,
 
         /// Download dataset if missing.
         #[arg(long)]
         download: bool,
+
+        /// Limit the number of questions (LongMemEval only).
+        #[arg(long)]
+        limit: Option<usize>,
     },
 
     /// Manage engram configuration.

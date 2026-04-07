@@ -27,7 +27,9 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         }
         Command::Forget { id } => commands::forget::run(&ctx, id),
         Command::Export { format } => commands::export::run(&ctx, format),
-        Command::Bench { suite, download } => commands::bench::run(&ctx, suite, download).await,
+        Command::Bench { suite, download, limit } => {
+            commands::bench::run(&ctx, suite, download, limit).await
+        }
         Command::Config(sub) => match sub {
             ConfigCommand::Show => commands::config::show(&ctx),
             ConfigCommand::Set { key, value } => commands::config::set(&ctx, key, value),

@@ -11,11 +11,16 @@ use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use serde_json::json;
 
-pub async fn run(ctx: &AppContext, suite: String, _download: bool) -> Result<(), CliError> {
+pub async fn run(
+    ctx: &AppContext,
+    suite: String,
+    download: bool,
+    limit: Option<usize>,
+) -> Result<(), CliError> {
     match suite.as_str() {
         "mini" => run_mini(ctx).await,
         "mini-fts" => run_mini_fts(ctx),
-        "longmemeval" => run_longmemeval(ctx),
+        "longmemeval" => run_longmemeval(ctx, download, limit).await,
         other => Err(CliError::BadInput(format!("unknown suite: {other}"))),
     }
 }
@@ -99,16 +104,68 @@ fn run_mini_fts(ctx: &AppContext) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_longmemeval(ctx: &AppContext) -> Result<(), CliError> {
-    // Phase 2 wires real dataset loading + per-question evaluation.
+async fn run_longmemeval(
+    ctx: &AppContext,
+    _download: bool,
+    limit: Option<usize>,
+) -> Result<(), CliError> {
+    use engram_bench::longmemeval::{
+        default_oracle_path, default_s_path, run_oracle_hybrid, LongMemEvalDataset,
+    };
+
+    // Prefer the S split (real retrieval test, ~48 sessions/question, 96%
+    // distractors) over the Oracle split (haystack == answer, trivially 1.0).
+    let split_choice = std::env::var("ENGRAM_LME_SPLIT").unwrap_or_else(|_| "s".into());
+    let path = match split_choice.as_str() {
+        "oracle" => default_oracle_path(),
+        _ => default_s_path(),
+    };
+    if !path.exists() {
+        return Err(CliError::Config(format!(
+            "LongMemEval split not found at {}. Download with: \
+             curl -sL 'https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_{}_cleaned.json' \
+             -o {}",
+            path.display(),
+            if split_choice == "oracle" { "oracle".to_string() } else { "s".to_string() },
+            path.display()
+        )));
+    }
+    let dataset = LongMemEvalDataset::load_from_file(&path)?;
+
+    let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0);
+
+    let report = if std::env::var("GEMINI_API_KEY").is_ok()
+        && std::env::var("ENGRAM_BENCH_FORCE_STUB").is_err()
+    {
+        let embedder = GeminiEmbedder::from_env()
+            .map_err(|e| CliError::Config(format!("gemini: {e}")))?;
+        run_oracle_hybrid(&dataset, &embedder, rrf_k, limit).await?
+    } else {
+        let embedder = StubEmbedder::default();
+        run_oracle_hybrid(&dataset, &embedder, rrf_k, limit).await?
+    };
+
+    let m = &report.metrics;
     let payload = json!({
         "suite": "longmemeval",
-        "status": "not_implemented",
-        "note": "Phase 2: download dataset, ingest sessions, run R@k. Use `--download` once implemented.",
-        "recall_at_1": 0.0,
-        "recall_at_5": 0.0,
-        "recall_at_10": 0.0,
-        "questions_evaluated": 0
+        "split": split_choice,
+        "mode": report.mode,
+        "rrf_k": rrf_k,
+        "recall_at_1": m.recall.at_1,
+        "recall_at_5": m.recall.at_5,
+        "recall_at_10": m.recall.at_10,
+        "mrr": m.mrr,
+        "p50_latency_ms": m.p50_latency_ms,
+        "p95_latency_ms": m.p95_latency_ms,
+        "mean_latency_ms": m.mean_latency_ms,
+        "questions_evaluated": m.questions_evaluated,
+        "r1_correct": report.r1_count,
+        "r5_correct": report.r5_count,
+        "r10_correct": report.r10_count,
+        "limit": limit,
     });
     print_success(
         ctx.format,

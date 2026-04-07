@@ -51,11 +51,17 @@ impl GeminiEmbedder {
 
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
+    model: String,
     content: Content<'a>,
     #[serde(rename = "taskType")]
     task_type: &'static str,
     #[serde(rename = "outputDimensionality", skip_serializing_if = "Option::is_none")]
     output_dimensionality: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct BatchEmbedRequest<'a> {
+    requests: Vec<EmbedRequest<'a>>,
 }
 
 #[derive(Serialize)]
@@ -74,8 +80,20 @@ struct EmbedResponse {
 }
 
 #[derive(Deserialize)]
+struct BatchEmbedResponse {
+    embeddings: Vec<Embedding>,
+}
+
+#[derive(Deserialize)]
 struct Embedding {
     values: Vec<f32>,
+}
+
+fn task_type_str(mode: TaskMode) -> &'static str {
+    match mode {
+        TaskMode::RetrievalQuery => "RETRIEVAL_QUERY",
+        TaskMode::RetrievalDocument => "RETRIEVAL_DOCUMENT",
+    }
 }
 
 #[async_trait]
@@ -89,16 +107,12 @@ impl Embedder for GeminiEmbedder {
     }
 
     async fn embed_one(&self, text: &str, mode: TaskMode) -> Result<Vec<f32>, EmbedError> {
-        let task_type = match mode {
-            TaskMode::RetrievalQuery => "RETRIEVAL_QUERY",
-            TaskMode::RetrievalDocument => "RETRIEVAL_DOCUMENT",
-        };
-
         let req = EmbedRequest {
+            model: format!("models/{}", self.model),
             content: Content {
                 parts: vec![Part { text }],
             },
-            task_type,
+            task_type: task_type_str(mode),
             output_dimensionality: Some(self.dimensions),
         };
 
@@ -132,5 +146,61 @@ impl Embedder for GeminiEmbedder {
             .await
             .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
         Ok(body.embedding.values)
+    }
+
+    /// Override default loop with a real batch call. Gemini accepts up to 250
+    /// texts per `:batchEmbedContents` request.
+    async fn embed_batch(
+        &self,
+        texts: &[&str],
+        mode: TaskMode,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        const BATCH: usize = 100;
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        let url = format!(
+            "{}/{}:batchEmbedContents?key={}",
+            ENDPOINT, self.model, self.api_key
+        );
+        for chunk in texts.chunks(BATCH) {
+            let requests: Vec<EmbedRequest> = chunk
+                .iter()
+                .map(|t| EmbedRequest {
+                    model: format!("models/{}", self.model),
+                    content: Content { parts: vec![Part { text: t }] },
+                    task_type: task_type_str(mode),
+                    output_dimensionality: Some(self.dimensions),
+                })
+                .collect();
+            let body = BatchEmbedRequest { requests };
+            let resp = self
+                .client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(EmbedError::RateLimited { provider: "gemini" });
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(EmbedError::Api {
+                    provider: "gemini",
+                    message: format!("status {}: {}", status, body),
+                });
+            }
+            let parsed: BatchEmbedResponse = resp
+                .json()
+                .await
+                .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
+            for emb in parsed.embeddings {
+                out.push(emb.values);
+            }
+        }
+        Ok(out)
     }
 }
