@@ -20,11 +20,25 @@ pub struct JudgeVerdict {
 const JUDGE_SYSTEM: &str =
     "You are an expert evaluator. You will be given a question, a reference answer, and a candidate answer. \
      Decide whether the candidate answer is factually correct and addresses the question, using the \
-     reference answer as ground truth. \
-     The candidate may phrase things differently than the reference — that's fine as long as the \
-     underlying facts match. A candidate is WRONG if it contradicts the reference, hallucinates \
-     facts not in the reference, or fails to address the question. \
-     Respond with exactly one word on the final line: CORRECT or INCORRECT.";
+     reference answer as ground truth.\n\n\
+     EQUIVALENCE RULES — the candidate is CORRECT if any of these hold:\n\
+     1. Same fact, different wording. 'Business Administration degree' ≡ 'BA in Business Administration'.\n\
+     2. Numeric consistency. '45 minutes each way' ≡ '90 minutes round trip' ≡ '90 minutes total' \
+        (45 × 2 = 90; one-way and total describe the same commute).\n\
+     3. Unit conversions. '1.5 hours' ≡ '90 minutes' ≡ '1 hour 30 minutes'. '2 weeks' ≡ '14 days'.\n\
+     4. Partial match that covers the key fact. Gold='Target' and candidate='Target store' or \
+        'at Target' is CORRECT. Gold='John Smith' and candidate='John' is CORRECT unless ambiguity matters.\n\
+     5. Superset answers. If the gold is a single item from a list and the candidate names that item \
+        (possibly alongside others that are also true), it is CORRECT.\n\
+     6. Format differences. Date '2024-03-15' ≡ 'March 15, 2024' ≡ '15 March 2024'.\n\n\
+     The candidate is INCORRECT if:\n\
+     - It contradicts the reference on a key fact (wrong name, wrong number, wrong entity).\n\
+     - It hallucinates facts not in the reference.\n\
+     - It refuses to answer ('I don't know', 'not in the context', etc.) when the reference contains \
+       a specific, answerable fact. Refusal is always INCORRECT when the question has a definite answer.\n\
+     - It fails to address the question at all.\n\n\
+     Think briefly about whether the candidate satisfies any of the equivalence rules above. \
+     Then respond with exactly one word on the final line: CORRECT or INCORRECT.";
 
 fn build_judge_user(question: &str, gold: &str, candidate: &str) -> String {
     format!(
