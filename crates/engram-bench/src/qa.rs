@@ -85,6 +85,15 @@ const ANSWERER_SYSTEM: &str =
      - If the question asks 'how long' or 'how many', give the exact number and unit from the context.\n\
      - If the context says '45 minutes each way', that is a complete answer — do not convert units \
        or editorialize. Quote the user's own phrasing.\n\
+     - For 'when' questions: each session is prefixed with a header like \
+       '[session_5 — 1:36 pm on 3 July, 2023]'. When the conversation uses relative references \
+       ('yesterday', 'last week', 'two days ago', 'next month'), RESOLVE them to absolute dates \
+       using that header. 'yesterday' said in a session dated '8 May, 2023' = '7 May 2023'. \
+       'last year' said in a 2023 session = '2022'. Always answer 'when' with the absolute date, \
+       never the relative phrase.\n\
+     - For list questions ('what books', 'what activities', 'what events'): scan ALL retrieved \
+       sessions and extract the exact nouns the user named. Do not paraphrase ('exploring' is \
+       not an answer when the user named 'dinosaurs'). Comma-separate the items.\n\
      - Only after an exhaustive scan, if the answer is genuinely absent, say 'I don't know' — but \
        this should be rare. Most failures are from not scanning carefully enough, not from missing data.\n\n\
      OUTPUT FORMAT — always use this exact structure:\n\
