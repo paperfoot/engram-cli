@@ -38,8 +38,9 @@ impl ZerankLocalReranker {
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Self {
             client: reqwest::Client::builder()
-                // Local model can be slow on first batch; allow ample time.
-                .timeout(std::time::Duration::from_secs(120))
+                // Local model on M-series Metal can be 1-3s for 50 docs;
+                // generous timeout to absorb GC pauses or contention spikes.
+                .timeout(std::time::Duration::from_secs(300))
                 .user_agent(concat!("engram/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to build reqwest client"),
@@ -119,38 +120,94 @@ impl Reranker for ZerankLocalReranker {
         };
 
         let url = format!("{}/rerank", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| RerankError::Http {
-                provider: "zerank_local",
-                source: e,
-            })?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RerankError::Api {
-                provider: "zerank_local",
-                message: format!(
-                    "status {}: {} (is the sidecar running? \
-                     start with: uv run --with sentence-transformers --with torch \
-                     crates/engram-rerank/python/zerank_server.py)",
-                    status, body
-                ),
-            });
-        }
+        // Full-lifecycle retry: localhost connections drop occasionally
+        // when the threading HTTP server's backlog fills up under load.
+        // Without retry, one transient kills the whole 1500+ question bench.
+        let delays_secs: [u64; 6] = [1, 2, 4, 8, 16, 32];
+        let mut attempt: u32 = 0;
+        let body: RerankResponse = loop {
+            // 1. send
+            let send_result = self.client.post(&url).json(&req).send().await;
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if (attempt as usize) < delays_secs.len() {
+                        let wait = delays_secs[attempt as usize];
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Err(RerankError::Http {
+                        provider: "zerank_local",
+                        source: e,
+                    });
+                }
+            };
 
-        let body: RerankResponse = resp
-            .json()
-            .await
-            .map_err(|e| RerankError::Http {
-                provider: "zerank_local",
-                source: e,
-            })?;
+            // 2. status
+            let status = resp.status();
+            if status.is_server_error() {
+                let body_text = resp.text().await.unwrap_or_default();
+                if (attempt as usize) < delays_secs.len() {
+                    let wait = delays_secs[attempt as usize];
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(RerankError::Api {
+                    provider: "zerank_local",
+                    message: format!("status {}: {}", status, body_text),
+                });
+            }
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(RerankError::Api {
+                    provider: "zerank_local",
+                    message: format!(
+                        "status {}: {} (is the sidecar running? start with: \
+                         uv run --with 'transformers<5.0,>=4.45' \
+                         --with 'sentence-transformers>=3.0,<4.0' --with torch \
+                         crates/engram-rerank/python/zerank_server.py)",
+                        status, body_text
+                    ),
+                });
+            }
+
+            // 3. body read
+            let body_text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    if (attempt as usize) < delays_secs.len() {
+                        let wait = delays_secs[attempt as usize];
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Err(RerankError::Http {
+                        provider: "zerank_local",
+                        source: e,
+                    });
+                }
+            };
+
+            // 4. parse
+            match serde_json::from_str::<RerankResponse>(&body_text) {
+                Ok(parsed) => break parsed,
+                Err(e) => {
+                    if (attempt as usize) < delays_secs.len() {
+                        let wait = delays_secs[attempt as usize];
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Err(RerankError::Api {
+                        provider: "zerank_local",
+                        message: format!("parse failed: {}; body: {}", e, body_text),
+                    });
+                }
+            }
+        };
 
         if let Some(err) = body.error {
             return Err(RerankError::Api {
