@@ -120,100 +120,135 @@ impl ChatLlm for OpenRouterClient {
             max_tokens: self.max_tokens,
         };
 
-        // Exponential backoff on rate limits AND transient network errors.
-        // Long benchmark runs (1500+ questions) WILL hit transient drops from
-        // any of the providers OpenRouter proxies. Without this retry the
-        // whole run fails 1+ hour in.
-        let delays = [2u64, 4, 8, 16, 32];
+        // Bulletproof retry covering the FULL request lifecycle:
+        //   1. send()           — DNS, TCP, TLS handshake errors
+        //   2. status check     — 429 backoff
+        //   3. resp.text()      — body read can fail mid-stream on TLS drop
+        //   4. JSON parse       — truncated body looks like a parse error
+        //
+        // 5xx server errors are also retried (transient on OpenRouter's side).
+        // 4xx (except 429) are NOT retried — those are real client errors.
+        //
+        // Long benchmark runs (1500+ requests) hit at least one of these
+        // failure modes per run. Without full-lifecycle retry the whole bench
+        // dies 1+ hour in. Confirmed twice in practice on 2026-04-08.
+        let delays = [2u64, 4, 8, 16, 32, 64];
         let mut attempt = 0usize;
-        loop {
-            let send_result = self
-                .client
-                .post(ENDPOINT)
-                .bearer_auth(&self.api_key)
-                .header("HTTP-Referer", "https://github.com/199-biotechnologies/engram-2")
-                .header("X-Title", "engram v2 benchmark")
-                .json(&body)
-                .send()
-                .await;
-            let resp = match send_result {
-                Ok(r) => r,
-                Err(e) => {
-                    // Connection-level error (DNS, TCP reset, timeout, TLS).
-                    // These are usually transient — retry with backoff.
-                    if attempt < delays.len() {
-                        let wait = delays[attempt];
-                        attempt += 1;
-                        tracing::warn!(
-                            "openrouter network error, backing off {}s (attempt {}): {}",
-                            wait,
-                            attempt,
-                            e
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                        continue;
-                    }
-                    return Err(LlmError::Http {
-                        provider: "openrouter",
-                        source: e,
-                    });
-                }
-            };
 
-            let status = resp.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                if attempt < delays.len() {
+        loop {
+            let attempt_result = self.try_chat_once(&body).await;
+            match attempt_result {
+                Ok(resp) => return Ok(resp),
+                Err(RetryReason::Permanent(err)) => return Err(err),
+                Err(RetryReason::Transient(err)) => {
+                    if attempt >= delays.len() {
+                        return Err(err);
+                    }
                     let wait = delays[attempt];
                     attempt += 1;
-                    tracing::info!(
-                        "openrouter 429, backing off {}s (attempt {})",
+                    tracing::warn!(
+                        "openrouter transient error, backing off {}s (attempt {}): {}",
                         wait,
-                        attempt
+                        attempt,
+                        err
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                    continue;
                 }
-                return Err(LlmError::RateLimited {
-                    provider: "openrouter",
-                });
             }
-            if !status.is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(LlmError::Api {
-                    provider: "openrouter",
-                    message: format!("status {}: {}", status, body_text),
-                });
-            }
+        }
+    }
+}
 
-            // Read the body as text first so we can log it on parse failure.
-            let body_text = resp.text().await.map_err(|e| LlmError::Http {
+/// Wrap a single try so the retry loop can pattern-match on the failure mode.
+enum RetryReason {
+    /// Don't retry — surface the error to the caller.
+    Permanent(LlmError),
+    /// Transient — retry with backoff.
+    Transient(LlmError),
+}
+
+impl OpenRouterClient {
+    async fn try_chat_once(
+        &self,
+        body: &ChatRequest<'_>,
+    ) -> Result<ChatResponse, RetryReason> {
+        // Step 1: send.
+        let resp = self
+            .client
+            .post(ENDPOINT)
+            .bearer_auth(&self.api_key)
+            .header("HTTP-Referer", "https://github.com/199-biotechnologies/engram-2")
+            .header("X-Title", "engram v2 benchmark")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                RetryReason::Transient(LlmError::Http {
+                    provider: "openrouter",
+                    source: e,
+                })
+            })?;
+
+        // Step 2: status.
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(RetryReason::Transient(LlmError::RateLimited {
+                provider: "openrouter",
+            }));
+        }
+        if status.is_server_error() {
+            // 5xx is a transient OpenRouter / upstream provider failure.
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(RetryReason::Transient(LlmError::Api {
+                provider: "openrouter",
+                message: format!("status {}: {}", status, body_text),
+            }));
+        }
+        if !status.is_success() {
+            // 4xx (other than 429) is a real client error — never retry.
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(RetryReason::Permanent(LlmError::Api {
+                provider: "openrouter",
+                message: format!("status {}: {}", status, body_text),
+            }));
+        }
+
+        // Step 3: body read. TLS drops mid-stream show up here.
+        let body_text = resp.text().await.map_err(|e| {
+            RetryReason::Transient(LlmError::Http {
                 provider: "openrouter",
                 source: e,
-            })?;
-            let parsed: ChatResponseBody =
-                serde_json::from_str(&body_text).map_err(|e| LlmError::InvalidResponse {
+            })
+        })?;
+
+        // Step 4: parse. Treat truncation-flavored failures as transient.
+        // A real schema mismatch (e.g. OpenRouter changed the response shape)
+        // would also retry, but it would burn through all 6 attempts and then
+        // surface — better than silently swallowing.
+        let parsed: ChatResponseBody = match serde_json::from_str(&body_text) {
+            Ok(p) => p,
+            Err(e) => {
+                let preview = body_text.chars().take(500).collect::<String>();
+                return Err(RetryReason::Transient(LlmError::InvalidResponse {
                     provider: "openrouter",
-                    message: format!(
-                        "decode failed: {}; body first 500 chars: {}",
-                        e,
-                        body_text.chars().take(500).collect::<String>()
-                    ),
-                })?;
+                    message: format!("decode failed: {}; body first 500 chars: {}", e, preview),
+                }));
+            }
+        };
 
-            // Null or missing content is treated as an empty string so one
-            // flaky question doesn't abort a whole benchmark run.
-            let content = parsed
-                .choices
-                .first()
-                .and_then(|c| c.message.content.clone())
-                .unwrap_or_default();
+        // Null or missing content is treated as an empty string so one
+        // flaky question doesn't abort a whole benchmark run.
+        let content = parsed
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone())
+            .unwrap_or_default();
 
-            return Ok(ChatResponse {
-                content,
-                prompt_tokens: parsed.usage.as_ref().and_then(|u| u.prompt_tokens),
-                completion_tokens: parsed.usage.as_ref().and_then(|u| u.completion_tokens),
-                model: parsed.model.unwrap_or_else(|| self.model.clone()),
-            });
-        }
+        Ok(ChatResponse {
+            content,
+            prompt_tokens: parsed.usage.as_ref().and_then(|u| u.prompt_tokens),
+            completion_tokens: parsed.usage.as_ref().and_then(|u| u.completion_tokens),
+            model: parsed.model.clone().unwrap_or_else(|| self.model.clone()),
+        })
     }
 }
