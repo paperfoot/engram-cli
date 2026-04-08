@@ -47,7 +47,8 @@ pub enum Command {
         diary: String,
     },
 
-    /// Retrieve relevant memories.
+    /// Retrieve relevant memories via hybrid search (dense + lexical + rerank).
+    #[command(visible_aliases = ["search"])]
     Recall {
         /// Search query.
         query: String,
@@ -60,9 +61,17 @@ pub enum Command {
         #[arg(long, default_value = "topic")]
         layer: String,
 
-        /// Specialist agent diary namespace.
+        /// Specialist agent diary namespace, or "*" for all.
         #[arg(long, default_value = "default")]
         diary: String,
+
+        /// Earliest event_time to include (RFC3339).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Latest event_time to include (RFC3339).
+        #[arg(long)]
+        until: Option<String>,
     },
 
     /// Ingest a file or directory into the memory store.
@@ -79,17 +88,39 @@ pub enum Command {
         diary: String,
     },
 
-    /// Soft-delete a memory by id.
+    /// Soft-delete a memory by id. Destructive — requires --confirm.
+    #[command(visible_aliases = ["delete", "rm"])]
     Forget {
         /// Memory id (UUID).
         id: String,
+        /// Confirm destructive operation.
+        #[arg(long)]
+        confirm: bool,
     },
 
-    /// Export memories.
+    /// Update a memory's content or importance.
+    Edit {
+        /// Memory id (UUID).
+        id: String,
+        /// New content.
+        #[arg(long)]
+        content: Option<String>,
+        /// New importance (0..=10).
+        #[arg(long)]
+        importance: Option<u8>,
+    },
+
+    /// Export memories as JSON.
     Export {
         /// Output format (json).
         #[arg(long, default_value = "json")]
         format: String,
+    },
+
+    /// Import memories from an export file.
+    Import {
+        /// Path to export JSON.
+        file: std::path::PathBuf,
     },
 
     /// Run a benchmark suite.

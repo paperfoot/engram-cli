@@ -6,6 +6,22 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+/// Serialize a slice of f32 into little-endian bytes for SQLite BLOB storage.
+fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// Deserialize little-endian bytes back into a Vec<f32>.
+fn f32_bytes_to_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 pub struct SqliteStore {
     conn: Connection,
     #[allow(dead_code)]
@@ -45,7 +61,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     position     INTEGER NOT NULL,
     section      TEXT,
     token_count  INTEGER,
-    embedding_id TEXT,
+    embedding    BLOB,    -- f32[] serialized as little-endian bytes
+    embed_model  TEXT,
     FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
 );
 
@@ -189,6 +206,219 @@ impl SqliteStore {
             params![chunk_id.to_string(), memory_id.to_string(), content, position, section],
         )?;
         Ok(())
+    }
+
+    /// Insert a chunk together with its embedding. The embedding is stored
+    /// as a BLOB of little-endian f32s.
+    pub fn insert_chunk_with_embedding(
+        &self,
+        chunk_id: Uuid,
+        memory_id: Uuid,
+        content: &str,
+        position: u32,
+        section: Option<&str>,
+        embedding: &[f32],
+        embed_model: &str,
+    ) -> Result<(), StorageError> {
+        let blob = f32_slice_to_bytes(embedding);
+        self.conn.execute(
+            "INSERT INTO chunks(id, memory_id, content, position, section, embedding, embed_model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                chunk_id.to_string(),
+                memory_id.to_string(),
+                content,
+                position,
+                section,
+                blob,
+                embed_model,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Attach an embedding to an already-inserted chunk.
+    pub fn set_chunk_embedding(
+        &self,
+        chunk_id: Uuid,
+        embedding: &[f32],
+        embed_model: &str,
+    ) -> Result<(), StorageError> {
+        let blob = f32_slice_to_bytes(embedding);
+        self.conn.execute(
+            "UPDATE chunks SET embedding = ?1, embed_model = ?2 WHERE id = ?3",
+            params![blob, embed_model, chunk_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// List all chunks (id, content, embedding, diary) matching filters.
+    /// Used by `dense_search` which does brute-force cosine in Rust.
+    pub fn iter_chunks_with_embeddings(
+        &self,
+        diary: Option<&str>,
+    ) -> Result<Vec<(Uuid, String, Vec<f32>, String)>, StorageError> {
+        let sql = match diary {
+            Some(_) => {
+                "SELECT c.id, c.content, c.embedding, m.diary
+                 FROM chunks c
+                 JOIN memories m ON m.id = c.memory_id
+                 WHERE c.embedding IS NOT NULL AND m.deleted = 0 AND m.diary = ?1"
+            }
+            None => {
+                "SELECT c.id, c.content, c.embedding, m.diary
+                 FROM chunks c
+                 JOIN memories m ON m.id = c.memory_id
+                 WHERE c.embedding IS NOT NULL AND m.deleted = 0"
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut out = Vec::new();
+        let mapper = |r: &rusqlite::Row| -> rusqlite::Result<(Uuid, String, Vec<f32>, String)> {
+            let id_str: String = r.get(0)?;
+            let content: String = r.get(1)?;
+            let blob: Vec<u8> = r.get(2)?;
+            let diary: String = r.get(3)?;
+            Ok((
+                Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+                content,
+                f32_bytes_to_vec(&blob),
+                diary,
+            ))
+        };
+        let rows_iter: Box<dyn Iterator<Item = rusqlite::Result<(Uuid, String, Vec<f32>, String)>>> =
+            match diary {
+                Some(d) => {
+                    let iter = stmt.query_map(params![d], mapper)?;
+                    Box::new(iter.collect::<Vec<_>>().into_iter())
+                }
+                None => {
+                    let iter = stmt.query_map([], mapper)?;
+                    Box::new(iter.collect::<Vec<_>>().into_iter())
+                }
+            };
+        for row in rows_iter {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch chunk content by id.
+    pub fn get_chunk_content(&self, chunk_id: Uuid) -> Result<Option<String>, StorageError> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT content FROM chunks WHERE id = ?1",
+                params![chunk_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(r)
+    }
+
+    /// Mark a memory as deleted (soft delete).
+    pub fn soft_delete_memory(&self, memory_id: Uuid) -> Result<bool, StorageError> {
+        let n = self.conn.execute(
+            "UPDATE memories SET deleted = 1 WHERE id = ?1 AND deleted = 0",
+            params![memory_id.to_string()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Update memory content / importance.
+    pub fn update_memory(
+        &self,
+        memory_id: Uuid,
+        content: Option<&str>,
+        importance: Option<u8>,
+    ) -> Result<bool, StorageError> {
+        let changed = match (content, importance) {
+            (Some(c), Some(i)) => self.conn.execute(
+                "UPDATE memories SET content = ?1, importance = ?2 WHERE id = ?3 AND deleted = 0",
+                params![c, i, memory_id.to_string()],
+            )?,
+            (Some(c), None) => self.conn.execute(
+                "UPDATE memories SET content = ?1 WHERE id = ?2 AND deleted = 0",
+                params![c, memory_id.to_string()],
+            )?,
+            (None, Some(i)) => self.conn.execute(
+                "UPDATE memories SET importance = ?1 WHERE id = ?2 AND deleted = 0",
+                params![i, memory_id.to_string()],
+            )?,
+            (None, None) => 0,
+        };
+        Ok(changed > 0)
+    }
+
+    /// List all memories with optional filters. Returns newest first.
+    pub fn list_memories(
+        &self,
+        diary: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Memory>, StorageError> {
+        let sql = match diary {
+            Some(_) =>
+                "SELECT id, content, created_at, event_time, importance, emotional_weight,
+                        access_count, last_accessed, stability, source_json, diary,
+                        valid_from, valid_until, tags_json
+                 FROM memories WHERE deleted = 0 AND diary = ?1
+                 ORDER BY created_at DESC LIMIT ?2",
+            None =>
+                "SELECT id, content, created_at, event_time, importance, emotional_weight,
+                        access_count, last_accessed, stability, source_json, diary,
+                        valid_from, valid_until, tags_json
+                 FROM memories WHERE deleted = 0
+                 ORDER BY created_at DESC LIMIT ?1",
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mapper = |r: &rusqlite::Row| -> rusqlite::Result<Memory> {
+            use chrono::{DateTime, Utc};
+            let id_str: String = r.get(0)?;
+            let created: String = r.get(2)?;
+            let event: Option<String> = r.get(3)?;
+            let last_ac: Option<String> = r.get(7)?;
+            let src_json: String = r.get(9)?;
+            let vf: Option<String> = r.get(11)?;
+            let vu: Option<String> = r.get(12)?;
+            let tags_json: String = r.get(13)?;
+            Ok(Memory {
+                id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+                content: r.get(1)?,
+                created_at: DateTime::parse_from_rfc3339(&created)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                event_time: event
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|d| d.with_timezone(&Utc)),
+                importance: r.get(4)?,
+                emotional_weight: r.get(5)?,
+                access_count: r.get(6)?,
+                last_accessed: last_ac
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|d| d.with_timezone(&Utc)),
+                stability: r.get(8)?,
+                source: serde_json::from_str(&src_json).unwrap_or(
+                    engram_core::types::MemorySource::Manual,
+                ),
+                diary: r.get(10)?,
+                valid_from: vf
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|d| d.with_timezone(&Utc)),
+                valid_until: vu
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|d| d.with_timezone(&Utc)),
+                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            })
+        };
+        let rows = match diary {
+            Some(d) => stmt
+                .query_map(params![d, limit as i64], mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map(params![limit as i64], mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
     }
 
     /// Lexical (FTS5/BM25) search. Returns chunk_id + bm25 score.

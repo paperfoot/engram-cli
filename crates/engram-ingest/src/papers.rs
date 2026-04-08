@@ -1,8 +1,11 @@
-//! Paper ingestion — section-aware chunking for scientific PDFs/text.
-//! v0 stub: forwards to naive splitter. Autoresearch target.
+//! Paper ingestion — section-aware chunking for scientific papers.
+//!
+//! Delegates to `chunker::section_aware_split`, which tracks Markdown ATX,
+//! setext, and numbered section headings so chunks carry `Methods > Cell Culture`
+//! style breadcrumbs.
 
-use crate::chunker::{naive_split, PendingChunk};
+use crate::chunker::{section_aware_split, PendingChunk};
 
 pub fn chunk_paper(text: &str) -> Vec<PendingChunk> {
-    naive_split(text)
+    section_aware_split(text)
 }

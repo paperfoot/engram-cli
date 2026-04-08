@@ -6,6 +6,7 @@ pub mod commands;
 pub mod context;
 pub mod error;
 pub mod output;
+pub mod retrieval;
 
 use crate::cli::{Cli, Command, ConfigCommand};
 use crate::error::CliError;
@@ -19,14 +20,18 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Remember { content, importance, tag, diary } => {
             commands::remember::run(&ctx, content, importance, tag, diary).await
         }
-        Command::Recall { query, top_k, layer, diary } => {
-            commands::recall::run(&ctx, query, top_k, layer, diary).await
+        Command::Recall { query, top_k, layer, diary, since, until } => {
+            commands::recall::run(&ctx, query, top_k, layer, diary, since, until).await
         }
         Command::Ingest { path, mode, diary } => {
             commands::ingest::run(&ctx, path, mode, diary).await
         }
-        Command::Forget { id } => commands::forget::run(&ctx, id),
+        Command::Forget { id, confirm } => commands::forget::run(&ctx, id, confirm),
+        Command::Edit { id, content, importance } => {
+            commands::edit::run(&ctx, id, content, importance)
+        }
         Command::Export { format } => commands::export::run(&ctx, format),
+        Command::Import { file } => commands::import::run(&ctx, file),
         Command::Bench { suite, download, limit } => {
             commands::bench::run(&ctx, suite, download, limit).await
         }

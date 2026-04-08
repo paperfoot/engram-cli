@@ -1,16 +1,29 @@
-//! `engram export` — v0 stub.
+//! `engram export` — dump all memories as JSON to stdout.
 
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use serde_json::json;
 
-pub fn run(ctx: &AppContext, _format: String) -> Result<(), CliError> {
+pub fn run(ctx: &AppContext, format: String) -> Result<(), CliError> {
+    if format != "json" {
+        return Err(CliError::BadInput(format!(
+            "unknown format: {format} (only json supported)"
+        )));
+    }
+    let memories = ctx.store.list_memories(None, 1_000_000)?;
+    let payload = json!({
+        "version": 1,
+        "count": memories.len(),
+        "memories": memories,
+    });
+    let mut meta = Metadata::default();
+    meta.add("count", memories.len());
     print_success(
         ctx.format,
-        json!({ "exported": 0, "note": "export will be wired in Phase 2" }),
-        Metadata::default(),
-        |data| println!("{}", data),
+        payload,
+        meta,
+        |data| println!("{}", serde_json::to_string(data).unwrap()),
     );
     Ok(())
 }
