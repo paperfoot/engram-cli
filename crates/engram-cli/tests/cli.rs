@@ -278,8 +278,11 @@ fn config_show_masks_secrets() {
     let value = gemini["value"].as_str().unwrap_or("");
     // Should be masked (contains "...")
     assert!(value.contains("..."), "key should be masked, got {value}");
-    // And NOT contain the full original
-    assert!(!value.contains("MDW58"), "tail should be masked");
+    // And NOT contain the full original key's middle section.
+    assert!(
+        !value.contains("567890"),
+        "middle of key should be masked, got {value}"
+    );
 }
 
 #[test]
