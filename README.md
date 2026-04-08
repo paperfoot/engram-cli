@@ -30,7 +30,9 @@ The cost of this bet is that engram has to be *demonstrably better* at retrieval
 
 ## Benchmarks
 
-Full 500-question **[LongMemEval S split](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned)** — 48 sessions per question, 96% distractors. Same dataset **MemPalace** (the current SOTA open-source memory system) reports against.
+### Retrieval — LongMemEval S (500 questions, 96% distractors)
+
+Full 500-question **[LongMemEval S split](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned)** — 48 sessions per question, 96% distractors. Same dataset [MemPalace](https://github.com/kw27claw/mempalace) reports against.
 
 | Pipeline | R@1 | R@5 | R@10 | MRR |
 |---|---|---|---|---|
@@ -38,9 +40,52 @@ Full 500-question **[LongMemEval S split](https://huggingface.co/datasets/xiaowu
 | **engram — hybrid only** (Gemini Embed 2 + FTS5 + RRF) | 0.910 | **0.990** | 0.998 | 0.946 |
 | **engram — hybrid + Cohere Rerank** (first 100 Qs) | 0.930 | 0.980 | 1.000 | 0.957 |
 
-**engram beats MemPalace on R@5 by 0.6 points** with no reranking, no graph traversal, no AAAK compression, no PageRank. Adding Cohere rerank gains another ~4 points on R@1.
+**engram beats MemPalace on R@5 by 0.6 points** on retrieval alone — no reranking, no graph traversal, no AAAK compression, no PageRank. Adding Cohere rerank gains another ~4 points on R@1.
 
-The boring hybrid foundation wins. We confirmed this against the same dataset with two independent cross-model reviews ([GPT-5.4 and Gemini 3.1 Pro](docs/superpowers/specs/2026-04-07-engram-v2-design.md)) before writing a single line of Rust.
+### End-to-end QA (retrieve → LLM answer → LLM judge)
+
+Retrieval numbers alone hide the real bottleneck. [@parcadei tested MemPalace](https://x.com/parcadei/status/2041479166764196206) with an actual LLM answering questions using MemPalace's retrieved context, and got **only 17% correct answers** — despite the published R@5 of 0.984.
+
+We implemented the same end-to-end evaluation for engram: retrieve top-k → pass to `openai/gpt-5.4` to answer → judge correctness with `openai/gpt-5.4`. Per-question results, token counts, and cost are saved to [`benchmarks/`](benchmarks/).
+
+| Suite | Sample | Correct | Accuracy | R@5 | MRR | Notes |
+|---|---|---|---|---|---|---|
+| **LongMemEval-QA** | 2 | 2 | **100%** | 1.00 | 1.00 | Easy single-session questions |
+| **LongMemEval-QA** | 3 | 1 | **33%** | 1.00 | 1.00 | Retrieval perfect, 1 interpretation error + 1 false refusal |
+| **LoCoMo-QA** | 5 | 2 | **40%** | — | — | Short multi-session test |
+| **LoCoMo-QA** | 50 | 14 | **28%** | — | — | First stable QA number on a harder dataset |
+
+**The 17% gap is real for everyone** — not just MemPalace. Our own retrieval is near-perfect (MRR = 1.0 on LongMemEval-QA), but the answerer LLM:
+- Interprets "daily commute" as round-trip (90 min) when the reference is one-way (45 min)
+- Refuses to answer with "I don't know" even when the answer is in the retrieved context
+- Fails on LoCoMo's harder multi-session reasoning
+
+These aren't engram bugs, they're the state of the art. Retrieval R@5 ≠ answer accuracy. Measuring only retrieval — as MemPalace did — hides the real problem.
+
+**What this shows about MemPalace's claims:** their published 0.984 R@5 is probably real as a retrieval number, but the claim that "MemPalace is the best agent memory system" rests on conflating retrieval with end-to-end correctness. The [critical thread from Han Xiao (Jina AI)](https://x.com/hxiao/status/2041821141006971232) dissects this further.
+
+### RAGAS metrics (LLM-as-judge, four orthogonal dimensions)
+
+Run `engram bench longmemeval-qa --ragas` to compute four additional metrics on top of correctness: **faithfulness** (no hallucination), **answer relevance** (on-topic), **context precision** (retrieved chunks are all useful), **context recall** (every fact in the gold answer is in the retrieved chunks). Each adds 4 LLM calls per question, so run sparingly.
+
+### Reproducing
+
+```bash
+# Retrieval only (fast, no LLM judge):
+engram bench longmemeval --json                          # full 500
+engram bench longmemeval --limit 50 --json               # first 50
+engram bench mini --json                                 # 10-question smoke
+
+# End-to-end QA (requires OPENROUTER_API_KEY for answerer + judge):
+engram bench longmemeval-qa --limit 20 --json            # ~50 minutes on free Gemini tier
+engram bench longmemeval-qa --limit 20 --ragas --json    # + 4 extra LLM calls/question
+engram bench locomo-qa --limit 50 --json                 # ~3 minutes
+
+# Every run saves a timestamped report to benchmarks/
+ls benchmarks/
+```
+
+All runs are logged with full per-question detail, token counts, and model IDs to [`benchmarks/`](benchmarks/) so you can audit failures or rerun the judge with a different prompt without re-embedding. See [`benchmarks/README.md`](benchmarks/README.md) for the report schema.
 
 ## Install
 
