@@ -72,10 +72,8 @@ class Handler(BaseHTTPRequestHandler):
 
             pairs = [(query, str(d)) for d in docs]
             t0 = time.perf_counter()
-            scores = MODEL.predict(pairs, show_progress_bar=False)
+            scores_list = MODEL.predict(pairs)
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
-
-            scores_list = scores.tolist() if hasattr(scores, "tolist") else list(scores)
             indexed = sorted(
                 ((i, float(s)) for i, s in enumerate(scores_list)),
                 key=lambda x: x[1],
@@ -100,6 +98,54 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+# Direct model + tokenizer (the CrossEncoder.predict path is incompatible
+# with zerank-2's custom ZeroEntropyTokenizer.__call__ signature in
+# sentence-transformers >= 3.0). We tokenize pairs manually, run the
+# forward pass, and score by extracting the "yes" token logit at the
+# last position — this is the listwise / yes-token scoring pattern from
+# the model's modeling_zeranker.py.
+TOKENIZER = None
+YES_TOKEN_ID = None
+DEVICE = None
+
+
+class _Predictor:
+    """Wraps tokenize+forward+score so the Handler doesn't need torch imports."""
+
+    def __init__(self, tokenizer, model, yes_token_id, device):
+        import torch  # noqa
+        self.torch = torch
+        self.tokenizer = tokenizer
+        self.model = model
+        self.yes_token_id = yes_token_id
+        self.device = device
+
+    def predict(self, pairs):
+        """Score a list of (query, doc) tuples. Returns a list of floats.
+
+        zerank-2's ZeroEntropyForSequenceClassification already extracts
+        the yes-token logit at the last non-pad position internally and
+        returns logits of shape [batch, 1] with the score divided by 5
+        for calibration. We just squeeze and return.
+        """
+        torch = self.torch
+        # ZeroEntropyTokenizer.__call__ accepts the pairs list directly and
+        # applies the chat template internally.
+        inputs = self.tokenizer(
+            pairs,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=4096,  # well under the 32K context, keeps batches sane
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.inference_mode():
+            outputs = self.model(**inputs)
+        # outputs.logits is already [batch, 1] — the calibrated yes-token logit.
+        scores = outputs.logits.squeeze(-1)  # [batch]
+        return scores.detach().float().cpu().tolist()
+
+
 def main():
     global MODEL
     host = "127.0.0.1"
@@ -110,13 +156,42 @@ def main():
     )
     sys.stdout.flush()
     t0 = time.perf_counter()
-    from sentence_transformers import CrossEncoder
 
-    MODEL = CrossEncoder(
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+    # Apple Silicon: Metal Performance Shaders backend.
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    sys.stdout.write(f"device: {device}\n")
+    sys.stdout.flush()
+
+    tokenizer = AutoTokenizer.from_pretrained(
         MODEL_NAME,
         revision=MODEL_REVISION,
         trust_remote_code=True,
     )
+    # zerank-2 registers as ZeroEntropyForSequenceClassification but its
+    # forward() returns CausalLMOutputWithPast — we extract the yes-token
+    # logit from the last position manually below.
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME,
+        revision=MODEL_REVISION,
+        trust_remote_code=True,
+        dtype=torch.float16,  # half precision for M-series Metal
+    )
+    model.eval()
+    model.to(device)
+
+    yes_token_id = getattr(model.config, "yes_token_id", 9454)
+    sys.stdout.write(f"yes_token_id: {yes_token_id}\n")
+
+    MODEL = _Predictor(tokenizer, model, yes_token_id, device)
+
     elapsed = time.perf_counter() - t0
     sys.stdout.write(f"loaded in {elapsed:.1f}s\n")
     sys.stdout.write(f"listening on http://{host}:{port}\n")
