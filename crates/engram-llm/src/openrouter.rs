@@ -83,7 +83,9 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ResponseMessage {
-    content: String,
+    /// Optional so we tolerate `content: null` that some models return when
+    /// the response was filtered / refused / empty.
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -177,17 +179,13 @@ impl ChatLlm for OpenRouterClient {
                     ),
                 })?;
 
+            // Null or missing content is treated as an empty string so one
+            // flaky question doesn't abort a whole benchmark run.
             let content = parsed
                 .choices
                 .first()
-                .map(|c| c.message.content.clone())
-                .ok_or_else(|| LlmError::InvalidResponse {
-                    provider: "openrouter",
-                    message: format!(
-                        "no choices in response; body first 300 chars: {}",
-                        body_text.chars().take(300).collect::<String>()
-                    ),
-                })?;
+                .and_then(|c| c.message.content.clone())
+                .unwrap_or_default();
 
             return Ok(ChatResponse {
                 content,
