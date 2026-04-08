@@ -20,6 +20,9 @@ pub enum BenchError {
     #[error("rerank error: {0}")]
     Rerank(#[from] engram_rerank::RerankError),
 
+    #[error("llm error: {0}")]
+    Llm(#[from] engram_llm::LlmError),
+
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 

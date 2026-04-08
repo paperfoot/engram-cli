@@ -38,8 +38,20 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         },
         Command::Export { format } => commands::export::run(&ctx, format),
         Command::Import { file } => commands::import::run(&ctx, file),
-        Command::Bench { suite, download, limit } => {
-            commands::bench::run(&ctx, suite, download, limit).await
+        Command::Bench {
+            suite,
+            download,
+            limit,
+            answerer,
+            judge,
+            ragas,
+            top_k,
+            save,
+        } => {
+            commands::bench::run(
+                &ctx, suite, download, limit, answerer, judge, ragas, top_k, save,
+            )
+            .await
         }
         Command::Config(sub) => match sub {
             ConfigCommand::Show => commands::config::show(&ctx),

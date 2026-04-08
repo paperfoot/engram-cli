@@ -1,0 +1,103 @@
+{
+  "suite": "longmemeval_qa",
+  "questions_evaluated": 3,
+  "correct_count": 1,
+  "accuracy": 0.33333334,
+  "recall_at_5": 1.0,
+  "mrr": 1.0,
+  "ragas": null,
+  "mean_latency_ms": 159079.0,
+  "p50_latency_ms": 181229.0,
+  "p95_latency_ms": 186528.0,
+  "answerer_total_prompt_tokens": 36437,
+  "answerer_total_completion_tokens": 21,
+  "judge_total_prompt_tokens": 444,
+  "judge_total_completion_tokens": 20,
+  "per_question": [
+    {
+      "question_id": "e47becba",
+      "question_type": "single-session-user",
+      "question": "What degree did I graduate with?",
+      "gold_answer": "Business Administration",
+      "candidate_answer": "Business Administration",
+      "correct": true,
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "retrieved_sessions": [
+        "answer_280352e9",
+        "sharegpt_QZMeA7V_17",
+        "sharegpt_BvwQVCO_0",
+        "sharegpt_PdnvIns_0",
+        "d414cac5_4"
+      ],
+      "answer_session_ids": [
+        "answer_280352e9"
+      ],
+      "ragas": null,
+      "latency_ms": 109480,
+      "answerer_prompt_tokens": 9394,
+      "answerer_completion_tokens": 6,
+      "judge_prompt_tokens": 144,
+      "judge_completion_tokens": 6
+    },
+    {
+      "question_id": "118b2229",
+      "question_type": "single-session-user",
+      "question": "How long is my daily commute to work?",
+      "gold_answer": "45 minutes each way",
+      "candidate_answer": "90 minutes.",
+      "correct": false,
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "retrieved_sessions": [
+        "answer_40a90d51",
+        "7d8b5834_1",
+        "004edb32",
+        "sharegpt_6poO9nA_41",
+        "sharegpt_1rIk8tS_17"
+      ],
+      "answer_session_ids": [
+        "answer_40a90d51"
+      ],
+      "ragas": null,
+      "latency_ms": 186528,
+      "answerer_prompt_tokens": 13590,
+      "answerer_completion_tokens": 7,
+      "judge_prompt_tokens": 150,
+      "judge_completion_tokens": 7
+    },
+    {
+      "question_id": "51a45a95",
+      "question_type": "single-session-user",
+      "question": "Where did I redeem a $5 coupon on coffee creamer?",
+      "gold_answer": "Target",
+      "candidate_answer": "I don't know.",
+      "correct": false,
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "retrieved_sessions": [
+        "answer_d61669c7",
+        "sharegpt_9MbC1u2_0",
+        "cd90590d",
+        "d680a212_1",
+        "4f435d20_2"
+      ],
+      "answer_session_ids": [
+        "answer_d61669c7"
+      ],
+      "ragas": null,
+      "latency_ms": 181229,
+      "answerer_prompt_tokens": 13453,
+      "answerer_completion_tokens": 8,
+      "judge_prompt_tokens": 150,
+      "judge_completion_tokens": 7
+    }
+  ],
+  "by_question_type": {
+    "single-session-user": {
+      "total": 3,
+      "correct": 1,
+      "accuracy": 0.33333334
+    }
+  }
+}

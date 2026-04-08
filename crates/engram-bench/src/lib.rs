@@ -4,9 +4,13 @@
 //! Same benchmark MemPalace uses, so numbers are directly comparable.
 
 pub mod error;
+pub mod judge;
+pub mod locomo;
 pub mod longmemeval;
 pub mod metrics;
 pub mod mini;
+pub mod qa;
+pub mod ragas;
 
 pub use error::BenchError;
 pub use metrics::{Metrics, Recall};

@@ -566,6 +566,7 @@ dependencies = [
  "engram-core",
  "engram-embed",
  "engram-ingest",
+ "engram-llm",
  "engram-rerank",
  "engram-storage",
  "reqwest",
@@ -591,6 +592,7 @@ dependencies = [
  "engram-embed",
  "engram-graph",
  "engram-ingest",
+ "engram-llm",
  "engram-rerank",
  "engram-storage",
  "figment",
@@ -659,6 +661,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "engram-llm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

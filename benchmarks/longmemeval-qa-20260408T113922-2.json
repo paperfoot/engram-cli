@@ -1,0 +1,77 @@
+{
+  "suite": "longmemeval_qa",
+  "questions_evaluated": 2,
+  "correct_count": 2,
+  "accuracy": 1.0,
+  "recall_at_5": 1.0,
+  "mrr": 1.0,
+  "ragas": null,
+  "mean_latency_ms": 143468.5,
+  "p50_latency_ms": 175745.0,
+  "p95_latency_ms": 175745.0,
+  "answerer_total_prompt_tokens": 22984,
+  "answerer_total_completion_tokens": 15,
+  "judge_total_prompt_tokens": 296,
+  "judge_total_completion_tokens": 12,
+  "per_question": [
+    {
+      "question_id": "e47becba",
+      "question_type": "single-session-user",
+      "question": "What degree did I graduate with?",
+      "gold_answer": "Business Administration",
+      "candidate_answer": "Business Administration",
+      "correct": true,
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "retrieved_sessions": [
+        "answer_280352e9",
+        "sharegpt_QZMeA7V_17",
+        "sharegpt_BvwQVCO_0",
+        "sharegpt_PdnvIns_0",
+        "d414cac5_4"
+      ],
+      "answer_session_ids": [
+        "answer_280352e9"
+      ],
+      "ragas": null,
+      "latency_ms": 111192,
+      "answerer_prompt_tokens": 9394,
+      "answerer_completion_tokens": 6,
+      "judge_prompt_tokens": 144,
+      "judge_completion_tokens": 6
+    },
+    {
+      "question_id": "118b2229",
+      "question_type": "single-session-user",
+      "question": "How long is my daily commute to work?",
+      "gold_answer": "45 minutes each way",
+      "candidate_answer": "45 minutes each way.",
+      "correct": true,
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "retrieved_sessions": [
+        "answer_40a90d51",
+        "7d8b5834_1",
+        "004edb32",
+        "sharegpt_6poO9nA_41",
+        "sharegpt_1rIk8tS_17"
+      ],
+      "answer_session_ids": [
+        "answer_40a90d51"
+      ],
+      "ragas": null,
+      "latency_ms": 175745,
+      "answerer_prompt_tokens": 13590,
+      "answerer_completion_tokens": 9,
+      "judge_prompt_tokens": 152,
+      "judge_completion_tokens": 6
+    }
+  ],
+  "by_question_type": {
+    "single-session-user": {
+      "total": 2,
+      "correct": 2,
+      "accuracy": 1.0
+    }
+  }
+}

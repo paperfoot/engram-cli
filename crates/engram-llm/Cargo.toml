@@ -1,0 +1,17 @@
+[package]
+name = "engram-llm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Chat LLM providers (OpenRouter) for answer generation and judging"
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
+tracing.workspace = true

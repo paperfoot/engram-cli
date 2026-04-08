@@ -217,20 +217,34 @@ impl Embedder for GeminiEmbedder {
                 .collect();
             let body = BatchEmbedRequest { requests };
 
-            // Retry with exponential backoff on 429. Gemini free tier hits
-            // the per-minute quota fast on large corpora; we try up to 6
-            // times with backoffs 4s, 8s, 16s, 32s, 60s, 60s (~3 min total)
-            // before surfacing the rate-limit error.
+            // Retry with exponential backoff on 429 and transient network
+            // errors. Gemini free tier hits the per-minute quota fast on
+            // large corpora; we try up to 6 times with backoffs 4s, 8s,
+            // 16s, 32s, 60s, 60s (~3 min total) before surfacing the error.
+            // Transport errors (connection reset, DNS hiccup) get the same
+            // backoff since they're usually transient.
             let mut attempt: u32 = 0;
             let delays_secs: [u64; 6] = [4, 8, 16, 32, 60, 60];
             let parsed: BatchEmbedResponse = loop {
-                let resp = self
-                    .client
-                    .post(&url)
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
+                let send_result = self.client.post(&url).json(&body).send().await;
+                let resp = match send_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if (attempt as usize) < delays_secs.len() {
+                            let wait = delays_secs[attempt as usize];
+                            attempt += 1;
+                            tracing::info!(
+                                "gemini network error ({}), backing off {}s (attempt {})",
+                                e,
+                                wait,
+                                attempt
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                            continue;
+                        }
+                        return Err(EmbedError::Http { provider: "gemini", source: e });
+                    }
+                };
                 let status = resp.status();
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     if (attempt as usize) < delays_secs.len() {

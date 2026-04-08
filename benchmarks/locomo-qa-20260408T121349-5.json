@@ -1,0 +1,9 @@
+{
+  "accuracy": 0.4000000059604645,
+  "answerer_model": "openai/gpt-5.4",
+  "correct": 2,
+  "elapsed_ms": 16071,
+  "judge_model": "openai/gpt-5.4",
+  "questions_evaluated": 5,
+  "suite": "locomo-qa"
+}

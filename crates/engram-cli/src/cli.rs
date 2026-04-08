@@ -129,7 +129,7 @@ pub enum Command {
 
     /// Run a benchmark suite.
     Bench {
-        /// Benchmark name: mini | mini-fts | longmemeval
+        /// Benchmark name: mini | mini-fts | longmemeval | longmemeval-qa | locomo-qa
         #[arg(default_value = "mini")]
         suite: String,
 
@@ -137,9 +137,29 @@ pub enum Command {
         #[arg(long)]
         download: bool,
 
-        /// Limit the number of questions (LongMemEval only).
+        /// Limit the number of questions (LongMemEval / LoCoMo).
         #[arg(long)]
         limit: Option<usize>,
+
+        /// Answerer model (OpenRouter slug, default openai/gpt-5.4).
+        #[arg(long, default_value = "openai/gpt-5.4")]
+        answerer: String,
+
+        /// Judge model (OpenRouter slug, default openai/gpt-5.4).
+        #[arg(long, default_value = "openai/gpt-5.4")]
+        judge: String,
+
+        /// Compute RAGAS metrics (4 extra LLM calls per question).
+        #[arg(long)]
+        ragas: bool,
+
+        /// Top-k chunks to pass to the answerer.
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+
+        /// Save the report JSON to this path (in addition to stdout).
+        #[arg(long)]
+        save: Option<std::path::PathBuf>,
     },
 
     /// Manage engram configuration.

@@ -16,6 +16,7 @@ engram-core.workspace = true
 engram-storage.workspace = true
 engram-embed.workspace = true
 engram-rerank.workspace = true
+engram-llm.workspace = true
 engram-ingest.workspace = true
 engram-graph.workspace = true
 engram-bench.workspace = true

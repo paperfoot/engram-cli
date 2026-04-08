@@ -5,6 +5,7 @@ members = [
     "crates/engram-storage",
     "crates/engram-embed",
     "crates/engram-rerank",
+    "crates/engram-llm",
     "crates/engram-ingest",
     "crates/engram-graph",
     "crates/engram-bench",
@@ -25,6 +26,7 @@ engram-core    = { path = "crates/engram-core" }
 engram-storage = { path = "crates/engram-storage" }
 engram-embed   = { path = "crates/engram-embed" }
 engram-rerank  = { path = "crates/engram-rerank" }
+engram-llm     = { path = "crates/engram-llm" }
 engram-ingest  = { path = "crates/engram-ingest" }
 engram-graph   = { path = "crates/engram-graph" }
 engram-bench   = { path = "crates/engram-bench" }
