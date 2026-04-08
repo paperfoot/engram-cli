@@ -640,7 +640,9 @@ dependencies = [
 name = "engram-graph"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "engram-core",
+ "engram-llm",
  "engram-storage",
  "serde",
  "serde_json",

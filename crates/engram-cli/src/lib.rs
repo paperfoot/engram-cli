@@ -8,7 +8,7 @@ pub mod error;
 pub mod output;
 pub mod retrieval;
 
-use crate::cli::{Cli, Command, ConfigCommand, EntitiesCommand};
+use crate::cli::{Cli, Command, ConfigCommand, EntitiesCommand, FactsCommand};
 use crate::error::CliError;
 
 pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
@@ -17,8 +17,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
 
     match cli.command {
         Command::AgentInfo => agent_info::run(&ctx),
-        Command::Remember { content, importance, tag, diary } => {
-            commands::remember::run(&ctx, content, importance, tag, diary).await
+        Command::Remember { content, importance, tag, diary, no_facts } => {
+            commands::remember::run(&ctx, content, importance, tag, diary, no_facts).await
         }
         Command::Recall { query, top_k, layer, diary, since, until } => {
             commands::recall::run(&ctx, query, top_k, layer, diary, since, until).await
@@ -35,6 +35,13 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 commands::entities::list(&ctx, limit, min_mentions)
             }
             EntitiesCommand::Show { name } => commands::entities::show(&ctx, name),
+        },
+        Command::Facts(sub) => match sub {
+            FactsCommand::List { subject, diary, all, limit } => {
+                commands::facts::list(&ctx, subject, diary, all, limit)
+            }
+            FactsCommand::Show { subject, diary } => commands::facts::show(&ctx, subject, diary),
+            FactsCommand::Conflicts { limit } => commands::facts::conflicts(&ctx, limit),
         },
         Command::Export { format } => commands::export::run(&ctx, format),
         Command::Import { file } => commands::import::run(&ctx, file),

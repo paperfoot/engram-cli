@@ -45,6 +45,11 @@ pub enum Command {
         /// Specialist agent diary namespace.
         #[arg(long, default_value = "default")]
         diary: String,
+
+        /// Skip LLM-based fact extraction + contradiction detection.
+        /// Use for cheap bulk imports where no contradiction check is needed.
+        #[arg(long)]
+        no_facts: bool,
     },
 
     /// Retrieve relevant memories via hybrid search (dense + lexical + rerank).
@@ -113,6 +118,10 @@ pub enum Command {
     /// Browse extracted entities.
     #[command(subcommand)]
     Entities(EntitiesCommand),
+
+    /// Browse atomic (subject, predicate, object) facts and contradictions.
+    #[command(subcommand)]
+    Facts(FactsCommand),
 
     /// Export memories as JSON.
     Export {
@@ -208,6 +217,40 @@ pub enum EntitiesCommand {
     Show {
         /// Entity name (case-insensitive).
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FactsCommand {
+    /// List currently-active facts (newest first).
+    #[command(visible_aliases = ["ls"])]
+    List {
+        /// Filter to a specific subject (case-insensitive).
+        #[arg(long)]
+        subject: Option<String>,
+        /// Diary scope. Default is "default".
+        #[arg(long, default_value = "default")]
+        diary: String,
+        /// Include superseded (historic) facts in addition to active ones.
+        #[arg(long)]
+        all: bool,
+        /// Max facts to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Show every fact (active + historic) about a subject.
+    #[command(visible_aliases = ["get"])]
+    Show {
+        /// Subject name (case-insensitive). Pass "*" to use all diaries.
+        subject: String,
+        /// Diary scope. Default is "default". Pass "*" for all.
+        #[arg(long, default_value = "default")]
+        diary: String,
+    },
+    /// Show recent contradictions: facts that were superseded by newer claims.
+    Conflicts {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 

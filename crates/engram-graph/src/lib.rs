@@ -1,12 +1,13 @@
 //! Knowledge graph helpers.
 //!
-//! v0 = deterministic edges only (citation, containment, co-occurrence,
-//! synonym). LLM-extracted triples are optional and added in Phase 4.
-//!
-//! Used as query-time expansion from top-N candidates, NOT as the primary
-//! retriever.
+//! - `extract`: deterministic entity extraction (no LLM, regex on capitalization)
+//! - `facts`: LLM-based (subject, predicate, object) extraction for
+//!   contradiction detection at write time
+//! - `expand`: query-time graph traversal (currently a stub)
 
 pub mod expand;
 pub mod extract;
+pub mod facts;
 
 pub use extract::extract_entities;
+pub use facts::{extract_facts, normalize, ExtractedFact, FactExtractionError};

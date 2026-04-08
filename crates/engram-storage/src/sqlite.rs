@@ -111,6 +111,32 @@ CREATE TABLE IF NOT EXISTS edges (
 
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
 CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
+
+-- Facts table: atomic (subject, predicate, object) triples extracted from
+-- memory content. Used for contradiction detection at write time. Old facts
+-- are superseded (not deleted) so the history is queryable.
+CREATE TABLE IF NOT EXISTS facts (
+    id               TEXT PRIMARY KEY,
+    source_memory_id TEXT NOT NULL,
+    subject          TEXT NOT NULL,
+    subject_norm     TEXT NOT NULL,
+    predicate        TEXT NOT NULL,
+    object           TEXT NOT NULL,
+    object_norm      TEXT NOT NULL,
+    confidence       REAL NOT NULL DEFAULT 1.0,
+    created_at       TEXT NOT NULL,
+    superseded_by    TEXT,
+    superseded_at    TEXT,
+    diary            TEXT NOT NULL DEFAULT 'default',
+    FOREIGN KEY(source_memory_id) REFERENCES memories(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_facts_active_lookup
+    ON facts(subject_norm, predicate)
+    WHERE superseded_by IS NULL;
+CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject_norm);
+CREATE INDEX IF NOT EXISTS idx_facts_diary ON facts(diary);
+CREATE INDEX IF NOT EXISTS idx_facts_superseded ON facts(superseded_by);
 "#;
 
 const CURRENT_VERSION: i32 = 1;
@@ -506,6 +532,252 @@ impl SqliteStore {
         }
         Ok(out)
     }
+
+    // ========================================================================
+    // Facts — atomic (subject, predicate, object) triples for contradiction
+    // detection. Lean MVP: insert, lookup by (subject_norm, predicate),
+    // supersede, browse. No bi-temporal windows, no entity resolution beyond
+    // lowercase.
+    // ========================================================================
+
+    /// Insert a new fact. Caller is responsible for first checking whether
+    /// it conflicts with an existing active fact and superseding the old one.
+    pub fn insert_fact(&self, f: &engram_core::types::Fact) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO facts(id, source_memory_id, subject, subject_norm,
+                predicate, object, object_norm, confidence, created_at,
+                superseded_by, superseded_at, diary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                f.id.to_string(),
+                f.source_memory_id.to_string(),
+                f.subject,
+                f.subject_norm,
+                f.predicate,
+                f.object,
+                f.object_norm,
+                f.confidence,
+                f.created_at.to_rfc3339(),
+                f.superseded_by.map(|u| u.to_string()),
+                f.superseded_at.map(|t| t.to_rfc3339()),
+                f.diary,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get currently-active facts (not superseded) about a subject + predicate.
+    /// Used at write time to check whether a new fact contradicts existing ones.
+    /// Filters by diary so specialist agents don't pollute each other's facts.
+    pub fn get_active_facts(
+        &self,
+        subject_norm: &str,
+        predicate: &str,
+        diary: &str,
+    ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                    object, object_norm, confidence, created_at,
+                    superseded_by, superseded_at, diary
+             FROM facts
+             WHERE subject_norm = ?1 AND predicate = ?2 AND diary = ?3
+                   AND superseded_by IS NULL
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![subject_norm, predicate, diary], parse_fact_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Mark `old_id` as superseded by `new_id`. Sets `superseded_at = now`.
+    /// Returns true if a row was updated.
+    pub fn supersede_fact(&self, old_id: Uuid, new_id: Uuid) -> Result<bool, StorageError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let n = self.conn.execute(
+            "UPDATE facts SET superseded_by = ?1, superseded_at = ?2
+             WHERE id = ?3 AND superseded_by IS NULL",
+            params![new_id.to_string(), now, old_id.to_string()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All facts about a subject (active + superseded), newest first.
+    /// `diary = None` means search across all diaries.
+    pub fn list_facts_by_subject(
+        &self,
+        subject_norm: &str,
+        diary: Option<&str>,
+        include_superseded: bool,
+    ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
+        let sql = match (diary, include_superseded) {
+            (Some(_), true) =>
+                "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                        object, object_norm, confidence, created_at,
+                        superseded_by, superseded_at, diary
+                 FROM facts WHERE subject_norm = ?1 AND diary = ?2
+                 ORDER BY created_at DESC",
+            (Some(_), false) =>
+                "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                        object, object_norm, confidence, created_at,
+                        superseded_by, superseded_at, diary
+                 FROM facts WHERE subject_norm = ?1 AND diary = ?2
+                       AND superseded_by IS NULL
+                 ORDER BY created_at DESC",
+            (None, true) =>
+                "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                        object, object_norm, confidence, created_at,
+                        superseded_by, superseded_at, diary
+                 FROM facts WHERE subject_norm = ?1
+                 ORDER BY created_at DESC",
+            (None, false) =>
+                "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                        object, object_norm, confidence, created_at,
+                        superseded_by, superseded_at, diary
+                 FROM facts WHERE subject_norm = ?1 AND superseded_by IS NULL
+                 ORDER BY created_at DESC",
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows: Vec<engram_core::types::Fact> = match diary {
+            Some(d) => stmt
+                .query_map(params![subject_norm, d], parse_fact_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map(params![subject_norm], parse_fact_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// All facts (active by default), newest first. For `engram facts list`.
+    pub fn list_facts(
+        &self,
+        diary: Option<&str>,
+        include_superseded: bool,
+        limit: usize,
+    ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
+        let sql = match (diary, include_superseded) {
+            (Some(_), true) =>
+                "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                        object, object_norm, confidence, created_at,
+                        superseded_by, superseded_at, diary
+                 FROM facts WHERE diary = ?1 ORDER BY created_at DESC LIMIT ?2",
+            (Some(_), false) =>
+                "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                        object, object_norm, confidence, created_at,
+                        superseded_by, superseded_at, diary
+                 FROM facts WHERE diary = ?1 AND superseded_by IS NULL
+                 ORDER BY created_at DESC LIMIT ?2",
+            (None, true) =>
+                "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                        object, object_norm, confidence, created_at,
+                        superseded_by, superseded_at, diary
+                 FROM facts ORDER BY created_at DESC LIMIT ?1",
+            (None, false) =>
+                "SELECT id, source_memory_id, subject, subject_norm, predicate,
+                        object, object_norm, confidence, created_at,
+                        superseded_by, superseded_at, diary
+                 FROM facts WHERE superseded_by IS NULL
+                 ORDER BY created_at DESC LIMIT ?1",
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows: Vec<engram_core::types::Fact> = match diary {
+            Some(d) => stmt
+                .query_map(params![d, limit as i64], parse_fact_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map(params![limit as i64], parse_fact_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// All recent contradictions: facts that were superseded.
+    /// Returns the OLD fact alongside the new one that replaced it.
+    pub fn list_recent_conflicts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(engram_core::types::Fact, engram_core::types::Fact)>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT old.id, old.source_memory_id, old.subject, old.subject_norm,
+                    old.predicate, old.object, old.object_norm, old.confidence,
+                    old.created_at, old.superseded_by, old.superseded_at, old.diary,
+                    new.id, new.source_memory_id, new.subject, new.subject_norm,
+                    new.predicate, new.object, new.object_norm, new.confidence,
+                    new.created_at, new.superseded_by, new.superseded_at, new.diary
+             FROM facts old
+             JOIN facts new ON new.id = old.superseded_by
+             WHERE old.superseded_by IS NOT NULL
+             ORDER BY old.superseded_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            let old = parse_fact_from_offset(r, 0)?;
+            let new = parse_fact_from_offset(r, 12)?;
+            Ok((old, new))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn count_facts(&self) -> Result<i64, StorageError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM facts WHERE superseded_by IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+}
+
+/// Parse a row of the standard 12-column fact projection into a Fact.
+fn parse_fact_row(r: &rusqlite::Row) -> rusqlite::Result<engram_core::types::Fact> {
+    parse_fact_from_offset(r, 0)
+}
+
+fn parse_fact_from_offset(
+    r: &rusqlite::Row,
+    o: usize,
+) -> rusqlite::Result<engram_core::types::Fact> {
+    use chrono::{DateTime, Utc};
+    let id_str: String = r.get(o)?;
+    let src_str: String = r.get(o + 1)?;
+    let subject: String = r.get(o + 2)?;
+    let subject_norm: String = r.get(o + 3)?;
+    let predicate: String = r.get(o + 4)?;
+    let object: String = r.get(o + 5)?;
+    let object_norm: String = r.get(o + 6)?;
+    let confidence: f32 = r.get(o + 7)?;
+    let created_at_str: String = r.get(o + 8)?;
+    let superseded_by_str: Option<String> = r.get(o + 9)?;
+    let superseded_at_str: Option<String> = r.get(o + 10)?;
+    let diary: String = r.get(o + 11)?;
+    Ok(engram_core::types::Fact {
+        id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+        source_memory_id: Uuid::parse_str(&src_str).unwrap_or(Uuid::nil()),
+        subject,
+        subject_norm,
+        predicate,
+        object,
+        object_norm,
+        confidence,
+        created_at: DateTime::parse_from_rfc3339(&created_at_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        superseded_by: superseded_by_str
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok()),
+        superseded_at: superseded_at_str
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc)),
+        diary,
+    })
 }
 
 #[cfg(test)]

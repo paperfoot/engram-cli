@@ -126,6 +126,35 @@ impl Layer {
     }
 }
 
+/// An atomic factual claim extracted from a memory's content for
+/// contradiction detection. Stored independently from chunks so we can answer
+/// "what does engram currently believe about subject X?" without re-retrieving
+/// raw text.
+///
+/// Lean MVP design: no bi-temporal windows, no entity normalization beyond
+/// lowercase, no quality gates. The minimum that lets us catch contradictions
+/// at write time and supersede the old value when a new one disagrees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Fact {
+    pub id: Uuid,
+    pub source_memory_id: MemoryId,
+    /// Display form of the subject ("Elias Danilovski").
+    pub subject: String,
+    /// Lowercased subject for lookup ("elias danilovski").
+    pub subject_norm: String,
+    /// Snake_case predicate ("works_at", "lives_in", "prefers", "graduated_from").
+    pub predicate: String,
+    pub object: String,
+    pub object_norm: String,
+    pub confidence: f32,
+    pub created_at: DateTime<Utc>,
+    /// If non-None, this fact has been superseded by another fact (by id).
+    /// Old facts are NOT deleted — they remain queryable for history.
+    pub superseded_by: Option<Uuid>,
+    pub superseded_at: Option<DateTime<Utc>>,
+    pub diary: String,
+}
+
 /// A scored result returned by retrieval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredChunk {

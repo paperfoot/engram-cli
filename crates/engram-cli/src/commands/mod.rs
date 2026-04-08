@@ -3,6 +3,7 @@ pub mod config;
 pub mod edit;
 pub mod entities;
 pub mod export;
+pub mod facts;
 pub mod forget;
 pub mod import;
 pub mod ingest;

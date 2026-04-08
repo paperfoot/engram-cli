@@ -10,6 +10,8 @@ description = "Knowledge graph (deterministic edges + optional LLM triples) for 
 [dependencies]
 engram-core.workspace = true
 engram-storage.workspace = true
+engram-llm.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
