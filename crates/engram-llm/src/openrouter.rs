@@ -120,12 +120,14 @@ impl ChatLlm for OpenRouterClient {
             max_tokens: self.max_tokens,
         };
 
-        // Exponential backoff on rate limits. OpenRouter proxies many providers
-        // and any of them can rate limit us independently.
+        // Exponential backoff on rate limits AND transient network errors.
+        // Long benchmark runs (1500+ questions) WILL hit transient drops from
+        // any of the providers OpenRouter proxies. Without this retry the
+        // whole run fails 1+ hour in.
         let delays = [2u64, 4, 8, 16, 32];
         let mut attempt = 0usize;
         loop {
-            let resp = self
+            let send_result = self
                 .client
                 .post(ENDPOINT)
                 .bearer_auth(&self.api_key)
@@ -133,11 +135,30 @@ impl ChatLlm for OpenRouterClient {
                 .header("X-Title", "engram v2 benchmark")
                 .json(&body)
                 .send()
-                .await
-                .map_err(|e| LlmError::Http {
-                    provider: "openrouter",
-                    source: e,
-                })?;
+                .await;
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    // Connection-level error (DNS, TCP reset, timeout, TLS).
+                    // These are usually transient — retry with backoff.
+                    if attempt < delays.len() {
+                        let wait = delays[attempt];
+                        attempt += 1;
+                        tracing::warn!(
+                            "openrouter network error, backing off {}s (attempt {}): {}",
+                            wait,
+                            attempt,
+                            e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Err(LlmError::Http {
+                        provider: "openrouter",
+                        source: e,
+                    });
+                }
+            };
 
             let status = resp.status();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {

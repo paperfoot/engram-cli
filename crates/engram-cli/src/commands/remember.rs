@@ -99,8 +99,11 @@ pub async fn run(
         let openrouter_key =
             crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter");
         if let Some(key) = openrouter_key {
+            // Default to the latest cheap/fast OpenAI model — never an old
+            // generation (no gpt-4o, no gpt-4o-mini). Override with
+            // ENGRAM_FACT_MODEL if a different slug is preferred.
             let extraction_model = std::env::var("ENGRAM_FACT_MODEL")
-                .unwrap_or_else(|_| "openai/gpt-4o-mini".to_string());
+                .unwrap_or_else(|_| "openai/gpt-5.4-mini".to_string());
             let llm = OpenRouterClient::new(key).with_model(extraction_model);
             match extract_facts(&llm, &content).await {
                 Ok(extracted) => {
