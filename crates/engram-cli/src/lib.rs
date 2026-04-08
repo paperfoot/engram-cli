@@ -28,7 +28,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         }
         Command::Forget { id, confirm } => commands::forget::run(&ctx, id, confirm),
         Command::Edit { id, content, importance } => {
-            commands::edit::run(&ctx, id, content, importance)
+            commands::edit::run(&ctx, id, content, importance).await
         }
         Command::Entities(sub) => match sub {
             EntitiesCommand::List { limit, min_mentions } => {

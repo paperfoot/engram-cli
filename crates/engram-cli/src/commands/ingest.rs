@@ -106,7 +106,6 @@ pub async fn run(
             tags: vec![file.display().to_string()],
         };
         ctx.store.insert_memory(&memory)?;
-        memories_created += 1;
 
         let chunks: Vec<PendingChunk> = match resolved_mode {
             Mode::Papers => papers::chunk_paper(&text),
@@ -115,16 +114,32 @@ pub async fn run(
             _ => general_mode::chunk_general(&text),
         };
 
-        // Batch-embed all chunks for this file in one or a few API calls.
+        // Batch-embed all chunks. If embedding fails (rate limit, network,
+        // etc.) roll back the memory row so we don't leave an orphan with
+        // no chunks — recall would find nothing anyway and the count would
+        // be misleading.
         let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let embeddings: Vec<Vec<f32>> = if chunk_texts.is_empty() {
-            Vec::new()
+        let embed_result: Result<Vec<Vec<f32>>, CliError> = if chunk_texts.is_empty() {
+            Ok(Vec::new())
         } else if have_gemini {
             let e = GeminiEmbedder::new(gemini_key.clone().unwrap());
-            e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument).await?
+            e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
+                .await
+                .map_err(CliError::from)
         } else {
             let e = StubEmbedder::default();
-            e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument).await?
+            e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
+                .await
+                .map_err(CliError::from)
+        };
+
+        let embeddings = match embed_result {
+            Ok(v) => v,
+            Err(e) => {
+                // Roll back the orphan memory row and bubble the error up.
+                let _ = ctx.store.hard_delete_memory(memory.id);
+                return Err(e);
+            }
         };
 
         for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
@@ -139,6 +154,7 @@ pub async fn run(
             )?;
             chunks_created += 1;
         }
+        memories_created += 1;
     }
 
     let mut meta = Metadata::default();

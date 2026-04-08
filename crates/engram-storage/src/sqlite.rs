@@ -350,6 +350,27 @@ impl SqliteStore {
         Ok(changed > 0)
     }
 
+    /// Delete all chunks belonging to a memory. Used by `edit` before
+    /// re-chunking + re-embedding so recall sees the updated content.
+    pub fn delete_chunks_for_memory(&self, memory_id: Uuid) -> Result<usize, StorageError> {
+        let n = self.conn.execute(
+            "DELETE FROM chunks WHERE memory_id = ?1",
+            params![memory_id.to_string()],
+        )?;
+        Ok(n)
+    }
+
+    /// Hard-delete a memory and all its chunks (used by ingest rollback
+    /// when embedding fails mid-batch and we want to clean up the orphan).
+    pub fn hard_delete_memory(&self, memory_id: Uuid) -> Result<(), StorageError> {
+        // Chunks are removed by ON DELETE CASCADE on the foreign key.
+        self.conn.execute(
+            "DELETE FROM memories WHERE id = ?1",
+            params![memory_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// List all memories with optional filters. Returns newest first.
     pub fn list_memories(
         &self,

@@ -18,10 +18,27 @@ pub fn run(ctx: &AppContext, path: PathBuf) -> Result<(), CliError> {
     }
     let bytes = std::fs::read(&path)?;
     let payload: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+    // Accept BOTH shapes:
+    //   - raw export body: { "memories": [...], "count": N, "version": 1 }
+    //   - full CLI envelope as dumped by `engram export --json > file.json`:
+    //       { "version": "1", "status": "success", "data": {"memories":[...]}, ... }
+    // so users can pipe `engram export --json > file.json` and re-import
+    // without unwrapping by hand.
     let memories_json = payload
         .get("memories")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| CliError::BadInput("expected { memories: [...] }".into()))?;
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|d| d.get("memories"))
+                .and_then(|v| v.as_array())
+        })
+        .ok_or_else(|| {
+            CliError::BadInput(
+                "expected { memories: [...] } at top level or under .data".into(),
+            )
+        })?;
 
     let mut imported = 0u32;
     let mut chunks_created = 0u32;
