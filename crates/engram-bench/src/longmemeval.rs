@@ -15,6 +15,7 @@ use crate::metrics::{recall_at_k, reciprocal_rank, Metrics, Recall};
 use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
 use engram_core::types::{Memory, MemorySource, RetrievalSource};
 use engram_embed::{Embedder, TaskMode};
+use engram_rerank::{RerankCandidate, Reranker};
 use engram_storage::SqliteStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -186,16 +187,23 @@ fn build_fts_query(text: &str) -> String {
     tokens.join(" OR ")
 }
 
-/// Run hybrid retrieval over the LongMemEval Oracle split. Each question
-/// gets its own in-memory store seeded with that question's haystack only,
-/// then we recall and check whether retrieved chunks belong to one of the
-/// gold answer sessions.
-pub async fn run_oracle_hybrid<E: Embedder + ?Sized>(
+/// Run hybrid retrieval over LongMemEval. Each question gets its own
+/// in-memory store seeded with that question's haystack only, then we
+/// recall and check whether retrieved chunks belong to one of the gold
+/// answer sessions.
+///
+/// If a reranker is provided it reranks the top-50 fused candidates.
+pub async fn run_oracle_hybrid<E, R>(
     dataset: &LongMemEvalDataset,
     embedder: &E,
+    reranker: Option<&R>,
     rrf_k: f32,
     limit: Option<usize>,
-) -> Result<LongMemEvalReport, BenchError> {
+) -> Result<LongMemEvalReport, BenchError>
+where
+    E: Embedder + ?Sized,
+    R: Reranker + ?Sized,
+{
     let cache_p = cache_path(embedder.name());
     let mut cache = EmbedCache::load(&cache_p);
     let mut cache_dirty = false;
@@ -331,10 +339,50 @@ pub async fn run_oracle_hybrid<E: Embedder + ?Sized>(
             .collect();
 
         let fused = reciprocal_rank_fusion(&[lexical_run, dense_run], rrf_k);
-        let retrieved_sessions: Vec<String> = fused
-            .iter()
-            .filter_map(|(id, _)| chunk_to_session.get(id).cloned())
-            .collect();
+
+        // Optional rerank on the top-50 fused candidates. Cohere returns a
+        // new ordering; we pipe it back into session ids.
+        let retrieved_sessions: Vec<String> = if let Some(r) = reranker {
+            let top_candidates: Vec<(Uuid, String)> = fused
+                .iter()
+                .take(50)
+                .filter_map(|(id, _)| {
+                    chunk_to_session.get(id).and_then(|_sid| {
+                        // Get the chunk text via the store.
+                        store
+                            .get_chunk_content(*id)
+                            .ok()
+                            .flatten()
+                            .map(|content| (*id, content))
+                    })
+                })
+                .collect();
+
+            if top_candidates.is_empty() {
+                Vec::new()
+            } else {
+                let cands: Vec<RerankCandidate> = top_candidates
+                    .iter()
+                    .map(|(id, text)| RerankCandidate {
+                        id: id.to_string(),
+                        text: text.clone(),
+                    })
+                    .collect();
+                let reranked = r.rerank(&q.question, &cands, 10).await?;
+                reranked
+                    .into_iter()
+                    .filter_map(|rr| {
+                        let uuid = Uuid::parse_str(&rr.id).ok()?;
+                        chunk_to_session.get(&uuid).cloned()
+                    })
+                    .collect()
+            }
+        } else {
+            fused
+                .iter()
+                .filter_map(|(id, _)| chunk_to_session.get(id).cloned())
+                .collect()
+        };
 
         let latency_ms = start.elapsed().as_millis() as u64;
         latencies.push(latency_ms);

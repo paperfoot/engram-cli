@@ -17,6 +17,9 @@ pub enum BenchError {
     #[error("embed error: {0}")]
     Embed(#[from] engram_embed::EmbedError),
 
+    #[error("rerank error: {0}")]
+    Rerank(#[from] engram_rerank::RerankError),
+
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 

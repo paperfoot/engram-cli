@@ -112,9 +112,9 @@ async fn run_longmemeval(
     use engram_bench::longmemeval::{
         default_oracle_path, default_s_path, run_oracle_hybrid, LongMemEvalDataset,
     };
+    use engram_rerank::cohere::CohereReranker;
+    use engram_rerank::passthrough::PassthroughReranker;
 
-    // Prefer the S split (real retrieval test, ~48 sessions/question, 96%
-    // distractors) over the Oracle split (haystack == answer, trivially 1.0).
     let split_choice = std::env::var("ENGRAM_LME_SPLIT").unwrap_or_else(|_| "s".into());
     let path = match split_choice.as_str() {
         "oracle" => default_oracle_path(),
@@ -137,15 +137,25 @@ async fn run_longmemeval(
         .and_then(|v| v.parse().ok())
         .unwrap_or(60.0);
 
-    let report = if std::env::var("GEMINI_API_KEY").is_ok()
-        && std::env::var("ENGRAM_BENCH_FORCE_STUB").is_err()
-    {
+    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let have_gemini = std::env::var("GEMINI_API_KEY").is_ok() && !force_stub;
+    let have_cohere = std::env::var("COHERE_API_KEY").is_ok() && !force_stub;
+
+    let report = if have_gemini {
         let embedder = GeminiEmbedder::from_env()
             .map_err(|e| CliError::Config(format!("gemini: {e}")))?;
-        run_oracle_hybrid(&dataset, &embedder, rrf_k, limit).await?
+        if have_cohere {
+            let reranker = CohereReranker::from_env()
+                .map_err(|e| CliError::Config(format!("cohere: {e}")))?;
+            run_oracle_hybrid(&dataset, &embedder, Some(&reranker), rrf_k, limit).await?
+        } else {
+            let no_rerank: Option<&PassthroughReranker> = None;
+            run_oracle_hybrid(&dataset, &embedder, no_rerank, rrf_k, limit).await?
+        }
     } else {
         let embedder = StubEmbedder::default();
-        run_oracle_hybrid(&dataset, &embedder, rrf_k, limit).await?
+        let no_rerank: Option<&PassthroughReranker> = None;
+        run_oracle_hybrid(&dataset, &embedder, no_rerank, rrf_k, limit).await?
     };
 
     let m = &report.metrics;

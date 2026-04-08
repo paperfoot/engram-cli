@@ -46,7 +46,11 @@ pub async fn run(
     let model_name = if have_gemini { "gemini-embedding-001" } else { "stub" };
 
     for file in files {
-        let text = std::fs::read_to_string(&file).map_err(CliError::Io)?;
+        let text = if engram_ingest::pdf::is_pdf(&file) {
+            engram_ingest::pdf::extract_text(&file)?
+        } else {
+            std::fs::read_to_string(&file).map_err(CliError::Io)?
+        };
         if text.trim().is_empty() {
             continue;
         }
@@ -181,13 +185,22 @@ fn auto_classify(path: &Path, text: &str) -> Mode {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if name_lower.contains("paper") || name_lower.contains("arxiv") || ext == "pdf" {
+    // PDFs and arxiv-style filenames are papers.
+    if ext == "pdf"
+        || name_lower.contains("paper")
+        || name_lower.contains("arxiv")
+        // arXiv filename pattern: four digits, dot, four to five digits
+        || name_lower
+            .split('.')
+            .next()
+            .map(|s| s.len() >= 4 && s.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+    {
         return Mode::Papers;
     }
     if ext == "rs" || ext == "py" || ext == "ts" || ext == "js" || ext == "go" || ext == "java" {
         return Mode::Repos;
     }
-    // Chat exports tend to have many role/speaker turns.
     let turn_markers = text.matches("user:").count() + text.matches("assistant:").count();
     if turn_markers >= 5 {
         return Mode::Conversations;
@@ -216,7 +229,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError> {
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 if matches!(
                     ext.to_ascii_lowercase().as_str(),
-                    "txt" | "md" | "rst" | "json" | "rs" | "py" | "ts" | "js" | "go" | "java"
+                    "txt" | "md" | "rst" | "json" | "rs" | "py" | "ts" | "js" | "go" | "java" | "pdf"
                 ) {
                     out.push(p);
                 }

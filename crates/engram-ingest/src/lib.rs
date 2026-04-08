@@ -8,6 +8,7 @@ pub mod conversations;
 pub mod error;
 pub mod general;
 pub mod papers;
+pub mod pdf;
 pub mod repos;
 
 pub use error::IngestError;
