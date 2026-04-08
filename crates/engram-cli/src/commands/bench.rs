@@ -246,6 +246,7 @@ async fn run_locomo_qa(
     use engram_bench::qa::run_locomo_qa as run_qa;
     use engram_rerank::cohere::CohereReranker;
     use engram_rerank::passthrough::PassthroughReranker;
+    use engram_rerank::zerank_local::ZerankLocalReranker;
 
     let path = default_path();
     if !path.exists() {
@@ -280,36 +281,60 @@ async fn run_locomo_qa(
     let judge = OpenRouterClient::new(openrouter_key).with_model(judge_model.clone());
 
     // Run LoCoMo through the SAME hybrid pipeline as LongMemEval-QA:
-    // dense (Gemini Embed 2) + FTS5 BM25 + RRF fusion + optional Cohere rerank.
-    // Previous version was dense-only, which understated engram's real score.
-    let report = if let Some(cohere) = cohere_key {
-        let reranker = CohereReranker::new(cohere);
-        run_qa(
-            &dataset,
-            &embedder,
-            Some(&reranker),
-            &answerer,
-            &judge,
-            rrf_k,
-            top_k,
-            limit,
-            ragas,
-        )
-        .await?
-    } else {
-        let no_rerank: Option<&PassthroughReranker> = None;
-        run_qa(
-            &dataset,
-            &embedder,
-            no_rerank,
-            &answerer,
-            &judge,
-            rrf_k,
-            top_k,
-            limit,
-            ragas,
-        )
-        .await?
+    // dense (Gemini Embed 2) + FTS5 BM25 + RRF fusion + optional reranker.
+    //
+    // Reranker provider is controlled by ENGRAM_RERANK_PROVIDER:
+    //   - "zerank2" : local zerank-2 sidecar (best quality on biomed/STEM)
+    //   - "cohere"  : Cohere rerank-v3.5 (default if COHERE_API_KEY set)
+    //   - "none"    : passthrough (no rerank)
+    let provider = std::env::var("ENGRAM_RERANK_PROVIDER")
+        .unwrap_or_else(|_| {
+            if cohere_key.is_some() { "cohere".to_string() } else { "none".to_string() }
+        });
+    let report = match provider.as_str() {
+        "zerank2" | "zerank-2" | "zerank_local" | "local" => {
+            let reranker = ZerankLocalReranker::new();
+            // Fail fast if the sidecar isn't reachable.
+            if !reranker.health_check().await.unwrap_or(false) {
+                return Err(CliError::Config(
+                    "ENGRAM_RERANK_PROVIDER=zerank2 but the sidecar is not reachable. \
+                     Start it with: uv run --with sentence-transformers --with torch \
+                     crates/engram-rerank/python/zerank_server.py"
+                        .into(),
+                ));
+            }
+            run_qa(
+                &dataset, &embedder, Some(&reranker), &answerer, &judge,
+                rrf_k, top_k, limit, ragas,
+            )
+            .await?
+        }
+        "cohere" => {
+            let cohere = cohere_key.ok_or_else(|| {
+                CliError::Config(
+                    "ENGRAM_RERANK_PROVIDER=cohere but COHERE_API_KEY not set".into(),
+                )
+            })?;
+            let reranker = CohereReranker::new(cohere);
+            run_qa(
+                &dataset, &embedder, Some(&reranker), &answerer, &judge,
+                rrf_k, top_k, limit, ragas,
+            )
+            .await?
+        }
+        "none" | "passthrough" | "off" => {
+            let no_rerank: Option<&PassthroughReranker> = None;
+            run_qa(
+                &dataset, &embedder, no_rerank, &answerer, &judge,
+                rrf_k, top_k, limit, ragas,
+            )
+            .await?
+        }
+        other => {
+            return Err(CliError::BadInput(format!(
+                "unknown ENGRAM_RERANK_PROVIDER={other} (expected: zerank2 | cohere | none)"
+            )));
+        }
     };
 
     // Persist the full per_question report to disk, same as LongMemEval-QA.

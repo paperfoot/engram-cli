@@ -3,6 +3,7 @@
 pub mod cohere;
 pub mod error;
 pub mod passthrough;
+pub mod zerank_local;
 
 use async_trait::async_trait;
 pub use error::RerankError;

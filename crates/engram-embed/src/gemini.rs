@@ -123,31 +123,111 @@ impl Embedder for GeminiEmbedder {
             ENDPOINT, self.model, self.api_key
         );
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
+        // Full-lifecycle retry: send + 429 + 5xx + body read + JSON parse.
+        // Long benchmark runs (1500+ queries) hit transient drops; without
+        // retry the whole bench dies on the first one.
+        let delays_secs: [u64; 6] = [2, 4, 8, 16, 32, 64];
+        let mut attempt: u32 = 0;
+        loop {
+            // 1. send
+            let send_result = self.client.post(&url).json(&req).send().await;
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if (attempt as usize) < delays_secs.len() {
+                        let wait = delays_secs[attempt as usize];
+                        attempt += 1;
+                        tracing::warn!(
+                            "gemini embed_one network error, backing off {}s (attempt {}): {}",
+                            wait, attempt, e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Err(EmbedError::Http { provider: "gemini", source: e });
+                }
+            };
 
-        let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(EmbedError::RateLimited { provider: "gemini" });
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(EmbedError::Api {
-                provider: "gemini",
-                message: format!("status {}: {}", status, body),
-            });
-        }
+            // 2. status
+            let status = resp.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if (attempt as usize) < delays_secs.len() {
+                    let wait = delays_secs[attempt as usize];
+                    attempt += 1;
+                    tracing::info!(
+                        "gemini embed_one 429, backing off {}s (attempt {})",
+                        wait, attempt
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(EmbedError::RateLimited { provider: "gemini" });
+            }
+            if status.is_server_error() {
+                let body = resp.text().await.unwrap_or_default();
+                if (attempt as usize) < delays_secs.len() {
+                    let wait = delays_secs[attempt as usize];
+                    attempt += 1;
+                    tracing::warn!(
+                        "gemini embed_one 5xx ({}), backing off {}s (attempt {}): {}",
+                        status, wait, attempt, body
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(EmbedError::Api {
+                    provider: "gemini",
+                    message: format!("status {}: {}", status, body),
+                });
+            }
+            if !status.is_success() {
+                // 4xx (non-429) — real client error, never retry.
+                let body = resp.text().await.unwrap_or_default();
+                return Err(EmbedError::Api {
+                    provider: "gemini",
+                    message: format!("status {}: {}", status, body),
+                });
+            }
 
-        let body: EmbedResponse = resp
-            .json()
-            .await
-            .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
-        Ok(body.embedding.values)
+            // 3. body read (TLS drop mid-stream lands here)
+            let body_text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    if (attempt as usize) < delays_secs.len() {
+                        let wait = delays_secs[attempt as usize];
+                        attempt += 1;
+                        tracing::warn!(
+                            "gemini embed_one body-read error, backing off {}s (attempt {}): {}",
+                            wait, attempt, e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Err(EmbedError::Http { provider: "gemini", source: e });
+                }
+            };
+
+            // 4. JSON parse
+            match serde_json::from_str::<EmbedResponse>(&body_text) {
+                Ok(parsed) => return Ok(parsed.embedding.values),
+                Err(e) => {
+                    if (attempt as usize) < delays_secs.len() {
+                        let wait = delays_secs[attempt as usize];
+                        attempt += 1;
+                        tracing::warn!(
+                            "gemini embed_one parse error, backing off {}s (attempt {}): {}",
+                            wait, attempt, e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Err(EmbedError::Api {
+                        provider: "gemini",
+                        message: format!("parse failed: {}; body: {}", e, body_text.chars().take(500).collect::<String>()),
+                    });
+                }
+            }
+        }
     }
 
     /// Override default loop with a real batch call. Gemini's
