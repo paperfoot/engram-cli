@@ -75,21 +75,59 @@ no LLM triple extraction, no PageRank.
 **Phase 4 (additional features)** — AAAK compression port, memory layers,
 temporal validity windows, graph expansion, mining modes, LanceDB persistence
 
+## Install
+
+```bash
+git clone https://github.com/199-biotechnologies/engram-2
+cd engram-2
+cargo install --path crates/engram-cli --locked
+```
+
+This installs a single `engram` binary to `~/.cargo/bin/engram`. Nothing
+else gets installed; the binary carries its own skill file and writes its
+data to XDG paths.
+
+### Configure API keys
+
+```bash
+export GEMINI_API_KEY='...'    # required for hybrid retrieval (Gemini Embedding 2)
+export COHERE_API_KEY='...'    # optional, adds ~4 R@1 points via rerank
+
+# Or persist to ~/.config/engram/config.toml:
+engram config set keys.gemini $GEMINI_API_KEY
+engram config set keys.cohere $COHERE_API_KEY
+engram config check
+```
+
+### Install the skill signpost for agents
+
+```bash
+engram skill install
+# Deploys SKILL.md to ~/.claude, ~/.codex, ~/.gemini
+```
+
+Any agent that reads those skill directories will see `engram` and use
+`engram agent-info` to discover commands.
+
 ## Quick start
 
 ```bash
-# Build
-cargo build --release
-
-# Self-describing manifest
-./target/release/engram agent-info | jq
+# Self-describing manifest (raw JSON, per agent-cli-framework)
+engram agent-info | jq
 
 # Store and retrieve
-./target/release/engram remember "Rapamycin extends mouse lifespan via mTORC1 inhibition."
-./target/release/engram recall "rapamycin lifespan" --json | jq
+engram remember "Rapamycin extends mouse lifespan via mTORC1 inhibition."
+engram recall "rapamycin lifespan" --json | jq
 
-# Run the fast benchmark loop (used by autoresearch)
-./target/release/engram bench mini --json | jq '.data.recall_at_1'
+# Ingest a directory of PDFs or text files
+engram ingest ./papers/ --mode papers
+
+# Separate specialist-agent diaries
+engram remember "Note for coder agent" --diary coder
+engram recall "anything" --diary coder
+
+# Measure quality against LongMemEval
+engram bench longmemeval --limit 100 --json
 ```
 
 ## Autoresearch loop
