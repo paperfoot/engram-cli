@@ -4,7 +4,9 @@ use crate::{RerankCandidate, RerankError, RerankedResult, Reranker};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_MODEL: &str = "rerank-english-v3.0"; // upgrade to rerank-4-pro when GA
+// Latest Cohere Rerank model (v3.5). Multilingual, better quality than
+// rerank-english-v3.0, same API and same price.
+const DEFAULT_MODEL: &str = "rerank-v3.5";
 const ENDPOINT: &str = "https://api.cohere.com/v2/rerank";
 
 pub struct CohereReranker {
