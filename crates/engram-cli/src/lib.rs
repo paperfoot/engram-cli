@@ -8,7 +8,7 @@ pub mod error;
 pub mod output;
 pub mod retrieval;
 
-use crate::cli::{Cli, Command, ConfigCommand};
+use crate::cli::{Cli, Command, ConfigCommand, EntitiesCommand};
 use crate::error::CliError;
 
 pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
@@ -30,6 +30,12 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Edit { id, content, importance } => {
             commands::edit::run(&ctx, id, content, importance)
         }
+        Command::Entities(sub) => match sub {
+            EntitiesCommand::List { limit, min_mentions } => {
+                commands::entities::list(&ctx, limit, min_mentions)
+            }
+            EntitiesCommand::Show { name } => commands::entities::show(&ctx, name),
+        },
         Command::Export { format } => commands::export::run(&ctx, format),
         Command::Import { file } => commands::import::run(&ctx, file),
         Command::Bench { suite, download, limit } => {

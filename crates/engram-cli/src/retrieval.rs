@@ -119,9 +119,13 @@ where
         .collect();
 
     // Lexical: FTS5 BM25 — pipe through the same query builder used by the bench.
+    // Scoped to the same diary as the dense path so results don't bleed across
+    // specialist agent namespaces.
     let fts_q = build_fts_query(params.query);
     let fts_hits = if fts_q.is_empty() {
         Vec::new()
+    } else if let Some(d) = params.filters.diary.as_deref() {
+        store.fts_search_in_diary(&fts_q, d, 50).unwrap_or_default()
     } else {
         store.fts_search(&fts_q, 50).unwrap_or_default()
     };

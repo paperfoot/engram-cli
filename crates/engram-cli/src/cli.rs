@@ -110,6 +110,10 @@ pub enum Command {
         importance: Option<u8>,
     },
 
+    /// Browse extracted entities.
+    #[command(subcommand)]
+    Entities(EntitiesCommand),
+
     /// Export memories as JSON.
     Export {
         /// Output format (json).
@@ -165,6 +169,26 @@ pub enum ConfigCommand {
     },
     /// Validate configured API keys.
     Check,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EntitiesCommand {
+    /// List entities by mention count.
+    #[command(visible_aliases = ["ls"])]
+    List {
+        /// Max entities to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Minimum mention count filter.
+        #[arg(long, default_value_t = 1)]
+        min_mentions: u32,
+    },
+    /// Show details for one entity.
+    #[command(visible_aliases = ["get"])]
+    Show {
+        /// Entity name (case-insensitive).
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

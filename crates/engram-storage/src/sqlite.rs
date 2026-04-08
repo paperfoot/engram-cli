@@ -422,6 +422,8 @@ impl SqliteStore {
     }
 
     /// Lexical (FTS5/BM25) search. Returns chunk_id + bm25 score.
+    /// Unscoped across all diaries — used by the bench which opens a fresh
+    /// store per question.
     pub fn fts_search(
         &self,
         query: &str,
@@ -432,11 +434,44 @@ impl SqliteStore {
             "SELECT c.id, -bm25(chunks_fts)
              FROM chunks_fts
              JOIN chunks c ON c.rowid = chunks_fts.rowid
-             WHERE chunks_fts MATCH ?1
+             JOIN memories m ON m.id = c.memory_id
+             WHERE chunks_fts MATCH ?1 AND m.deleted = 0
              ORDER BY bm25(chunks_fts)
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![query, limit as i64], |r| {
+            let id_str: String = r.get(0)?;
+            let score: f64 = r.get(1)?;
+            Ok((id_str, score as f32))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_str, score) = row?;
+            if let Ok(id) = Uuid::parse_str(&id_str) {
+                out.push((id, score));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Diary-scoped lexical search. Same as `fts_search` but filters to one
+    /// diary (namespace per specialist agent).
+    pub fn fts_search_in_diary(
+        &self,
+        query: &str,
+        diary: &str,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, f32)>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, -bm25(chunks_fts)
+             FROM chunks_fts
+             JOIN chunks c ON c.rowid = chunks_fts.rowid
+             JOIN memories m ON m.id = c.memory_id
+             WHERE chunks_fts MATCH ?1 AND m.deleted = 0 AND m.diary = ?2
+             ORDER BY bm25(chunks_fts)
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![query, diary, limit as i64], |r| {
             let id_str: String = r.get(0)?;
             let score: f64 = r.get(1)?;
             Ok((id_str, score as f32))

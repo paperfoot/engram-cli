@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod config;
 pub mod edit;
+pub mod entities;
 pub mod export;
 pub mod forget;
 pub mod import;

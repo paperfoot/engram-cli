@@ -16,6 +16,21 @@ const COMMON_WORDS: &[&str] = &[
     "It", "He", "She", "They", "My", "Your", "Our", "His", "Her", "Their",
     "Is", "Are", "Was", "Were", "Has", "Have", "Had", "Be", "Been", "Do",
     "Does", "Did", "Will", "Would", "Should", "Can", "Could", "May", "Might",
+    // Paper-prose noise — capitalized at start of sentences.
+    "In", "On", "At", "As", "By", "For", "From", "Of", "To", "With",
+    "We", "Our", "Us", "If", "Then", "When", "While", "After", "Before",
+    "Where", "Which", "Who", "Why", "How", "What", "Also", "Only", "Not",
+    "But", "And", "Or", "So", "Such", "Both", "Either", "Neither",
+    "All", "Any", "Some", "Each", "Every", "Most", "More", "Less",
+    "First", "Second", "Third", "Last", "Next", "Previous", "Following",
+    // Paper structural words that get picked up from "Table 1", "Figure 2", etc.
+    "Table", "Figure", "Fig", "Section", "Appendix", "Abstract",
+    "Introduction", "Methods", "Results", "Discussion", "Conclusion",
+    "References", "Acknowledgments", "Appendices",
+    // Citation noise
+    "Proceedings", "Conference", "Journal", "Workshop", "Symposium",
+    "Volume", "Issue", "Page", "Pages", "Chapter", "Vol",
+    "URL", "DOI", "ISBN", "ISSN",
 ];
 
 /// Return a deduplicated list of entity surface forms found in `text`.
