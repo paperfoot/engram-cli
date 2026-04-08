@@ -107,15 +107,32 @@ pub fn default_path() -> PathBuf {
 }
 
 /// Extract every session_N key as a flat list of (session_id, text) pairs.
-/// Speaker turns are flattened into a single string per session.
+/// Speaker turns are flattened into a single string per session. The matching
+/// `session_N_date_time` sibling key (e.g. "1:56 pm on 8 May, 2023") is
+/// prepended to the text as a header so downstream readers can resolve
+/// relative time references ("yesterday", "last year") to absolute dates.
+/// Skips adversarial / metadata keys like `session_N_date_time` themselves.
 pub fn flatten_conversation(conv: &serde_json::Value) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(obj) = conv.as_object() {
-        let mut keys: Vec<&String> = obj.keys().filter(|k| k.starts_with("session_")).collect();
-        keys.sort();
+        // Keep only the raw session keys, not their `_date_time` siblings.
+        let mut keys: Vec<&String> = obj
+            .keys()
+            .filter(|k| {
+                k.starts_with("session_")
+                    && !k.ends_with("_date_time")
+                    && !k.ends_with("_summary")
+            })
+            .collect();
+        // Sort numerically so session_10 comes after session_2, not after session_1.
+        keys.sort_by_key(|k| {
+            k.strip_prefix("session_")
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(u32::MAX)
+        });
         for key in keys {
             let val = &obj[key];
-            let text = match val {
+            let body = match val {
                 // session is usually an array of {speaker, text} or similar.
                 serde_json::Value::Array(turns) => {
                     let mut buf = String::new();
@@ -146,9 +163,20 @@ pub fn flatten_conversation(conv: &serde_json::Value) -> Vec<(String, String)> {
                 serde_json::Value::String(s) => s.clone(),
                 _ => val.to_string(),
             };
-            if !text.trim().is_empty() {
-                out.push((key.clone(), text));
+            if body.trim().is_empty() {
+                continue;
             }
+            // Prepend the session timestamp if present — critical for temporal
+            // questions where the conversation uses relative references like
+            // "yesterday" or "last year".
+            let date_time_key = format!("{key}_date_time");
+            let header = obj
+                .get(&date_time_key)
+                .and_then(|v| v.as_str())
+                .map(|dt| format!("[{key} — {dt}]\n"))
+                .unwrap_or_else(|| format!("[{key}]\n"));
+            let text = format!("{header}{body}");
+            out.push((key.clone(), text));
         }
     }
     out
@@ -178,5 +206,55 @@ mod tests {
         assert_eq!(flat.len(), 2);
         assert_eq!(flat[0].0, "session_1");
         assert!(flat[0].1.contains("alice"));
+        // Without a date_time sibling we still emit a bare header.
+        assert!(flat[0].1.contains("[session_1]"));
+    }
+
+    #[test]
+    fn flatten_conversation_includes_timestamp_header() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_1_date_time": "1:56 pm on 8 May, 2023",
+                "session_1": [{"speaker":"alice","text":"hi"}]
+            }"#,
+        )
+        .unwrap();
+        let flat = flatten_conversation(&v);
+        assert_eq!(flat.len(), 1);
+        assert!(flat[0].1.contains("1:56 pm on 8 May, 2023"),
+            "expected timestamp in flattened text, got: {}", flat[0].1);
+        assert!(flat[0].1.contains("[session_1 — 1:56 pm on 8 May, 2023]"));
+    }
+
+    #[test]
+    fn flatten_conversation_sorts_numerically() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_10": [{"speaker":"a","text":"ten"}],
+                "session_2":  [{"speaker":"a","text":"two"}],
+                "session_1":  [{"speaker":"a","text":"one"}]
+            }"#,
+        )
+        .unwrap();
+        let flat = flatten_conversation(&v);
+        let keys: Vec<&str> = flat.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["session_1", "session_2", "session_10"]);
+    }
+
+    #[test]
+    fn flatten_conversation_skips_summary_and_date_time_keys() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_1": [{"speaker":"a","text":"hi"}],
+                "session_1_date_time": "1:00 pm on 1 Jan, 2024",
+                "session_1_summary": "they said hi",
+                "session_2": [{"speaker":"b","text":"yo"}],
+                "session_2_date_time": "2:00 pm on 2 Jan, 2024"
+            }"#,
+        )
+        .unwrap();
+        let flat = flatten_conversation(&v);
+        let keys: Vec<&str> = flat.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["session_1", "session_2"]);
     }
 }

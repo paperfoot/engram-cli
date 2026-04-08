@@ -1,0 +1,102 @@
+{
+  "suite": "locomo_qa",
+  "questions_evaluated": 3,
+  "correct_count": 1,
+  "accuracy": 0.33333334,
+  "recall_at_5": 0.0,
+  "mrr": 0.0,
+  "ragas": null,
+  "mean_latency_ms": 3485.6667,
+  "p50_latency_ms": 3311.0,
+  "p95_latency_ms": 3938.0,
+  "answerer_total_prompt_tokens": 11730,
+  "answerer_total_completion_tokens": 159,
+  "judge_total_prompt_tokens": 1355,
+  "judge_total_completion_tokens": 20,
+  "per_question": [
+    {
+      "question_id": "conv-26:0",
+      "question_type": "category_2",
+      "question": "When did Caroline go to the LGBTQ support group?",
+      "gold_answer": "7 May 2023",
+      "candidate_answer": "Caroline went to the LGBTQ support group yesterday.",
+      "correct": false,
+      "recall_at_5": 0.0,
+      "mrr": 0.0,
+      "retrieved_sessions": [
+        "session_1",
+        "session_10",
+        "session_7",
+        "session_4",
+        "session_5"
+      ],
+      "answer_session_ids": [],
+      "ragas": null,
+      "latency_ms": 3938,
+      "answerer_prompt_tokens": 3651,
+      "answerer_completion_tokens": 45,
+      "judge_prompt_tokens": 454,
+      "judge_completion_tokens": 7
+    },
+    {
+      "question_id": "conv-26:1",
+      "question_type": "category_2",
+      "question": "When did Melanie paint a sunrise?",
+      "gold_answer": "2022",
+      "candidate_answer": "Melanie painted the sunrise last year.",
+      "correct": false,
+      "recall_at_5": 0.0,
+      "mrr": 0.0,
+      "retrieved_sessions": [
+        "session_1",
+        "session_14",
+        "session_17",
+        "session_8",
+        "session_16"
+      ],
+      "answer_session_ids": [],
+      "ragas": null,
+      "latency_ms": 3208,
+      "answerer_prompt_tokens": 4726,
+      "answerer_completion_tokens": 44,
+      "judge_prompt_tokens": 446,
+      "judge_completion_tokens": 7
+    },
+    {
+      "question_id": "conv-26:2",
+      "question_type": "category_3",
+      "question": "What fields would Caroline be likely to pursue in her educaton?",
+      "gold_answer": "Psychology, counseling certification",
+      "candidate_answer": "Caroline would likely pursue counseling or mental health.",
+      "correct": true,
+      "recall_at_5": 0.0,
+      "mrr": 0.0,
+      "retrieved_sessions": [
+        "session_1",
+        "session_4",
+        "session_7",
+        "session_6",
+        "session_5"
+      ],
+      "answer_session_ids": [],
+      "ragas": null,
+      "latency_ms": 3311,
+      "answerer_prompt_tokens": 3353,
+      "answerer_completion_tokens": 70,
+      "judge_prompt_tokens": 455,
+      "judge_completion_tokens": 6
+    }
+  ],
+  "by_question_type": {
+    "category_3": {
+      "total": 1,
+      "correct": 1,
+      "accuracy": 1.0
+    },
+    "category_2": {
+      "total": 2,
+      "correct": 0,
+      "accuracy": 0.0
+    }
+  }
+}
