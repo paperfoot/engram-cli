@@ -39,6 +39,9 @@ pub async fn run(
 
     let mut memories_created = 0u32;
     let mut chunks_created = 0u32;
+    // Cost accounting for Gemini embeddings: ~4 chars per token heuristic,
+    // $0.15 per 1M input tokens for gemini-embedding-001 (priced 2026-04).
+    let mut total_embedded_chars: usize = 0;
 
     // Embedder: env var → config file → stub fallback
     let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
@@ -119,6 +122,7 @@ pub async fn run(
         // no chunks — recall would find nothing anyway and the count would
         // be misleading.
         let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let embed_chars: usize = chunk_texts.iter().map(|t| t.len()).sum();
         let embed_result: Result<Vec<Vec<f32>>, CliError> = if chunk_texts.is_empty() {
             Ok(Vec::new())
         } else if have_gemini {
@@ -154,14 +158,26 @@ pub async fn run(
             )?;
             chunks_created += 1;
         }
+        total_embedded_chars += embed_chars;
         memories_created += 1;
     }
+
+    // Cost summary.
+    let tokens_estimated = (total_embedded_chars + 3) / 4;
+    let gemini_cost_usd = if have_gemini {
+        tokens_estimated as f64 * 0.15 / 1_000_000.0
+    } else {
+        0.0
+    };
 
     let mut meta = Metadata::default();
     meta.elapsed_ms = start.elapsed().as_millis() as u64;
     meta.add("memories_created", memories_created);
     meta.add("chunks_created", chunks_created);
     meta.add("embedder", model_name);
+    meta.add("embed_chars", total_embedded_chars);
+    meta.add("embed_tokens_estimated", tokens_estimated);
+    meta.add("embed_cost_usd_estimated", format!("{:.6}", gemini_cost_usd));
 
     print_success(
         ctx.format,
@@ -169,6 +185,9 @@ pub async fn run(
             "memories_created": memories_created,
             "chunks_created": chunks_created,
             "mode": mode,
+            "embed_chars": total_embedded_chars,
+            "embed_tokens_estimated": tokens_estimated,
+            "embed_cost_usd_estimated": gemini_cost_usd,
         }),
         meta,
         |data| println!("Ingested: {}", data),

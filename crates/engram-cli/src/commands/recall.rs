@@ -104,6 +104,17 @@ pub async fn run(
         }))
         .collect();
 
+    // Per-call API cost estimate:
+    //   Gemini: embed the query once. Assume ~chars/4 tokens, $0.15/1M.
+    //   Cohere: one rerank call per recall, ~$0.002 per call on Rerank v3.
+    let query_tokens_estimated = (query.len() + 3) / 4;
+    let gemini_query_cost = if have_gemini {
+        query_tokens_estimated as f64 * 0.15 / 1_000_000.0
+    } else {
+        0.0
+    };
+    let cohere_cost = if have_cohere { 0.002 } else { 0.0 };
+
     let mut meta = Metadata::default();
     meta.elapsed_ms = start.elapsed().as_millis() as u64;
     meta.add("retriever", if have_gemini { "hybrid_gemini" } else { "hybrid_stub" });
@@ -113,6 +124,10 @@ pub async fn run(
     meta.add("token_budget", budget);
     meta.add("tokens_used", used_tokens);
     meta.add("results_returned", results_json.len());
+    meta.add("gemini_query_tokens_estimated", query_tokens_estimated);
+    meta.add("gemini_cost_usd", format!("{:.7}", gemini_query_cost));
+    meta.add("cohere_cost_usd", format!("{:.5}", cohere_cost));
+    meta.add("total_cost_usd_estimated", format!("{:.6}", gemini_query_cost + cohere_cost));
 
     let status = if results_json.is_empty() { "no_results" } else { "success" };
     print_success(

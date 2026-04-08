@@ -202,8 +202,6 @@ impl Embedder for GeminiEmbedder {
                 batch_chars += truncated[end].len();
                 end += 1;
             }
-            // Always include at least one text per batch (in case a single
-            // text is bigger than the budget — we already truncated above).
             if end == idx {
                 end = idx + 1;
             }
@@ -218,28 +216,49 @@ impl Embedder for GeminiEmbedder {
                 })
                 .collect();
             let body = BatchEmbedRequest { requests };
-            let resp = self
-                .client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(EmbedError::RateLimited { provider: "gemini" });
-            }
-            if !status.is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(EmbedError::Api {
-                    provider: "gemini",
-                    message: format!("status {}: {}", status, body_text),
-                });
-            }
-            let parsed: BatchEmbedResponse = resp
-                .json()
-                .await
-                .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
+
+            // Retry with exponential backoff on 429. Gemini free tier hits
+            // the per-minute quota fast on large corpora; we try up to 6
+            // times with backoffs 4s, 8s, 16s, 32s, 60s, 60s (~3 min total)
+            // before surfacing the rate-limit error.
+            let mut attempt: u32 = 0;
+            let delays_secs: [u64; 6] = [4, 8, 16, 32, 60, 60];
+            let parsed: BatchEmbedResponse = loop {
+                let resp = self
+                    .client
+                    .post(&url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
+                let status = resp.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    if (attempt as usize) < delays_secs.len() {
+                        let wait = delays_secs[attempt as usize];
+                        attempt += 1;
+                        tracing::info!(
+                            "gemini 429, backing off {}s (attempt {})",
+                            wait,
+                            attempt
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Err(EmbedError::RateLimited { provider: "gemini" });
+                }
+                if !status.is_success() {
+                    let body_text = resp.text().await.unwrap_or_default();
+                    return Err(EmbedError::Api {
+                        provider: "gemini",
+                        message: format!("status {}: {}", status, body_text),
+                    });
+                }
+                let parsed: BatchEmbedResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
+                break parsed;
+            };
             for emb in parsed.embeddings {
                 out.push(emb.values);
             }
