@@ -138,15 +138,15 @@ async fn run_longmemeval(
         .unwrap_or(60.0);
 
     let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
-    let have_gemini = std::env::var("GEMINI_API_KEY").is_ok() && !force_stub;
-    let have_cohere = std::env::var("COHERE_API_KEY").is_ok() && !force_stub;
+    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
+    let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
+    let have_gemini = gemini_key.is_some() && !force_stub;
+    let have_cohere = cohere_key.is_some() && !force_stub;
 
     let report = if have_gemini {
-        let embedder = GeminiEmbedder::from_env()
-            .map_err(|e| CliError::Config(format!("gemini: {e}")))?;
+        let embedder = GeminiEmbedder::new(gemini_key.clone().unwrap());
         if have_cohere {
-            let reranker = CohereReranker::from_env()
-                .map_err(|e| CliError::Config(format!("cohere: {e}")))?;
+            let reranker = CohereReranker::new(cohere_key.clone().unwrap());
             run_oracle_hybrid(&dataset, &embedder, Some(&reranker), rrf_k, limit).await?
         } else {
             let no_rerank: Option<&PassthroughReranker> = None;

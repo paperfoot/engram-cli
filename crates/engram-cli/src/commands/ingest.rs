@@ -40,9 +40,10 @@ pub async fn run(
     let mut memories_created = 0u32;
     let mut chunks_created = 0u32;
 
-    // Embedder
+    // Embedder: env var → config file → stub fallback
     let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
-    let have_gemini = std::env::var("GEMINI_API_KEY").is_ok() && !force_stub;
+    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
+    let have_gemini = gemini_key.is_some() && !force_stub;
     let model_name = if have_gemini { "gemini-embedding-001" } else { "stub" };
 
     for file in files {
@@ -119,8 +120,7 @@ pub async fn run(
         let embeddings: Vec<Vec<f32>> = if chunk_texts.is_empty() {
             Vec::new()
         } else if have_gemini {
-            let e = GeminiEmbedder::from_env()
-                .map_err(|err| CliError::Config(format!("gemini: {err}")))?;
+            let e = GeminiEmbedder::new(gemini_key.clone().unwrap());
             e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument).await?
         } else {
             let e = StubEmbedder::default();

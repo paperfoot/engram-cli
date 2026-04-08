@@ -49,12 +49,12 @@ pub async fn run(
     let chunks = naive_split(&content);
     let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
 
-    // Embed every chunk. Gemini if available, stub otherwise.
+    // Embed every chunk. Gemini if available (env or config file), stub otherwise.
     let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let (embeddings, model_name): (Vec<Vec<f32>>, &'static str) =
-        if !force_stub && std::env::var("GEMINI_API_KEY").is_ok() {
-            let e = GeminiEmbedder::from_env()
-                .map_err(|err| CliError::Config(format!("gemini: {err}")))?;
+        if !force_stub && gemini_key.is_some() {
+            let e = GeminiEmbedder::new(gemini_key.unwrap());
             let v = e
                 .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
                 .await?;

@@ -162,6 +162,24 @@ fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
     cur.as_str().map(|s| !s.is_empty()).unwrap_or(false)
 }
 
+/// Resolve a secret in the canonical order: env var → config file → None.
+/// This is the single source of truth for key lookup so users can either
+/// `export GEMINI_API_KEY=...` or `engram config set keys.gemini ...` and
+/// both work identically. Framework rule: env overrides file.
+pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(env) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let root = read_toml().ok()?;
+    let mut cur = &root;
+    for part in toml_path.split('.') {
+        cur = cur.get(part)?;
+    }
+    cur.as_str().map(|s| s.to_string()).filter(|s| !s.is_empty())
+}
+
 // Silence unused-imports warning for `Write` on non-unix.
 fn _keep_write_import(mut w: impl Write) {
     let _ = writeln!(w, "");
