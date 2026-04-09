@@ -176,6 +176,9 @@ fn build_fts_query(text: &str) -> String {
 
 /// Run the full QA track on LongMemEval. For each question: build the haystack,
 /// retrieve, answer via LLM, judge against gold. Optionally compute RAGAS too.
+///
+/// If `checkpoint_path` is Some, each completed question is appended as a JSONL
+/// line to that file and fsynced, so a crash leaves a valid partial record.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_longmemeval_qa<E, R, A, J>(
     dataset: &LongMemEvalDataset,
@@ -187,6 +190,7 @@ pub async fn run_longmemeval_qa<E, R, A, J>(
     top_k: usize,
     limit: Option<usize>,
     enable_ragas: bool,
+    checkpoint_path: Option<std::path::PathBuf>,
 ) -> Result<QaReport, BenchError>
 where
     E: Embedder + ?Sized,
@@ -194,9 +198,24 @@ where
     A: ChatLlm + ?Sized,
     J: ChatLlm + ?Sized,
 {
+    use std::io::Write as _;
     let n = limit
         .map(|l| l.min(dataset.questions.len()))
         .unwrap_or(dataset.questions.len());
+
+    let mut checkpoint_file: Option<std::fs::File> = if let Some(ref path) = checkpoint_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        Some(f)
+    } else {
+        None
+    };
 
     let mut results = Vec::with_capacity(n);
     let mut latencies = Vec::with_capacity(n);
@@ -413,7 +432,7 @@ where
             latency_ms
         );
 
-        results.push(QaRunResult {
+        let result = QaRunResult {
             question_id: q.question_id.clone(),
             question_type: q.question_type.clone(),
             question: q.question.clone(),
@@ -430,7 +449,17 @@ where
             answerer_completion_tokens: answer_resp.completion_tokens.unwrap_or(0),
             judge_prompt_tokens: verdict.prompt_tokens.unwrap_or(0),
             judge_completion_tokens: verdict.completion_tokens.unwrap_or(0),
-        });
+        };
+
+        // Append-only checkpoint with fsync — see run_locomo_qa for rationale.
+        if let Some(ref mut f) = checkpoint_file {
+            let line = serde_json::to_string(&result).unwrap_or_default();
+            if let Err(e) = writeln!(f, "{}", line).and_then(|_| f.sync_data()) {
+                tracing::warn!("checkpoint write failed (continuing): {}", e);
+            }
+        }
+
+        results.push(result);
     }
 
     let nf = n as f32;
@@ -518,6 +547,7 @@ pub async fn run_locomo_qa<E, R, A, J>(
     top_k: usize,
     limit: Option<usize>,
     enable_ragas: bool,
+    checkpoint_path: Option<std::path::PathBuf>,
 ) -> Result<QaReport, BenchError>
 where
     E: Embedder + ?Sized,
@@ -526,7 +556,27 @@ where
     J: ChatLlm + ?Sized,
 {
     use crate::locomo::flatten_conversation;
+    use std::io::Write as _;
     let max_questions = limit.unwrap_or(usize::MAX);
+
+    // Open checkpoint file in append mode if requested. We write one
+    // QaRunResult as a JSONL line per completed question, flushed
+    // immediately so a crash leaves a valid partial record on disk.
+    let mut checkpoint_file: Option<std::fs::File> = if let Some(ref path) = checkpoint_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Truncate any prior checkpoint — caller can rename it if they
+        // want to keep a previous run's partial results.
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        Some(f)
+    } else {
+        None
+    };
 
     let chrono_epoch = chrono::Utc.timestamp_opt(0, 0).single().unwrap();
     use chrono::TimeZone;
@@ -770,7 +820,7 @@ where
                 latency_ms
             );
 
-            results.push(QaRunResult {
+            let result = QaRunResult {
                 question_id: format!("{sample_key}:{}", results.len()),
                 question_type: category_label,
                 question: qa.question.clone(),
@@ -787,7 +837,21 @@ where
                 answerer_completion_tokens: answer_resp.completion_tokens.unwrap_or(0),
                 judge_prompt_tokens: verdict.prompt_tokens.unwrap_or(0),
                 judge_completion_tokens: verdict.completion_tokens.unwrap_or(0),
-            });
+            };
+
+            // Append the result to the checkpoint JSONL immediately and
+            // fsync so a crash leaves a valid partial record on disk.
+            // Best-effort: a checkpoint write failure is logged but does
+            // NOT abort the bench (we'd rather lose checkpoint coverage
+            // than the whole run).
+            if let Some(ref mut f) = checkpoint_file {
+                let line = serde_json::to_string(&result).unwrap_or_default();
+                if let Err(e) = writeln!(f, "{}", line).and_then(|_| f.sync_data()) {
+                    tracing::warn!("checkpoint write failed (continuing): {}", e);
+                }
+            }
+
+            results.push(result);
         }
     }
 

@@ -160,6 +160,18 @@ async fn run_longmemeval_qa(
     let answerer = OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
     let judge = OpenRouterClient::new(openrouter_key).with_model(judge_model.clone());
 
+    // Per-question checkpoint goes next to the final save path with a
+    // .checkpoint.jsonl suffix. Always written so a crash leaves at
+    // least the partial results recoverable. The user explicitly asked
+    // for this after losing 30+ min on a sidecar OOM event.
+    let benchmarks_dir = std::path::PathBuf::from("benchmarks");
+    let _ = std::fs::create_dir_all(&benchmarks_dir);
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let default_name = benchmarks_dir
+        .join(format!("longmemeval-qa-{}.json", timestamp));
+    let save_path = save.unwrap_or(default_name);
+    let checkpoint_path = save_path.with_extension("checkpoint.jsonl");
+
     let report = if let Some(cohere) = cohere_key {
         let reranker = CohereReranker::new(cohere);
         run_qa(
@@ -172,6 +184,7 @@ async fn run_longmemeval_qa(
             top_k,
             limit,
             ragas,
+            Some(checkpoint_path.clone()),
         )
         .await?
     } else {
@@ -186,17 +199,12 @@ async fn run_longmemeval_qa(
             top_k,
             limit,
             ragas,
+            Some(checkpoint_path.clone()),
         )
         .await?
     };
 
-    // Persist the report to disk if requested, plus always to benchmarks/.
-    let benchmarks_dir = std::path::PathBuf::from("benchmarks");
-    let _ = std::fs::create_dir_all(&benchmarks_dir);
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-    let default_name = benchmarks_dir
-        .join(format!("longmemeval-qa-{}-{}.json", timestamp, report.questions_evaluated));
-    let save_path = save.unwrap_or(default_name);
+    // Final report file (transactional, written only on full success).
     if let Some(parent) = save_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -280,6 +288,16 @@ async fn run_locomo_qa(
     let answerer = OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
     let judge = OpenRouterClient::new(openrouter_key).with_model(judge_model.clone());
 
+    // Determine save path + per-question checkpoint up front so we can pass
+    // the checkpoint into run_qa(). The checkpoint sits next to the final
+    // report path with a .checkpoint.jsonl extension.
+    let benchmarks_dir = std::path::PathBuf::from("benchmarks");
+    let _ = std::fs::create_dir_all(&benchmarks_dir);
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let default_name = benchmarks_dir.join(format!("locomo-qa-{}.json", timestamp));
+    let save_path = save.unwrap_or(default_name);
+    let checkpoint_path = save_path.with_extension("checkpoint.jsonl");
+
     // Run LoCoMo through the SAME hybrid pipeline as LongMemEval-QA:
     // dense (Gemini Embed 2) + FTS5 BM25 + RRF fusion + optional reranker.
     //
@@ -305,7 +323,7 @@ async fn run_locomo_qa(
             }
             run_qa(
                 &dataset, &embedder, Some(&reranker), &answerer, &judge,
-                rrf_k, top_k, limit, ragas,
+                rrf_k, top_k, limit, ragas, Some(checkpoint_path.clone()),
             )
             .await?
         }
@@ -318,7 +336,7 @@ async fn run_locomo_qa(
             let reranker = CohereReranker::new(cohere);
             run_qa(
                 &dataset, &embedder, Some(&reranker), &answerer, &judge,
-                rrf_k, top_k, limit, ragas,
+                rrf_k, top_k, limit, ragas, Some(checkpoint_path.clone()),
             )
             .await?
         }
@@ -326,7 +344,7 @@ async fn run_locomo_qa(
             let no_rerank: Option<&PassthroughReranker> = None;
             run_qa(
                 &dataset, &embedder, no_rerank, &answerer, &judge,
-                rrf_k, top_k, limit, ragas,
+                rrf_k, top_k, limit, ragas, Some(checkpoint_path.clone()),
             )
             .await?
         }
@@ -337,13 +355,7 @@ async fn run_locomo_qa(
         }
     };
 
-    // Persist the full per_question report to disk, same as LongMemEval-QA.
-    let benchmarks_dir = std::path::PathBuf::from("benchmarks");
-    let _ = std::fs::create_dir_all(&benchmarks_dir);
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-    let default_name = benchmarks_dir
-        .join(format!("locomo-qa-{}-{}.json", timestamp, report.questions_evaluated));
-    let save_path = save.unwrap_or(default_name);
+    // Final transactional report (only written on full success).
     if let Some(parent) = save_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
