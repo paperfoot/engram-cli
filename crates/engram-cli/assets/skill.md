@@ -107,6 +107,28 @@ Equivalent env overrides: `ENGRAM_INGEST_REQUIRE_SCOPE`,
 `ENGRAM_INGEST_INCLUDE`, `ENGRAM_INGEST_EXCLUDE`,
 `ENGRAM_INGEST_MAX_FILES`.
 
+### Update safety
+
+Agents may check freshness, but should not mutate installs during ordinary
+memory work:
+
+```bash
+# Safe bootstrap/maintenance check:
+engram update --check --json
+
+# Mutating update only when the user asks for it:
+engram update --json
+```
+
+The JSON output includes `install_source`, `update_mode`, `release_url`,
+`upgrade_command`, `can_execute_update`, and `post_update_commands`. Configure
+repeated workflows with `update.mode` (`auto`, `check_only`, or `disabled`),
+`update.channel` (`github` or `crates`), and optional `update.install_source`
+(`homebrew`, `cargo`, `standalone`, or `source_build`). Equivalent env
+overrides are `ENGRAM_UPDATE_MODE`, `ENGRAM_UPDATE_CHANNEL`,
+`ENGRAM_UPDATE_INSTALL_SOURCE`, `ENGRAM_UPDATE_GITHUB_REPO`,
+`ENGRAM_UPDATE_CRATE`, and `ENGRAM_UPDATE_HOMEBREW_FORMULA`.
+
 Optional cloud compiler pass:
 
 ```bash
@@ -312,6 +334,7 @@ Keys are resolved in order: explicit env var → config TOML → none. If Gemini
 | `engram entities list` / `engram entities show <name>` | Browse the entity graph. |
 | `engram bench longmemeval --limit 100` | Verify retrieval quality against LongMemEval. |
 | `engram config show\|set\|check` | Configuration. |
+| `engram update --check` | Report current/latest version, install source, and runnable upgrade command. |
 | `engram agent-info` | Self-describing manifest (read this first). |
 
 ## When NOT to use engram

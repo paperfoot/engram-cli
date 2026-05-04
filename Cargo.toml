@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Paperfoot"]
@@ -22,14 +22,14 @@ repository = "https://github.com/paperfoot/engram-cli"
 
 [workspace.dependencies]
 # Internal
-engram-core    = { package = "paperfoot-engram-core", version = "0.1.1", path = "crates/engram-core" }
-engram-storage = { package = "paperfoot-engram-storage", version = "0.1.1", path = "crates/engram-storage" }
-engram-embed   = { package = "paperfoot-engram-embed", version = "0.1.1", path = "crates/engram-embed" }
-engram-rerank  = { package = "paperfoot-engram-rerank", version = "0.1.1", path = "crates/engram-rerank" }
-engram-llm     = { package = "paperfoot-engram-llm", version = "0.1.1", path = "crates/engram-llm" }
-engram-ingest  = { package = "paperfoot-engram-ingest", version = "0.1.1", path = "crates/engram-ingest" }
-engram-graph   = { package = "paperfoot-engram-graph", version = "0.1.1", path = "crates/engram-graph" }
-engram-bench   = { package = "paperfoot-engram-bench", version = "0.1.1", path = "crates/engram-bench" }
+engram-core    = { package = "paperfoot-engram-core", version = "0.1.2", path = "crates/engram-core" }
+engram-storage = { package = "paperfoot-engram-storage", version = "0.1.2", path = "crates/engram-storage" }
+engram-embed   = { package = "paperfoot-engram-embed", version = "0.1.2", path = "crates/engram-embed" }
+engram-rerank  = { package = "paperfoot-engram-rerank", version = "0.1.2", path = "crates/engram-rerank" }
+engram-llm     = { package = "paperfoot-engram-llm", version = "0.1.2", path = "crates/engram-llm" }
+engram-ingest  = { package = "paperfoot-engram-ingest", version = "0.1.2", path = "crates/engram-ingest" }
+engram-graph   = { package = "paperfoot-engram-graph", version = "0.1.2", path = "crates/engram-graph" }
+engram-bench   = { package = "paperfoot-engram-bench", version = "0.1.2", path = "crates/engram-bench" }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

@@ -137,7 +137,7 @@ cd engram-cli
 cargo install --path crates/engram-cli --locked
 ```
 
-One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.1.1`.
+One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.1.2`.
 
 ### Package manager status
 
@@ -154,7 +154,7 @@ Source install from this repository also works:
 cargo install --path crates/engram-cli --locked
 ```
 
-`engram update` is still a structured stub until GitHub Releases publish signed/prebuilt artifacts. The crates.io package name is `paperfoot-engram` because `engram-cli` is already owned by another project on crates.io.
+`engram update --check --json` reports the current/latest version, detected install source, release URL, and runnable upgrade command. `engram update --json` runs the package-manager update only when `update.mode=auto` and an update is available. Configure with `update.mode`, `update.channel`, and optional `update.install_source` (or the matching `ENGRAM_UPDATE_*` env vars). The crates.io package name is `paperfoot-engram` because `engram-cli` is already owned by another project on crates.io.
 
 ### Configure keys
 

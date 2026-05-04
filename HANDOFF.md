@@ -8,7 +8,7 @@
 ## Verify the install
 
 ```bash
-engram --version        # -> engram 0.1.1
+engram --version        # -> engram 0.1.2
 engram agent-info       # returns raw JSON manifest
 engram doctor --json    # verifies keys, schema, embedding metadata, daemon port
 engram skill install    # installs SKILL.md + agents/openai.yaml to agent dirs
@@ -99,8 +99,8 @@ Cohere on the full 500 it's expected to land around R@1 ~0.95.**
 
 1. **GitHub Actions CI** — build release binaries for mac/linux on tag push.
    Repo exists, just needs `.github/workflows/release.yml`.
-2. **Real `engram update` implementation** — currently a stub. Trivial once
-   GitHub Releases has artifacts.
+2. **GitHub Actions release CI** — build and upload mac/linux artifacts on tag
+   push instead of creating release assets manually.
 3. **`ENGRAM_RERANK_TOP_N` env var** — cuts Cohere cost 60% by reranking
    top-20 instead of top-50. Code change in one place in `retrieval.rs`.
 4. **Local embedding fallback** — candle + bge-small-en-v1.5 so recall

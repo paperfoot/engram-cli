@@ -432,7 +432,11 @@ fn auto_classify(path: &Path, text: &str) -> Mode {
     if ext == "rs" || ext == "py" || ext == "ts" || ext == "js" || ext == "go" || ext == "java" {
         return Mode::Repos;
     }
-    let turn_markers = text.matches("user:").count() + text.matches("assistant:").count();
+    let lower_text = text.to_ascii_lowercase();
+    let turn_markers = ["user:", "human:", "assistant:", "claude:", "chatgpt:"]
+        .iter()
+        .map(|marker| lower_text.matches(marker).count())
+        .sum::<usize>();
     if turn_markers >= 5 {
         return Mode::Conversations;
     }

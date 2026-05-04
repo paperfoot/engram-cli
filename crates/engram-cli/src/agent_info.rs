@@ -54,7 +54,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "config set <key> <value>": "Persist a configuration value to ~/.config/engram/config.toml",
             "config check": "Validate configured API keys",
             "skill install | package | uninstall": "Install, package, or remove the agent skill. Installs SKILL.md plus Codex agents/openai.yaml metadata.",
-            "update [--check]": "Self-update from GitHub releases"
+            "update [--check]": "Check or apply distribution-aware updates. Output includes install_source, update_mode, release_url, upgrade_command, and post_update_commands."
         },
         "flags": {
             "--json": "Force JSON envelope output (auto when stdout is piped)",
@@ -111,6 +111,27 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                 "safe_mode": "--dry-run",
                 "mutating_mode": "--confirm",
                 "repairs": ["facts from deleted memories", "derived graph residue in empty KBs"]
+            },
+            "update": {
+                "destructive": false,
+                "args": {},
+                "flags": { "check": "boolean; only report update status and command" },
+                "config": {
+                    "update.mode": "auto|check_only|disabled; auto permits `engram update` to run the package-manager command",
+                    "update.channel": "github|crates",
+                    "update.install_source": "optional override: homebrew|cargo|standalone|source_build"
+                },
+                "output_data": {
+                    "current_version": "string",
+                    "latest_version": "string|null",
+                    "update_available": "boolean",
+                    "install_source": "homebrew|cargo|standalone|source_build|unknown",
+                    "update_mode": "auto|check_only|disabled",
+                    "release_url": "string|null",
+                    "upgrade_command": "string|null",
+                    "can_execute_update": "boolean",
+                    "post_update_commands": "string[]"
+                }
             }
         },
         "exit_codes": {
@@ -141,6 +162,12 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "ENGRAM_INGEST_INCLUDE": "Comma-separated default include patterns for directory ingest, overridden by CLI --include.",
             "ENGRAM_INGEST_EXCLUDE": "Comma-separated default exclude patterns for directory ingest, overridden by CLI --exclude.",
             "ENGRAM_INGEST_MAX_FILES": "Default directory ingest cap, overridden by CLI --max-files.",
+            "ENGRAM_UPDATE_MODE": "auto|check_only|disabled. Default auto.",
+            "ENGRAM_UPDATE_CHANNEL": "github|crates. Default github.",
+            "ENGRAM_UPDATE_INSTALL_SOURCE": "Override package-manager detection: homebrew|cargo|standalone|source_build.",
+            "ENGRAM_UPDATE_GITHUB_REPO": "GitHub repo used by update checks. Default paperfoot/engram-cli.",
+            "ENGRAM_UPDATE_CRATE": "crates.io package used by cargo updates. Default paperfoot-engram.",
+            "ENGRAM_UPDATE_HOMEBREW_FORMULA": "Homebrew formula used by brew updates. Default paperfoot/tap/engram.",
             "ENGRAM_EMBEDDER": "Force embedder: gemini|stub (default: gemini if key set)",
             "ENGRAM_RERANK_PROVIDER": "Force reranker: cohere|zerank2|none (default: cohere if key set)",
             "ENGRAM_LME_SPLIT": "LongMemEval split: s|oracle (default: s)"
@@ -149,7 +176,13 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "ingest.require_scope": "true by default. Keep true for agent safety; set false only in tightly controlled batch environments.",
             "ingest.include": "Comma-separated default include patterns, for example `*.pdf,notes/*.md`.",
             "ingest.exclude": "Comma-separated default exclude patterns, for example `private/*,drafts/*`.",
-            "ingest.max_files": "Default maximum matched files for directory ingest."
+            "ingest.max_files": "Default maximum matched files for directory ingest.",
+            "update.mode": "auto|check_only|disabled. Use check_only when agents may detect but not mutate installs.",
+            "update.channel": "github|crates. GitHub checks the latest release; crates checks the package registry.",
+            "update.install_source": "Optional override when binary path detection is ambiguous.",
+            "update.github_repo": "Repository for release checks and standalone release downloads.",
+            "update.crate": "crates.io package for cargo install upgrades.",
+            "update.homebrew_formula": "Homebrew formula for brew upgrades."
         },
         "agent_decision_rules": {
             "ingest": [
@@ -158,6 +191,12 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                 "For a curated batch, rerun without --dry-run using the same --include/--exclude and a reasonable --max-files cap.",
                 "Use --all only when the user explicitly asks to ingest the entire folder or after the preview clearly matches the intended corpus.",
                 "Use config or ENGRAM_INGEST_* defaults for repeated agent workflows, but keep command-line flags in task logs when the current task has a specific scope."
+            ],
+            "update": [
+                "Run `engram update --check --json` during bootstrap or maintenance if knowing install freshness matters.",
+                "Do not run `engram update` as a side effect of ordinary recall/remember/ingest workflows.",
+                "Run `engram update --json` only when the user asks to update the CLI or an approved maintenance workflow allows package-manager mutation.",
+                "After a successful update, restart the agent process and run `engram skill install` if local agent skill files are used."
             ]
         },
         "config_path": engram_storage::paths::config_path().to_string_lossy(),

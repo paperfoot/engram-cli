@@ -2319,6 +2319,7 @@ impl SqliteStore {
         };
         let mut frontier = vec![seed.id];
         let mut seen = std::collections::HashSet::new();
+        let mut seen_relations = std::collections::HashSet::new();
         let mut out = Vec::new();
         for _ in 0..hops.max(1) {
             let mut next = Vec::new();
@@ -2328,23 +2329,29 @@ impl SqliteStore {
                 }
                 let mut stmt = self.conn.prepare(
                     "SELECT r.id, r.kb, f.canonical_name, t.canonical_name, r.predicate,
-                            r.weight, r.provenance_json
+                            r.weight, r.provenance_json, r.from_entity_id, r.to_entity_id
                      FROM relations r
                      JOIN entities f ON f.id = r.from_entity_id
                      JOIN entities t ON t.id = r.to_entity_id
                      WHERE r.kb = ?1 AND (r.from_entity_id = ?2 OR r.to_entity_id = ?2)
                      ORDER BY r.weight DESC LIMIT 50",
                 )?;
-                let rows =
-                    stmt.query_map(params![kb, entity_id.to_string()], parse_relation_row)?;
+                let current = entity_id.to_string();
+                let rows = stmt.query_map(params![kb, current.clone()], |row| {
+                    let rel = parse_relation_row(row)?;
+                    let from_id: String = row.get(7)?;
+                    let to_id: String = row.get(8)?;
+                    let neighbor_id = if from_id == current { to_id } else { from_id };
+                    Ok((rel, Uuid::parse_str(&neighbor_id).unwrap_or(Uuid::nil())))
+                })?;
                 for row in rows {
-                    let rel = row?;
-                    if let Some(neighbor_id) =
-                        self.find_entity(Some(kb), &rel.to_entity)?.map(|e| e.id)
-                    {
+                    let (rel, neighbor_id) = row?;
+                    if neighbor_id != Uuid::nil() {
                         next.push(neighbor_id);
                     }
-                    out.push(rel);
+                    if seen_relations.insert(rel.id) {
+                        out.push(rel);
+                    }
                 }
             }
             frontier = next;
@@ -3052,5 +3059,28 @@ mod tests {
         let hits = store.fts_search("rapamycin", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, chunk_id);
+    }
+
+    #[test]
+    fn graph_neighbors_traverses_reverse_edges() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("kb", None).unwrap();
+        let a = store.upsert_entity("kb", "Alpha", "Concept", 1).unwrap();
+        let b = store.upsert_entity("kb", "Beta", "Concept", 1).unwrap();
+        let c = store.upsert_entity("kb", "Gamma", "Concept", 1).unwrap();
+        store
+            .insert_relation("kb", a, b, "related_to", 1.0, serde_json::json!({}), None)
+            .unwrap();
+        store
+            .insert_relation("kb", c, a, "supports", 0.8, serde_json::json!({}), None)
+            .unwrap();
+
+        let rels = store.graph_neighbors("kb", "Beta", 2).unwrap();
+        assert!(rels
+            .iter()
+            .any(|rel| rel.from_entity == "Alpha" && rel.to_entity == "Beta"));
+        assert!(rels
+            .iter()
+            .any(|rel| rel.from_entity == "Gamma" && rel.to_entity == "Alpha"));
     }
 }

@@ -103,6 +103,15 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
                     .or_else(|| resolve_config_string("ingest.include")),
                 "exclude": std::env::var("ENGRAM_INGEST_EXCLUDE").ok()
                     .or_else(|| resolve_config_string("ingest.exclude")),
+            },
+            "update": {
+                "mode": resolve_setting("ENGRAM_UPDATE_MODE", "update.mode", "auto"),
+                "channel": resolve_setting("ENGRAM_UPDATE_CHANNEL", "update.channel", "github"),
+                "install_source": std::env::var("ENGRAM_UPDATE_INSTALL_SOURCE").ok()
+                    .or_else(|| resolve_config_string("update.install_source")),
+                "github_repo": resolve_setting("ENGRAM_UPDATE_GITHUB_REPO", "update.github_repo", "paperfoot/engram-cli"),
+                "crate": resolve_setting("ENGRAM_UPDATE_CRATE", "update.crate", "paperfoot-engram"),
+                "homebrew_formula": resolve_setting("ENGRAM_UPDATE_HOMEBREW_FORMULA", "update.homebrew_formula", "paperfoot/tap/engram"),
             }
         }),
         Metadata::default(),

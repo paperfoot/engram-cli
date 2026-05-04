@@ -1210,7 +1210,7 @@ checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
 
 [[package]]
 name = "paperfoot-engram"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "assert_cmd",
  "chrono",
@@ -1228,6 +1228,7 @@ dependencies = [
  "paperfoot-engram-rerank",
  "paperfoot-engram-storage",
  "predicates",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1242,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "paperfoot-engram-bench"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1263,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "paperfoot-engram-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "ordered-float",
@@ -1275,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "paperfoot-engram-embed"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "paperfoot-engram-core",
@@ -1289,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "paperfoot-engram-graph"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "paperfoot-engram-core",
@@ -1303,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "paperfoot-engram-ingest"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "paperfoot-engram-core",
@@ -1318,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "paperfoot-engram-llm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -1331,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "paperfoot-engram-rerank"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "paperfoot-engram-core",
@@ -1344,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "paperfoot-engram-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "directories",

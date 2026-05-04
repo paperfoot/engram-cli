@@ -277,6 +277,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             ConfigCommand::Check => commands::config::check(&ctx).await,
         },
         Command::Skill(sub) => commands::skill::run(&ctx, sub),
-        Command::Update { check } => commands::update::run(&ctx, check),
+        Command::Update { check } => commands::update::run(&ctx, check).await,
     }
 }

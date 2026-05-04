@@ -349,6 +349,50 @@ fn usage_command_returns_summary_envelope() {
 }
 
 #[test]
+fn update_check_reports_agent_runnable_command_without_executing() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    let out = cmd
+        .env("ENGRAM_UPDATE_LATEST_VERSION", "9.9.9")
+        .env("ENGRAM_UPDATE_INSTALL_SOURCE", "cargo")
+        .args(["update", "--check", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["data"]["latest_version"], "9.9.9");
+    assert_eq!(v["data"]["update_available"], true);
+    assert_eq!(v["data"]["install_source"], "cargo");
+    assert_eq!(v["data"]["can_execute_update"], true);
+    assert_eq!(v["data"]["executed"], false);
+    assert_eq!(
+        v["data"]["upgrade_command"],
+        "cargo install paperfoot-engram --version 9.9.9 --locked --force"
+    );
+}
+
+#[test]
+fn update_disabled_is_offline_and_non_mutating() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    let out = cmd
+        .env("ENGRAM_UPDATE_MODE", "disabled")
+        .args(["update", "--check", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["data"]["update_mode"], "disabled");
+    assert_eq!(v["data"]["latest_version"], Value::Null);
+    assert_eq!(v["data"]["update_available"], false);
+    assert_eq!(v["data"]["executed"], false);
+}
+
+#[test]
 fn documents_jobs_budget_and_scientific_bench_work() {
     let (tmp, mut ingest_cmd) = with_isolated_home();
     let fixture = tmp.path().join("paper.md");

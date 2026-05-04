@@ -3,7 +3,7 @@
 //! - `extract`: deterministic entity extraction (no LLM, regex on capitalization)
 //! - `facts`: LLM-based (subject, predicate, object) extraction for
 //!   contradiction detection at write time
-//! - `expand`: query-time graph traversal (currently a stub)
+//! - `expand`: bounded query-time graph traversal
 
 pub mod expand;
 pub mod extract;
