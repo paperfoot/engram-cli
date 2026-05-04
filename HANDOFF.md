@@ -8,7 +8,7 @@
 ## Verify the install
 
 ```bash
-engram --version        # -> engram 0.1.0
+engram --version        # -> engram 0.1.1
 engram agent-info       # returns raw JSON manifest
 engram doctor --json    # verifies keys, schema, embedding metadata, daemon port
 engram skill install    # installs SKILL.md + agents/openai.yaml to agent dirs
