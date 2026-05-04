@@ -1,16 +1,17 @@
 # engram v2 — autoresearch loop config
 #
-# The fast loop targets the inline mini benchmark (10 questions, runs in <1s).
-# When R@1 saturates near 1.0 on the mini set, switch eval_command to
-# `cargo build --quiet 2>&1 >/dev/null && ./target/debug/engram bench longmemeval --json`
-# and metric_path to `data.recall_at_5`.
+# Current goal: beat Cohere's 78.8% LoCoMo-full-mini end-to-end QA accuracy.
+# Every experiment modifies scripts/experiment.vars (the "target file") to
+# flip ONE knob at a time: reranker provider, embed model, top-k, etc.
+# eval_command sources those vars, runs a deterministic 50-question slice
+# of LoCoMo-QA, and prints the accuracy as a bare float.
 
-target_file     = "crates/engram-bench/src/mini.rs"
-eval_command    = "cargo build --quiet 2>&1 >/dev/null && ./target/debug/engram bench mini --json | jq -r '.data.recall_at_1'"
-metric_name     = "recall_at_1"
+target_file     = "scripts/experiment.vars"
+eval_command    = "./scripts/eval_locomo_slice.sh"
+metric_name     = "locomo_qa_accuracy_50q"
 metric_direction = "maximize"
-time_budget_seconds = 180
-branch          = "autoresearch/retrieval-mini-r1"
+time_budget_seconds = 2400   # 40 min ceiling per experiment; 50q Cohere ~3min, 50q MLX ~15min
+branch          = "feat/mlx-reranker"
 
 [bounds]
 implausible_above = 1.001

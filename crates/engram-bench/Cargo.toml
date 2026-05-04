@@ -1,11 +1,14 @@
 [package]
-name = "engram-bench"
+name = "paperfoot-engram-bench"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "LongMemEval and benchmark harness for engram v2"
+
+[lib]
+name = "engram_bench"
 
 [dependencies]
 engram-core.workspace = true

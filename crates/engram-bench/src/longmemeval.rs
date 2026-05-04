@@ -155,7 +155,11 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
         na += x * x;
         nb += y * y;
     }
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na.sqrt() * nb.sqrt()) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,17 +175,22 @@ pub struct LongMemEvalReport {
 /// Build an FTS5 query from a free-text question. Mirrors `mini::build_fts_query`.
 fn build_fts_query(text: &str) -> String {
     const STOPWORDS: &[&str] = &[
-        "the", "and", "for", "with", "that", "what", "which", "how",
-        "does", "are", "was", "were", "from", "into", "this", "have",
-        "has", "had", "been", "being", "shown", "show", "shows",
+        "the", "and", "for", "with", "that", "what", "which", "how", "does", "are", "was", "were",
+        "from", "into", "this", "have", "has", "had", "been", "being", "shown", "show", "shows",
         "can", "could", "should", "would", "may", "might",
     ];
     let mut tokens: Vec<String> = Vec::new();
     for raw in text.split(|c: char| !c.is_alphanumeric()) {
-        if raw.is_empty() { continue; }
+        if raw.is_empty() {
+            continue;
+        }
         let lower = raw.to_ascii_lowercase();
-        if lower.len() < 3 { continue; }
-        if STOPWORDS.contains(&lower.as_str()) { continue; }
+        if lower.len() < 3 {
+            continue;
+        }
+        if STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
         tokens.push(format!("\"{}\"", lower));
     }
     tokens.join(" OR ")
@@ -233,10 +242,18 @@ where
         let mut seen_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Pass 1: insert into store and figure out which chunks need embedding.
-        struct PendingChunk { chunk_id: Uuid, text: String, key: String }
+        struct PendingChunk {
+            chunk_id: Uuid,
+            text: String,
+            key: String,
+        }
         let mut pending: Vec<PendingChunk> = Vec::new();
 
-        for (sid, turns) in q.haystack_session_ids.iter().zip(q.haystack_sessions.iter()) {
+        for (sid, turns) in q
+            .haystack_session_ids
+            .iter()
+            .zip(q.haystack_sessions.iter())
+        {
             if !seen_sids.insert(sid.clone()) {
                 continue;
             }
@@ -254,7 +271,10 @@ where
                 access_count: 0,
                 last_accessed: None,
                 stability: 1.0,
-                source: MemorySource::Conversation { thread: sid.clone(), turn: 0 },
+                source: MemorySource::Conversation {
+                    thread: sid.clone(),
+                    turn: 0,
+                },
                 diary: "lme".into(),
                 valid_from: None,
                 valid_until: None,
@@ -268,7 +288,11 @@ where
             if let Some(v) = cache.blobs.get(&key) {
                 chunk_embeddings.insert(chunk_id, v.clone());
             } else {
-                pending.push(PendingChunk { chunk_id, text, key });
+                pending.push(PendingChunk {
+                    chunk_id,
+                    text,
+                    key,
+                });
             }
         }
 
@@ -276,7 +300,9 @@ where
         // (split into 100-text chunks internally) instead of N sequential calls.
         if !pending.is_empty() {
             let texts: Vec<&str> = pending.iter().map(|p| p.text.as_str()).collect();
-            let vecs = embedder.embed_batch(&texts, TaskMode::RetrievalDocument).await?;
+            let vecs = embedder
+                .embed_batch(&texts, TaskMode::RetrievalDocument)
+                .await?;
             for (p, v) in pending.into_iter().zip(vecs.into_iter()) {
                 cache.blobs.insert(p.key, v.clone());
                 chunk_embeddings.insert(p.chunk_id, v);
@@ -309,7 +335,9 @@ where
         let q_emb = if let Some(v) = cache.blobs.get(&q_key) {
             v.clone()
         } else {
-            let fresh = embedder.embed_one(&q.question, TaskMode::RetrievalQuery).await?;
+            let fresh = embedder
+                .embed_one(&q.question, TaskMode::RetrievalQuery)
+                .await?;
             cache.blobs.insert(q_key, fresh.clone());
             cache_dirty = true;
             fresh
@@ -323,7 +351,8 @@ where
             })
             .collect();
         dense_scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
         let dense_run: Vec<RankedHit> = dense_scored
@@ -392,13 +421,24 @@ where
         let r10 = recall_at_k(&retrieved_sessions, &q.answer_session_ids, 10);
         let rr = reciprocal_rank(&retrieved_sessions, &q.answer_session_ids, 10);
 
-        r1_total += r1; r5_total += r5; r10_total += r10; mrr_total += rr;
-        if r1 > 0.0 { r1_count += 1; }
-        if r5 > 0.0 { r5_count += 1; }
-        if r10 > 0.0 { r10_count += 1; }
+        r1_total += r1;
+        r5_total += r5;
+        r10_total += r10;
+        mrr_total += rr;
+        if r1 > 0.0 {
+            r1_count += 1;
+        }
+        if r5 > 0.0 {
+            r5_count += 1;
+        }
+        if r10 > 0.0 {
+            r10_count += 1;
+        }
     }
 
-    if cache_dirty { cache.save(&cache_p); }
+    if cache_dirty {
+        cache.save(&cache_p);
+    }
 
     let nf = n as f32;
     let mut metrics = Metrics::default();

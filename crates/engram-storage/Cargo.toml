@@ -1,11 +1,14 @@
 [package]
-name = "engram-storage"
+name = "paperfoot-engram-storage"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "SQLite + LanceDB + FTS5 storage for engram v2"
+description = "SQLite + FTS5 storage for engram v2"
+
+[lib]
+name = "engram_storage"
 
 [dependencies]
 engram-core.workspace = true

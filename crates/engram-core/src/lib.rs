@@ -3,7 +3,6 @@
 //! This crate is intentionally I/O free so it tests fast and is easy to
 //! optimize via autoresearch loops.
 
-pub mod compress;
 pub mod error;
 pub mod fusion;
 pub mod layers;

@@ -68,16 +68,46 @@ const HAYSTACK: &[&str] = &[
 ];
 
 const QUESTIONS: &[(&str, &str)] = &[
-    ("Which drug originally called sirolimus prolongs life in laboratory mice?", "Rapamycin extends median"),
-    ("What biguanide antidiabetic is being repurposed as a longevity intervention?", "Metformin reduces all-cause"),
-    ("Which senolytic combination removes zombie cells from old tissue?", "The combination of dasatinib"),
-    ("What GLP-1 receptor agonist marketed as Wegovy treats obesity?", "Wegovy produced fifteen"),
-    ("How does eating fewer calories than normal affect animal lifespan?", "Reducing daily energy intake"),
-    ("Which NAD+ booster has been shown to raise the cofactor in elderly humans?", "Nicotinamide riboside"),
-    ("What pathway senses amino acids and regulates cellular growth versus autophagy?", "TORC1 integrates"),
-    ("What secretory profile do senescent cells develop that drives inflammation?", "Cells that undergo replicative"),
-    ("Which incretin hormone from the gut triggers insulin release after meals?", "Glucagon-like peptide"),
-    ("How do sirtuins use NAD+ to influence chromatin and aging?", "Sirtuin deacetylases"),
+    (
+        "Which drug originally called sirolimus prolongs life in laboratory mice?",
+        "Rapamycin extends median",
+    ),
+    (
+        "What biguanide antidiabetic is being repurposed as a longevity intervention?",
+        "Metformin reduces all-cause",
+    ),
+    (
+        "Which senolytic combination removes zombie cells from old tissue?",
+        "The combination of dasatinib",
+    ),
+    (
+        "What GLP-1 receptor agonist marketed as Wegovy treats obesity?",
+        "Wegovy produced fifteen",
+    ),
+    (
+        "How does eating fewer calories than normal affect animal lifespan?",
+        "Reducing daily energy intake",
+    ),
+    (
+        "Which NAD+ booster has been shown to raise the cofactor in elderly humans?",
+        "Nicotinamide riboside",
+    ),
+    (
+        "What pathway senses amino acids and regulates cellular growth versus autophagy?",
+        "TORC1 integrates",
+    ),
+    (
+        "What secretory profile do senescent cells develop that drives inflammation?",
+        "Cells that undergo replicative",
+    ),
+    (
+        "Which incretin hormone from the gut triggers insulin release after meals?",
+        "Glucagon-like peptide",
+    ),
+    (
+        "How do sirtuins use NAD+ to influence chromatin and aging?",
+        "Sirtuin deacetylases",
+    ),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,8 +139,8 @@ fn stable_id(prefix: &str, text: &str) -> Uuid {
 fn seed_haystack(
     store: &SqliteStore,
 ) -> Result<Vec<(Uuid, &'static str)>, crate::error::BenchError> {
-    use engram_core::types::{Memory, MemorySource};
     use chrono::TimeZone;
+    use engram_core::types::{Memory, MemorySource};
     let epoch = chrono::Utc.timestamp_opt(0, 0).single().unwrap();
     let mut chunk_ids_by_text: Vec<(Uuid, &'static str)> = Vec::new();
     for text in HAYSTACK {
@@ -233,7 +263,10 @@ pub fn run_fts_baseline() -> Result<MiniReport, crate::error::BenchError> {
     metrics.p50_latency_ms = sorted[sorted.len() / 2] as f32;
     metrics.p95_latency_ms = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32;
 
-    Ok(MiniReport { metrics, per_question })
+    Ok(MiniReport {
+        metrics,
+        per_question,
+    })
 }
 
 /// Path for the on-disk haystack/query embedding cache. Keyed by embedder name
@@ -336,7 +369,9 @@ pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
         let q_emb = if let Some(cached) = cache.queries.get(*question) {
             cached.clone()
         } else {
-            let fresh = embedder.embed_one(question, TaskMode::RetrievalQuery).await?;
+            let fresh = embedder
+                .embed_one(question, TaskMode::RetrievalQuery)
+                .await?;
             cache.queries.insert((*question).to_string(), fresh.clone());
             cache_dirty = true;
             fresh
@@ -422,7 +457,10 @@ pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
     metrics.p50_latency_ms = sorted[sorted.len() / 2] as f32;
     metrics.p95_latency_ms = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32;
 
-    Ok(MiniReport { metrics, per_question })
+    Ok(MiniReport {
+        metrics,
+        per_question,
+    })
 }
 
 /// Convert a free-text query into FTS5 syntax. Strips punctuation, lowercases,
@@ -430,11 +468,11 @@ pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
 /// FTS5 cannot interpret hyphens, plus signs or numbers as syntax.
 pub fn build_fts_query(text: &str) -> String {
     const STOPWORDS: &[&str] = &[
-        "the", "and", "for", "with", "that", "what", "which", "how",
-        "does", "are", "was", "were", "from", "into", "this", "have",
+        "the", "and", "for", "with", "that", "what", "which", "how", "does", "are", "was", "were",
+        "from", "into", "this", "have",
         // Experiment 1: also drop generic auxiliaries that match many chunks
-        "has", "had", "been", "being", "shown", "show", "shows",
-        "can", "could", "should", "would", "may", "might",
+        "has", "had", "been", "being", "shown", "show", "shows", "can", "could", "should", "would",
+        "may", "might",
     ];
     let mut tokens: Vec<String> = Vec::new();
     for raw in text.split(|c: char| !c.is_alphanumeric()) {

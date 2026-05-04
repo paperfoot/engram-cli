@@ -13,6 +13,10 @@ pub struct AppContext {
 impl AppContext {
     pub fn new(format: OutputFormat, quiet: bool) -> Result<Self, CliError> {
         let store = SqliteStore::open(paths::db_path())?;
-        Ok(Self { format, quiet, store })
+        Ok(Self {
+            format,
+            quiet,
+            store,
+        })
     }
 }

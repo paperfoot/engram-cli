@@ -1,0 +1,21 @@
+{
+  "variant": "v1-bf16-final",
+  "n_queries": 20,
+  "docs_per_query": 30,
+  "total_pairs": 600,
+  "load_time_s": 1.257,
+  "warmup_time_s": 1.074,
+  "total_time_s": 21.07,
+  "pairs_per_sec": 28.48,
+  "latency_ms_per_call": {
+    "mean": 1053.5,
+    "p50": 1046.4,
+    "p90": 1101.9,
+    "p95": 1106.3,
+    "p99": 1117.6,
+    "max": 1120.4
+  },
+  "peak_ram_gb": 8.069,
+  "commit": "d15440c",
+  "timestamp": "2026-04-09T03:01:12.904196+00:00"
+}

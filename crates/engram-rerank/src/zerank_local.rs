@@ -34,8 +34,8 @@ pub struct ZerankLocalReranker {
 
 impl ZerankLocalReranker {
     pub fn new() -> Self {
-        let base_url = std::env::var("ENGRAM_ZERANK_URL")
-            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let base_url =
+            std::env::var("ENGRAM_ZERANK_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Self {
             client: reqwest::Client::builder()
                 // Local model on M-series Metal can be 1-3s for 50 docs;

@@ -1,6 +1,6 @@
 # Engram v2 — Design Spec
 
-**Author:** Boris Djordjevic, 199 Biotechnologies
+**Author:** Paperfoot
 **Date:** 2026-04-07
 **Status:** Approved for implementation
 
@@ -101,7 +101,8 @@ Following [agent-cli-framework](https://github.com/199-biotechnologies/agent-cli
 | `engram bench [longmemeval]` | Run benchmark, output metrics |
 | `engram config show\|set\|check` | Manage config |
 | `engram update [--check]` | Self-update from GitHub Releases |
-| `engram skill install` | Deploy skill signpost to ~/.claude, ~/.codex, ~/.gemini |
+| `engram skill install` | Deploy skill folder to ~/.claude, ~/.codex, ~/.gemini, and ~/.agents |
+| `engram skill package` | Build uploadable skill ZIP for Claude.ai / Claude desktop app |
 | `engram agent-info` | Self-describing JSON manifest |
 
 ### 4.5 JSON envelope

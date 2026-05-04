@@ -37,14 +37,14 @@ async fn score_01<J: ChatLlm + ?Sized>(
     user: &str,
 ) -> Result<f32, LlmError> {
     let resp = judge
-        .chat(&[
-            ChatMessage::system(system),
-            ChatMessage::user(user),
-        ])
+        .chat(&[ChatMessage::system(system), ChatMessage::user(user)])
         .await?;
     // Pull the first float-looking token.
     let mut best: Option<f32> = None;
-    for token in resp.content.split(|c: char| !c.is_ascii_digit() && c != '.') {
+    for token in resp
+        .content
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+    {
         if let Ok(v) = token.parse::<f32>() {
             if (0.0..=1.0).contains(&v) {
                 best = Some(v);

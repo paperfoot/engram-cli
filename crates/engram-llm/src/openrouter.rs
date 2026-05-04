@@ -8,9 +8,12 @@ use crate::{ChatLlm, ChatMessage, ChatResponse, LlmError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-// Default to the latest GPT flagship on OpenRouter. User explicitly wants
-// frontier models for QA evaluation.
+// Default to the latest GPT flagship on OpenRouter for generic chat/bench
+// work. Compiler defaults are separated below so evidence extraction can use
+// a fast model while synthesis uses a stronger one.
 const DEFAULT_MODEL: &str = "openai/gpt-5.4";
+pub const DEFAULT_EXTRACTION_MODEL: &str = "google/gemini-3.1-flash-lite-preview";
+pub const DEFAULT_SYNTHESIS_MODEL: &str = "google/gemini-3.1-pro-preview";
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 pub struct OpenRouterClient {
@@ -168,16 +171,13 @@ enum RetryReason {
 }
 
 impl OpenRouterClient {
-    async fn try_chat_once(
-        &self,
-        body: &ChatRequest<'_>,
-    ) -> Result<ChatResponse, RetryReason> {
+    async fn try_chat_once(&self, body: &ChatRequest<'_>) -> Result<ChatResponse, RetryReason> {
         // Step 1: send.
         let resp = self
             .client
             .post(ENDPOINT)
             .bearer_auth(&self.api_key)
-            .header("HTTP-Referer", "https://github.com/199-biotechnologies/engram-2")
+            .header("HTTP-Referer", "https://github.com/paperfoot/engram-cli")
             .header("X-Title", "engram v2 benchmark")
             .json(body)
             .send()

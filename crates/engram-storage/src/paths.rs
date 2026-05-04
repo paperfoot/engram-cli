@@ -8,8 +8,7 @@ const ORG: &str = "199-biotechnologies";
 const APP: &str = "engram";
 
 fn dirs() -> ProjectDirs {
-    ProjectDirs::from(QUALIFIER, ORG, APP)
-        .expect("could not determine user directories")
+    ProjectDirs::from(QUALIFIER, ORG, APP).expect("could not determine user directories")
 }
 
 /// `~/.local/share/engram/db.sqlite` (Linux) — equivalents on macOS/Windows.

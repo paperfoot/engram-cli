@@ -35,6 +35,15 @@ pub fn recall_at_k<T: PartialEq>(retrieved: &[T], relevant: &[T], k: usize) -> f
     0.0
 }
 
+/// True iff ALL relevant items appear in top-k. Stricter than recall_at_k.
+pub fn all_gold_present<T: PartialEq>(retrieved: &[T], relevant: &[T], k: usize) -> bool {
+    if relevant.is_empty() {
+        return true;
+    }
+    let top_k: Vec<&T> = retrieved.iter().take(k).collect();
+    relevant.iter().all(|r| top_k.contains(&r))
+}
+
 /// Reciprocal rank of the first relevant item; 0 if none in top-k.
 pub fn reciprocal_rank<T: PartialEq>(retrieved: &[T], relevant: &[T], k: usize) -> f32 {
     for (i, r) in retrieved.iter().take(k).enumerate() {
@@ -55,6 +64,15 @@ mod tests {
         let relevant = vec![3];
         assert_eq!(recall_at_k(&retrieved, &relevant, 5), 1.0);
         assert_eq!(recall_at_k(&retrieved, &relevant, 2), 0.0);
+    }
+
+    #[test]
+    fn all_gold_present_requires_full_coverage() {
+        let retrieved = vec![1, 2, 3, 4, 5];
+        assert!(all_gold_present(&retrieved, &vec![1, 3], 5));
+        assert!(!all_gold_present(&retrieved, &vec![1, 6], 5));
+        assert!(!all_gold_present(&retrieved, &vec![3], 2));
+        assert!(all_gold_present(&retrieved, &Vec::<i32>::new(), 5));
     }
 
     #[test]

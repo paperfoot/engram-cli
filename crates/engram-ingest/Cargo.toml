@@ -1,11 +1,14 @@
 [package]
-name = "engram-ingest"
+name = "paperfoot-engram-ingest"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Mining modes (papers, conversations, repos, general) for engram v2"
+
+[lib]
+name = "engram_ingest"
 
 [dependencies]
 engram-core.workspace = true

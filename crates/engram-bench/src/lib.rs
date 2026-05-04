@@ -6,7 +6,9 @@
 pub mod error;
 pub mod judge;
 pub mod locomo;
+pub mod locomo_plus;
 pub mod longmemeval;
+pub mod memoryagentbench;
 pub mod metrics;
 pub mod mini;
 pub mod qa;

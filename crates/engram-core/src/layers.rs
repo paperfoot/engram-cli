@@ -1,7 +1,6 @@
-//! Memory layers (L0–L3) — tiered context loading inspired by MemPalace.
 //!
 //! L0 = identity (static)
-//! L1 = critical facts (AAAK-compressed)
+//! L1 = critical facts (compressed)
 //! L2 = topic context (loaded on demand)
 //! L3 = deep search
 
@@ -12,7 +11,6 @@ use serde::{Deserialize, Serialize};
 pub struct LayerBudget {
     pub layer: Layer,
     pub max_tokens: usize,
-    pub include_compressed: bool,
 }
 
 impl Default for LayerBudget {
@@ -20,7 +18,6 @@ impl Default for LayerBudget {
         Self {
             layer: Layer::Topic,
             max_tokens: Layer::Topic.default_token_budget(),
-            include_compressed: false,
         }
     }
 }

@@ -1,0 +1,21 @@
+{
+  "variant": "v3-q8",
+  "n_queries": 20,
+  "docs_per_query": 30,
+  "total_pairs": 600,
+  "load_time_s": 1.069,
+  "warmup_time_s": 1.188,
+  "total_time_s": 24.683,
+  "pairs_per_sec": 24.31,
+  "latency_ms_per_call": {
+    "mean": 1234.1,
+    "p50": 1233.2,
+    "p90": 1289.4,
+    "p95": 1300.0,
+    "p99": 1330.2,
+    "max": 1337.8
+  },
+  "peak_ram_gb": 4.693,
+  "commit": "d15440c",
+  "timestamp": "2026-04-09T02:59:48.582439+00:00"
+}

@@ -41,6 +41,17 @@ pub fn print_success<T: Serialize, F: FnOnce(&T)>(
     metadata: Metadata,
     human: F,
 ) {
+    print_envelope(format, "success", data, metadata, human)
+}
+
+/// Print a JSON envelope with an explicit status.
+pub fn print_envelope<T: Serialize, F: FnOnce(&T)>(
+    format: OutputFormat,
+    status: &str,
+    data: T,
+    metadata: Metadata,
+    human: F,
+) {
     match format {
         OutputFormat::Json => {
             let mut meta = json!({ "elapsed_ms": metadata.elapsed_ms });
@@ -51,7 +62,7 @@ pub fn print_success<T: Serialize, F: FnOnce(&T)>(
             }
             let envelope = json!({
                 "version": "1",
-                "status": "success",
+                "status": status,
                 "data": data,
                 "metadata": meta,
             });

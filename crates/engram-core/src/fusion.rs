@@ -25,10 +25,7 @@ pub struct RankedHit {
 /// The deterministic tiebreak matters because HashMap iteration order is
 /// randomized — without this, the ranking flips between runs whenever two
 /// chunks share a fused score.
-pub fn reciprocal_rank_fusion(
-    runs: &[Vec<RankedHit>],
-    k: f32,
-) -> Vec<(ChunkId, Score)> {
+pub fn reciprocal_rank_fusion(runs: &[Vec<RankedHit>], k: f32) -> Vec<(ChunkId, Score)> {
     let mut scores: HashMap<ChunkId, f32> = HashMap::new();
     for run in runs {
         for hit in run {
@@ -56,12 +53,32 @@ mod tests {
         let c = Uuid::new_v4();
 
         let dense = vec![
-            RankedHit { chunk_id: a, rank: 1, raw_score: 0.9, source: RetrievalSource::Dense },
-            RankedHit { chunk_id: b, rank: 2, raw_score: 0.7, source: RetrievalSource::Dense },
+            RankedHit {
+                chunk_id: a,
+                rank: 1,
+                raw_score: 0.9,
+                source: RetrievalSource::Dense,
+            },
+            RankedHit {
+                chunk_id: b,
+                rank: 2,
+                raw_score: 0.7,
+                source: RetrievalSource::Dense,
+            },
         ];
         let lexical = vec![
-            RankedHit { chunk_id: b, rank: 1, raw_score: 5.0, source: RetrievalSource::Lexical },
-            RankedHit { chunk_id: c, rank: 2, raw_score: 3.0, source: RetrievalSource::Lexical },
+            RankedHit {
+                chunk_id: b,
+                rank: 1,
+                raw_score: 5.0,
+                source: RetrievalSource::Lexical,
+            },
+            RankedHit {
+                chunk_id: c,
+                rank: 2,
+                raw_score: 3.0,
+                source: RetrievalSource::Lexical,
+            },
         ];
 
         let fused = reciprocal_rank_fusion(&[dense, lexical], 60.0);

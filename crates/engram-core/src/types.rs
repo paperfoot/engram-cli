@@ -19,7 +19,7 @@ pub struct Memory {
     pub content: String,
     pub created_at: DateTime<Utc>,
     pub event_time: Option<DateTime<Utc>>,
-    pub importance: u8, // 0..=10
+    pub importance: u8,       // 0..=10
     pub emotional_weight: i8, // -5..=5
     pub access_count: u32,
     pub last_accessed: Option<DateTime<Utc>>,
@@ -35,9 +35,20 @@ pub struct Memory {
 #[serde(rename_all = "snake_case")]
 pub enum MemorySource {
     Manual,
-    Paper { doi: Option<String>, title: String, section: Option<String> },
-    Conversation { thread: String, turn: u32 },
-    Repo { repo: String, path: String, line_start: Option<u32> },
+    Paper {
+        doi: Option<String>,
+        title: String,
+        section: Option<String>,
+    },
+    Conversation {
+        thread: String,
+        turn: u32,
+    },
+    Repo {
+        repo: String,
+        path: String,
+        line_start: Option<u32>,
+    },
     General,
 }
 
@@ -47,10 +58,10 @@ pub struct Chunk {
     pub id: ChunkId,
     pub memory_id: MemoryId,
     pub content: String,
-    pub position: u32, // ordinal within the parent memory
+    pub position: u32,           // ordinal within the parent memory
     pub section: Option<String>, // for papers: "Methods > Cell Culture"
     pub token_count: Option<u32>,
-    pub embedding_id: Option<String>, // pointer into LanceDB
+    pub embedding_id: Option<String>, // reserved for external index
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +73,7 @@ pub struct Entity {
     pub mention_count: u32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Person,
@@ -102,12 +113,12 @@ pub enum EdgeKind {
 }
 
 /// Memory layers (L0–L3) — tiered context loading.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Layer {
     /// L0: identity / system prompt (~50 tokens).
     Identity,
-    /// L1: critical facts, AAAK-encoded (~120 tokens).
+    /// L1: critical facts, condensed (~120 tokens).
     Critical,
     /// L2: topic-specific context loaded on demand.
     Topic,
@@ -138,9 +149,9 @@ impl Layer {
 pub struct Fact {
     pub id: Uuid,
     pub source_memory_id: MemoryId,
-    /// Display form of the subject ("Elias Danilovski").
+    /// Display form of the subject ("Ada Example").
     pub subject: String,
-    /// Lowercased subject for lookup ("elias danilovski").
+    /// Lowercased subject for lookup ("ada example").
     pub subject_norm: String,
     /// Snake_case predicate ("works_at", "lives_in", "prefers", "graduated_from").
     pub predicate: String,
@@ -163,7 +174,7 @@ pub struct ScoredChunk {
     pub source: RetrievalSource,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalSource {
     Dense,

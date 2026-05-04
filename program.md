@@ -1,80 +1,107 @@
 # engram v2 — Autoresearch Research Direction
 
-## Goal
+## Current goal (2026-04-09)
 
-Match or beat MemPalace's 98.4% R@5 on LongMemEval (S split, held-out questions), then push higher.
+**Beat Cohere's 78.8% LoCoMo-full-mini end-to-end QA accuracy** — locally, reproducibly, with
+a reranker path we own. Secondary goal: restore per-question latency to ≤3s/q.
 
-## Current state — end of bootstrap session
+The target eval is a **deterministic 50-question slice** of LoCoMo-full-mini (first 50 in
+sample order). The Cohere baseline on the same slice is 71.1% (27/38 from the partial MLX
+run mapped to the same index range). The full 1542-question Cohere run scored 78.8%
+(`benchmarks/locomo-full-mini-cohere.json`).
 
-### Mini benchmark (10 hand-written questions, runs in <1 s)
+## The confound we're untangling
 
-| mode | R@1 | R@5 | MRR | notes |
-|---|---|---|---|---|
-| `mini-fts` (FTS5 only) | 0.90 | 1.00 | 0.95 | After expt#1 stopword tuning |
-| `mini` hybrid_stub | 0.50 | — | — | Offline CI baseline |
-| `mini` hybrid_gemini | **1.00** | **1.00** | **1.00** | Gemini Embed 2 + RRF fusion (saturated) |
+The partial MLX bench crashed at 38/1542 with 47.4% accuracy and 17.0s/q — 24 points below
+Cohere on the same 38 questions and 6× slower. **BUT** the two runs used different embed
+models:
 
-### LongMemEval S split (500 questions, ~48 sessions/q, 96% distractors)
+| run | timestamp | embed model | reranker | acc (slice) | latency |
+|---|---|---|---|---:|---:|
+| Cohere | 2026-04-09 01:56 | gemini-embedding-001 (OLD) | Cohere rerank-v3.5 | 71.1% | 2.7s/q |
+| zerank2-mlx (crashed) | 2026-04-09 04:24 | gemini-embedding-2-preview (NEW) | zerank-2-mlx | 47.4% | 17.0s/q |
 
-| mode | R@1 | R@5 | R@10 | MRR | notes |
-|---|---|---|---|---|---|
-| Stub embedder, first 10 questions | 0.20 | 0.50 | 0.80 | 0.31 | Random-ish baseline |
-| **Gemini, first 10 questions** | **TBD** | **TBD** | **TBD** | **TBD** | Free-tier quota exhausted; resume when reset |
-| **Gemini, full 500** | **TBD** | **TBD** | **TBD** | **TBD** | Target ≥ 0.984 R@5 (MemPalace parity) |
+We don't know yet which change is the killer. The loop's first four experiments isolate it.
 
-### What is wired up
+## Iteration strategy (Karpathy ordering)
 
-- Cargo workspace, 8 crates, 17 unit tests pass
-- agent-cli-framework patterns: `agent-info`, JSON envelope, semantic exit codes, `skill install`
-- SQLite + FTS5 source of truth with Porter stemming
-- Gemini Embed 2 client with both `embedContent` and `batchEmbedContents`, token-budgeted batching, per-text truncation under 2,048 tokens
-- Cohere Rerank 4 Pro client (untested — `COHERE_API_KEY` not set in this env)
-- Stub embedder for offline / CI runs (deterministic)
-- Reciprocal Rank Fusion with deterministic tiebreak (UUID v5 + chunk_id ordering)
-- LongMemEval Oracle + S split loaders, dedup of duplicate session IDs
-- LongMemEval runner: in-memory store per question, batch-embed haystack, hybrid retrieval, R@k metrics
-- Embedding cache on disk per embedder name so iterative runs hit cache after warmup
+### Phase 0 — confound isolation (MUST do first)
 
-### What is NOT wired up yet (Phase 2 priorities)
+| # | embed model | reranker | hypothesis |
+|---|---|---|---|
+| 1 | gemini-embedding-001 | cohere | BASELINE: re-confirm 71.1% on the 50-q slice |
+| 2 | gemini-embedding-001 | zerank2 (MLX) | Isolate reranker: if accuracy holds, MLX port is fine |
+| 3 | gemini-embedding-2-preview | cohere | Isolate embed: if accuracy tanks, embed-2 is broken |
+| 4 | gemini-embedding-2-preview | zerank2 (MLX) | Matches crashed run baseline |
 
-The autoresearch loop should attack these in order:
+After these four runs we know which component is the regression. Then:
 
-1. **Run the full LongMemEval S split with Gemini once quota resets** — establish the honest baseline, record it, compare to MemPalace's 98.4% R@5
-2. **Cohere Rerank 4 Pro on top-50 candidates** — biggest single quality lift after dense retrieval
-3. **Section-aware chunking** that preserves headers in chunk metadata
-4. **LanceDB** as the persistent vector store (currently in-memory HashMap per question)
-5. **Memory layers (L0–L3)** — actually use them in `recall` output, not just types
-6. **AAAK compression port from MemPalace** — replace `IdentityCompressor`
+### Phase 1 — hyperparameters (cheap, high signal)
 
-### Hyperparameter targets (Karpathy ordering: hyperparameters first)
+- RRF k constant (currently 60; sweep 20..120)
+- Dense retrieval top-N into fusion (currently 50; sweep 20..100)
+- Rerank top-K into answerer (currently 5; sweep 3..10)
+- Answerer context format (current: `[session N — id]\n{text}`)
 
-1. RRF `k` constant (current: 60, range: 1..200)
-2. Top-N for dense retrieval (current: 50, range: 10..200)
-3. Top-N for FTS retrieval (current: 50, range: 10..200)
-4. Rerank top-N (current: 20, range: 5..50)
-5. Stopword list size for FTS query builder
-6. Token length threshold for FTS query (current: <3 chars dropped)
-7. Embedding output dimensionality (Gemini supports 768/1536/3072)
+### Phase 2 — embed/rerank swaps
 
-### Reward hacking watch
+- Gemini Embed 2 (if Phase 0 says it's good)
+- Pinned embed-001 (if Phase 0 says preview is bad)
+- Replace zerank-2 with a newer/stronger local reranker (see "candidate local rerankers" below)
 
-- The mini bench is **saturated** at R@1 = 1.0 with hybrid_gemini. Do NOT keep tuning against it — switch the loop's eval to LongMemEval S as soon as quota allows.
-- The Oracle split is degenerate (haystack == answer set). Do not use it for retrieval evaluation; it tests answer generation only.
-- Always run determinism check (`for i in 1 2 3; do ./target/debug/engram bench mini --json | jq -r .data.recall_at_1; done`) before declaring a win — earlier 1.0 R@1 results were caused by random UUIDs and non-deterministic HashMap iteration order. We caught and fixed two such bugs already.
+### Phase 3 — architecture changes
 
-### When stuck (5+ consecutive discards)
+- Section-aware chunking of LoCoMo sessions (currently whole-session chunks)
+- Query expansion before embed (LLM-rewritten query)
+- Two-stage rerank (cheap → expensive)
+- Answerer switch to gpt-5.4 with longer context window
+
+## Candidate local rerankers (max 6 months old per project constraint)
+
+Current date: 2026-04-09. Max-6-months cutoff: **2025-10-09**. To research in Phase 2 if
+Phase 0 implicates the reranker:
+
+- ZeroEntropy `zerank-2` (current) — released ~Sep 2025 (borderline, model card claims SOTA
+  on biomedical, not necessarily LoCoMo-style multi-turn)
+- Qwen3-Reranker-4B / 8B — check release date
+- mxbai-rerank-v3 — if it exists
+- jina-reranker-v3 — check release date
+- BAAI bge-reranker-v3 — check release date
+- Gemma-rerank (Google) — check
+
+Any candidate must:
+1. Have a clean MLX or torch path for Apple Silicon
+2. Fit in 64 GB unified memory with room for the answerer
+3. Pass a correctness gate vs its own HF reference on ≥20 pairs before shipping
+
+## Eval mechanics
+
+- `scripts/experiment.vars` — the knobs (autoresearch target_file)
+- `scripts/eval_locomo_slice.sh` — runs the bench, prints accuracy on stdout
+- Checkpoint per-question JSONL at `benchmarks/ar/locomo-slice-<hash>-<ts>.json`
+- Slice size: 50 questions (ENGRAM_LOCOMO_LIMIT). Validate wins at 200q before declaring a
+  milestone. 50q has ±13% 95% CI so require ≥2pt deltas to trust the signal.
+
+## Reward-hacking watch
+
+- LoCoMo recall_at_5 / MRR are always 0 because the dataset has no `answer_session_ids`.
+  Only the LLM-judged `correct` verdict is meaningful. Any experiment that improves R@5
+  or MRR without improving accuracy is noise.
+- The 50-q slice is stratified by the first-in-dataset sample order, not randomly sampled.
+  Results on it may over- or under-represent easier categories. Spot-check category
+  distribution after each run.
+- Don't game latency by reducing retrieval quality. Latency is a secondary metric — wins
+  must not cost ≥1pt of accuracy.
+
+## Prior autoresearch milestones (different loop, for context)
+
+- LongMemEval S 500-q full run: R@5 = 0.99 with plain hybrid Gemini + FTS + RRF,
+  no rerank. Retrieval is not the bottleneck.
+- Mini bench: saturated at R@1 = 1.0 since run 4 (architectural: added Gemini dense).
+
+## When stuck
 
 1. Re-read this file
-2. Run `autoresearch review` and pipe to Codex/Gemini for cross-model second opinions
-3. Try the opposite of what's been failing
-4. Switch from hyperparameter tuning to an architecture change
-5. Check for bottleneck shifts (R@1 plateau may mean it's now a latency or cost problem)
-
-### Cross-references
-
-- Spec: `docs/superpowers/specs/2026-04-07-engram-v2-design.md`
-- LongMemEval: https://github.com/xiaowu0162/LongMemEval
-- LongMemEval-cleaned: https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned
-- agent-cli-framework: https://github.com/199-biotechnologies/agent-cli-framework
-- HippoRAG2: https://github.com/OSU-NLP-Group/HippoRAG
-- Gemini Embedding API: https://ai.google.dev/gemini-api/docs/embeddings
+2. `autoresearch review` → pipe to Codex (gpt-5.4, xhigh) and Gemini (auto) for second opinions
+3. Try a completely different lever than the last 5 discards
+4. If the eval slice saturates, expand to 200q or the full 1542

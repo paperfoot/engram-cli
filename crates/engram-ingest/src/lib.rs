@@ -16,6 +16,7 @@ pub use error::IngestError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Papers,
+    Takeaways,
     Conversations,
     Repos,
     General,

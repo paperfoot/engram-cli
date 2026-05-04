@@ -1,11 +1,14 @@
 [package]
-name = "engram-llm"
+name = "paperfoot-engram-llm"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Chat LLM providers (OpenRouter) for answer generation and judging"
+
+[lib]
+name = "engram_llm"
 
 [dependencies]
 reqwest.workspace = true

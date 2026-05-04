@@ -22,6 +22,12 @@ pub enum TaskMode {
 pub trait Embedder: Send + Sync {
     fn name(&self) -> &'static str;
     fn dimensions(&self) -> usize;
+    fn model(&self) -> String {
+        self.name().to_string()
+    }
+    fn prompt_format(&self) -> &'static str {
+        "legacy"
+    }
 
     async fn embed_one(&self, text: &str, mode: TaskMode) -> Result<Vec<f32>, EmbedError>;
 

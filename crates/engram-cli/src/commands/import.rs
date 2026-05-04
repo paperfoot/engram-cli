@@ -35,9 +35,7 @@ pub fn run(ctx: &AppContext, path: PathBuf) -> Result<(), CliError> {
                 .and_then(|v| v.as_array())
         })
         .ok_or_else(|| {
-            CliError::BadInput(
-                "expected { memories: [...] } at top level or under .data".into(),
-            )
+            CliError::BadInput("expected { memories: [...] } at top level or under .data".into())
         })?;
 
     let mut imported = 0u32;

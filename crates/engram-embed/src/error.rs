@@ -13,7 +13,10 @@ pub enum EmbedError {
     },
 
     #[error("API error from {provider}: {message}")]
-    Api { provider: &'static str, message: String },
+    Api {
+        provider: &'static str,
+        message: String,
+    },
 
     #[error("rate limited by {provider}")]
     RateLimited { provider: &'static str },

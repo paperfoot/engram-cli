@@ -6,8 +6,10 @@
 //! `object_norm`, the old fact is superseded by the new one (non-destructive —
 //! the old row is preserved with `superseded_by` set).
 //!
-//! Toggle off with `--no-facts` for cheap bulk imports.
+//! Fact extraction is opt-in via `--extract-facts` so the default write path
+//! stays fast, local, and predictable for agents.
 
+use crate::commands::usage::{estimated_tokens, estimated_tokens_for_texts, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
@@ -29,7 +31,8 @@ pub async fn run(
     importance: u8,
     tags: Vec<String>,
     diary: String,
-    no_facts: bool,
+    kb: String,
+    extract_facts_enabled: bool,
 ) -> Result<(), CliError> {
     if content.trim().is_empty() {
         return Err(CliError::BadInput("content cannot be empty".into()));
@@ -55,7 +58,7 @@ pub async fn run(
         valid_until: None,
         tags,
     };
-    ctx.store.insert_memory(&memory)?;
+    ctx.store.insert_memory_with_kb(&memory, &kb)?;
 
     let chunks = naive_split(&content);
     let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
@@ -63,30 +66,55 @@ pub async fn run(
     // Embed every chunk. Gemini if available (env or config file), stub otherwise.
     let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let (embeddings, model_name): (Vec<Vec<f32>>, &'static str) =
-        if !force_stub && gemini_key.is_some() {
+    let have_gemini = !force_stub && gemini_key.is_some();
+    let (embeddings, model_name, dims, prompt_format): (Vec<Vec<f32>>, String, usize, String) =
+        if have_gemini {
             let e = GeminiEmbedder::new(gemini_key.unwrap());
             let v = e
                 .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
                 .await?;
-            (v, "gemini-embedding-001")
+            (v, e.model(), e.dimensions(), e.prompt_format().to_string())
         } else {
             let e = StubEmbedder::default();
             let v = e
                 .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
                 .await?;
-            (v, "stub")
+            (v, e.model(), e.dimensions(), e.prompt_format().to_string())
         };
 
     for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-        ctx.store.insert_chunk_with_embedding(
+        ctx.store.insert_chunk_with_embedding_meta(
             Uuid::new_v4(),
             memory.id,
             &chunk.text,
             chunk.position,
             chunk.section.as_deref(),
             emb,
-            model_name,
+            &model_name,
+            dims,
+            &prompt_format,
+            None,
+        )?;
+    }
+    if have_gemini && !chunk_texts.is_empty() {
+        let tokens = estimated_tokens_for_texts(&chunk_texts);
+        ctx.store.record_usage_event(
+            "gemini",
+            "remember_embed",
+            Some(&model_name),
+            Some(&kb),
+            Some(&diary),
+            1,
+            chunk_texts.len() as i64,
+            tokens,
+            0,
+            0.0,
+            gemini_embed_cost_usd(tokens),
+            json!({
+                "dimensions": dims,
+                "prompt_format": prompt_format.clone(),
+                "estimated": true,
+            }),
         )?;
     }
 
@@ -95,16 +123,35 @@ pub async fn run(
     // never blocks a `remember` call.
     let mut facts_added = 0usize;
     let mut conflicts: Vec<serde_json::Value> = Vec::new();
-    if !no_facts {
+    if extract_facts_enabled {
         let openrouter_key =
             crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter");
         if let Some(key) = openrouter_key {
-            // Default to the latest cheap/fast OpenAI model — never an old
-            // generation (no gpt-4o, no gpt-4o-mini). Override with
-            // ENGRAM_FACT_MODEL if a different slug is preferred.
-            let extraction_model = std::env::var("ENGRAM_FACT_MODEL")
-                .unwrap_or_else(|_| "openai/gpt-5.4-mini".to_string());
-            let llm = OpenRouterClient::new(key).with_model(extraction_model);
+            // Fact extraction should be fast and cheap. The default follows
+            // the compiler extraction model; override with ENGRAM_FACT_MODEL
+            // for a different OpenRouter slug.
+            let extraction_model = std::env::var("ENGRAM_FACT_MODEL").unwrap_or_else(|_| {
+                crate::commands::config::resolve_setting(
+                    "ENGRAM_COMPILER_EXTRACTION_MODEL",
+                    "compiler.extraction_model",
+                    engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL,
+                )
+            });
+            let llm = OpenRouterClient::new(key).with_model(extraction_model.clone());
+            ctx.store.record_usage_event(
+                "openrouter",
+                "remember_fact_extract",
+                Some(&extraction_model),
+                Some(&kb),
+                Some(&diary),
+                1,
+                1,
+                estimated_tokens(&content),
+                0,
+                0.0,
+                0.0,
+                json!({ "estimated": true }),
+            )?;
             match extract_facts(&llm, &content).await {
                 Ok(extracted) => {
                     for ef in extracted {
@@ -121,9 +168,7 @@ pub async fn run(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "fact extraction failed (continuing without facts): {e}"
-                    );
+                    tracing::warn!("fact extraction failed (continuing without facts): {e}");
                 }
             }
         } else {
@@ -135,7 +180,10 @@ pub async fn run(
     meta.elapsed_ms = start.elapsed().as_millis() as u64;
     meta.add("memory_id", memory.id.to_string());
     meta.add("chunks_stored", chunks.len());
-    meta.add("embedder", model_name);
+    meta.add("embedder", model_name.clone());
+    meta.add("embed_dimensions", dims);
+    meta.add("embed_prompt_format", prompt_format.clone());
+    meta.add("kb", kb.clone());
     meta.add("facts_added", facts_added);
     meta.add("conflicts_detected", conflicts.len());
 
@@ -145,6 +193,7 @@ pub async fn run(
             "id": memory.id,
             "stored": true,
             "chunks": chunks.len(),
+            "kb": kb,
             "facts_added": facts_added,
             "conflicts": conflicts,
         }),

@@ -16,7 +16,14 @@ fn mask_key(key: &str) -> String {
         "***".to_string()
     } else {
         let head: String = key.chars().take(6).collect();
-        let tail: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
+        let tail: String = key
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         format!("{head}...{tail}")
     }
 }
@@ -51,6 +58,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
 
     let gemini_source = describe_key_source("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere_source = describe_key_source("COHERE_API_KEY", &file_cfg, "keys.cohere");
+    let openrouter_source = describe_key_source("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
 
     print_success(
         ctx.format,
@@ -62,6 +70,39 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
             "keys": {
                 "gemini": gemini_source,
                 "cohere": cohere_source,
+                "openrouter": openrouter_source,
+            },
+            "retrieval": {
+                "profile": "cloud_quality",
+                "rerank_top_n": 50,
+            },
+            "embedding": {
+                "provider": "gemini",
+                "model": engram_embed::gemini::DEFAULT_MODEL,
+                "dimensions": engram_embed::gemini::DEFAULT_DIMS,
+                "prompt_format": engram_embed::gemini::PROMPT_FORMAT,
+            },
+            "compiler": {
+                "extraction_model": resolve_setting(
+                    "ENGRAM_COMPILER_EXTRACTION_MODEL",
+                    "compiler.extraction_model",
+                    engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL,
+                ),
+                "synthesis_model": resolve_setting(
+                    "ENGRAM_COMPILER_SYNTHESIS_MODEL",
+                    "compiler.synthesis_model",
+                    engram_llm::openrouter::DEFAULT_SYNTHESIS_MODEL,
+                ),
+                "llm_default": resolve_setting("ENGRAM_COMPILER_LLM", "compiler.llm", "false"),
+            },
+            "ingest": {
+                "require_scope": resolve_setting("ENGRAM_INGEST_REQUIRE_SCOPE", "ingest.require_scope", "true"),
+                "max_files": std::env::var("ENGRAM_INGEST_MAX_FILES").ok()
+                    .or_else(|| resolve_config_string("ingest.max_files")),
+                "include": std::env::var("ENGRAM_INGEST_INCLUDE").ok()
+                    .or_else(|| resolve_config_string("ingest.include")),
+                "exclude": std::env::var("ENGRAM_INGEST_EXCLUDE").ok()
+                    .or_else(|| resolve_config_string("ingest.exclude")),
             }
         }),
         Metadata::default(),
@@ -93,9 +134,9 @@ fn describe_key_source(env: &str, file: &toml::Value, path: &str) -> serde_json:
 
 pub fn set(ctx: &AppContext, key: String, value: String) -> Result<(), CliError> {
     let mut root = read_toml()?;
-    let root_table = root.as_table_mut().ok_or_else(|| {
-        CliError::Config("config root is not a table".into())
-    })?;
+    let root_table = root
+        .as_table_mut()
+        .ok_or_else(|| CliError::Config("config root is not a table".into()))?;
     // Walk the dotted key, creating intermediate tables.
     let parts: Vec<&str> = key.split('.').collect();
     if parts.is_empty() {
@@ -107,9 +148,9 @@ pub fn set(ctx: &AppContext, key: String, value: String) -> Result<(), CliError>
         let entry = cur
             .entry((*p).to_string())
             .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-        cur = entry.as_table_mut().ok_or_else(|| {
-            CliError::Config(format!("{p} exists but is not a table"))
-        })?;
+        cur = entry
+            .as_table_mut()
+            .ok_or_else(|| CliError::Config(format!("{p} exists but is not a table")))?;
     }
     cur.insert((*last).to_string(), toml::Value::String(value));
 
@@ -129,12 +170,14 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
     let file_cfg = read_toml().unwrap_or(toml::Value::Table(toml::value::Table::new()));
     let gemini = has_key("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere = has_key("COHERE_API_KEY", &file_cfg, "keys.cohere");
+    let openrouter = has_key("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
 
     print_success(
         ctx.format,
         json!({
             "gemini": if gemini { "configured" } else { "missing" },
             "cohere": if cohere { "configured (optional)" } else { "missing (optional)" },
+            "openrouter": if openrouter { "configured (compiler)" } else { "missing (compiler optional)" },
             "ok": gemini,
             "summary": if gemini {
                 if cohere { "hybrid_gemini + cohere" } else { "hybrid_gemini (no rerank)" }
@@ -164,7 +207,7 @@ fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
 
 /// Resolve a secret in the canonical order: env var → config file → None.
 /// This is the single source of truth for key lookup so users can either
-/// `export GEMINI_API_KEY=...` or `engram config set keys.gemini ...` and
+/// set `GEMINI_API_KEY` in the environment or run `engram config set keys.gemini <value>` and
 /// both work identically. Framework rule: env overrides file.
 pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
     if let Ok(v) = std::env::var(env) {
@@ -177,7 +220,28 @@ pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
     for part in toml_path.split('.') {
         cur = cur.get(part)?;
     }
-    cur.as_str().map(|s| s.to_string()).filter(|s| !s.is_empty())
+    cur.as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn resolve_config_string(toml_path: &str) -> Option<String> {
+    let root = read_toml().ok()?;
+    let mut cur = &root;
+    for part in toml_path.split('.') {
+        cur = cur.get(part)?;
+    }
+    cur.as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn resolve_setting(env: &str, toml_path: &str, default: &str) -> String {
+    std::env::var(env)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| resolve_config_string(toml_path))
+        .unwrap_or_else(|| default.to_string())
 }
 
 // Silence unused-imports warning for `Write` on non-unix.

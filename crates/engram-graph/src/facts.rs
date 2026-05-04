@@ -8,7 +8,7 @@
 //! - One prompt, one model, one shot. No multi-turn refinement.
 //! - Predicate vocabulary is open (snake_case suggested) — no fixed schema.
 //! - Subject normalization is `trim().to_lowercase()`. No alias resolution.
-//!   This means "Elias Danilovski" and "elias danilovski" merge, but "Elias D"
+//!   This means "Ada Example" and "ada example" merge, but "Ada E"
 //!   does not. Good enough for the MVP; entity normalization is a follow-up.
 //! - Confidence is reported by the LLM and trusted as-is. No reranking.
 //! - JSON parsing is forgiving: tolerates code fences and stray whitespace.
@@ -36,13 +36,13 @@ If there are no extractable facts, output exactly: []
 Output ONLY the JSON. No prose, no code fences, no commentary.
 
 EXAMPLE INPUT:
-"Elias Danilovski founded 199 Biotechnologies in 2024 and prefers Rust over Go for CLI tools because of single-binary deployment."
+"Ada Example founded Example Labs in 2024 and prefers Rust over Go for CLI tools because of single-binary deployment."
 
 EXAMPLE OUTPUT:
 [
-  {"subject":"Elias Danilovski","predicate":"founded","object":"199 Biotechnologies","confidence":1.0},
-  {"subject":"199 Biotechnologies","predicate":"founded_in","object":"2024","confidence":1.0},
-  {"subject":"Elias Danilovski","predicate":"prefers_language","object":"Rust","confidence":1.0}
+  {"subject":"Ada Example","predicate":"founded","object":"Example Labs","confidence":1.0},
+  {"subject":"Example Labs","predicate":"founded_in","object":"2024","confidence":1.0},
+  {"subject":"Ada Example","predicate":"prefers_language","object":"Rust","confidence":1.0}
 ]"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,7 +115,8 @@ mod tests {
 
     #[test]
     fn parse_bare_array() {
-        let raw = r#"[{"subject":"Alice","predicate":"works_at","object":"Acme","confidence":1.0}]"#;
+        let raw =
+            r#"[{"subject":"Alice","predicate":"works_at","object":"Acme","confidence":1.0}]"#;
         let f = parse_extraction_output(raw).unwrap();
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].subject, "Alice");
@@ -153,7 +154,7 @@ mod tests {
 
     #[test]
     fn normalize_lowercases_and_trims() {
-        assert_eq!(normalize("  Elias Danilovski  "), "elias danilovski");
-        assert_eq!(normalize("199 Biotechnologies"), "199 biotechnologies");
+        assert_eq!(normalize("  Ada Example  "), "ada example");
+        assert_eq!(normalize("Example Labs"), "example labs");
     }
 }

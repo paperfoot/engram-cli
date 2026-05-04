@@ -12,8 +12,8 @@ pub fn run(ctx: &AppContext, id: String, confirm: bool) -> Result<(), CliError> 
             "destructive operation — pass --confirm to actually delete".into(),
         ));
     }
-    let uuid = Uuid::parse_str(&id)
-        .map_err(|e| CliError::BadInput(format!("invalid UUID {id}: {e}")))?;
+    let uuid =
+        Uuid::parse_str(&id).map_err(|e| CliError::BadInput(format!("invalid UUID {id}: {e}")))?;
     let deleted = ctx.store.soft_delete_memory(uuid)?;
     print_success(
         ctx.format,

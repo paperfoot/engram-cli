@@ -1,0 +1,21 @@
+{
+  "variant": "v2-mx-compile",
+  "n_queries": 20,
+  "docs_per_query": 30,
+  "total_pairs": 600,
+  "load_time_s": 1.5,
+  "warmup_time_s": 1.092,
+  "total_time_s": 22.451,
+  "pairs_per_sec": 26.72,
+  "latency_ms_per_call": {
+    "mean": 1122.6,
+    "p50": 1102.4,
+    "p90": 1222.7,
+    "p95": 1232.7,
+    "p99": 1247.5,
+    "max": 1251.1
+  },
+  "peak_ram_gb": 8.001,
+  "commit": "d15440c",
+  "timestamp": "2026-04-09T02:57:47.815455+00:00"
+}

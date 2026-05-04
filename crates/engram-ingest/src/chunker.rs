@@ -99,12 +99,7 @@ pub fn section_aware_split(text: &str) -> Vec<PendingChunk> {
     out
 }
 
-fn flush_chunk(
-    buf: &mut String,
-    out: &mut Vec<PendingChunk>,
-    pos: &mut u32,
-    headings: &[String],
-) {
+fn flush_chunk(buf: &mut String, out: &mut Vec<PendingChunk>, pos: &mut u32, headings: &[String]) {
     let trimmed = buf.trim();
     if !trimmed.is_empty() {
         out.push(PendingChunk {

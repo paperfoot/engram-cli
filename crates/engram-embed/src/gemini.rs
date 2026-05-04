@@ -1,14 +1,18 @@
-//! Gemini Embed 2 client (gemini-embedding-001 / -002).
+//! Gemini Embedding 2 client.
 //!
 //! Uses Google's `:embedContent` REST endpoint with the v1beta API.
 //! Reads `GEMINI_API_KEY` or accepts an explicit key.
+//!
+//! Model override: set `GEMINI_EMBED_MODEL` to force a specific model name
+//! (e.g. "gemini-embedding-001" to pin to the legacy stable version).
 
-use crate::{Embedder, EmbedError, TaskMode};
+use crate::{EmbedError, Embedder, TaskMode};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_MODEL: &str = "gemini-embedding-001";
-const DEFAULT_DIMS: usize = 768;
+pub const DEFAULT_MODEL: &str = "gemini-embedding-2";
+pub const DEFAULT_DIMS: usize = 1536;
+pub const PROMPT_FORMAT: &str = "gemini-embedding-2-v1";
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
 pub struct GeminiEmbedder {
@@ -37,7 +41,11 @@ impl GeminiEmbedder {
     pub fn from_env() -> Result<Self, EmbedError> {
         let key = std::env::var("GEMINI_API_KEY")
             .map_err(|_| EmbedError::MissingKey { provider: "gemini" })?;
-        Ok(Self::new(key))
+        let mut e = Self::new(key);
+        if let Ok(model) = std::env::var("GEMINI_EMBED_MODEL") {
+            e = e.with_model(model);
+        }
+        Ok(e)
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -49,31 +57,38 @@ impl GeminiEmbedder {
         self.dimensions = dims;
         self
     }
+
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
 }
 
 #[derive(Serialize)]
-struct EmbedRequest<'a> {
+struct EmbedRequest {
     model: String,
-    content: Content<'a>,
-    #[serde(rename = "taskType")]
-    task_type: &'static str,
-    #[serde(rename = "outputDimensionality", skip_serializing_if = "Option::is_none")]
+    content: Content,
+    #[serde(rename = "taskType", skip_serializing_if = "Option::is_none")]
+    task_type: Option<&'static str>,
+    #[serde(
+        rename = "outputDimensionality",
+        skip_serializing_if = "Option::is_none"
+    )]
     output_dimensionality: Option<usize>,
 }
 
 #[derive(Serialize)]
-struct BatchEmbedRequest<'a> {
-    requests: Vec<EmbedRequest<'a>>,
+struct BatchEmbedRequest {
+    requests: Vec<EmbedRequest>,
 }
 
 #[derive(Serialize)]
-struct Content<'a> {
-    parts: Vec<Part<'a>>,
+struct Content {
+    parts: Vec<Part>,
 }
 
 #[derive(Serialize)]
-struct Part<'a> {
-    text: &'a str,
+struct Part {
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -98,6 +113,17 @@ fn task_type_str(mode: TaskMode) -> &'static str {
     }
 }
 
+fn supports_task_type(model: &str) -> bool {
+    !model.starts_with("gemini-embedding-2")
+}
+
+fn format_input(text: &str, mode: TaskMode) -> String {
+    match mode {
+        TaskMode::RetrievalQuery => format!("query: {}", text.trim()),
+        TaskMode::RetrievalDocument => format!("document: {}", text.trim()),
+    }
+}
+
 #[async_trait]
 impl Embedder for GeminiEmbedder {
     fn name(&self) -> &'static str {
@@ -108,13 +134,22 @@ impl Embedder for GeminiEmbedder {
         self.dimensions
     }
 
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+
+    fn prompt_format(&self) -> &'static str {
+        PROMPT_FORMAT
+    }
+
     async fn embed_one(&self, text: &str, mode: TaskMode) -> Result<Vec<f32>, EmbedError> {
+        let formatted = format_input(text, mode);
         let req = EmbedRequest {
             model: format!("models/{}", self.model),
             content: Content {
-                parts: vec![Part { text }],
+                parts: vec![Part { text: formatted }],
             },
-            task_type: task_type_str(mode),
+            task_type: supports_task_type(&self.model).then_some(task_type_str(mode)),
             output_dimensionality: Some(self.dimensions),
         };
 
@@ -139,12 +174,17 @@ impl Embedder for GeminiEmbedder {
                         attempt += 1;
                         tracing::warn!(
                             "gemini embed_one network error, backing off {}s (attempt {}): {}",
-                            wait, attempt, e
+                            wait,
+                            attempt,
+                            e
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
-                    return Err(EmbedError::Http { provider: "gemini", source: e });
+                    return Err(EmbedError::Http {
+                        provider: "gemini",
+                        source: e,
+                    });
                 }
             };
 
@@ -156,7 +196,8 @@ impl Embedder for GeminiEmbedder {
                     attempt += 1;
                     tracing::info!(
                         "gemini embed_one 429, backing off {}s (attempt {})",
-                        wait, attempt
+                        wait,
+                        attempt
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     continue;
@@ -170,7 +211,10 @@ impl Embedder for GeminiEmbedder {
                     attempt += 1;
                     tracing::warn!(
                         "gemini embed_one 5xx ({}), backing off {}s (attempt {}): {}",
-                        status, wait, attempt, body
+                        status,
+                        wait,
+                        attempt,
+                        body
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     continue;
@@ -190,22 +234,26 @@ impl Embedder for GeminiEmbedder {
             }
 
             // 3. body read (TLS drop mid-stream lands here)
-            let body_text = match resp.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    if (attempt as usize) < delays_secs.len() {
-                        let wait = delays_secs[attempt as usize];
-                        attempt += 1;
-                        tracing::warn!(
+            let body_text =
+                match resp.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if (attempt as usize) < delays_secs.len() {
+                            let wait = delays_secs[attempt as usize];
+                            attempt += 1;
+                            tracing::warn!(
                             "gemini embed_one body-read error, backing off {}s (attempt {}): {}",
                             wait, attempt, e
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                        continue;
+                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                            continue;
+                        }
+                        return Err(EmbedError::Http {
+                            provider: "gemini",
+                            source: e,
+                        });
                     }
-                    return Err(EmbedError::Http { provider: "gemini", source: e });
-                }
-            };
+                };
 
             // 4. JSON parse
             match serde_json::from_str::<EmbedResponse>(&body_text) {
@@ -216,14 +264,20 @@ impl Embedder for GeminiEmbedder {
                         attempt += 1;
                         tracing::warn!(
                             "gemini embed_one parse error, backing off {}s (attempt {}): {}",
-                            wait, attempt, e
+                            wait,
+                            attempt,
+                            e
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
                     return Err(EmbedError::Api {
                         provider: "gemini",
-                        message: format!("parse failed: {}; body: {}", e, body_text.chars().take(500).collect::<String>()),
+                        message: format!(
+                            "parse failed: {}; body: {}",
+                            e,
+                            body_text.chars().take(500).collect::<String>()
+                        ),
                     });
                 }
             }
@@ -252,14 +306,14 @@ impl Embedder for GeminiEmbedder {
             .iter()
             .map(|t| {
                 if t.len() <= MAX_CHARS_PER_TEXT {
-                    (*t).to_string()
+                    format_input(t, mode)
                 } else {
                     // Truncate at a char boundary.
                     let mut end = MAX_CHARS_PER_TEXT;
                     while !t.is_char_boundary(end) && end > 0 {
                         end -= 1;
                     }
-                    t[..end].to_string()
+                    format_input(&t[..end], mode)
                 }
             })
             .collect();
@@ -290,8 +344,10 @@ impl Embedder for GeminiEmbedder {
                 .iter()
                 .map(|t| EmbedRequest {
                     model: format!("models/{}", self.model),
-                    content: Content { parts: vec![Part { text: t }] },
-                    task_type: task_type_str(mode),
+                    content: Content {
+                        parts: vec![Part { text: t.clone() }],
+                    },
+                    task_type: supports_task_type(&self.model).then_some(task_type_str(mode)),
                     output_dimensionality: Some(self.dimensions),
                 })
                 .collect();
@@ -322,7 +378,10 @@ impl Embedder for GeminiEmbedder {
                             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                             continue;
                         }
-                        return Err(EmbedError::Http { provider: "gemini", source: e });
+                        return Err(EmbedError::Http {
+                            provider: "gemini",
+                            source: e,
+                        });
                     }
                 };
                 let status = resp.status();
@@ -330,11 +389,7 @@ impl Embedder for GeminiEmbedder {
                     if (attempt as usize) < delays_secs.len() {
                         let wait = delays_secs[attempt as usize];
                         attempt += 1;
-                        tracing::info!(
-                            "gemini 429, backing off {}s (attempt {})",
-                            wait,
-                            attempt
-                        );
+                        tracing::info!("gemini 429, backing off {}s (attempt {})", wait, attempt);
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
@@ -347,10 +402,11 @@ impl Embedder for GeminiEmbedder {
                         message: format!("status {}: {}", status, body_text),
                     });
                 }
-                let parsed: BatchEmbedResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| EmbedError::Http { provider: "gemini", source: e })?;
+                let parsed: BatchEmbedResponse =
+                    resp.json().await.map_err(|e| EmbedError::Http {
+                        provider: "gemini",
+                        source: e,
+                    })?;
                 break parsed;
             };
             for emb in parsed.embeddings {

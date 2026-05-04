@@ -1,4 +1,4 @@
-//! Cohere Rerank 4 Pro client.
+//! Cohere rerank-v3.5 client.
 
 use crate::{RerankCandidate, RerankError, RerankedResult, Reranker};
 use async_trait::async_trait;
@@ -105,7 +105,10 @@ impl Reranker for CohereReranker {
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
-                    return Err(RerankError::Http { provider: "cohere", source: e });
+                    return Err(RerankError::Http {
+                        provider: "cohere",
+                        source: e,
+                    });
                 }
             };
 
@@ -151,7 +154,10 @@ impl Reranker for CohereReranker {
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
-                    return Err(RerankError::Http { provider: "cohere", source: e });
+                    return Err(RerankError::Http {
+                        provider: "cohere",
+                        source: e,
+                    });
                 }
             };
 

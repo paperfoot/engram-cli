@@ -1,0 +1,7 @@
+interface:
+  display_name: "Engram"
+  short_description: "Persistent memory, domain expertise, and cited research retrieval for agents."
+  brand_color: "#2563EB"
+  default_prompt: "Use Engram to recall relevant memory or domain knowledge before working, research cited evidence from KBs when needed, then save durable facts, decisions, and reusable expertise after."
+policy:
+  allow_implicit_invocation: true

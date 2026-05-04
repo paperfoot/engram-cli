@@ -1,11 +1,14 @@
 [package]
-name = "engram-embed"
+name = "paperfoot-engram-embed"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Embedding providers (Gemini Embed 2, local fallback) for engram v2"
+
+[lib]
+name = "engram_embed"
 
 [dependencies]
 engram-core.workspace = true

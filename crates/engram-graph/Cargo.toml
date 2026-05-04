@@ -1,11 +1,14 @@
 [package]
-name = "engram-graph"
+name = "paperfoot-engram-graph"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Knowledge graph (deterministic edges + optional LLM triples) for engram v2"
+
+[lib]
+name = "engram_graph"
 
 [dependencies]
 engram-core.workspace = true

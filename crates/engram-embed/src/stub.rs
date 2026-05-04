@@ -1,7 +1,7 @@
 //! Deterministic stub embedder for tests and CI. Hashes text into a fixed-size
 //! float vector. Not meaningful semantically but stable and offline.
 
-use crate::{Embedder, EmbedError, TaskMode};
+use crate::{EmbedError, Embedder, TaskMode};
 use async_trait::async_trait;
 
 pub struct StubEmbedder {
@@ -30,6 +30,14 @@ impl Embedder for StubEmbedder {
         self.dims
     }
 
+    fn model(&self) -> String {
+        format!("stub-{}", self.dims)
+    }
+
+    fn prompt_format(&self) -> &'static str {
+        "stub-v1"
+    }
+
     async fn embed_one(&self, text: &str, _mode: TaskMode) -> Result<Vec<f32>, EmbedError> {
         let mut v = vec![0f32; self.dims];
         for (i, byte) in text.bytes().enumerate() {
@@ -54,16 +62,28 @@ mod tests {
     #[tokio::test]
     async fn stub_is_deterministic() {
         let e = StubEmbedder::default();
-        let a = e.embed_one("hello", TaskMode::RetrievalQuery).await.unwrap();
-        let b = e.embed_one("hello", TaskMode::RetrievalQuery).await.unwrap();
+        let a = e
+            .embed_one("hello", TaskMode::RetrievalQuery)
+            .await
+            .unwrap();
+        let b = e
+            .embed_one("hello", TaskMode::RetrievalQuery)
+            .await
+            .unwrap();
         assert_eq!(a, b);
     }
 
     #[tokio::test]
     async fn different_texts_give_different_embeddings() {
         let e = StubEmbedder::default();
-        let a = e.embed_one("rapamycin", TaskMode::RetrievalQuery).await.unwrap();
-        let b = e.embed_one("metformin", TaskMode::RetrievalQuery).await.unwrap();
+        let a = e
+            .embed_one("rapamycin", TaskMode::RetrievalQuery)
+            .await
+            .unwrap();
+        let b = e
+            .embed_one("metformin", TaskMode::RetrievalQuery)
+            .await
+            .unwrap();
         assert_ne!(a, b);
     }
 }

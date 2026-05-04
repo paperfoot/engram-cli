@@ -16,20 +16,20 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-authors = ["Boris Djordjevic <5087259+longevityboris@users.noreply.github.com>"]
+authors = ["Paperfoot"]
 license = "MIT"
-repository = "https://github.com/199-biotechnologies/engram-2"
+repository = "https://github.com/paperfoot/engram-cli"
 
 [workspace.dependencies]
 # Internal
-engram-core    = { path = "crates/engram-core" }
-engram-storage = { path = "crates/engram-storage" }
-engram-embed   = { path = "crates/engram-embed" }
-engram-rerank  = { path = "crates/engram-rerank" }
-engram-llm     = { path = "crates/engram-llm" }
-engram-ingest  = { path = "crates/engram-ingest" }
-engram-graph   = { path = "crates/engram-graph" }
-engram-bench   = { path = "crates/engram-bench" }
+engram-core    = { package = "paperfoot-engram-core", version = "0.1.0", path = "crates/engram-core" }
+engram-storage = { package = "paperfoot-engram-storage", version = "0.1.0", path = "crates/engram-storage" }
+engram-embed   = { package = "paperfoot-engram-embed", version = "0.1.0", path = "crates/engram-embed" }
+engram-rerank  = { package = "paperfoot-engram-rerank", version = "0.1.0", path = "crates/engram-rerank" }
+engram-llm     = { package = "paperfoot-engram-llm", version = "0.1.0", path = "crates/engram-llm" }
+engram-ingest  = { package = "paperfoot-engram-ingest", version = "0.1.0", path = "crates/engram-ingest" }
+engram-graph   = { package = "paperfoot-engram-graph", version = "0.1.0", path = "crates/engram-graph" }
+engram-bench   = { package = "paperfoot-engram-bench", version = "0.1.0", path = "crates/engram-bench" }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -57,7 +57,6 @@ toml = "0.8"
 # Output
 comfy-table = "7"
 owo-colors  = "4"
-indicatif   = "0.17"
 
 # Paths
 directories = "5"
@@ -74,10 +73,8 @@ assert_cmd = "2"
 predicates = "3"
 
 # Bench
-criterion = { version = "0.5", features = ["html_reports"] }
 
 # Self update
-self_update = { version = "0.43", default-features = false, features = ["rustls", "compression-flate2", "archive-tar"] }
 
 # Hashing / IDs
 uuid = { version = "1", features = ["v4", "v5", "serde"] }

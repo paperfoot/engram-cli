@@ -1,0 +1,13 @@
+{
+  "variant": "v2-q4-FAILED",
+  "status": "FAILED_VALIDATION",
+  "reason": "Q4 quantization produces score drifts of 0.05-0.55 on the validation set (max diff 5.47e-1, mean 2.18e-1), flipping top-10 ranking positions 1-2 and 4-5. Cross-encoder classifier heads are quantization-sensitive because the calibrated yes-token logit amplifies any perturbation. Confirmed by research agents: bgconley/qwen3-reranker-multi, jundot/omlx, and multiple 2025-2026 papers all explicitly defer Q4 for reranker weights.",
+  "quantization": "Q4 affine, group_size=64",
+  "peak_ram_gb_would_have_been": 2.26,
+  "scored_pairs_before_fail": 20,
+  "validation_max_diff": 0.547,
+  "validation_mean_diff": 0.218,
+  "top_10_rank_match": false,
+  "recommendation": "Use bf16 baseline or Q8; avoid Q4 for reranker weights. Mixed-precision (bf16 lm_head + embed_tokens, Q8 for body) is a future option via mlx_lm quant_predicate.",
+  "timestamp": "2026-04-09T03:45:00Z"
+}

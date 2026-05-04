@@ -10,8 +10,7 @@ use std::path::Path;
 
 /// Extract text from a PDF file. Returns plain UTF-8 on success.
 pub fn extract_text(path: &Path) -> Result<String, IngestError> {
-    pdf_extract::extract_text(path)
-        .map_err(|e| IngestError::Invalid(format!("pdf extract: {e}")))
+    pdf_extract::extract_text(path).map_err(|e| IngestError::Invalid(format!("pdf extract: {e}")))
 }
 
 /// Best-effort extraction for a PDF byte slice.

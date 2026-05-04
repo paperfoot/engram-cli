@@ -38,13 +38,16 @@ pub enum CliError {
 
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    #[error("zip error: {0}")]
+    Zip(#[from] zip::result::ZipError),
 }
 
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         use CliError::*;
         match self {
-            Transient(_) | Storage(_) | Io(_) | Serde(_) => 1,
+            Transient(_) | Storage(_) | Io(_) | Serde(_) | Zip(_) => 1,
             Config(_) => 2,
             BadInput(_) | Ingest(_) | Bench(_) => 3,
             RateLimited(_) => 4,
@@ -75,6 +78,7 @@ impl CliError {
             Bench(_) => "bench_error",
             Io(_) => "io_error",
             Serde(_) => "serde_error",
+            Zip(_) => "zip_error",
         }
     }
 
@@ -112,4 +116,3 @@ impl CliError {
         }
     }
 }
-
