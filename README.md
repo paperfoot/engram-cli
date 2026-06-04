@@ -137,7 +137,7 @@ cd engram-cli
 cargo install --path crates/engram-cli --locked
 ```
 
-One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.1.2`.
+One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.1.3`.
 
 ### Package manager status
 
@@ -244,7 +244,7 @@ engram usage --kb ageing-biology --json
 engram budget set --kb ageing-biology --daily-usd 5 --monthly-usd 100
 ```
 
-Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25, claim/entity search, graph expansion, and Cohere `rerank-v3.5` when configured. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
+Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25, claim/entity search, graph expansion, and Cohere `rerank-v4.0-pro` when configured. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
 
 `engram usage` summarizes recorded cloud usage by provider, operation, model, KB, estimated input/output tokens, Cohere search units, and estimated cost. Gemini embedding token counts use a local chars/4 estimate. Cohere is tracked as `search_units`; set `ENGRAM_COHERE_RERANK_USD_PER_SEARCH` if you want local dollar estimates. `engram budget` adds local daily/monthly guardrails; provider invoices remain the source of truth.
 
