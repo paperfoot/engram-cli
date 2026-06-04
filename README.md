@@ -6,7 +6,7 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![LongMemEval S R@5](https://img.shields.io/badge/LongMemEval_S_R%405-0.99-brightgreen)](#benchmarks)
 [![LoCoMo-QA](https://img.shields.io/badge/LoCoMo--QA_strict-74.5%25-blue)](#benchmarks)
-[![tests](https://img.shields.io/badge/tests-78%20passing-brightgreen)](crates/engram-cli/tests/cli.rs)
+[![tests](https://img.shields.io/badge/tests-passing-brightgreen)](crates/engram-cli/tests/cli.rs)
 
 ```bash
 git clone https://github.com/paperfoot/engram-cli
@@ -244,7 +244,7 @@ engram usage --kb ageing-biology --json
 engram budget set --kb ageing-biology --daily-usd 5 --monthly-usd 100
 ```
 
-Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25, claim/entity search, graph expansion, and Cohere `rerank-v4.0-pro` when configured. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
+Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25, claim/entity search, graph expansion, and Cohere `rerank-v4.0-pro` when configured. The reranker sees a wide candidate pool (`cloud_quality` default 200, tunable via `ENGRAM_RERANK_CANDIDATES`), and the returned results are capped to at most N chunks per source document (default 2, tunable via `ENGRAM_RERANK_MAX_PER_DOC`; `0` = legacy/unlimited) so a few near-duplicate passages from one document cannot crowd out other sources. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
 
 `engram usage` summarizes recorded cloud usage by provider, operation, model, KB, estimated input/output tokens, Cohere search units, and estimated cost. Gemini embedding token counts use a local chars/4 estimate. Cohere is tracked as `search_units`; set `ENGRAM_COHERE_RERANK_USD_PER_SEARCH` if you want local dollar estimates. `engram budget` adds local daily/monthly guardrails; provider invoices remain the source of truth.
 
@@ -311,6 +311,17 @@ engram entities list --kb ageing-biology --limit 10
 
 Each result has `id`, `kind` (`claim|chunk|wiki_page|entity|relation`), `score`, `content`, citations, KB, and `sources`. **Your agent should quote the content and cite the source/chunk_id** so you can always re-run `engram recall` to verify a claim.
 
+### Grounded answers: cite or abstain
+
+For source-backed questions, treat retrieval as the only evidence:
+
+- **Recall first**, then answer **only** from the returned chunk content — do not fill gaps from training data.
+- **Cite every claim** with its source (for papers, the `PMID`/title + `chunk_id` from `citations[].source`). A claim with no citation should not be stated as fact.
+- **Abstain** when recall is empty or low-scoring: say "insufficient evidence in the knowledge base" rather than guessing, and never invent a citation to fill the gap.
+- **Surface conflicts**: if retrieved sources disagree, report it and cite both.
+
+engram attaches the source to every chunk, so every answer stays independently verifiable — the user can re-run the same `engram recall` and check the cited chunk. Enforcing that the citation reaches the final answer is the calling agent's job; the installed skill instructs agents to do exactly this.
+
 ## Architecture
 
 ```
@@ -330,8 +341,12 @@ Dense    FTS5     Claims       Entity   Wiki
  (k=60, deterministic tiebreak)
           │
           ▼
- Cohere Rerank v3.5
- (or passthrough/offline)
+ Cohere Rerank 4 (rerank-v4.0-pro,
+ env-overridable; or passthrough/offline)
+          │
+          ▼
+ Per-document diversity cap
+ (<=N chunks/doc, default 2)
           │
           ▼
  Memory layer budgeting
@@ -357,7 +372,7 @@ Cargo workspace layout:
 | `engram-core` (`paperfoot-engram-core` on crates.io) | Pure types, fusion (RRF), memory layers, temporal validity. Zero I/O. |
 | `engram-storage` (`paperfoot-engram-storage`) | SQLite source of truth + FTS5 + chunk-embedding BLOBs + KB/claim/entity/wiki tables. |
 | `engram-embed` (`paperfoot-engram-embed`) | `Embedder` trait + Gemini Embed 2 (batch + single) + deterministic offline stub. |
-| `engram-rerank` (`paperfoot-engram-rerank`) | `Reranker` trait + Cohere Rerank v3.5 + passthrough. |
+| `engram-rerank` (`paperfoot-engram-rerank`) | `Reranker` trait + Cohere Rerank 4 (default `rerank-v4.0-pro`, env-overridable) + passthrough. |
 | `engram-ingest` (`paperfoot-engram-ingest`) | Mining modes: papers (PDF + section-aware), takeaways, conversations, repos, general, auto. |
 | `engram-graph` (`paperfoot-engram-graph`) | Deterministic entity extraction + SQLite graph expansion. |
 | `engram-bench` (`paperfoot-engram-bench`) | LongMemEval + LoCoMo-QA harness + strict LLM judge + gold evidence retrieval metrics. |
@@ -424,7 +439,7 @@ The daemon is local-only by default and uses the same SQLite store and retrieval
 
 ```bash
 cargo build --release                         # build
-cargo test                                    # 78 tests currently passing
+cargo test                                    # unit + integration suite (64 unit tests run offline; integration needs keys)
 ./target/release/engram bench mini --json     # fast smoke bench (<1s)
 ./target/release/engram bench scientific-mini --json
 ./target/release/engram bench longmemeval     # real benchmark (~5 min with Cohere)
@@ -449,7 +464,7 @@ Research direction for contributors: [`program.md`](program.md). Design rational
 - Optional LLM compiler pass: Gemini 3.1 Flash-Lite Preview extraction + Gemini 3.1 Pro Preview synthesis via OpenRouter
 - LongMemEval + LoCoMo-QA harness with strict evaluation
 - `scientific-mini` evidence compiler benchmark
-- 82 unit + integration tests
+- Unit + integration test suite (run with `cargo test`)
 
 **Next up**
 - Strict benchmark suite: buried-needle, multi-hop, temporal reasoning, adversarial, and attribution tests

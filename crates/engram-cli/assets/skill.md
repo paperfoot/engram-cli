@@ -44,6 +44,18 @@ engram remember "Decision 2026-04-08: use SQLite BLOB embeddings and SQLite grap
 
 Importance scale: 0–3 trivia, 4–6 useful context, 7–8 decisions/preferences, 9–10 load-bearing facts you must not forget.
 
+## Grounded answers: cite or abstain
+
+When you answer a user from a KB (papers, medical, support, any source corpus), retrieval is your **only** evidence:
+
+1. **Recall first** (`engram recall` / `engram research --kb K`) before stating anything source-backed.
+2. **Answer only from returned content.** Do not fill gaps from training data for source-backed questions.
+3. **Cite every claim.** Attach its source — for papers, the `PMID`/title and `chunk_id` from `citations[].source`; quote or closely paraphrase the chunk. A claim with no citation should not be stated as fact.
+4. **Abstain when support is weak.** If recall is empty (`status: no_results`) or only low-scoring chunks come back, say "insufficient evidence in the knowledge base" instead of guessing. Never invent a citation to satisfy the rule.
+5. **Surface disagreement.** If sources conflict, report the conflict and cite both rather than silently choosing one.
+
+This keeps every answer independently verifiable: the user can re-run the same `engram recall` and check the cited chunk.
+
 ## Scientific papers / document corpus workflow
 
 engram is purpose-built for ingesting documents and answering questions against them with real citations.
