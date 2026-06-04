@@ -99,6 +99,39 @@ pub fn section_aware_split(text: &str) -> Vec<PendingChunk> {
     out
 }
 
+/// Merge adjacent chunks that belong to the same section until the accumulated
+/// text reaches `target_chars`. Paper chunkers emit roughly one paragraph per
+/// chunk; a lone sentence embeds and reranks poorly, so we coalesce neighbours
+/// into richer, self-contained units. Never merges across a section boundary and
+/// never splits an already-large chunk; positions are renumbered sequentially.
+pub fn merge_small_chunks(chunks: Vec<PendingChunk>, target_chars: usize) -> Vec<PendingChunk> {
+    let mut out: Vec<PendingChunk> = Vec::with_capacity(chunks.len());
+    let mut pos = 0u32;
+    let mut cur: Option<PendingChunk> = None;
+    for ch in chunks {
+        match cur.take() {
+            None => cur = Some(ch),
+            Some(mut acc) => {
+                if acc.section == ch.section && acc.text.len() < target_chars {
+                    acc.text.push_str("\n\n");
+                    acc.text.push_str(&ch.text);
+                    cur = Some(acc);
+                } else {
+                    acc.position = pos;
+                    pos += 1;
+                    out.push(acc);
+                    cur = Some(ch);
+                }
+            }
+        }
+    }
+    if let Some(mut acc) = cur {
+        acc.position = pos;
+        out.push(acc);
+    }
+    out
+}
+
 fn flush_chunk(buf: &mut String, out: &mut Vec<PendingChunk>, pos: &mut u32, headings: &[String]) {
     let trimmed = buf.trim();
     if !trimmed.is_empty() {
@@ -245,5 +278,73 @@ mod tests {
         assert!(mice.is_some());
         // Sections stored in chunk metadata — exact nesting depends on depth heuristic.
         assert!(mice.unwrap().section.is_some());
+    }
+
+    #[test]
+    fn merge_combines_small_same_section_chunks() {
+        let chunks = vec![
+            PendingChunk {
+                text: "a".repeat(10),
+                position: 0,
+                section: Some("Intro".into()),
+            },
+            PendingChunk {
+                text: "b".repeat(10),
+                position: 1,
+                section: Some("Intro".into()),
+            },
+            PendingChunk {
+                text: "c".repeat(10),
+                position: 2,
+                section: Some("Intro".into()),
+            },
+        ];
+        let merged = merge_small_chunks(chunks, 1000);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].position, 0);
+        assert!(merged[0].text.contains(&"a".repeat(10)));
+        assert!(merged[0].text.contains(&"c".repeat(10)));
+    }
+
+    #[test]
+    fn merge_respects_section_boundaries() {
+        let chunks = vec![
+            PendingChunk {
+                text: "intro".into(),
+                position: 0,
+                section: Some("Intro".into()),
+            },
+            PendingChunk {
+                text: "methods".into(),
+                position: 1,
+                section: Some("Methods".into()),
+            },
+        ];
+        let merged = merge_small_chunks(chunks, 1000);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].section.as_deref(), Some("Intro"));
+        assert_eq!(merged[1].section.as_deref(), Some("Methods"));
+        assert_eq!(merged[1].position, 1);
+    }
+
+    #[test]
+    fn merge_passes_large_chunks_through_and_renumbers() {
+        let chunks = vec![
+            PendingChunk {
+                text: "x".repeat(50),
+                position: 0,
+                section: None,
+            },
+            PendingChunk {
+                text: "y".repeat(50),
+                position: 1,
+                section: None,
+            },
+        ];
+        // target smaller than each chunk -> no merge, positions stay contiguous.
+        let merged = merge_small_chunks(chunks, 10);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].position, 0);
+        assert_eq!(merged[1].position, 1);
     }
 }
