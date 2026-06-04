@@ -302,7 +302,7 @@ Returns the full manifest: every command, every flag, exit codes, envelope shape
 ```bash
 engram config check                                    # see what's configured
 engram config set keys.gemini $YOUR_GEMINI_API_KEY       # Gemini Embedding 2
-engram config set keys.cohere $YOUR_COHERE_API_KEY       # Cohere rerank-v3.5
+engram config set keys.cohere $YOUR_COHERE_API_KEY       # Cohere Rerank 4
 engram config set keys.openrouter $YOUR_OPENROUTER_KEY   # optional synthesis/fact extraction
 engram config set compiler.extraction_model google/gemini-3.1-flash-lite-preview
 engram config set compiler.synthesis_model google/gemini-3.1-pro-preview

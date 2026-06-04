@@ -63,6 +63,7 @@ pub async fn run(
         profile_enum != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
     let use_cohere =
         profile_enum != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub;
+    let cohere_model = engram_rerank::cohere::resolve_model();
 
     let (results, embed_model, embed_dims, prompt_format) = if use_cloud {
         let embedder = GeminiEmbedder::new(gemini_key.clone().unwrap());
@@ -122,7 +123,7 @@ pub async fn run(
         ctx.store.record_usage_event(
             "cohere",
             "research_rerank",
-            Some("rerank-v3.5"),
+            Some(cohere_model.as_str()),
             if all_kbs { None } else { Some(&kb) },
             if diary == "*" { None } else { Some(&diary) },
             1,
@@ -202,7 +203,7 @@ pub async fn run(
                 "profile": profile_enum.as_str(),
                 "embed_model": embed_model,
                 "embed_dims": embed_dims,
-                "reranker": if use_cohere { "cohere/rerank-v3.5" } else { "passthrough" },
+                "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
                 "candidates_considered": rerank_candidates,
             }
         }),

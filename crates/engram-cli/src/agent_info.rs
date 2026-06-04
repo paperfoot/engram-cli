@@ -169,7 +169,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "ENGRAM_UPDATE_CRATE": "crates.io package used by cargo updates. Default paperfoot-engram.",
             "ENGRAM_UPDATE_HOMEBREW_FORMULA": "Homebrew formula used by brew updates. Default paperfoot/tap/engram.",
             "ENGRAM_EMBEDDER": "Force embedder: gemini|stub (default: gemini if key set)",
-            "ENGRAM_RERANK_PROVIDER": "Force reranker: cohere|zerank2|none (default: cohere if key set)",
+            "ENGRAM_COHERE_RERANK_MODEL": "Override the Cohere rerank model slug (default rerank-v4.0-pro; e.g. rerank-v4.0-fast).",
+            "ENGRAM_RERANK_PROVIDER": "Benchmark reranker selector: cohere|zerank2|none. recall/serve use Cohere when COHERE_API_KEY is set.",
             "ENGRAM_LME_SPLIT": "LongMemEval split: s|oracle (default: s)"
         },
         "config_keys": {
@@ -205,7 +206,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
         "cache_path": engram_storage::paths::cache_dir().to_string_lossy(),
         "providers": {
             "embeddings": ["gemini-embedding-2 (cloud, 1536 dims)", "stub (offline, deterministic)"],
-            "rerankers": ["cohere/rerank-v3.5 (cloud)", "passthrough (none)"],
+            "rerankers": ["cohere/rerank-v4.0-pro (cloud)", "passthrough (none)"],
             "compiler": {
                 "extraction_default": engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL,
                 "synthesis_default": engram_llm::openrouter::DEFAULT_SYNTHESIS_MODEL
@@ -245,7 +246,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             }
         },
         "retrieval_profiles": {
-            "cloud_quality": { "embedder": "gemini-embedding-2", "dims": 1536, "lexical": "FTS5 BM25", "entity_claim_search": true, "graph_expansion": true, "reranker": "cohere/rerank-v3.5", "rerank_top_n": 50 },
+            "cloud_quality": { "embedder": "gemini-embedding-2", "dims": 1536, "lexical": "FTS5 BM25", "entity_claim_search": true, "graph_expansion": true, "reranker": "cohere/rerank-v4.0-pro", "rerank_top_n": 50 },
             "fast": { "embedder": "gemini-embedding-2", "dims": 1536, "rerank_top_n": 20 },
             "offline": { "embedder": "stub", "lexical": "FTS5 BM25", "reranker": "none" }
         },

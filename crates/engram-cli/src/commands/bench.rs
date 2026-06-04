@@ -453,7 +453,7 @@ async fn run_locomo_qa(
     //
     // Reranker provider is controlled by ENGRAM_RERANK_PROVIDER:
     //   - "zerank2" : local zerank-2 sidecar (best quality on biomed/STEM)
-    //   - "cohere"  : Cohere rerank-v3.5 (default if COHERE_API_KEY set)
+    //   - "cohere"  : Cohere Rerank 4 / rerank-v4.0-pro (default if COHERE_API_KEY set)
     //   - "none"    : passthrough (no rerank)
     let provider = std::env::var("ENGRAM_RERANK_PROVIDER").unwrap_or_else(|_| {
         if cohere_key.is_some() {

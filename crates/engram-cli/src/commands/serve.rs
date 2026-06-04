@@ -323,6 +323,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let use_cloud = profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
     let use_cohere = profile != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub;
+    let cohere_model = engram_rerank::cohere::resolve_model();
     let rerank_candidates = req
         .rerank_top_n
         .unwrap_or_else(|| profile.default_rerank_top_n());
@@ -378,7 +379,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
             })).collect::<Vec<_>>(),
             "metadata": {
                 "profile": profile.as_str(),
-                "reranker": if use_cohere { "cohere/rerank-v3.5" } else { "passthrough" },
+                "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
                 "candidates_considered": rerank_candidates
             }
         }
@@ -396,6 +397,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let use_cloud = profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
     let use_cohere = profile != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub;
+    let cohere_model = engram_rerank::cohere::resolve_model();
     let rerank_candidates = req
         .rerank_top_n
         .unwrap_or_else(|| profile.default_rerank_top_n());
@@ -458,7 +460,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
         store.record_usage_event(
             "cohere",
             "api_recall_rerank",
-            Some("rerank-v3.5"),
+            Some(cohere_model.as_str()),
             req_kb.as_deref().filter(|k| *k != "*"),
             req_diary.as_deref().filter(|d| *d != "*"),
             1,
@@ -496,7 +498,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
                 "embed_model": embed_model,
                 "embed_dims": embed_dims,
                 "prompt_format": prompt_format,
-                "reranker": if use_cohere { "cohere/rerank-v3.5" } else { "passthrough" },
+                "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
                 "candidates_considered": rerank_candidates
             }
         }
