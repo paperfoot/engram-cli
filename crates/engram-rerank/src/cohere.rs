@@ -1,13 +1,23 @@
-//! Cohere rerank-v3.5 client.
+//! Cohere Rerank client (Rerank 4 by default).
 
 use crate::{RerankCandidate, RerankError, RerankedResult, Reranker};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-// Latest Cohere Rerank model (v3.5). Multilingual, better quality than
-// rerank-english-v3.0, same API and same price.
-const DEFAULT_MODEL: &str = "rerank-v3.5";
+/// Default Cohere Rerank model: Rerank 4 ("pro") — the current state-of-the-art
+/// multilingual reranker (32K context), succeeding rerank-v3.5. Override per
+/// process with `ENGRAM_COHERE_RERANK_MODEL` (e.g. `rerank-v4.0-fast`).
+pub const DEFAULT_MODEL: &str = "rerank-v4.0-pro";
 const ENDPOINT: &str = "https://api.cohere.com/v2/rerank";
+
+/// Resolve the rerank model, honouring the `ENGRAM_COHERE_RERANK_MODEL`
+/// override and falling back to [`DEFAULT_MODEL`].
+pub fn resolve_model() -> String {
+    std::env::var("ENGRAM_COHERE_RERANK_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
 
 pub struct CohereReranker {
     client: reqwest::Client,
@@ -24,7 +34,7 @@ impl CohereReranker {
                 .build()
                 .expect("failed to build reqwest client"),
             api_key: api_key.into(),
-            model: DEFAULT_MODEL.to_string(),
+            model: resolve_model(),
         }
     }
 
