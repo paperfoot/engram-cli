@@ -35,7 +35,10 @@ pub async fn run(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60.0);
-    let rerank_candidates = profile_enum.default_rerank_top_n();
+    let rerank_candidates = std::env::var("ENGRAM_RERANK_CANDIDATES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| profile_enum.default_rerank_top_n());
     let filters = Filters {
         diary: if diary == "*" {
             None

@@ -84,7 +84,7 @@ impl RetrievalProfile {
 
     pub fn default_rerank_top_n(self) -> usize {
         match self {
-            Self::CloudQuality => 50,
+            Self::CloudQuality => 200,
             Self::Fast => 20,
             Self::Offline => 50,
         }
@@ -339,23 +339,51 @@ where
         return Ok(Vec::new());
     }
 
+    // Rerank the full candidate pool (not just top_k) so the diversity cap
+    // below has enough material to spread results across distinct documents.
+    let rerank_limit = rerank_candidates.len();
     let reranked = if let Some(r) = reranker {
-        r.rerank(params.query, &rerank_candidates, params.top_k)
+        r.rerank(params.query, &rerank_candidates, rerank_limit)
             .await?
     } else {
         let pt = PassthroughReranker;
-        pt.rerank(params.query, &rerank_candidates, params.top_k)
+        pt.rerank(params.query, &rerank_candidates, rerank_limit)
             .await?
     };
 
+    // Diversity cap: keep at most N chunks per source document so a few
+    // near-duplicate passages from one paper can't crowd out other papers
+    // (this lifts paper-level recall). Tune via ENGRAM_RERANK_MAX_PER_DOC;
+    // 0 = unlimited (legacy behaviour).
+    const DEFAULT_MAX_PER_DOC: usize = 2;
+    let max_per_doc = match std::env::var("ENGRAM_RERANK_MAX_PER_DOC")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => DEFAULT_MAX_PER_DOC,
+    };
+
     let using_reranker = reranker.is_some();
-    let mut out = Vec::with_capacity(reranked.len());
+    let mut out = Vec::with_capacity(params.top_k);
+    let mut per_doc: HashMap<Uuid, usize> = HashMap::new();
     for r in reranked {
+        if out.len() >= params.top_k {
+            break;
+        }
         let id = candidate_ids
             .get(r.original_index)
             .copied()
             .unwrap_or_else(Uuid::nil);
         if let Some(c) = candidate_records.get(&id) {
+            if let Some(doc) = c.citations.first().and_then(|cit| cit.document_id) {
+                let seen = per_doc.entry(doc).or_insert(0);
+                if *seen >= max_per_doc {
+                    continue;
+                }
+                *seen += 1;
+            }
             let mut sources: Vec<RetrievalSource> = source_map
                 .get(&id)
                 .cloned()
