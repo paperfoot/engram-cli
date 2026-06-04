@@ -6,16 +6,24 @@
 //! section-aware chunker downstream produces meaningful breadcrumbs.
 
 use crate::error::IngestError;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
 /// Extract text from a PDF file. Returns plain UTF-8 on success.
+///
+/// `pdf-extract` can panic (e.g. `unwrap()` on malformed font tables in some
+/// scientific PDFs). We isolate it with `catch_unwind` so one bad file becomes
+/// a recoverable error instead of crashing the entire ingest batch.
 pub fn extract_text(path: &Path) -> Result<String, IngestError> {
-    pdf_extract::extract_text(path).map_err(|e| IngestError::Invalid(format!("pdf extract: {e}")))
+    catch_unwind(AssertUnwindSafe(|| pdf_extract::extract_text(path)))
+        .map_err(|_| IngestError::Invalid("pdf extract: parser panicked".to_string()))?
+        .map_err(|e| IngestError::Invalid(format!("pdf extract: {e}")))
 }
 
 /// Best-effort extraction for a PDF byte slice.
 pub fn extract_text_from_bytes(bytes: &[u8]) -> Result<String, IngestError> {
-    pdf_extract::extract_text_from_mem(bytes)
+    catch_unwind(AssertUnwindSafe(|| pdf_extract::extract_text_from_mem(bytes)))
+        .map_err(|_| IngestError::Invalid("pdf extract: parser panicked".to_string()))?
         .map_err(|e| IngestError::Invalid(format!("pdf extract: {e}")))
 }
 

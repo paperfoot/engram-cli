@@ -117,6 +117,7 @@ pub async fn run(
     let mut memories_created = 0u32;
     let mut chunks_created = 0u32;
     let mut skipped_existing = 0u32;
+    let mut skipped_failed = 0u32;
     // Cost accounting for Gemini embeddings: ~4 chars per token heuristic,
     // $0.15 per 1M input tokens for gemini-embedding-2 (priced 2026-04).
     let mut total_embedded_chars: usize = 0;
@@ -135,9 +136,23 @@ pub async fn run(
 
     for file in files {
         let text = if engram_ingest::pdf::is_pdf(&file) {
-            engram_ingest::pdf::extract_text(&file)?
+            match engram_ingest::pdf::extract_text(&file) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("skip (pdf parse failed): {} — {e}", file.display());
+                    skipped_failed += 1;
+                    continue;
+                }
+            }
         } else {
-            std::fs::read_to_string(&file).map_err(CliError::Io)?
+            match std::fs::read_to_string(&file) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("skip (read failed): {} — {e}", file.display());
+                    skipped_failed += 1;
+                    continue;
+                }
+            }
         };
         if text.trim().is_empty() {
             continue;
@@ -312,6 +327,7 @@ pub async fn run(
     meta.add("memories_created", memories_created);
     meta.add("chunks_created", chunks_created);
     meta.add("skipped_existing", skipped_existing);
+    meta.add("skipped_failed", skipped_failed);
     meta.add("matched_files", matched_files.len());
     meta.add("require_scope", require_scope);
     meta.add("embedder", model_name.clone());
@@ -337,6 +353,7 @@ pub async fn run(
             "memories_created": memories_created,
             "chunks_created": chunks_created,
             "skipped_existing": skipped_existing,
+            "skipped_failed": skipped_failed,
             "matched_count": matched_files.len(),
             "matched_files": matched_files,
             "include": include,
