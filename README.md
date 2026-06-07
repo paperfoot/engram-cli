@@ -319,6 +319,8 @@ For source-backed questions, treat retrieval as the only evidence:
 - **Cite every claim** with its source (for papers, the `PMID`/title + `chunk_id` from `citations[].source`). A claim with no citation should not be stated as fact.
 - **Abstain** when recall is empty or low-scoring: say "insufficient evidence in the knowledge base" rather than guessing, and never invent a citation to fill the gap.
 - **Surface conflicts**: if retrieved sources disagree, report it and cite both.
+- **Retrieve deep** for "how many / list all / comprehensive" questions: the top few results cover only a minority of relevant documents (measured paper-level recall ≈ 0.2 in the top 10 vs ≈ 0.75 across the full result set on a 14k-paper corpus). Use a high `--top-k` (30–50) and synthesize over the whole set; for coverage questions also union acronym/synonym query variants.
+- **Weigh the evidence**: retrieved *primary* studies can skew positive (publication bias) — prefer reviews/meta-analyses for effect-direction claims and report null/heterogeneous results rather than overstating.
 
 engram attaches the source to every chunk, so every answer stays independently verifiable — the user can re-run the same `engram recall` and check the cited chunk. Enforcing that the citation reaches the final answer is the calling agent's job; the installed skill instructs agents to do exactly this.
 

@@ -53,6 +53,8 @@ When you answer a user from a KB (papers, medical, support, any source corpus), 
 3. **Cite every claim.** Attach its source — for papers, the `PMID`/title and `chunk_id` from `citations[].source`; quote or closely paraphrase the chunk. A claim with no citation should not be stated as fact.
 4. **Abstain when support is weak.** If recall is empty (`status: no_results`) or only low-scoring chunks come back, say "insufficient evidence in the knowledge base" instead of guessing. Never invent a citation to satisfy the rule.
 5. **Surface disagreement.** If sources conflict, report the conflict and cite both rather than silently choosing one.
+6. **Retrieve deep — especially for "how many / list all / comprehensive" questions.** The top few results cover only a minority of the relevant documents (measured paper-level recall ≈ 0.2 in the top 10 vs ≈ 0.75 across the full result set on a 14k-paper corpus). Pass a high `--top-k` (30–50) and synthesize over the *whole* returned set, not the first few. For coverage/aggregation questions, also run acronym/synonym variants of the query (e.g. `rTMS` ↔ "repetitive transcranial magnetic stimulation"; `PPC` ↔ `IPS` ↔ "posterior parietal cortex") and union the hits — a single phrasing misses synonym-only matches.
+7. **Weigh the evidence; don't overstate.** Grounding in retrieved *primary* studies can skew positive (publication bias). Prefer reviews/meta-analyses for effect-direction claims, report null/negative results and effect heterogeneity, and don't turn a few positive primary papers into a firm general conclusion.
 
 This keeps every answer independently verifiable: the user can re-run the same `engram recall` and check the cited chunk.
 
