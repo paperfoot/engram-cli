@@ -29,6 +29,12 @@ pub struct CompileStats {
     pub llm_enabled: bool,
     pub llm_extraction_chunks: usize,
     pub llm_claims: usize,
+    #[serde(default)]
+    pub llm_claims_rejected: usize,
+    #[serde(default)]
+    pub llm_facts: usize,
+    #[serde(default)]
+    pub llm_facts_rejected: usize,
     pub llm_entities: usize,
     pub llm_relations: usize,
     pub llm_takeaways: usize,
@@ -150,6 +156,39 @@ pub async fn compile_kb_with_options(
 ) -> Result<CompileStats, CliError> {
     ctx.store.ensure_kb(kb, None)?;
     let chunks = ctx.store.list_chunks_for_kb(kb)?;
+
+    // Build-then-swap: clear + rebuild happen inside ONE transaction. Under
+    // WAL, concurrent readers keep seeing the previous compilation until
+    // commit; if the rebuild fails partway (e.g. the LLM provider dies at
+    // chunk 40/100), rollback restores the previous good compilation instead
+    // of leaving the KB half-wiped.
+    let mut usage_events: Vec<PendingUsage> = Vec::new();
+    ctx.store.begin_immediate()?;
+    let result = compile_within_tx(ctx, kb, &chunks, &options, &mut usage_events).await;
+    let stats = match result {
+        Ok(stats) => {
+            ctx.store.commit()?;
+            stats
+        }
+        Err(e) => {
+            let _ = ctx.store.rollback();
+            // Usage was still spent even though the compile failed; record
+            // it outside the rolled-back transaction.
+            flush_usage_events(ctx, kb, &usage_events);
+            return Err(e);
+        }
+    };
+    flush_usage_events(ctx, kb, &usage_events);
+    Ok(stats)
+}
+
+async fn compile_within_tx(
+    ctx: &AppContext,
+    kb: &str,
+    chunks: &[engram_storage::ChunkRecord],
+    options: &CompileOptions,
+    usage_events: &mut Vec<PendingUsage>,
+) -> Result<CompileStats, CliError> {
     ctx.store.clear_derived_for_kb(kb)?;
 
     let mut stats = CompileStats {
@@ -164,6 +203,9 @@ pub async fn compile_kb_with_options(
         llm_enabled: options.llm,
         llm_extraction_chunks: 0,
         llm_claims: 0,
+        llm_claims_rejected: 0,
+        llm_facts: 0,
+        llm_facts_rejected: 0,
         llm_entities: 0,
         llm_relations: 0,
         llm_takeaways: 0,
@@ -177,18 +219,23 @@ pub async fn compile_kb_with_options(
     let mut doc_takeaway_done: HashSet<Option<uuid::Uuid>> = HashSet::new();
     let mut span_by_chunk: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
 
-    for chunk in &chunks {
+    for chunk in chunks {
+        // Chunk-level span (no char offset — used by the LLM path, which
+        // attributes claims to the whole chunk).
         let preview: String = chunk.content.chars().take(500).collect();
-        let span_id = ctx.store.insert_source_span(
+        let chunk_span_id = ctx.store.insert_source_span(
             kb,
             chunk.document_id,
             Some(chunk.chunk_id),
             chunk.section.as_deref(),
             chunk.source.as_deref(),
             &preview,
+            None,
+            None,
+            None,
         )?;
         stats.source_spans += 1;
-        span_by_chunk.insert(chunk.chunk_id, span_id);
+        span_by_chunk.insert(chunk.chunk_id, chunk_span_id);
 
         let entities = extract_entities(&chunk.content);
         let mut local_entities = Vec::new();
@@ -212,20 +259,36 @@ pub async fn compile_kb_with_options(
                     "co_occurs_with",
                     1.0,
                     json!({ "chunk_id": chunk.chunk_id.to_string(), "from": a_name, "to": b_name }),
-                    Some(span_id),
+                    Some(chunk_span_id),
                 )?;
                 stats.relations += 1;
             }
         }
 
-        for sentence in evidence_sentences(&chunk.content).into_iter().take(3) {
-            let level = infer_evidence_level(&sentence);
+        // Deterministic claims: real sentence segmentation (never splits a
+        // decimal / p-value / abbreviation), each stored with a PRECISE source
+        // span (char offsets into the chunk) so a citation resolves to the
+        // exact supporting sentence, not the whole chunk.
+        for sent in evidence_sentences(&chunk.content).into_iter().take(3) {
+            let level = infer_evidence_level(&sent.text);
+            let claim_span_id = ctx.store.insert_source_span(
+                kb,
+                chunk.document_id,
+                Some(chunk.chunk_id),
+                chunk.section.as_deref(),
+                chunk.source.as_deref(),
+                &sent.text,
+                Some(sent.start),
+                Some(sent.end),
+                None,
+            )?;
+            stats.source_spans += 1;
             ctx.store.insert_claim(
                 kb,
-                &sentence,
+                &sent.text,
                 level,
                 0.72,
-                Some(span_id),
+                Some(claim_span_id),
                 Some(chunk.chunk_id),
                 chunk.document_id,
             )?;
@@ -233,12 +296,11 @@ pub async fn compile_kb_with_options(
         }
 
         if doc_takeaway_done.insert(chunk.document_id) {
-            let takeaway = first_sentence(&chunk.content);
-            if !takeaway.is_empty() {
+            if let Some(takeaway) = first_sentence(&chunk.content) {
                 ctx.store.insert_takeaway(
                     kb,
                     chunk.document_id,
-                    &takeaway,
+                    &takeaway.text,
                     infer_evidence_level(&chunk.content),
                     json!([{ "chunk_id": chunk.chunk_id.to_string(), "source": chunk.source }]),
                 )?;
@@ -251,18 +313,56 @@ pub async fn compile_kb_with_options(
         run_llm_compiler(
             ctx,
             kb,
-            &chunks,
+            chunks,
             &span_by_chunk,
             &mut entity_mentions,
             &mut stats,
-            &options,
+            options,
+            usage_events,
         )
         .await?;
     }
 
     stats.entities = entity_ids.len();
-    stats.wiki_pages = write_wiki(ctx, kb, &chunks, &entity_mentions)?;
+    stats.wiki_pages = write_wiki(ctx, kb, chunks, &entity_mentions)?;
     Ok(stats)
+}
+
+/// A cloud-usage record buffered during a compile transaction. Usage is
+/// flushed AFTER commit/rollback so a rolled-back compile still accounts for
+/// the tokens it spent.
+struct PendingUsage {
+    operation: &'static str,
+    model: String,
+    fallback_prompt_tokens: i64,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+}
+
+fn flush_usage_events(ctx: &AppContext, kb: &str, events: &[PendingUsage]) {
+    for ev in events {
+        let input = ev
+            .prompt_tokens
+            .map(|v| v as i64)
+            .unwrap_or(ev.fallback_prompt_tokens);
+        let output = ev.completion_tokens.map(|v| v as i64).unwrap_or(0);
+        if let Err(e) = ctx.store.record_usage_event(
+            "openrouter",
+            ev.operation,
+            Some(&ev.model),
+            Some(kb),
+            None,
+            1,
+            1,
+            input,
+            output,
+            0.0,
+            0.0,
+            json!({ "estimated_cost": false }),
+        ) {
+            tracing::warn!("failed to record compiler usage event: {e}");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,11 +374,14 @@ async fn run_llm_compiler(
     entity_mentions: &mut BTreeMap<String, usize>,
     stats: &mut CompileStats,
     options: &CompileOptions,
+    usage_events: &mut Vec<PendingUsage>,
 ) -> Result<(), CliError> {
     let key = crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
         .ok_or_else(|| {
             CliError::Config("OPENROUTER_API_KEY is required for `engram compile --llm`".into())
         })?;
+    // Enforce spend guardrails before the compiler's paid LLM calls.
+    crate::commands::budget::enforce_budget(ctx, Some(kb))?;
     let extraction_llm = OpenRouterClient::new(key.clone())
         .with_model(options.extraction_model.clone())
         .with_max_tokens(4096);
@@ -286,6 +389,10 @@ async fn run_llm_compiler(
         .with_model(options.synthesis_model.clone())
         .with_max_tokens(8192);
     let max_chunks = options.max_llm_chunks.unwrap_or(chunks.len());
+    // Bound the corpus the synthesis pass may cite to the chunks actually
+    // seen, so we can validate its [chunk:uuid] citations.
+    let known_chunk_ids: HashSet<uuid::Uuid> =
+        chunks.iter().take(max_chunks).map(|c| c.chunk_id).collect();
     for chunk in chunks.iter().take(max_chunks) {
         let prompt = extraction_prompt(kb, chunk);
         let response = extraction_llm
@@ -297,15 +404,13 @@ async fn run_llm_compiler(
             ])
             .await
             .map_err(|e| CliError::Transient(format!("compiler extraction failed: {e}")))?;
-        record_openrouter_usage(
-            ctx,
-            "compiler_extract",
-            &response.model,
-            Some(kb),
-            estimated_tokens(&prompt),
-            response.prompt_tokens,
-            response.completion_tokens,
-        )?;
+        usage_events.push(PendingUsage {
+            operation: "compiler_extract",
+            model: response.model.clone(),
+            fallback_prompt_tokens: estimated_tokens(&prompt),
+            prompt_tokens: response.prompt_tokens,
+            completion_tokens: response.completion_tokens,
+        });
         let evidence = match parse_llm_evidence(&response.content) {
             Ok(e) => e,
             Err(e) => {
@@ -321,8 +426,10 @@ async fn run_llm_compiler(
         stats.llm_extraction_chunks += 1;
     }
 
-    if !chunks.is_empty() {
-        let overview_prompt = synthesis_prompt(kb, chunks);
+    if !known_chunk_ids.is_empty() {
+        let synth_chunks: Vec<&engram_storage::ChunkRecord> =
+            chunks.iter().take(max_chunks).collect();
+        let overview_prompt = synthesis_prompt(kb, &synth_chunks);
         let response = synthesis_llm
             .chat(&[
                 ChatMessage::system(
@@ -332,22 +439,29 @@ async fn run_llm_compiler(
             ])
             .await
             .map_err(|e| CliError::Transient(format!("compiler synthesis failed: {e}")))?;
-        record_openrouter_usage(
-            ctx,
-            "compiler_synthesize",
-            &response.model,
-            Some(kb),
-            estimated_tokens(&overview_prompt),
-            response.prompt_tokens,
-            response.completion_tokens,
-        )?;
+        usage_events.push(PendingUsage {
+            operation: "compiler_synthesize",
+            model: response.model.clone(),
+            fallback_prompt_tokens: estimated_tokens(&overview_prompt),
+            prompt_tokens: response.prompt_tokens,
+            completion_tokens: response.completion_tokens,
+        });
         let content = response.content.trim();
         if !content.is_empty() {
+            // Validate [chunk:<uuid>] citations: fabricated ones (not in the
+            // set we actually gave the model) are stripped so the wiki never
+            // shows a citation that can't be re-verified with `recall`.
+            let (validated, dropped) = validate_chunk_citations(content, &known_chunk_ids);
+            if dropped > 0 {
+                tracing::warn!(
+                    "compiler synthesis: stripped {dropped} fabricated chunk citation(s) for kb {kb}"
+                );
+            }
             ctx.store.upsert_wiki_page(
                 kb,
                 "llm/overview.md",
                 &format!("{kb} LLM overview"),
-                content,
+                &validated,
             )?;
             stats.llm_wiki_pages += 1;
         }
@@ -355,34 +469,36 @@ async fn run_llm_compiler(
     Ok(())
 }
 
-fn record_openrouter_usage(
-    ctx: &AppContext,
-    operation: &str,
-    model: &str,
-    kb: Option<&str>,
-    fallback_prompt_tokens: i64,
-    prompt_tokens: Option<u32>,
-    completion_tokens: Option<u32>,
-) -> Result<(), CliError> {
-    let input = prompt_tokens
-        .map(|v| v as i64)
-        .unwrap_or(fallback_prompt_tokens);
-    let output = completion_tokens.map(|v| v as i64).unwrap_or(0);
-    ctx.store.record_usage_event(
-        "openrouter",
-        operation,
-        Some(model),
-        kb,
-        None,
-        1,
-        1,
-        input,
-        output,
-        0.0,
-        0.0,
-        json!({ "estimated_cost": false }),
-    )?;
-    Ok(())
+/// Replace any `[chunk:<uuid>]` citation whose UUID is not in `known` with
+/// `[chunk:unverified]`, so the stored wiki never carries a citation that
+/// can't be traced back to a real chunk. Returns (text, dropped_count).
+fn validate_chunk_citations(text: &str, known: &HashSet<uuid::Uuid>) -> (String, usize) {
+    let mut out = String::with_capacity(text.len());
+    let mut dropped = 0usize;
+    let mut rest = text;
+    while let Some(pos) = rest.find("[chunk:") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + "[chunk:".len()..];
+        if let Some(close) = after.find(']') {
+            let id_str = after[..close].trim();
+            let ok = uuid::Uuid::parse_str(id_str)
+                .map(|u| known.contains(&u))
+                .unwrap_or(false);
+            if ok {
+                out.push_str(&rest[pos..pos + "[chunk:".len() + close + 1]);
+            } else {
+                out.push_str("[chunk:unverified]");
+                dropped += 1;
+            }
+            rest = &after[close + 1..];
+        } else {
+            out.push_str(&rest[pos..]);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    (out, dropped)
 }
 
 fn insert_llm_evidence(
@@ -410,12 +526,29 @@ fn insert_llm_evidence(
         stats.llm_entities += 1;
     }
     for claim in evidence.claims {
-        if claim.content.trim().is_empty() {
+        let content = claim.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        // HALLUCINATION GATE: an LLM-extracted claim is only stored if it is
+        // actually grounded in the source chunk. Otherwise a fabricated claim
+        // would land in the KB carrying a real chunk/span citation — a
+        // fully-sourced-looking falsehood, which is exactly what this tool
+        // exists to prevent. We require (a) every number in the claim to
+        // appear in the chunk, and (b) meaningful lexical overlap with the
+        // chunk.
+        if !claim_grounded_in_chunk(content, &chunk.content) {
+            tracing::warn!(
+                "compiler: dropped ungrounded LLM claim for chunk {}: {:?}",
+                chunk.chunk_id,
+                content.chars().take(80).collect::<String>()
+            );
+            stats.llm_claims_rejected += 1;
             continue;
         }
         ctx.store.insert_claim(
             kb,
-            claim.content.trim(),
+            content,
             claim.evidence_level.as_deref().unwrap_or("unknown"),
             claim.confidence.unwrap_or(0.75).clamp(0.0, 1.0),
             span_id,
@@ -467,7 +600,90 @@ fn insert_llm_evidence(
         )?;
         stats.llm_relations += 1;
     }
+    // KB-scoped facts with contradiction detection: a compiled paper populates
+    // the fact/supersession table so a later paper that disagrees is caught.
+    // Grounded like claims (the fact's object must be supported by the chunk).
+    let diary = &chunk.diary;
+    for fact in evidence.facts {
+        let subject = fact.subject.trim();
+        let predicate = fact.predicate.trim();
+        let object = fact.object.trim();
+        if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+            continue;
+        }
+        if !claim_grounded_in_chunk(&format!("{subject} {object}"), &chunk.content) {
+            stats.llm_facts_rejected += 1;
+            continue;
+        }
+        let inserted = insert_compiled_fact(
+            ctx,
+            kb,
+            diary,
+            chunk.memory_id,
+            subject,
+            predicate,
+            object,
+            fact.confidence.unwrap_or(0.7).clamp(0.0, 1.0),
+        )?;
+        if inserted {
+            stats.llm_facts += 1;
+        }
+    }
     Ok(())
+}
+
+/// Insert a compiled fact KB-scoped, superseding any active fact with the same
+/// (subject, predicate) but a different object. Returns false if the identical
+/// fact already existed (dedup). Mirrors the `remember` write path but scoped
+/// to the KB so a corpus's own contradictions are tracked.
+#[allow(clippy::too_many_arguments)]
+fn insert_compiled_fact(
+    ctx: &AppContext,
+    kb: &str,
+    diary: &str,
+    memory_id: uuid::Uuid,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    confidence: f32,
+) -> Result<bool, CliError> {
+    use engram_graph::facts::normalize;
+    let subject_norm = normalize(subject);
+    let object_norm = normalize(object);
+    if subject_norm.is_empty() || object_norm.is_empty() {
+        return Ok(false);
+    }
+    let existing = ctx
+        .store
+        .get_active_facts_in_kb(&subject_norm, predicate, diary, kb)?;
+    let new_fact = engram_core::types::Fact {
+        id: uuid::Uuid::new_v4(),
+        source_memory_id: memory_id,
+        subject: subject.to_string(),
+        subject_norm: subject_norm.clone(),
+        predicate: predicate.to_string(),
+        object: object.to_string(),
+        object_norm: object_norm.clone(),
+        confidence,
+        created_at: chrono::Utc::now(),
+        superseded_by: None,
+        superseded_at: None,
+        diary: diary.to_string(),
+        fact_type: engram_core::types::FactType::Assertion,
+        valid_from: Some(chrono::Utc::now()),
+        valid_until: None,
+        resolution: None,
+        source_kind: engram_core::types::SourceKind::CompileLlm,
+        confirmations: 0,
+    };
+    for old in &existing {
+        if old.object_norm == object_norm {
+            return Ok(false); // identical fact already present
+        }
+        ctx.store.supersede_fact(old.id, new_fact.id)?;
+    }
+    ctx.store.insert_fact(&new_fact)?;
+    Ok(true)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -480,6 +696,19 @@ struct LlmEvidence {
     relations: Vec<LlmRelation>,
     #[serde(default)]
     takeaways: Vec<String>,
+    #[serde(default)]
+    facts: Vec<LlmFact>,
+}
+
+/// An atomic (subject, predicate, object) fact the extractor found in a chunk.
+/// These feed the contradiction table KB-scoped, so an ingested-and-compiled
+/// paper can later be seen to be superseded by a newer one.
+#[derive(Debug, Deserialize)]
+struct LlmFact {
+    subject: String,
+    predicate: String,
+    object: String,
+    confidence: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -505,17 +734,126 @@ struct LlmRelation {
 
 fn parse_llm_evidence(text: &str) -> Result<LlmEvidence, serde_json::Error> {
     let trimmed = text.trim();
-    if let Ok(v) = serde_json::from_str(trimmed) {
+    if let Ok(v) = serde_json::from_str::<LlmEvidence>(trimmed) {
         return Ok(v);
     }
-    let start = trimmed.find('{').unwrap_or(0);
-    let end = trimmed.rfind('}').map(|i| i + 1).unwrap_or(trimmed.len());
-    serde_json::from_str(&trimmed[start..end])
+    // Strip a ```json fence if present, then find the first BALANCED top-level
+    // object. The old first-`{`/last-`}` slice broke whenever a `}` appeared
+    // inside a string value or prose followed the JSON.
+    let candidate = strip_code_fence(trimmed);
+    if let Some(obj) = first_balanced_object(candidate) {
+        return serde_json::from_str(obj);
+    }
+    // Last resort: surface a real parse error from the raw text.
+    serde_json::from_str(candidate)
+}
+
+fn strip_code_fence(text: &str) -> &str {
+    let t = text.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        // Drop an optional language tag on the first line, and the trailing ```.
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        let rest = rest.trim_start_matches('\n');
+        return rest.strip_suffix("```").unwrap_or(rest).trim();
+    }
+    t
+}
+
+/// Return the first balanced `{...}` object substring, respecting string
+/// literals and escapes so a brace inside a string doesn't miscount.
+fn first_balanced_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = text.find('{')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A number's canonical digit string (drops separators/sign) for matching.
+fn numeric_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() || (c == '.' && !cur.is_empty()) {
+            cur.push(c);
+        } else {
+            if cur.chars().any(|c| c.is_ascii_digit()) {
+                out.push(cur.trim_matches('.').to_string());
+            }
+            cur.clear();
+        }
+    }
+    if cur.chars().any(|c| c.is_ascii_digit()) {
+        out.push(cur.trim_matches('.').to_string());
+    }
+    out
+}
+
+/// Is an LLM-extracted claim actually grounded in its source chunk?
+///
+/// Two requirements, both cheap and deterministic:
+/// 1. Every numeric value in the claim must appear in the chunk (so the model
+///    cannot invent a dosage, p-value, or effect size).
+/// 2. The claim's content words must overlap the chunk enough that it is
+///    plausibly a restatement of it, not a free-floating assertion.
+fn claim_grounded_in_chunk(claim: &str, chunk: &str) -> bool {
+    let chunk_lower = chunk.to_ascii_lowercase();
+    let chunk_nums = numeric_tokens(&chunk_lower);
+    for n in numeric_tokens(&claim.to_ascii_lowercase()) {
+        if n.len() >= 2 && !chunk_nums.iter().any(|c| c == &n) {
+            return false;
+        }
+    }
+    // Lexical overlap on content words (length >= 4 to skip stopwords).
+    let chunk_words: HashSet<String> = word_set(&chunk_lower)
+        .into_iter()
+        .filter(|w| w.len() >= 4)
+        .collect();
+    let claim_words: Vec<String> = word_set(&claim.to_ascii_lowercase())
+        .into_iter()
+        .filter(|w| w.len() >= 4)
+        .collect();
+    if claim_words.is_empty() {
+        return true; // nothing substantive to verify (rare)
+    }
+    let overlap = claim_words
+        .iter()
+        .filter(|w| chunk_words.contains(*w))
+        .count();
+    let ratio = overlap as f32 / claim_words.len() as f32;
+    ratio >= 0.5
 }
 
 fn extraction_prompt(kb: &str, chunk: &engram_storage::ChunkRecord) -> String {
     format!(
-        "KB: {kb}\nChunk id: {chunk_id}\nDocument id: {document_id}\nSection: {section}\nSource: {source}\n\nExtract evidence from the chunk below.\nReturn JSON only with this shape:\n{{\"claims\":[{{\"content\":\"short factual claim with numbers if present\",\"evidence_level\":\"review|meta_analysis|rct|human_observational|animal|in_vitro|preprint|news|opinion|unknown\",\"confidence\":0.0}}],\"entities\":[{{\"name\":\"canonical entity\",\"kind\":\"gene|protein|pathway|person|organization|drug|concept|method|species|dataset\"}}],\"relations\":[{{\"from\":\"entity\",\"to\":\"entity\",\"predicate\":\"typed_relation\",\"weight\":1.0}}],\"takeaways\":[\"short cited takeaway\"]}}\nEvery claim must be directly supported by this chunk. Do not invent citations.\n\nChunk:\n{content}",
+        "KB: {kb}\nChunk id: {chunk_id}\nDocument id: {document_id}\nSection: {section}\nSource: {source}\n\nExtract evidence from the chunk below.\nReturn JSON only with this shape:\n{{\"claims\":[{{\"content\":\"short factual claim with numbers if present\",\"evidence_level\":\"review|meta_analysis|rct|human_observational|animal|in_vitro|preprint|news|opinion|unknown\",\"confidence\":0.0}}],\"entities\":[{{\"name\":\"canonical entity\",\"kind\":\"gene|protein|pathway|person|organization|drug|concept|method|species|dataset\"}}],\"relations\":[{{\"from\":\"entity\",\"to\":\"entity\",\"predicate\":\"typed_relation\",\"weight\":1.0}}],\"takeaways\":[\"short cited takeaway\"],\"facts\":[{{\"subject\":\"entity\",\"predicate\":\"snake_case_relation\",\"object\":\"value or entity\",\"confidence\":0.0}}]}}\nEvery claim and fact must be directly supported by this chunk. Emit a fact only for a stable, checkable assertion (a dosage, a target, an effect direction), not vague prose. Do not invent citations.\n\nChunk:\n{content}",
         chunk_id = chunk.chunk_id,
         document_id = chunk
             .document_id
@@ -523,11 +861,25 @@ fn extraction_prompt(kb: &str, chunk: &engram_storage::ChunkRecord) -> String {
             .unwrap_or_else(|| "none".to_string()),
         section = chunk.section.as_deref().unwrap_or("unknown"),
         source = chunk.source.as_deref().unwrap_or("unknown"),
-        content = chunk.content
+        // Cap the inlined chunk so one oversized chunk can't blow the model's
+        // context / cost. Paper chunks are ~1800 chars (see the chunker cap);
+        // this is a belt-and-suspenders bound for any legacy oversized chunk.
+        content = truncate_chars(&chunk.content, 6000)
     )
 }
 
-fn synthesis_prompt(kb: &str, chunks: &[engram_storage::ChunkRecord]) -> String {
+/// Truncate `text` to at most `max` chars on a char boundary, appending an
+/// ellipsis marker when it was cut.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push_str(" …[truncated]");
+    out
+}
+
+fn synthesis_prompt(kb: &str, chunks: &[&engram_storage::ChunkRecord]) -> String {
     let excerpts = chunks
         .iter()
         .take(20)
@@ -548,12 +900,11 @@ fn synthesis_prompt(kb: &str, chunks: &[engram_storage::ChunkRecord]) -> String 
     )
 }
 
-fn evidence_sentences(text: &str) -> Vec<String> {
-    text.split_terminator(['.', '\n'])
-        .map(str::trim)
-        .filter(|s| s.len() > 40 && s.len() < 700)
-        .filter(|s| looks_like_evidence(s))
-        .map(|s| format!("{s}."))
+fn evidence_sentences(text: &str) -> Vec<engram_ingest::sentences::Sentence> {
+    engram_ingest::sentences::segment(text)
+        .into_iter()
+        .filter(|s| s.text.len() > 40 && s.text.len() < 700)
+        .filter(|s| looks_like_evidence(&s.text))
         .collect()
 }
 
@@ -583,29 +934,40 @@ fn looks_like_evidence(s: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
-fn first_sentence(text: &str) -> String {
-    text.split_terminator(['.', '\n'])
-        .map(str::trim)
-        .find(|s| s.len() > 30)
-        .map(|s| format!("{s}."))
-        .unwrap_or_default()
+fn first_sentence(text: &str) -> Option<engram_ingest::sentences::Sentence> {
+    engram_ingest::sentences::segment(text)
+        .into_iter()
+        .find(|s| s.text.len() > 30)
+}
+
+/// Tokenize into lowercase word tokens for word-boundary matching. Avoids the
+/// substring bug where "rat" matched "temperature"/"literature" and "cell"
+/// matched "excellent", mislabeling most chunks' evidence level.
+fn word_set(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+        .collect()
 }
 
 fn infer_evidence_level(text: &str) -> &'static str {
     let lower = text.to_ascii_lowercase();
+    let words = word_set(text);
+    let has = |w: &str| words.contains(w);
+    // Phrase checks first (multi-word), then word-boundary single tokens.
     if lower.contains("meta-analysis") || lower.contains("meta analysis") {
         "meta_analysis"
-    } else if lower.contains("randomized") || lower.contains("rct") || lower.contains("trial") {
+    } else if has("randomized") || has("randomised") || has("rct") || has("trial") {
         "rct"
-    } else if lower.contains("cohort") || lower.contains("patients") || lower.contains("human") {
+    } else if has("cohort") || has("patients") || has("human") || has("humans") {
         "human_observational"
-    } else if lower.contains("mouse") || lower.contains("mice") || lower.contains("rat") {
+    } else if has("mouse") || has("mice") || has("rat") || has("rats") || has("murine") {
         "animal"
-    } else if lower.contains("cell") || lower.contains("in vitro") {
+    } else if has("cell") || has("cells") || lower.contains("in vitro") || has("vitro") {
         "in_vitro"
-    } else if lower.contains("review") {
+    } else if has("review") {
         "review"
-    } else if lower.contains("preprint") {
+    } else if has("preprint") {
         "preprint"
     } else {
         "unknown"
@@ -613,12 +975,28 @@ fn infer_evidence_level(text: &str) -> &'static str {
 }
 
 fn infer_entity_kind(name: &str) -> &'static str {
-    if name
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
+    // A short all-caps/alphanumeric token with a digit or hyphen looks like a
+    // gene/protein symbol (BRCA1, IL-6, p53, mTORC1). Bare all-caps words
+    // (DNA, USA, FDA, ELISA) are NOT genes — the old rule labeled every one
+    // "gene". Keep it conservative and default to "concept".
+    let letters: String = name.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    let has_digit = name.chars().any(|c| c.is_ascii_digit());
+    let is_symbolish = name.len() <= 12
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && has_digit
+        && letters.chars().any(|c| c.is_ascii_uppercase());
+    if is_symbolish {
+        "gene_or_protein"
+    } else if name.ends_with(" Inc")
+        || name.ends_with(" Ltd")
+        || name.ends_with(" Labs")
+        || name.ends_with(" Corp")
+        || name.ends_with(" LLC")
+        || name.ends_with(" University")
+        || name.ends_with(" Institute")
     {
-        "gene"
-    } else if name.ends_with(" Inc") || name.ends_with(" Ltd") || name.ends_with(" Labs") {
         "organization"
     } else {
         "concept"
@@ -686,4 +1064,96 @@ fn write_wiki(
     }
 
     Ok(pages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn evidence_sentences_keep_decimals_intact() {
+        let text = "The IC50 of rapamycin was 0.1 nM in the mTOR kinase assay. Filler.";
+        let sents = evidence_sentences(text);
+        assert!(sents.iter().any(|s| s.text.contains("0.1 nM")));
+        // The offset must point back to the exact sentence text.
+        let s = &sents[0];
+        assert_eq!(&text[s.start..s.end], s.text);
+    }
+
+    #[test]
+    fn evidence_level_uses_word_boundaries() {
+        // "literature"/"temperature" must NOT match "rat"; "excellent" not "cell".
+        assert_eq!(
+            infer_evidence_level("The literature at ambient temperature was excellent."),
+            "unknown"
+        );
+        assert_eq!(
+            infer_evidence_level("Lifespan rose in aged mice given the drug."),
+            "animal"
+        );
+        assert_eq!(
+            infer_evidence_level("A randomized controlled trial in humans."),
+            "rct"
+        );
+    }
+
+    #[test]
+    fn entity_kind_not_every_caps_token_is_gene() {
+        assert_eq!(infer_entity_kind("DNA"), "concept");
+        assert_eq!(infer_entity_kind("FDA"), "concept");
+        assert_eq!(infer_entity_kind("ELISA"), "concept");
+        assert_eq!(infer_entity_kind("BRCA1"), "gene_or_protein");
+        assert_eq!(infer_entity_kind("IL-6"), "gene_or_protein");
+        assert_eq!(infer_entity_kind("Acme Labs"), "organization");
+    }
+
+    #[test]
+    fn grounding_gate_rejects_invented_numbers() {
+        let chunk = "Rapamycin extended median lifespan by 14% in treated mice.";
+        // Same numbers + overlap → grounded.
+        assert!(claim_grounded_in_chunk(
+            "Rapamycin extended lifespan by 14% in mice.",
+            chunk
+        ));
+        // Invented number 34% not in chunk → rejected.
+        assert!(!claim_grounded_in_chunk(
+            "Rapamycin extended lifespan by 34% in mice.",
+            chunk
+        ));
+        // No lexical overlap → rejected even with no numbers.
+        assert!(!claim_grounded_in_chunk(
+            "Metformin improves insulin sensitivity substantially.",
+            chunk
+        ));
+    }
+
+    #[test]
+    fn balanced_object_survives_braces_in_strings() {
+        let text = r#"Sure! Here you go: {"takeaways":["uses a } brace"],"claims":[]} — done."#;
+        let obj = first_balanced_object(text).unwrap();
+        let parsed: LlmEvidence = serde_json::from_str(obj).unwrap();
+        assert_eq!(parsed.takeaways.len(), 1);
+    }
+
+    #[test]
+    fn strip_fence_handles_json_block() {
+        let text = "```json\n{\"claims\":[]}\n```";
+        let parsed = parse_llm_evidence(text).unwrap();
+        assert!(parsed.claims.is_empty());
+    }
+
+    #[test]
+    fn validate_citations_strips_unknown_uuids() {
+        let known: HashSet<uuid::Uuid> = [uuid::Uuid::nil()].into_iter().collect();
+        let text = format!(
+            "Real [chunk:{}] and fake [chunk:{}].",
+            uuid::Uuid::nil(),
+            uuid::Uuid::new_v4()
+        );
+        let (out, dropped) = validate_chunk_citations(&text, &known);
+        assert_eq!(dropped, 1);
+        assert!(out.contains("[chunk:unverified]"));
+        assert!(out.contains(&uuid::Uuid::nil().to_string()));
+    }
 }

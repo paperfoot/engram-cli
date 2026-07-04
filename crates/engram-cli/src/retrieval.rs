@@ -18,7 +18,11 @@ use uuid::Uuid;
 pub struct Filters {
     pub diary: Option<String>,
     pub kb: Option<String>,
-    pub valid_at: Option<DateTime<Utc>>,
+    /// Inclusive lower/upper bounds on each memory's effective event time
+    /// (`COALESCE(event_time, created_at)`). `recall --since/--until` map here
+    /// and are actually applied to the candidate set (previously discarded).
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,11 +121,13 @@ pub struct HybridParams<'a> {
 
 #[derive(Debug, Clone)]
 struct CandidateRecord {
-    id: Uuid,
     kind: String,
     content: String,
     kb: String,
     citations: Vec<SourceCitation>,
+    /// For a claim candidate, the chunk it was derived from — used to drop a
+    /// claim that merely duplicates a chunk already in the result set.
+    parent_chunk: Option<Uuid>,
 }
 
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
@@ -184,7 +190,14 @@ where
     let mut source_map: HashMap<Uuid, HashSet<RetrievalSource>> = HashMap::new();
     let mut runs: Vec<Vec<RankedHit>> = Vec::new();
 
-    let chunks = store.iter_chunks_with_embedding_records(diary, kb)?;
+    let since = params.filters.since.map(|t| t.to_rfc3339());
+    let until = params.filters.until.map(|t| t.to_rfc3339());
+    let chunks = store.iter_chunks_with_embedding_records_since(
+        diary,
+        kb,
+        since.as_deref(),
+        until.as_deref(),
+    )?;
     guard_embedding_compatibility(
         &chunks,
         &expected_model,
@@ -192,6 +205,20 @@ where
         &expected_prompt,
         params.allow_mixed_embeddings,
     )?;
+
+    // When a temporal window is active, the lexical (FTS) path — which queries
+    // the whole table independently — must be restricted to the same in-window
+    // chunk set as the dense path, or `--since/--until` would leak out-of-window
+    // hits through FTS.
+    let temporal_active = since.is_some() || until.is_some();
+    let allowed_chunks: Option<HashSet<Uuid>> =
+        temporal_active.then(|| chunks.iter().map(|c| c.chunk_id).collect());
+
+    // Index chunk content/kb by id so the dense path can score all chunks
+    // without cloning content or fetching citations for every one — those are
+    // materialized lazily for only the post-fusion rerank pool (see below).
+    let chunk_index: HashMap<Uuid, &StoredChunkEmbedding> =
+        chunks.iter().map(|c| (c.chunk_id, c)).collect();
 
     if params.mode != RecallMode::Wiki {
         let q_emb = embedder
@@ -203,17 +230,6 @@ where
                 continue;
             }
             dense_scored.push((chunk.chunk_id, cosine_sim(&q_emb, &chunk.embedding)));
-            candidate_records
-                .entry(chunk.chunk_id)
-                .or_insert_with(|| CandidateRecord {
-                    id: chunk.chunk_id,
-                    kind: "chunk".to_string(),
-                    content: chunk.content.clone(),
-                    kb: chunk.kb.clone(),
-                    citations: store
-                        .citations_for_chunk(chunk.chunk_id)
-                        .unwrap_or_default(),
-                });
         }
         dense_scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
@@ -227,25 +243,22 @@ where
 
     let fts_q = build_fts_query(params.query);
     if !fts_q.is_empty() && params.mode != RecallMode::Wiki {
-        let lexical = store
-            .fts_search_scoped(&fts_q, kb, diary, params.rerank_top_n)
-            .unwrap_or_default();
-        for (id, _) in &lexical {
-            if !candidate_records.contains_key(id) {
-                if let Some(content) = store.get_chunk_content(*id)? {
-                    candidate_records.insert(
-                        *id,
-                        CandidateRecord {
-                            id: *id,
-                            kind: "chunk".to_string(),
-                            content,
-                            kb: kb.unwrap_or("default").to_string(),
-                            citations: store.citations_for_chunk(*id).unwrap_or_default(),
-                        },
-                    );
-                }
+        let mut lexical = match store.fts_search_scoped(&fts_q, kb, diary, params.rerank_top_n) {
+            Ok(hits) => hits,
+            Err(e) => {
+                // Don't silently degrade to dense-only: a malformed FTS query or
+                // SQL error is worth surfacing, but must not abort the whole
+                // recall, so warn and continue with an empty lexical run.
+                tracing::warn!("lexical (FTS) search failed, continuing without it: {e}");
+                Vec::new()
             }
+        };
+        if let Some(allowed) = &allowed_chunks {
+            lexical.retain(|(id, _)| allowed.contains(id));
         }
+        // Chunk content/citations for lexical-only hits are resolved lazily for
+        // the rerank pool (see resolve_candidate), not here — so we don't do a
+        // per-hit chunk fetch for candidates that fusion will discard.
         let lexical_run = ranked_run(&lexical, RetrievalSource::Lexical, params.rerank_top_n);
         mark_sources(&mut source_map, &lexical_run);
         runs.push(lexical_run);
@@ -257,24 +270,31 @@ where
             RecallMode::Evidence | RecallMode::Explore | RecallMode::Agent
         )
     {
-        let claims = store
-            .claim_fts_search(&fts_q, kb, params.rerank_top_n)
-            .unwrap_or_default();
+        let claims = match store.claim_fts_search(&fts_q, kb, params.rerank_top_n) {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!("claim search failed, continuing without it: {e}");
+                Vec::new()
+            }
+        };
         for (id, _) in &claims {
             if let Some(claim) = store.get_claim(*id)? {
+                // Claims found via their own FTS index are a distinct
+                // provenance from raw-chunk lexical hits.
+                let parent_chunk = claim.citations.iter().find_map(|c| c.chunk_id);
                 candidate_records.insert(
                     *id,
                     CandidateRecord {
-                        id: *id,
                         kind: "claim".to_string(),
                         content: claim.content,
                         kb: claim.kb,
                         citations: claim.citations,
+                        parent_chunk,
                     },
                 );
             }
         }
-        let claim_run = ranked_run(&claims, RetrievalSource::Lexical, params.rerank_top_n);
+        let claim_run = ranked_run(&claims, RetrievalSource::Claim, params.rerank_top_n);
         mark_sources(&mut source_map, &claim_run);
         runs.push(claim_run);
     }
@@ -285,24 +305,28 @@ where
             RecallMode::Wiki | RecallMode::Explore | RecallMode::Agent
         )
     {
-        let wiki_hits = store
-            .wiki_fts_search(&fts_q, kb, params.rerank_top_n)
-            .unwrap_or_default();
+        let wiki_hits = match store.wiki_fts_search(&fts_q, kb, params.rerank_top_n) {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!("wiki search failed, continuing without it: {e}");
+                Vec::new()
+            }
+        };
         for (id, _) in &wiki_hits {
             if let Some(page) = store.get_wiki_page_by_id(*id)? {
                 candidate_records.insert(
                     *id,
                     CandidateRecord {
-                        id: *id,
                         kind: "wiki_page".to_string(),
                         content: page.content,
                         kb: page.kb,
                         citations: Vec::new(),
+                        parent_chunk: None,
                     },
                 );
             }
         }
-        let wiki_run = ranked_run(&wiki_hits, RetrievalSource::Lexical, params.rerank_top_n);
+        let wiki_run = ranked_run(&wiki_hits, RetrievalSource::Wiki, params.rerank_top_n);
         mark_sources(&mut source_map, &wiki_run);
         runs.push(wiki_run);
     }
@@ -323,14 +347,24 @@ where
     }
 
     let fused = reciprocal_rank_fusion(&runs, params.rrf_k);
+
+    // Resolve content for ONLY the post-fusion rerank pool. Chunk candidates
+    // that were never materialized (dense/lexical-only hits) get their content
+    // from the in-memory chunk index — no per-candidate DB round-trip, and
+    // citations are fetched lazily below for just the survivors.
     let mut rerank_candidates: Vec<RerankCandidate> = Vec::new();
     let mut candidate_ids: Vec<Uuid> = Vec::new();
     for (id, _) in fused.iter().take(params.rerank_top_n) {
-        if let Some(c) = candidate_records.get(id) {
+        let text = if let Some(c) = candidate_records.get(id) {
+            Some(c.content.clone())
+        } else {
+            chunk_index.get(id).map(|c| c.content.clone())
+        };
+        if let Some(text) = text {
             candidate_ids.push(*id);
             rerank_candidates.push(RerankCandidate {
                 id: id.to_string(),
-                text: c.content.clone(),
+                text,
             });
         }
     }
@@ -368,6 +402,7 @@ where
     let using_reranker = reranker.is_some();
     let mut out = Vec::with_capacity(params.top_k);
     let mut per_doc: HashMap<Uuid, usize> = HashMap::new();
+    let mut emitted_chunks: HashSet<Uuid> = HashSet::new();
     for r in reranked {
         if out.len() >= params.top_k {
             break;
@@ -376,44 +411,93 @@ where
             .get(r.original_index)
             .copied()
             .unwrap_or_else(Uuid::nil);
-        if let Some(c) = candidate_records.get(&id) {
-            if let Some(doc) = c.citations.first().and_then(|cit| cit.document_id) {
-                let seen = per_doc.entry(doc).or_insert(0);
-                if *seen >= max_per_doc {
+
+        // Resolve the candidate: a materialized record (claim/wiki/entity/
+        // relation) or, failing that, a raw chunk from the index. Citations
+        // are fetched lazily here — for pool survivors only, not the whole KB.
+        let (kind, content, cand_kb, citations, parent_chunk) =
+            if let Some(c) = candidate_records.get(&id) {
+                let citations = if c.kind == "chunk" && c.citations.is_empty() {
+                    store.citations_for_chunk(id).unwrap_or_default()
+                } else {
+                    c.citations.clone()
+                };
+                (
+                    c.kind.clone(),
+                    c.content.clone(),
+                    c.kb.clone(),
+                    citations,
+                    c.parent_chunk,
+                )
+            } else if let Some(chunk) = chunk_index.get(&id) {
+                let citations = store.citations_for_chunk(id).unwrap_or_default();
+                (
+                    "chunk".to_string(),
+                    chunk.content.clone(),
+                    chunk.kb.clone(),
+                    citations,
+                    None,
+                )
+            } else {
+                continue;
+            };
+
+        // Drop a claim whose parent chunk is already in the result set — it
+        // would be a redundant restatement of a chunk we already returned.
+        if kind == "claim" {
+            if let Some(parent) = parent_chunk {
+                if emitted_chunks.contains(&parent) {
                     continue;
                 }
-                *seen += 1;
             }
-            let mut sources: Vec<RetrievalSource> = source_map
-                .get(&id)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            if using_reranker && !sources.contains(&RetrievalSource::Reranker) {
-                sources.push(RetrievalSource::Reranker);
-            }
-            sources.sort_by_key(|s| match s {
-                RetrievalSource::Dense => 0,
-                RetrievalSource::Lexical => 1,
-                RetrievalSource::Entity => 2,
-                RetrievalSource::Graph => 3,
-                RetrievalSource::Reranker => 4,
-            });
-            out.push(HybridResult {
-                id: c.id,
-                kind: c.kind.clone(),
-                content: c.content.clone(),
-                score: r.score,
-                rerank_score: using_reranker.then_some(r.score),
-                kb: c.kb.clone(),
-                citations: c.citations.clone(),
-                sources,
-            });
         }
+
+        if let Some(doc) = citations.first().and_then(|cit| cit.document_id) {
+            let seen = per_doc.entry(doc).or_insert(0);
+            if *seen >= max_per_doc {
+                continue;
+            }
+            *seen += 1;
+        }
+        if kind == "chunk" {
+            emitted_chunks.insert(id);
+        }
+
+        let mut sources: Vec<RetrievalSource> = source_map
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if using_reranker && !sources.contains(&RetrievalSource::Reranker) {
+            sources.push(RetrievalSource::Reranker);
+        }
+        sources.sort_by_key(source_rank);
+        out.push(HybridResult {
+            id,
+            kind,
+            content,
+            score: r.score,
+            rerank_score: using_reranker.then_some(r.score),
+            kb: cand_kb,
+            citations,
+            sources,
+        });
     }
 
     Ok(out)
+}
+
+fn source_rank(s: &RetrievalSource) -> u8 {
+    match s {
+        RetrievalSource::Dense => 0,
+        RetrievalSource::Lexical => 1,
+        RetrievalSource::Claim => 2,
+        RetrievalSource::Wiki => 3,
+        RetrievalSource::Entity => 4,
+        RetrievalSource::Graph => 5,
+        RetrievalSource::Reranker => 6,
+    }
 }
 
 fn guard_embedding_compatibility(
@@ -490,48 +574,66 @@ fn add_entity_and_graph_candidates(
         return Ok(());
     }
     let kb = kb.unwrap();
-    let mut entity_names = extract_entities(query);
-    if entity_names.is_empty() {
-        entity_names.push(query.trim().to_string());
+    // Match entity names from the query. `find_entity` already lowercases both
+    // sides, so a lowercased query term matches a Title-Case entity. Also try
+    // individual query tokens, so "rapamycin dose" matches the entity
+    // "Rapamycin" even though extract_entities (which wants capitalization)
+    // finds nothing in a lowercase query.
+    let mut entity_names: Vec<String> = extract_entities(query);
+    for tok in query.split(|c: char| !c.is_alphanumeric()) {
+        if tok.len() >= 3 {
+            entity_names.push(tok.to_string());
+        }
     }
+    entity_names.sort();
+    entity_names.dedup();
+
     let mut entity_scored = Vec::new();
     let mut graph_scored = Vec::new();
+    let mut seen_entities: HashSet<Uuid> = HashSet::new();
     for name in entity_names {
         if let Some(entity) = store.find_entity(Some(kb), &name)? {
+            if !seen_entities.insert(entity.id) {
+                continue;
+            }
             candidate_records.insert(
                 entity.id,
                 CandidateRecord {
-                    id: entity.id,
                     kind: "entity".to_string(),
                     content: format!(
                         "{} ({}) mentioned {} times in KB {}",
                         entity.canonical_name, entity.kind, entity.mention_count, entity.kb
                     ),
-                    kb: entity.kb,
+                    kb: entity.kb.clone(),
                     citations: Vec::new(),
+                    parent_chunk: None,
                 },
             );
             entity_scored.push((entity.id, entity.mention_count as f32));
-            let hops = if mode == RecallMode::Explore {
-                graph_hops.max(2)
-            } else {
-                graph_hops.max(1).min(1)
-            };
-            for rel in store.graph_neighbors(kb, &entity.canonical_name, hops)? {
-                candidate_records.insert(
-                    rel.id,
-                    CandidateRecord {
-                        id: rel.id,
-                        kind: "relation".to_string(),
-                        content: format!(
-                            "{} --{}--> {}",
-                            rel.from_entity, rel.predicate, rel.to_entity
-                        ),
-                        kb: rel.kb,
-                        citations: Vec::new(),
-                    },
-                );
-                graph_scored.push((rel.id, rel.weight));
+
+            // Graph expansion only in Explore mode. co_occurs_with edges are
+            // uncited text-adjacency, not evidence — injecting them into the
+            // fused ranking of a precision recall (evidence/agent) let a
+            // frequently-co-mentioned but irrelevant entity displace a real
+            // passage. In Explore (a browsing mode) they're useful context.
+            if mode == RecallMode::Explore {
+                let hops = graph_hops.clamp(1, 3);
+                for rel in store.graph_neighbors(kb, &entity.canonical_name, hops)? {
+                    candidate_records.insert(
+                        rel.id,
+                        CandidateRecord {
+                            kind: "relation".to_string(),
+                            content: format!(
+                                "{} --{}--> {}",
+                                rel.from_entity, rel.predicate, rel.to_entity
+                            ),
+                            kb: rel.kb,
+                            citations: Vec::new(),
+                            parent_chunk: None,
+                        },
+                    );
+                    graph_scored.push((rel.id, rel.weight));
+                }
             }
         }
     }

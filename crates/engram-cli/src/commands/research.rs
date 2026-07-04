@@ -46,7 +46,8 @@ pub async fn run(
             Some(diary.clone())
         },
         kb: if all_kbs { None } else { Some(kb.clone()) },
-        valid_at: None,
+        since: None,
+        until: None,
     };
     let params = HybridParams {
         query: &query,
@@ -65,7 +66,8 @@ pub async fn run(
     let use_cloud =
         profile_enum != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
     let use_cohere =
-        profile_enum != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub;
+        profile_enum != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
+        && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
 
     let (results, embed_model, embed_dims, prompt_format) = if use_cloud {

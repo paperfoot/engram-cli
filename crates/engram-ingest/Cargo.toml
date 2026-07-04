@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Mining modes (papers, conversations, repos, general) for engram v2"
+description = "Mining modes (papers, conversations, repos, general) for engram"
 
 [lib]
 name = "engram_ingest"

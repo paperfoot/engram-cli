@@ -142,9 +142,11 @@ impl Layer {
 /// "what does engram currently believe about subject X?" without re-retrieving
 /// raw text.
 ///
-/// Lean MVP design: no bi-temporal windows, no entity normalization beyond
-/// lowercase, no quality gates. The minimum that lets us catch contradictions
-/// at write time and supersede the old value when a new one disagrees.
+/// Facts are bi-temporal: `created_at`/`superseded_at` record when the system
+/// learned things (transaction time), while `valid_from`/`valid_until` record
+/// when the fact was true in the world (event time). Old facts are never
+/// deleted — superseding closes their validity window and the history stays
+/// queryable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Fact {
     pub id: Uuid,
@@ -164,6 +166,99 @@ pub struct Fact {
     pub superseded_by: Option<Uuid>,
     pub superseded_at: Option<DateTime<Utc>>,
     pub diary: String,
+    /// Semantic category. Profile slots get zero-LLM conflict policies.
+    #[serde(default)]
+    pub fact_type: FactType,
+    /// Event time: when this fact became true in the world (if known).
+    #[serde(default)]
+    pub valid_from: Option<DateTime<Utc>>,
+    /// Event time: when this fact stopped being true (set on supersession).
+    #[serde(default)]
+    pub valid_until: Option<DateTime<Utc>>,
+    /// How a supersession/conflict involving this fact was decided:
+    /// exact_match | slot_lww | semantic_llm | caller | daemon_sweep.
+    #[serde(default)]
+    pub resolution: Option<String>,
+    /// Provenance class of the fact — feeds trust weighting.
+    #[serde(default)]
+    pub source_kind: SourceKind,
+    /// Times this exact fact was re-asserted (dedup hits). Feeds trust.
+    #[serde(default)]
+    pub confirmations: u32,
+}
+
+/// Semantic category of a fact. Closed taxonomy so conflict policies can be
+/// keyed off it without semantics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FactType {
+    /// Single-valued attribute of an entity (employer, city, age).
+    ProfileSlot,
+    Preference,
+    Relationship,
+    Event,
+    #[default]
+    Assertion,
+    Procedural,
+}
+
+impl FactType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FactType::ProfileSlot => "profile_slot",
+            FactType::Preference => "preference",
+            FactType::Relationship => "relationship",
+            FactType::Event => "event",
+            FactType::Assertion => "assertion",
+            FactType::Procedural => "procedural",
+        }
+    }
+
+    pub fn parse(s: &str) -> FactType {
+        match s {
+            "profile_slot" => FactType::ProfileSlot,
+            "preference" => FactType::Preference,
+            "relationship" => FactType::Relationship,
+            "event" => FactType::Event,
+            "procedural" => FactType::Procedural,
+            _ => FactType::Assertion,
+        }
+    }
+}
+
+/// Where a fact came from. Ordered roughly by trustworthiness; used as a
+/// prior when adjudicating conflicts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    UserStated,
+    UserConfirmed,
+    #[default]
+    AgentExtracted,
+    CompileLlm,
+    Import,
+}
+
+impl SourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceKind::UserStated => "user_stated",
+            SourceKind::UserConfirmed => "user_confirmed",
+            SourceKind::AgentExtracted => "agent_extracted",
+            SourceKind::CompileLlm => "compile_llm",
+            SourceKind::Import => "import",
+        }
+    }
+
+    pub fn parse(s: &str) -> SourceKind {
+        match s {
+            "user_stated" => SourceKind::UserStated,
+            "user_confirmed" => SourceKind::UserConfirmed,
+            "compile_llm" => SourceKind::CompileLlm,
+            "import" => SourceKind::Import,
+            _ => SourceKind::AgentExtracted,
+        }
+    }
 }
 
 /// A scored result returned by retrieval.
@@ -179,6 +274,8 @@ pub struct ScoredChunk {
 pub enum RetrievalSource {
     Dense,
     Lexical,
+    Claim,
+    Wiki,
     Entity,
     Graph,
     Reranker,

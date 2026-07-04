@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Reranking providers (Cohere Rerank 4, passthrough) for engram v2"
+description = "Reranking providers (Cohere Rerank 4, passthrough) for engram"
 
 [lib]
 name = "engram_rerank"

@@ -187,11 +187,38 @@ fn build_mab_judge_user(question: &str, answers: &[String], candidate: &str) -> 
 }
 
 fn parse_mab_correct(raw: &str) -> bool {
-    raw.to_ascii_lowercase()
-        .chars()
-        .take(10)
-        .collect::<String>()
-        .contains("yes")
+    yes_no_verdict(raw).unwrap_or(false)
+}
+
+/// Extract a yes/no verdict by WORD-boundary token match, not substring.
+/// Substring matching mis-fired: "NO" matched NOT/CANNOT/NONE/ANNOTATION, and
+/// "yes" in first-10-chars matched "yes and no". We scan the last non-empty
+/// line first (models put the verdict last), then the whole text; a line with
+/// a bare `yes`/`no` token wins, and if both appear we defer to the other
+/// scope. Returns None when neither token is present as a word.
+fn yes_no_verdict(raw: &str) -> Option<bool> {
+    fn has_word(text: &str, word: &str) -> bool {
+        text.split(|c: char| !c.is_ascii_alphabetic())
+            .any(|tok| tok.eq_ignore_ascii_case(word))
+    }
+    let lower = raw.to_ascii_lowercase();
+    for scope in [
+        lower
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(""),
+        lower.as_str(),
+    ] {
+        let yes = has_word(scope, "yes");
+        let no = has_word(scope, "no");
+        match (yes, no) {
+            (true, false) => return Some(true),
+            (false, true) => return Some(false),
+            _ => continue, // neither or both — try the next (wider) scope
+        }
+    }
+    None
 }
 
 pub async fn judge_answer_mab<J: ChatLlm + ?Sized>(
@@ -214,6 +241,123 @@ pub async fn judge_answer_mab<J: ChatLlm + ?Sized>(
         prompt_tokens: resp.prompt_tokens,
         completion_tokens: resp.completion_tokens,
     })
+}
+
+// ---------------------------------------------------------------------------
+// ∞Bench-Sum keypoint entailment (Long_Range_Understanding summarisation)
+// ---------------------------------------------------------------------------
+
+const KEYPOINT_RECALL_JUDGE_SYSTEM: &str =
+    "You are a strict summarisation evaluator. You will be given a SUMMARY and a single \
+     KEY POINT. Decide whether the key point is entailed by — i.e. clearly stated or \
+     directly implied by — the summary. Paraphrase is fine; the meaning must be present. \
+     If the summary omits, contradicts, or only vaguely gestures at the key point, it is \
+     NOT entailed. Respond with exactly one word on the final line: YES or NO.";
+
+const KEYPOINT_PRECISION_JUDGE_SYSTEM: &str =
+    "You are a strict summarisation evaluator. You will be given a list of reference KEY \
+     POINTS and a single SUMMARY SENTENCE. Decide whether the sentence corresponds to (is \
+     supported by) at least one of the key points — i.e. it conveys information also present \
+     in some key point. If the sentence states something not covered by any key point, it \
+     does NOT correspond. Respond with exactly one word on the final line: YES or NO.";
+
+/// Parse a binary YES/NO judge response by word-boundary token match (last
+/// non-empty line first, then whole text). Avoids the substring trap where
+/// "NO" matches NOT/CANNOT/NONE/ANNOTATION.
+fn parse_yes(raw: &str) -> bool {
+    yes_no_verdict(raw).unwrap_or(false)
+}
+
+/// Judge whether a single gold `keypoint` is entailed by the generated
+/// `summary` (the recall half of ∞Bench-Sum keypoint-F1).
+pub async fn judge_keypoint_present<J: ChatLlm + ?Sized>(
+    judge: &J,
+    summary: &str,
+    keypoint: &str,
+) -> Result<JudgeVerdict, engram_llm::LlmError> {
+    let user = format!(
+        "SUMMARY:\n{}\n\nKEY POINT:\n{}\n\nIs the key point entailed by the summary? Answer YES or NO.",
+        summary.trim(),
+        keypoint.trim()
+    );
+    let messages = vec![
+        ChatMessage::system(KEYPOINT_RECALL_JUDGE_SYSTEM),
+        ChatMessage::user(user),
+    ];
+    let resp = judge.chat(&messages).await?;
+    let raw = resp.content.clone();
+    let correct = parse_yes(&raw);
+    Ok(JudgeVerdict {
+        correct,
+        raw_response: raw,
+        prompt_tokens: resp.prompt_tokens,
+        completion_tokens: resp.completion_tokens,
+    })
+}
+
+/// Judge whether a single summary `sentence` corresponds to at least one of the
+/// gold `keypoints` (the precision half of ∞Bench-Sum keypoint-F1).
+pub async fn judge_sentence_matches_keypoints<J: ChatLlm + ?Sized>(
+    judge: &J,
+    keypoints: &[String],
+    sentence: &str,
+) -> Result<JudgeVerdict, engram_llm::LlmError> {
+    let joined = keypoints
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("{}. {}", i + 1, k.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let user = format!(
+        "KEY POINTS:\n{}\n\nSUMMARY SENTENCE:\n{}\n\nDoes the sentence correspond to at least one key point? Answer YES or NO.",
+        joined,
+        sentence.trim()
+    );
+    let messages = vec![
+        ChatMessage::system(KEYPOINT_PRECISION_JUDGE_SYSTEM),
+        ChatMessage::user(user),
+    ];
+    let resp = judge.chat(&messages).await?;
+    let raw = resp.content.clone();
+    let correct = parse_yes(&raw);
+    Ok(JudgeVerdict {
+        correct,
+        raw_response: raw,
+        prompt_tokens: resp.prompt_tokens,
+        completion_tokens: resp.completion_tokens,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Generic NLI entailment (BioGen citation support, ALCE citation scoring)
+// ---------------------------------------------------------------------------
+
+const ENTAILMENT_JUDGE_SYSTEM: &str =
+    "You are a strict natural-language-inference judge. You will be given a PREMISE and a \
+     HYPOTHESIS. Decide whether the premise entails the hypothesis — i.e. whether the \
+     hypothesis is fully supported by, and follows from, the premise. If the premise does not \
+     support the hypothesis, or only partially supports it, or contradicts it, the answer is \
+     NO. Respond with exactly one word on the final line: YES or NO.";
+
+/// Judge whether `premise` entails `hypothesis`. Returns the raw `bool` (the
+/// shape consumed by [`crate::citation::citation_scores`] and
+/// [`crate::biogen::citation_support_rate`]).
+pub async fn judge_entails<J: ChatLlm + ?Sized>(
+    judge: &J,
+    premise: &str,
+    hypothesis: &str,
+) -> Result<bool, engram_llm::LlmError> {
+    let user = format!(
+        "PREMISE:\n{}\n\nHYPOTHESIS:\n{}\n\nDoes the premise entail the hypothesis? Answer YES or NO.",
+        premise.trim(),
+        hypothesis.trim()
+    );
+    let messages = vec![
+        ChatMessage::system(ENTAILMENT_JUDGE_SYSTEM),
+        ChatMessage::user(user),
+    ];
+    let resp = judge.chat(&messages).await?;
+    Ok(parse_yes(&resp.content))
 }
 
 #[cfg(test)]
@@ -251,5 +395,32 @@ mod tests {
     #[test]
     fn parses_mab_no_verdict() {
         assert!(!parse_mab_correct("No, it misses the answer."));
+    }
+
+    #[test]
+    fn parses_yes_no_verdicts() {
+        assert!(parse_yes("Reasoning...\nYES"));
+        assert!(!parse_yes("Reasoning...\nNO"));
+        // Last-line verdict wins over an earlier mention.
+        assert!(!parse_yes("Maybe YES at first glance.\nNO"));
+        // Whole-text fallback when the final line is not a bare verdict.
+        assert!(parse_yes("YES, the key point is clearly entailed."));
+        // Ambiguous / empty -> false (conservative).
+        assert!(!parse_yes(""));
+    }
+
+    #[test]
+    fn yes_no_ignores_substring_traps() {
+        // "NOT"/"CANNOT"/"NONE"/"ANNOTATION" must NOT read as a "NO" verdict.
+        assert!(parse_yes("This is NOT wrong; the point is present.\nYES"));
+        assert!(parse_yes("The summary CANNOT be faulted here.\nYES"));
+        assert!(parse_yes("Per the ANNOTATION, this is entailed.\nYES"));
+        // A genuine bare "no" token is still detected.
+        assert!(!parse_yes("no"));
+        // mab: "yes and no" on one line is ambiguous → whole-text also
+        // ambiguous → conservative false, not a false "yes" from substring.
+        assert!(!parse_mab_correct("yes and no"));
+        assert!(parse_mab_correct("YES"));
+        assert!(!parse_mab_correct("Notably, the answer is absent."));
     }
 }

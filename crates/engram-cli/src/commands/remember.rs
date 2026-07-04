@@ -1,30 +1,31 @@
 //! `engram remember <content>` — store + embed a memory.
 //!
-//! Optionally extracts atomic (subject, predicate, object) facts via one LLM
-//! call and inserts them into the `facts` table. If a new fact has the same
-//! `(subject_norm, predicate)` as an existing active fact and a different
-//! `object_norm`, the old fact is superseded by the new one (non-destructive —
-//! the old row is preserved with `superseded_by` set).
-//!
-//! Fact extraction is opt-in via `--extract-facts` so the default write path
-//! stays fast, local, and predictable for agents.
+//! Facts enter through two doors: `--extract-facts` (one LLM extraction
+//! call) or `--facts-json` (the caller supplies triples directly, no LLM).
+//! Every fact then runs the write-path v2 pipeline in `fact_write`: predicate
+//! and subject canonicalization, exact-match dedup/supersession, slot
+//! policies, and the embedding novelty gate. Uncertain contradictions are
+//! queued for the calling agent under the default `assisted` autonomy —
+//! see `facts resolve`.
 
 use crate::commands::usage::{estimated_tokens, estimated_tokens_for_texts, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use chrono::Utc;
-use engram_core::types::{Fact, Memory, MemorySource};
+use crate::fact_write::{write_fact, Autonomy, FactWriteOutcome};
+use engram_core::types::{Memory, MemorySource, SourceKind};
 use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
-use engram_graph::facts::{extract_facts, normalize, ExtractedFact};
+use engram_graph::facts::{extract_facts, ExtractedFact};
 use engram_ingest::chunker::naive_split;
 use engram_llm::openrouter::OpenRouterClient;
 use serde_json::json;
 use std::time::Instant;
 use uuid::Uuid;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     ctx: &AppContext,
     content: String,
@@ -33,7 +34,13 @@ pub async fn run(
     diary: String,
     kb: String,
     extract_facts_enabled: bool,
+    allow_duplicate: bool,
+    autonomy: String,
+    facts_json: Option<String>,
 ) -> Result<(), CliError> {
+    let autonomy = Autonomy::parse(&autonomy)?;
+    // Paid calls (embedding, extraction) respect the KB budget guardrail.
+    crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     if content.trim().is_empty() {
         return Err(CliError::BadInput("content cannot be empty".into()));
     }
@@ -42,10 +49,36 @@ pub async fn run(
     }
 
     let start = Instant::now();
+
+    // Dedup: saving an identical fact into the same (kb, diary) is a no-op
+    // rather than a second row + a second embedding charge. Opt out with
+    // --allow-duplicate if you truly want a second copy.
+    if !allow_duplicate {
+        if let Some(existing) = ctx.store.find_duplicate_memory(&kb, &diary, &content)? {
+            let mut meta = Metadata::default();
+            meta.add("deduplicated", true);
+            meta.add("existing_id", existing.to_string());
+            print_success(
+                ctx.format,
+                json!({
+                    "id": existing.to_string(),
+                    "stored": false,
+                    "deduplicated": true,
+                    "kb": kb,
+                    "reason": "identical content already stored in this kb/diary; nothing re-embedded",
+                }),
+                meta,
+                |_| println!("Duplicate of {existing} — nothing stored (use --allow-duplicate to force)"),
+            );
+            return Ok(());
+        }
+    }
+
+    let now = Utc::now();
     let memory = Memory {
         id: Uuid::new_v4(),
         content: content.clone(),
-        created_at: Utc::now(),
+        created_at: now,
         event_time: None,
         importance,
         emotional_weight: 0,
@@ -54,7 +87,10 @@ pub async fn run(
         stability: 1.0,
         source: MemorySource::Manual,
         diary: diary.clone(),
-        valid_from: None,
+        // A stored fact is valid from the moment it is recorded; superseding
+        // facts close this window later. Keeps the temporal model populated
+        // instead of leaving valid_from perpetually NULL.
+        valid_from: Some(now),
         valid_until: None,
         tags,
     };
@@ -118,26 +154,31 @@ pub async fn run(
         )?;
     }
 
-    // Optional fact extraction + contradiction detection.
-    // Runs after the memory is safely persisted so a fact-extraction failure
-    // never blocks a `remember` call.
-    let mut facts_added = 0usize;
-    let mut conflicts: Vec<serde_json::Value> = Vec::new();
+    // Fact processing (extraction and/or caller-supplied triples) runs after
+    // the memory is safely persisted so a fact failure never blocks `remember`.
+    let mut extracted: Vec<ExtractedFact> = Vec::new();
+    if let Some(raw) = &facts_json {
+        extracted.extend(
+            serde_json::from_str::<Vec<ExtractedFact>>(raw)
+                .map_err(|e| CliError::BadInput(format!("--facts-json is not a valid fact array: {e}")))?,
+        );
+    }
+
+    let openrouter_key =
+        crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter");
+    let extraction_model = std::env::var("ENGRAM_FACT_MODEL").unwrap_or_else(|_| {
+        crate::commands::config::resolve_setting(
+            "ENGRAM_COMPILER_EXTRACTION_MODEL",
+            "compiler.extraction_model",
+            engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL,
+        )
+    });
+    let llm = openrouter_key
+        .clone()
+        .map(|key| OpenRouterClient::new(key).with_model(extraction_model.clone()));
+
     if extract_facts_enabled {
-        let openrouter_key =
-            crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter");
-        if let Some(key) = openrouter_key {
-            // Fact extraction should be fast and cheap. The default follows
-            // the compiler extraction model; override with ENGRAM_FACT_MODEL
-            // for a different OpenRouter slug.
-            let extraction_model = std::env::var("ENGRAM_FACT_MODEL").unwrap_or_else(|_| {
-                crate::commands::config::resolve_setting(
-                    "ENGRAM_COMPILER_EXTRACTION_MODEL",
-                    "compiler.extraction_model",
-                    engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL,
-                )
-            });
-            let llm = OpenRouterClient::new(key).with_model(extraction_model.clone());
+        if let Some(llm) = &llm {
             ctx.store.record_usage_event(
                 "openrouter",
                 "remember_fact_extract",
@@ -152,21 +193,8 @@ pub async fn run(
                 0.0,
                 json!({ "estimated": true }),
             )?;
-            match extract_facts(&llm, &content).await {
-                Ok(extracted) => {
-                    for ef in extracted {
-                        match insert_fact_with_conflict_check(ctx, &memory, &diary, &ef) {
-                            Ok(Some(conflict)) => {
-                                conflicts.push(conflict);
-                                facts_added += 1;
-                            }
-                            Ok(None) => facts_added += 1,
-                            Err(e) => {
-                                tracing::warn!("fact insert failed for {:?}: {e}", ef);
-                            }
-                        }
-                    }
-                }
+            match extract_facts(llm, &content).await {
+                Ok(more) => extracted.extend(more),
                 Err(e) => {
                     tracing::warn!("fact extraction failed (continuing without facts): {e}");
                 }
@@ -175,6 +203,39 @@ pub async fn run(
             tracing::debug!("OPENROUTER_API_KEY not set — skipping fact extraction");
         }
     }
+
+    let mut outcome = FactWriteOutcome::default();
+    if !extracted.is_empty() {
+        // The novelty gate uses the same embedder family as the chunks above.
+        let gate_embedder: Option<Box<dyn Embedder>> = if have_gemini {
+            crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
+                .map(|k| Box::new(GeminiEmbedder::new(k)) as Box<dyn Embedder>)
+        } else {
+            Some(Box::new(StubEmbedder::default()) as Box<dyn Embedder>)
+        };
+        for ef in &extracted {
+            if let Err(e) = write_fact(
+                ctx,
+                memory.id,
+                &diary,
+                &kb,
+                ef,
+                gate_embedder.as_deref(),
+                llm.as_ref().map(|l| l as &dyn engram_llm::ChatLlm),
+                autonomy,
+                SourceKind::AgentExtracted,
+                &mut outcome,
+            )
+            .await
+            {
+                tracing::warn!("fact write failed for {:?}: {e}", ef);
+            }
+        }
+    }
+    let facts_added = outcome.added;
+    let conflicts = outcome.conflicts;
+    let adjudication_needed = outcome.queued;
+    let facts_deduped = outcome.deduped;
 
     let mut meta = Metadata::default();
     meta.elapsed_ms = start.elapsed().as_millis() as u64;
@@ -185,7 +246,9 @@ pub async fn run(
     meta.add("embed_prompt_format", prompt_format.clone());
     meta.add("kb", kb.clone());
     meta.add("facts_added", facts_added);
+    meta.add("facts_deduped", facts_deduped);
     meta.add("conflicts_detected", conflicts.len());
+    meta.add("conflicts_queued", adjudication_needed.len());
 
     print_success(
         ctx.format,
@@ -195,80 +258,21 @@ pub async fn run(
             "chunks": chunks.len(),
             "kb": kb,
             "facts_added": facts_added,
+            "facts_deduped": facts_deduped,
             "conflicts": conflicts,
+            "adjudication_needed": adjudication_needed,
         }),
         meta,
         |_| {
             println!(
-                "Stored memory {} ({} chunks, {} facts, {} conflicts)",
+                "Stored memory {} ({} chunks, {} facts, {} conflicts, {} queued for resolution)",
                 memory.id,
                 chunks.len(),
                 facts_added,
-                conflicts.len()
+                conflicts.len(),
+                adjudication_needed.len()
             )
         },
     );
     Ok(())
-}
-
-/// Insert one extracted fact into the store. If an active fact already exists
-/// for the same `(subject_norm, predicate)` in the same diary with a different
-/// `object_norm`, supersede it. Returns `Some(conflict_json)` describing the
-/// supersession, or `None` if there was no conflict.
-fn insert_fact_with_conflict_check(
-    ctx: &AppContext,
-    memory: &Memory,
-    diary: &str,
-    ef: &ExtractedFact,
-) -> Result<Option<serde_json::Value>, CliError> {
-    let subject_norm = normalize(&ef.subject);
-    let object_norm = normalize(&ef.object);
-    if subject_norm.is_empty() || ef.predicate.is_empty() || object_norm.is_empty() {
-        return Ok(None);
-    }
-
-    let existing = ctx
-        .store
-        .get_active_facts(&subject_norm, &ef.predicate, diary)?;
-
-    let new_fact = Fact {
-        id: Uuid::new_v4(),
-        source_memory_id: memory.id,
-        subject: ef.subject.clone(),
-        subject_norm: subject_norm.clone(),
-        predicate: ef.predicate.clone(),
-        object: ef.object.clone(),
-        object_norm: object_norm.clone(),
-        confidence: ef.confidence,
-        created_at: Utc::now(),
-        superseded_by: None,
-        superseded_at: None,
-        diary: diary.to_string(),
-    };
-
-    // Find any active fact whose object differs from the new one.
-    let mut conflict_payload: Option<serde_json::Value> = None;
-    for old in &existing {
-        if old.object_norm == object_norm {
-            // Same fact already known — skip insert (de-dup) and return.
-            return Ok(None);
-        }
-        // Different value for same (subject, predicate) in same diary → conflict.
-        if conflict_payload.is_none() {
-            conflict_payload = Some(json!({
-                "subject": old.subject,
-                "predicate": old.predicate,
-                "old_object": old.object,
-                "new_object": new_fact.object,
-                "old_fact_id": old.id.to_string(),
-                "new_fact_id": new_fact.id.to_string(),
-                "old_created_at": old.created_at.to_rfc3339(),
-            }));
-        }
-        // Supersede every active prior with a different value (typically just one).
-        ctx.store.supersede_fact(old.id, new_fact.id)?;
-    }
-
-    ctx.store.insert_fact(&new_fact)?;
-    Ok(conflict_payload)
 }

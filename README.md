@@ -5,7 +5,7 @@
 [![rust](https://img.shields.io/badge/rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![LongMemEval S R@5](https://img.shields.io/badge/LongMemEval_S_R%405-0.99-brightgreen)](#benchmarks)
-[![LoCoMo-QA](https://img.shields.io/badge/LoCoMo--QA_strict-74.5%25-blue)](#benchmarks)
+[![hallucination-resistance](https://img.shields.io/badge/hallucination--resistance-4--axis_triangulation-blue)](#benchmarks)
 [![tests](https://img.shields.io/badge/tests-passing-brightgreen)](crates/engram-cli/tests/cli.rs)
 
 ```bash
@@ -26,7 +26,7 @@ engram recall "what drug extends lifespan" --kb ageing-biology --mode evidence
 
 engram is a **knowledge engine** that gives AI agents three things they currently lack:
 
-1. **Persistent memory that updates itself.** Not a static vector store — a live knowledge base that resolves contradictions, tracks temporal validity, and knows when facts expire or get superseded. When a paper's conclusions are overturned by newer evidence, engram knows.
+1. **Persistent memory that updates itself.** Not a static vector store — a live knowledge base that tracks fact supersession and temporal validity. When you store a fact that disagrees with an existing one for the same subject, the old value is superseded (not deleted — the history stays queryable), and `recall` surfaces the change so an agent cites the current value instead of the stale one. Detection is semantic, not string-matching: predicate synonyms canonicalize (`employed_by` ≡ `works_at`), subjects resolve through an alias/fuzzy cascade, and an embedding novelty gate catches paraphrased contradictions. Routine profile slots update last-writer-wins; safety-critical slots (allergies, medication) are **never auto-superseded** — both values stay active as *contested* and the conflict is handed to the calling agent (`adjudication_needed` + `facts resolve`), which has the conversation context engram lacks. Facts run on the `remember --extract-facts` / `--facts-json` and `compile --llm` paths (KB-scoped); chunk-level "which paper overturned which" is on the roadmap.
 
 2. **Precision retrieval for science.** Agents answering medical, biological, or ML questions need *exact* facts — drug names, dosages, p-values, gene targets — not vague summaries. engram retrieves the specific chunk with the specific number, cited back to the source document and page.
 
@@ -51,82 +51,108 @@ The important split is: **KBs are source corpora/domains** (`ageing-biology`, `s
 
 ## Why not MCP / vector databases / RAG-as-a-service?
 
-- **MCP tool discovery costs ~44,000 tokens** per session per server. engram costs 1,400.
+- **No per-session tool-discovery tax.** engram is a CLI your agent already knows how to shell out to; a single `agent-info` call (a few KB of JSON) discovers every command, versus an MCP server whose tool schemas are re-sent on each session. The installed skill body is ~5K tokens and only loads when the skill is invoked.
 - **Vector databases lose precision.** Embedding similarity finds "related" documents, not the specific fact. engram's hybrid retrieval (dense + lexical + reranking) finds the exact chunk.
-- **RAG services don't resolve contradictions.** If two papers disagree on a dosage, a naive retriever returns both. engram tracks provenance, timestamps, and validity windows.
+- **RAG services don't resolve contradictions.** If two papers disagree on a dosage, a naive retriever returns both. engram tracks provenance and supersession: `recall` surfaces a `conflicts` array when a queried fact was superseded, and `facts conflicts` shows the full history.
 - **Nothing handles the science workflow natively.** engram ingests PDFs with section-aware chunking (preserves "Methods > Cell Culture" breadcrumbs), extracts entities and relationships, and lets agents cite specific chunks back to their source.
 
 ## Benchmarks
 
-### Retrieval — LongMemEval S (500 questions, 96% distractors)
+engram is built to make agents *hallucination-resistant* over a **specialized corpus** — you ingest the papers/protocols for your domain and query *those*, not the entire literature. The benchmarks below test that realistic setup: precision retrieval, grounded answering, and **abstention instead of guessing**, over a bounded domain corpus.
 
-Full 500-question **[LongMemEval S split](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned)** — 48 sessions per question, 96% distractors.
+> **Framing rule:** No single benchmark proves hallucination-resistance — read the axes together: **retrieval quality**, **answer accuracy**, **abstention/precision** (refuse rather than guess), and **citation faithfulness**. A system strong on one axis but weak on another is not hallucination-resistant; treat any single number in isolation as noise.
+
+Numbers below were produced with answerer `anthropic/claude-opus-4.8`, grader `google/gemini-3.1-pro-preview`, embeddings `gemini-embedding-2`, reranker `cohere rerank-v4.0-pro` (June 2026). Full per-question detail, tokens, and model IDs are logged to `benchmarks/` for audit.
+
+### Axis 1 — Scientific-QA over a specialized corpus (headline): LitQA2
+
+**Setup.** The 199-question **LitQA2** biomedical literature set (`futurehouse/lab-bench`, ungated — the benchmark PaperQA2 reports on, peer-anchored to **AstaBench** [arXiv:2510.21652](https://arxiv.org/abs/2510.21652); PaperQA2 itself [arXiv:2409.13740](https://arxiv.org/abs/2409.13740)). We ingest the answer-bearing passages as a **bounded specialized corpus** (181 docs) and run retrieve-then-answer over it — engram's actual use pattern — against a **closed-book** control (no retrieval, the model's own knowledge).
+
+| Pipeline | Accuracy | Precision (abstention-adjusted) | Precision (strict) | Coverage | Retrieval-success |
+|---|---:|---:|---:|---:|---:|
+| Closed-book (no RAG) | 43.7% | 49.7% | — | 87.9% | — |
+| **Full-text RAG (specialized corpus)** | **87.9%** | **99.4%** | **92.1%** | 88.4% | **97.0%** |
+| *ref — PaperQA2 (full literature)* | *66.0%* | *85.2%* | — | — | — |
+| *ref — human experts* | *67.7%* | — | — | — | — |
+
+Retrieval adds **+44 points of accuracy**. Two precision numbers, reported honestly:
+
+- **Precision, abstention-adjusted = 99.4%** — of the answers where the model *committed* to an option, it was almost never wrong. This excludes both principled abstentions and empty/unparseable API responses from the denominator (the PaperQA2/LitQA2 convention).
+- **Precision, strict = 92.1%** — the same, but counting empty/unparseable answerer responses as failed commitments rather than safe declines. In the logged 199-question run, 14 of 23 "abstentions" were zero-token API responses, not principled declines; the strict number is what you get when those count against you. The bench now records `no_response_rate` and both precision figures so this can never be hidden again.
+
+**Where it wins / where it doesn't** (199-question decomposition):
+
+- **Retrieval is not the bottleneck** — the right passage is surfaced for **193/199 (97%)** questions.
+- **Genuine hallucination resistance** — on all **6/6** true retrieval misses it selected "Insufficient information" (real, token-bearing responses), with **0 wrong answers**.
+- **The remaining gap is the answerer** — of the non-correct questions, most are answer errors on correctly-retrieved evidence (accuracy given a retrieval hit ≈ 90.7%). The lever is answer interpretation, not retrieval.
+
+> *Comparability:* the 87.9% is over a curated specialized corpus (answer-bearing passages present) — engram's design point — and is **not** apples-to-apples with PaperQA2's 66% (which searches a far larger, noisier corpus). Retrieval-success 97% is likewise an easy find-1-of-181 task, not open-literature retrieval. The robust, honest reads are: the +44-pt accuracy lift over closed-book (same model, same prompt — a fair comparison), and strict precision 92.1%.
+
+```bash
+engram bench litqa2 --mode fulltext --corpus data/litqa2/corpus.json --limit 199 --json  # RAG over your corpus
+engram bench litqa2 --mode closed-book --limit 199 --json                                 # no-retrieval control
+```
+
+### Axis 2 — Retrieval quality: BEIR-scientific nDCG@10
+
+**What it measures.** Pure retrieval ranking on scientific IR, no LLM involved: does the hybrid pipeline (Gemini Embed 2 + FTS5 + RRF + Cohere rerank) put the relevant documents at the top? Primary metric **nDCG@10**. Measured on **SciFact** (300 test queries over a 5,183-doc corpus); anchor BEIR — [arXiv:2104.08663](https://arxiv.org/abs/2104.08663).
+
+| Pipeline | nDCG@10 | Recall@10 | Recall@100 |
+|---|---:|---:|---:|
+| BM25 (lexical only) | 0.689 | 0.814 | 0.923 |
+| **hybrid + Cohere rerank** | **0.817** | **0.935** | **0.990** |
+| *ref — BM25 (BEIR paper)* | *~0.665* | — | — |
+| *ref — strong dense retriever* | *~0.74* | — | — |
+
+engram's full hybrid stack reaches **nDCG@10 = 0.817 on SciFact — above the strong-dense reference (~0.74)** — and Recall@100 = 0.99 (the relevant document is almost always retrievable). nDCG uses **linear gain**, matching `pytrec_eval`'s `ndcg_cut` (the tool the published BEIR leaderboard is computed with), so graded datasets are comparable to the paper; SciFact qrels are binary, so the 0.817 is identical under either gain convention. NFCorpus / TREC-COVID / SCIDOCS wire identically via `--dataset`.
+
+```bash
+engram bench beir --dataset scifact --rerank on --json
+```
+
+### Axis 3 — Citation faithfulness (wired): ALCE citation P/R + repaired RAGAS
+
+**What it measures.** Whether each answer sentence is *actually supported by the source it cites* — over **your own retrieved corpus**, not a fixed external answer set.
+
+- **ALCE citation precision / recall** ([arXiv:2305.14627](https://arxiv.org/abs/2305.14627)) — recall: is a statement's cited evidence sufficient to entail it; precision: how many carried citations are load-bearing. The denominator is aligned to the reference `eval.py` (an early divergence was caught and fixed in review). Implemented in [`citation.rs`](crates/engram-bench/src/citation.rs); scores once a domain corpus + held-out QA set is configured.
+- **Repaired RAGAS faithfulness** ([arXiv:2309.15217](https://arxiv.org/abs/2309.15217)) — claim-decomposition + per-claim entailment to the retrieved context (the upstream single-score version was replaced). Runs **live today** as an add-on on any QA suite:
+
+```bash
+engram bench litqa2 --mode fulltext --corpus data/litqa2/corpus.json --limit 50 --ragas --json
+```
+
+> *Dropped — TREC-BioGen citation-support:* it requires retrieving over the **full PubMed corpus**, which is not engram's specialized-corpus model. ALCE-over-your-own-corpus is the relevant attribution check; the abstention behaviour in Axis 1 (0 wrong answers on 6 retrieval misses) is the live hallucination-resistance evidence.
+
+### Supporting retrieval result — LongMemEval S (500 questions, 96% distractors)
+
+Retrieval-only sanity check on the full 500-question **[LongMemEval S split](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned)** — 48 sessions per question, 96% distractors. Not part of the hallucination-resistance triangulation (it is conversational memory, not science), but it shows the hybrid pipeline is near-ceiling on retrieval:
 
 | Pipeline | R@1 | R@5 | R@10 | MRR |
 |---|---|---|---|---|
 | **engram — hybrid only** (Gemini Embed 2 + FTS5 + RRF) | 0.910 | **0.990** | 0.998 | 0.946 |
 | **engram — hybrid + Cohere Rerank** (first 100 Qs) | 0.930 | 0.980 | 1.000 | 0.957 |
 
-### End-to-end QA — LoCoMo-full-mini (1542 questions, multi-turn conversation)
-
-**[LoCoMo](https://snap-research.github.io/locomo/)** is a multi-turn conversational memory benchmark with 5 question categories: single-hop factoid, multi-hop, temporal reasoning, open-ended, and adversarial. Harder than LongMemEval because sessions contain real dialogue with pronouns, time references, and contradictions.
-
-#### engram results (strict judge — no partial answers, no hedging)
-
-| Reranker | Embed | Accuracy (200q) | R@5 | MRR | Cat 1 | Cat 2 | Cat 4 |
-|---|---|---:|---:|---:|---:|---:|---:|
-| **Cohere rerank-v3.5** | gemini-embed-2 | **74.5%** | 0.950 | 0.862 | 44% | 86% | 84% |
-
-95% CI: 68.5%–80.5% (200 questions across 2 conversations). Category 1 (adversarial/speaker-confusion) remains the primary bottleneck at 44%.
-
-Answerer: `openai/gpt-5.4`. Judge: `openai/gpt-5.4` (strict — complete lists required, exact terms, no hedging, relative dates must be resolved to absolute).
-
-#### SOTA comparison
-
-| System | LoCoMo Accuracy | Answerer | Notes |
-|---|---:|---|---|
-| EverMemOS | ~92% | — | Unreleased; approximate from leaderboard |
-| MemMachine v0.2 | 91.7% | gpt-4.1-mini | [arXiv:2604.04853](https://arxiv.org/abs/2604.04853) |
-| **engram** | **74.5%** | gpt-5.4 | Strict judge (see caveat below) |
-
-**Where we stand:** engram's retrieval is strong (R@5=0.95 — gold evidence in top-5 for 95% of questions) but end-to-end accuracy trails SOTA by ~17 points. The gap is in the answerer, not retrieval — 88% of wrong answers have correct context in the retrieved chunks.
-
-**Caveat:** Not directly comparable. MemMachine uses the Mem0 LoCoMo evaluation protocol with a more generous LLM judge that skips category 5. engram uses a stricter judge (rejects partial list answers, requires resolved dates). We report SOTA numbers as external reference until both systems are evaluated under the same protocol.
-
-### Reproducing
-
 ```bash
-# Retrieval only (fast, no LLM judge):
-engram bench longmemeval --json                          # full 500
+engram bench longmemeval --json                          # full 500, retrieval only
 engram bench longmemeval --limit 50 --json               # first 50
-engram bench mini --json                                 # 10-question smoke
-engram bench scientific-mini --json                      # evidence compiler/retrieval smoke
-
-# End-to-end QA (requires OPENROUTER_API_KEY for answerer + judge):
-engram bench locomo-qa --limit 50 --json                 # ~3-8 minutes
-engram bench longmemeval-qa --limit 20 --json            # ~50 minutes
-
-# Cross-model judge validation:
-engram bench locomo-qa --limit 50 --judge anthropic/claude-sonnet-4.6 --json
-
-# Every run saves a timestamped report to benchmarks/
-ls benchmarks/
+engram bench mini --json                                 # 10-question offline smoke
+engram bench scientific-mini --json                      # cited-evidence compiler/retrieval smoke (offline, deterministic)
 ```
 
-All runs log full per-question detail, token counts, model IDs, gold evidence retrieval metrics, and judge verdicts to [`benchmarks/`](benchmarks/) for audit.
+All runs log full per-question detail, token counts, model IDs, retrieval metrics, and judge verdicts to [`benchmarks/`](benchmarks/) for audit. Datasets must be downloaded first (the CLI prints the exact `curl` command on first run).
 
-### Additional benchmarks (April 2026)
+### Additional benchmarks
 
 | Suite | Status | Source | Notes |
 |---|---|---|---|
 | `locomo-plus` | wired | [xjtuleeyf/Locomo-Plus](https://github.com/xjtuleeyf/Locomo-Plus) | 401 cognitive cue/trigger pairs. SOTA: gemini-2.5-pro 26%. Binary judge. |
 | `mab` (`accurate_retrieval`) | wired | [HUST-AI-HYZ/MemoryAgentBench](https://github.com/HUST-AI-HYZ/MemoryAgentBench) | 22 rows, ~1500 retrieval questions. |
 | `mab` (`test_time_learning`) | wired | same | 6 rows, MCC + movie rec |
-| `mab` (`long_range_understanding`) | partial | same | LLM-judge for DetectiveQA only; ∞Bench-Sum F1 not yet implemented |
+| `mab` (`long_range_understanding`) | wired | same | DetectiveQA LLM-judge + ∞Bench-Sum keypoint-F1 |
 | `mab` (`conflict_resolution`) | wired | same | Selective forgetting |
 | `scientific-mini` | wired | local fixture | Tiny cited evidence compiler + retrieval smoke. Offline/stub deterministic. |
 
-Run any of them with `engram bench <suite> --limit N`. Datasets must be downloaded first (commands printed by the CLI on first run).
+Run any of them with `engram bench <suite> --limit N`.
 
 ## Install
 
@@ -137,24 +163,24 @@ cd engram-cli
 cargo install --path crates/engram-cli --locked
 ```
 
-One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.1.4`.
+One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.1.5`.
 
 ### Package manager status
 
-Live install paths:
-
-```bash
-cargo install paperfoot-engram --locked
-brew install paperfoot/tap/engram
-```
-
-Source install from this repository also works:
+**Live today — source install from this repository:**
 
 ```bash
 cargo install --path crates/engram-cli --locked
 ```
 
-`engram update --check --json` reports the current/latest version, detected install source, release URL, and runnable upgrade command. `engram update --json` runs the package-manager update only when `update.mode=auto` and an update is available. Configure with `update.mode`, `update.channel`, and optional `update.install_source` (or the matching `ENGRAM_UPDATE_*` env vars). The crates.io package name is `paperfoot-engram` because `engram-cli` is already owned by another project on crates.io.
+**Planned (not yet published — no crates.io release or Homebrew tap exists yet):**
+
+```bash
+cargo install engram --locked                        # planned
+brew install paperfoot/tap/engram           # planned
+```
+
+`engram update --check --json` reports the current/latest version, detected install source, release URL, and runnable upgrade command. `engram update --json` runs the package-manager update only when `update.mode=auto` and an update is available. Configure with `update.mode`, `update.channel`, and optional `update.install_source` (or the matching `ENGRAM_UPDATE_*` env vars). The crates.io package name is `engram` because `engram-cli` is already owned by another project on crates.io.
 
 ### Configure keys
 
@@ -246,7 +272,7 @@ engram budget set --kb ageing-biology --daily-usd 5 --monthly-usd 100
 
 Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25, claim/entity search, graph expansion, and Cohere `rerank-v4.0-pro` when configured. The reranker sees a wide candidate pool (`cloud_quality` default 200, tunable via `ENGRAM_RERANK_CANDIDATES`), and the returned results are capped to at most N chunks per source document (default 2, tunable via `ENGRAM_RERANK_MAX_PER_DOC`; `0` = legacy/unlimited) so a few near-duplicate passages from one document cannot crowd out other sources. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
 
-`engram usage` summarizes recorded cloud usage by provider, operation, model, KB, estimated input/output tokens, Cohere search units, and estimated cost. Gemini embedding token counts use a local chars/4 estimate. Cohere is tracked as `search_units`; set `ENGRAM_COHERE_RERANK_USD_PER_SEARCH` if you want local dollar estimates. `engram budget` adds local daily/monthly guardrails; provider invoices remain the source of truth.
+`engram usage` summarizes recorded cloud usage by provider, operation, model, KB, estimated input/output tokens, Cohere search units, and estimated cost. Gemini embedding token counts use a local chars/4 estimate. Cohere is tracked as `search_units`; set `ENGRAM_COHERE_RERANK_USD_PER_SEARCH` if you want local dollar estimates. `engram budget` sets local daily/monthly guardrails that are **enforced**: before any paid embed/rerank/LLM call, `recall`, `ingest`, and `compile --llm` check recorded spend against the cap and refuse with exit code 4 when it's reached (override for one run with `ENGRAM_BUDGET_ENFORCE=off`). The gate reads recorded usage *estimates*; provider invoices remain the source of truth.
 
 ### Domain recipes
 
@@ -371,14 +397,14 @@ Cargo workspace layout:
 
 | Crate | Purpose |
 |---|---|
-| `engram-core` (`paperfoot-engram-core` on crates.io) | Pure types, fusion (RRF), memory layers, temporal validity. Zero I/O. |
-| `engram-storage` (`paperfoot-engram-storage`) | SQLite source of truth + FTS5 + chunk-embedding BLOBs + KB/claim/entity/wiki tables. |
-| `engram-embed` (`paperfoot-engram-embed`) | `Embedder` trait + Gemini Embed 2 (batch + single) + deterministic offline stub. |
-| `engram-rerank` (`paperfoot-engram-rerank`) | `Reranker` trait + Cohere Rerank 4 (default `rerank-v4.0-pro`, env-overridable) + passthrough. |
-| `engram-ingest` (`paperfoot-engram-ingest`) | Mining modes: papers (PDF + section-aware), takeaways, conversations, repos, general, auto. |
-| `engram-graph` (`paperfoot-engram-graph`) | Deterministic entity extraction + SQLite graph expansion. |
-| `engram-bench` (`paperfoot-engram-bench`) | LongMemEval + LoCoMo-QA harness + strict LLM judge + gold evidence retrieval metrics. |
-| `engram-cli` (`paperfoot-engram`) | The single `engram` binary and the shared hybrid retrieval pipeline. |
+| `engram-core` (`engram-core` on crates.io) | Pure types, fusion (RRF), memory layers, temporal validity. Zero I/O. |
+| `engram-storage` (`engram-storage`) | SQLite source of truth + FTS5 + chunk-embedding BLOBs + KB/claim/entity/wiki tables. |
+| `engram-embed` (`engram-embed`) | `Embedder` trait + Gemini Embed 2 (batch + single) + deterministic offline stub. |
+| `engram-rerank` (`engram-rerank`) | `Reranker` trait + Cohere Rerank 4 (default `rerank-v4.0-pro`, env-overridable) + passthrough. |
+| `engram-ingest` (`engram-ingest`) | Mining modes: papers (PDF + section-aware), takeaways, conversations, repos, general, auto. |
+| `engram-graph` (`engram-graph`) | Deterministic entity extraction + SQLite graph expansion. |
+| `engram-bench` (`engram-bench`) | Hallucination-resistance harness: LitQA2 (precision-with-abstention), BEIR-sci (nDCG@10), BioGen CSR + ALCE citation P/R, RAGAS faithfulness, plus LongMemEval / LoCoMo-Plus retrieval+QA and the strict LLM judge. |
+| `engram-cli` (`engram`) | The single `engram` binary and the shared hybrid retrieval pipeline. |
 
 ## Framework compliance
 
@@ -404,7 +430,8 @@ ingest.require_scope true`, `ingest.include`, `ingest.exclude`, and
 | | |
 |---|---|
 | `engram kb create/list/show/delete` | Manage domain knowledge bases |
-| `engram remember <content>` | Store a memory. Flags: `--importance 0-10`, `--tag` (repeatable), `--diary`, `--kb` |
+| `engram remember <content>` | Store a memory. Flags: `--importance 0-10`, `--tag` (repeatable), `--diary`, `--kb`, `--extract-facts`, `--facts-json '<array>'` (store known triples with zero LLM cost), `--autonomy full\|assisted\|strict`, `--allow-duplicate`. Identical content in the same kb/diary is deduplicated (no second embedding) unless `--allow-duplicate`. |
+| `engram facts list \| show <subject> \| conflicts [--open] \| resolve <id> --action <a>` | Browse the fact store and contradiction record; `--open` lists contested (unresolved) conflicts; `resolve` records the calling agent's verdict |
 | `engram recall <query>` | Hybrid search. Flags: `--kb`, `--mode evidence\|raw\|wiki\|explore\|agent`, `--profile cloud_quality\|fast\|offline`, `--top-k`, `--allow-mixed-embeddings` |
 | `engram research <query>` | Evidence-first research retrieval. Returns query plan, evidence leads, answer context, and citation-readiness checks |
 | `engram ingest <path>` | Mine one file, or a scoped directory. `--mode papers\|takeaways\|conversations\|repos\|general\|auto`, `--compile evidence`, `--dry-run`, `--include`, `--exclude`, `--max-files`, `--all` |
@@ -422,7 +449,7 @@ ingest.require_scope true`, `ingest.include`, `ingest.exclude`, and
 | `engram forget <id> --confirm` | Soft-delete (destructive, requires `--confirm`) |
 | `engram entities list \| show <name>` | Browse extracted entities |
 | `engram export` / `engram import <file>` | JSON backup / restore |
-| `engram bench <suite>` | Run benchmarks. Suites: `mini`, `mini-fts`, `scientific-mini`, `longmemeval`, `longmemeval-qa`, `locomo-qa`, `locomo-plus`, `mab` |
+| `engram bench <suite>` | Run benchmarks. Suites: `mini`, `mini-fts`, `scientific-mini`, `longmemeval`, `longmemeval-qa`, `locomo-plus`, `mab`, `litqa2`, `beir`, `biogen` |
 | `engram config show \| set \| check` | Configuration |
 | `engram skill install \| package \| uninstall` | Deploy/package the agent skill |
 | `engram agent-info` | Self-describing manifest (start here) |
@@ -441,7 +468,7 @@ The daemon is local-only by default and uses the same SQLite store and retrieval
 
 ```bash
 cargo build --release                         # build
-cargo test                                    # unit + integration suite (64 unit tests run offline; integration needs keys)
+cargo test                                    # unit + integration suite (165 unit tests run offline; integration needs keys)
 ./target/release/engram bench mini --json     # fast smoke bench (<1s)
 ./target/release/engram bench scientific-mini --json
 ./target/release/engram bench longmemeval     # real benchmark (~5 min with Cohere)
@@ -455,6 +482,7 @@ Research direction for contributors: [`program.md`](program.md). Design rational
 - Single-binary install, hybrid Gemini Embedding 2 + FTS5 + RRF + Cohere retrieval
 - Persistent SQLite store with chunk-embedding BLOBs and KB/domain evidence tables
 - Full CRUD (`remember`, `recall`, `edit`, `forget`, `export`, `import`)
+- Write-path v2: semantic supersession (predicate canonicalization + subject alias/fuzzy cascade + embedding novelty gate), typed facts with bi-temporal validity, slot policies (last-writer-wins vs never-auto-supersede safety slots), and cooperative adjudication (`--autonomy`, `adjudication_needed`, `facts conflicts --open`, `facts resolve`)
 - KB CRUD, reindex, doctor, generated wiki pages, and local daemon/API
 - Mining modes for papers, takeaways, conversations, repos, general
 - PDF ingestion with section-aware chunking
@@ -464,21 +492,28 @@ Research direction for contributors: [`program.md`](program.md). Design rational
 - Entity extraction, graph browsing, and graph expansion during recall
 - Document/job/budget UX plus local daemon endpoints for KBs, recall, research, compile, reindex, documents, entities, jobs, usage, and budgets
 - Optional LLM compiler pass: Gemini 3.1 Flash-Lite Preview extraction + Gemini 3.1 Pro Preview synthesis via OpenRouter
-- LongMemEval + LoCoMo-QA harness with strict evaluation
+- Hallucination-resistance harness (loaders + scorers + unit tests): LitQA2 precision-with-abstention, BEIR-sci nDCG@10, BioGen CSR, ALCE citation P/R, repaired RAGAS faithfulness
+- LongMemEval + LoCoMo-Plus retrieval/QA harness with strict evaluation
 - `scientific-mini` evidence compiler benchmark
 - Unit + integration test suite (run with `cargo test`)
 
 **Next up**
-- Strict benchmark suite: buried-needle, multi-hop, temporal reasoning, adversarial, and attribution tests
-- Contradiction detection and resolution (temporal validity windows + provenance)
-- GitHub Actions CI releasing prebuilt macOS + Linux binaries
+- Close the answerer gap: LitQA2 full-text accuracy is answerer-limited — 90.7% given a retrieval hit, while retrieval surfaces the right passage 97% of the time — so the lever is answer interpretation (chain-of-thought / quote-the-span / self-verify prompts, and head-to-head answerer models)
+- Harder retrieval eval: a full open-access-paper corpus, instead of the curated key-passage corpus, to measure the retriever's ceiling under realistic haystack
+- A runnable `engram bench citation` suite (the ALCE scorer is implemented in `citation.rs`; it needs a CLI subcommand)
+- Chunk-level contradiction detection ("which paper overturned which") — fact-level supersession is shipped (`recall` `conflicts`, `facts conflicts`, KB-scoped over `remember --extract-facts` and `compile --llm`); extending it to disagreements *between retrieved chunks* is next
+- GitHub Actions CI releasing prebuilt macOS + Linux binaries; a real crates.io release + Homebrew tap (install today is source-only via `cargo install --path`)
 - Local embedding fallback via `candle` + `bge-small-en-v1.5` (zero API, p95 < 10 ms)
 
 ## Credits
 
 - **[HippoRAG 2](https://github.com/OSU-NLP-Group/HippoRAG)** — "return verbatim passages, don't paraphrase"
-- **[LongMemEval](https://github.com/xiaowu0162/LongMemEval)** — the retrieval benchmark
-- **[LoCoMo](https://snap-research.github.io/locomo/)** — the conversational QA benchmark
+- **[LitQA2 / PaperQA2](https://arxiv.org/abs/2409.13740)** + **[AstaBench](https://arxiv.org/abs/2510.21652)** — scientific-QA with abstention; AstaBench is the peer anchor
+- **[BEIR](https://arxiv.org/abs/2104.08663)** — heterogeneous scientific retrieval (nDCG@10)
+- **[TREC BioGen](https://arxiv.org/abs/2411.18069)** + **[ALCE](https://arxiv.org/abs/2305.14627)** — citation support rate and citation precision/recall
+- **[RAGAS](https://arxiv.org/abs/2309.15217)** — reference-free faithfulness
+- **[LongMemEval](https://github.com/xiaowu0162/LongMemEval)** — the conversational retrieval benchmark
+- **[LoCoMo](https://snap-research.github.io/locomo/)** — the conversational QA dataset behind LoCoMo-Plus
 - **[Cohere Rerank](https://docs.cohere.com/docs/reranking)** — cloud reranking for the default profile
 - **[agent-cli-framework](https://github.com/paperfoot/agent-cli-framework)** — the principles engram follows
 
@@ -488,5 +523,5 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-Built by **[Paperfot AI (SG) Pte Ltd](https://github.com/199-biotechnologies)**.
+Built by **[paperfoot](https://github.com/paperfoot)**.
 Questions? Open an issue. Pull requests welcome.

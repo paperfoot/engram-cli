@@ -12,36 +12,287 @@ use engram_embed::stub::StubEmbedder;
 use engram_llm::openrouter::OpenRouterClient;
 use serde_json::json;
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    ctx: &AppContext,
-    suite: String,
-    mab_split: String,
-    download: bool,
-    limit: Option<usize>,
-    answerer: String,
-    judge: String,
-    ragas: bool,
-    top_k: usize,
-    save: Option<std::path::PathBuf>,
-) -> Result<(), CliError> {
-    match suite.as_str() {
+/// Flattened `bench` CLI arguments. Carrying these in one struct keeps the
+/// dispatcher signature small (and clippy happy) now that several suites add
+/// their own flags (`--mode`, `--kb`, `--corpus`, `--dataset`, `--rerank`,
+/// `--year`); each suite reads only the fields it needs.
+#[derive(Debug)]
+pub struct BenchArgs {
+    pub suite: String,
+    pub mab_split: String,
+    pub download: bool,
+    pub limit: Option<usize>,
+    pub answerer: String,
+    pub judge: String,
+    pub ragas: bool,
+    pub top_k: usize,
+    pub save: Option<std::path::PathBuf>,
+    pub mode: String,
+    pub kb: Option<String>,
+    pub corpus: Option<std::path::PathBuf>,
+    pub dataset: String,
+    pub rerank: String,
+    pub year: String,
+}
+
+pub async fn run(ctx: &AppContext, args: BenchArgs) -> Result<(), CliError> {
+    match args.suite.as_str() {
         "mini" => run_mini(ctx).await,
         "mini-fts" => run_mini_fts(ctx),
         "scientific-mini" | "science-mini" => run_scientific_mini(ctx).await,
-        "longmemeval" => run_longmemeval(ctx, download, limit).await,
+        "longmemeval" => run_longmemeval(ctx, args.download, args.limit).await,
         "longmemeval-qa" | "lme-qa" => {
-            run_longmemeval_qa(ctx, limit, answerer, judge, ragas, top_k, save).await
+            run_longmemeval_qa(
+                ctx,
+                args.limit,
+                args.answerer,
+                args.judge,
+                args.ragas,
+                top_k_or(args.top_k, QA_DEFAULT_TOP_K),
+                args.save,
+            )
+            .await
         }
-        "locomo-qa" => run_locomo_qa(ctx, limit, answerer, judge, ragas, top_k, save).await,
         "locomo-plus" | "locomo-plus-qa" => {
-            run_locomo_plus_qa(ctx, limit, answerer, judge, ragas, top_k, save).await
+            run_locomo_plus_qa(
+                ctx,
+                args.limit,
+                args.answerer,
+                args.judge,
+                args.ragas,
+                top_k_or(args.top_k, QA_DEFAULT_TOP_K),
+                args.save,
+            )
+            .await
         }
         "memoryagentbench" | "mab" => {
-            run_memoryagentbench_qa(ctx, mab_split, limit, answerer, judge, top_k, save).await
+            run_memoryagentbench_qa(
+                ctx,
+                args.mab_split,
+                args.limit,
+                args.answerer,
+                args.judge,
+                top_k_or(args.top_k, QA_DEFAULT_TOP_K),
+                args.save,
+            )
+            .await
+        }
+        "litqa2" => {
+            run_litqa2(
+                ctx,
+                args.mode,
+                args.limit,
+                args.kb,
+                args.corpus,
+                top_k_or(args.top_k, LITQA2_DEFAULT_TOP_K),
+                args.answerer,
+                args.judge,
+                args.save,
+            )
+            .await
+        }
+        "beir" => {
+            run_beir(
+                ctx,
+                args.dataset,
+                args.rerank,
+                top_k_or(args.top_k, BEIR_DEFAULT_TOP_K),
+                args.save,
+            )
+            .await
+        }
+        "biogen" => {
+            run_biogen(
+                ctx,
+                args.year,
+                args.kb,
+                args.corpus,
+                top_k_or(args.top_k, QA_DEFAULT_TOP_K),
+                args.answerer,
+                args.judge,
+                args.save,
+            )
+            .await
         }
         other => Err(CliError::BadInput(format!("unknown suite: {other}"))),
     }
+}
+
+/// Per-suite default retrieval/context pool size for the answerer QA suites.
+const QA_DEFAULT_TOP_K: usize = 5;
+/// Default top-k for LitQA2 full-text retrieval (PaperQA2 uses a wide pool).
+const LITQA2_DEFAULT_TOP_K: usize = 30;
+/// Default top-k for BEIR retrieval rows.
+const BEIR_DEFAULT_TOP_K: usize = 30;
+
+/// Resolve the effective top-k: a `--top-k 0` (the "auto" sentinel) selects the
+/// suite default; any explicit positive value is used verbatim.
+fn top_k_or(value: usize, default: usize) -> usize {
+    if value == 0 {
+        default
+    } else {
+        value
+    }
+}
+
+/// Build a retrieval corpus (doc-id -> full text) from either an ingested KB or a
+/// corpus file. Exactly one of `kb` / `corpus` must be supplied.
+///
+/// - KB: chunks are read via [`SqliteStore::list_chunks_for_kb`], grouped by
+///   their document, joined in position order, and keyed by the document's DOI
+///   when present (so it lines up with LitQA2 `target_doi`), else by the
+///   document title / id.
+/// - file: a JSON object `{ "<id>": "<text>", ... }`, a JSON array of
+///   `{ _id|id|doi, text|abstract|contents }` rows, or the same one-per-line as
+///   JSONL (the BEIR `corpus.jsonl` shape).
+fn build_corpus(
+    ctx: &AppContext,
+    kb: Option<&str>,
+    corpus_path: Option<&std::path::Path>,
+) -> Result<std::collections::HashMap<String, String>, CliError> {
+    match (kb, corpus_path) {
+        (Some(_), Some(_)) => Err(CliError::BadInput(
+            "pass only one of --kb or --corpus, not both".into(),
+        )),
+        (None, None) => Err(CliError::BadInput(
+            "full-text retrieval requires --kb <name> or --corpus <file>".into(),
+        )),
+        (Some(kb), None) => build_corpus_from_kb(ctx, kb),
+        (None, Some(path)) => load_corpus_file(path),
+    }
+}
+
+fn build_corpus_from_kb(
+    ctx: &AppContext,
+    kb: &str,
+) -> Result<std::collections::HashMap<String, String>, CliError> {
+    use std::collections::HashMap;
+    // document_id -> stable corpus key (DOI when available, else title/id).
+    let mut doc_key: HashMap<uuid::Uuid, String> = HashMap::new();
+    for doc in ctx.store.list_documents(Some(kb), 1_000_000)? {
+        let key = doc
+            .doi
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| {
+                if doc.title.trim().is_empty() {
+                    doc.id.to_string()
+                } else {
+                    doc.title.clone()
+                }
+            });
+        doc_key.insert(doc.id, key);
+    }
+
+    // Chunks come back ordered by (position, id); concatenate per corpus key.
+    let mut corpus: HashMap<String, String> = HashMap::new();
+    for chunk in ctx.store.list_chunks_for_kb(kb)? {
+        let key = match chunk.document_id.and_then(|id| doc_key.get(&id).cloned()) {
+            Some(k) => k,
+            // Chunks with no document row fall back to their memory id so they
+            // still contribute a (singleton) corpus entry rather than vanishing.
+            None => chunk.memory_id.to_string(),
+        };
+        let entry = corpus.entry(key).or_default();
+        if !entry.is_empty() {
+            entry.push_str("\n\n");
+        }
+        entry.push_str(&chunk.content);
+    }
+
+    if corpus.is_empty() {
+        return Err(CliError::Config(format!(
+            "KB '{kb}' has no ingested chunks — ingest documents first or pass --corpus"
+        )));
+    }
+    Ok(corpus)
+}
+
+fn load_corpus_file(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<String, String>, CliError> {
+    use std::collections::HashMap;
+    if !path.exists() {
+        return Err(CliError::Config(format!(
+            "corpus file not found: {}",
+            path.display()
+        )));
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let trimmed = contents.trim_start();
+
+    // Pull (id, text) out of a corpus row object under any of the common keys.
+    fn row_to_pair(v: &serde_json::Value) -> Option<(String, String)> {
+        let obj = v.as_object()?;
+        let id = obj
+            .get("_id")
+            .or_else(|| obj.get("id"))
+            .or_else(|| obj.get("doi"))
+            .or_else(|| obj.get("doc_id"))
+            .map(|x| match x {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })?;
+        let title = obj.get("title").and_then(|x| x.as_str()).unwrap_or("");
+        let text = obj
+            .get("text")
+            .or_else(|| obj.get("abstract"))
+            .or_else(|| obj.get("contents"))
+            .or_else(|| obj.get("content"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let body = if title.trim().is_empty() {
+            text.to_string()
+        } else {
+            format!("{title}\n{text}")
+        };
+        Some((id, body))
+    }
+
+    let mut corpus: HashMap<String, String> = HashMap::new();
+    if trimmed.starts_with('{') {
+        // Could be a flat {id: text} map OR a single corpus-row object.
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|e| CliError::Config(format!("failed to parse {}: {e}", path.display())))?;
+        if let Some((id, body)) = row_to_pair(&value) {
+            corpus.insert(id, body);
+        } else if let Some(map) = value.as_object() {
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    corpus.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+    } else if trimmed.starts_with('[') {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(trimmed)
+            .map_err(|e| CliError::Config(format!("failed to parse {}: {e}", path.display())))?;
+        for v in &rows {
+            if let Some((id, body)) = row_to_pair(v) {
+                corpus.insert(id, body);
+            }
+        }
+    } else {
+        // JSONL: one corpus-row object per non-empty line.
+        for (idx, line) in contents.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+                CliError::Config(format!("{} line {}: {e}", path.display(), idx + 1))
+            })?;
+            if let Some((id, body)) = row_to_pair(&v) {
+                corpus.insert(id, body);
+            }
+        }
+    }
+
+    if corpus.is_empty() {
+        return Err(CliError::Config(format!(
+            "corpus file {} produced 0 documents",
+            path.display()
+        )));
+    }
+    Ok(corpus)
 }
 
 async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
@@ -152,7 +403,8 @@ async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
                 filters: Filters {
                     diary: Some("default".to_string()),
                     kb: Some(kb.to_string()),
-                    valid_at: None,
+                    since: None,
+                    until: None,
                 },
                 mode: RecallMode::Evidence,
                 graph_hops: 1,
@@ -379,179 +631,6 @@ async fn run_longmemeval_qa(
         "judge_prompt_tokens": report.judge_total_prompt_tokens,
         "judge_completion_tokens": report.judge_total_completion_tokens,
         "by_question_type": report.by_question_type,
-        "saved_to": save_path.to_string_lossy(),
-    });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
-        println!("{}", serde_json::to_string_pretty(data).unwrap())
-    });
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_locomo_qa(
-    ctx: &AppContext,
-    limit: Option<usize>,
-    answerer_model: String,
-    judge_model: String,
-    ragas: bool,
-    top_k: usize,
-    save: Option<std::path::PathBuf>,
-) -> Result<(), CliError> {
-    use engram_bench::locomo::{default_path, LocomoDataset};
-    use engram_bench::qa::run_locomo_qa as run_qa;
-    use engram_rerank::cohere::CohereReranker;
-    use engram_rerank::passthrough::PassthroughReranker;
-    use engram_rerank::zerank_local::ZerankLocalReranker;
-
-    let path = default_path();
-    if !path.exists() {
-        return Err(CliError::Config(format!(
-            "LoCoMo not found at {}. Download with: mkdir -p data/locomo && \
-             curl -sL 'https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json' \
-             -o {}",
-            path.display(),
-            path.display()
-        )));
-    }
-    let dataset = LocomoDataset::load_from_file(&path)?;
-
-    let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60.0);
-
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
-        .ok_or_else(|| CliError::Config("GEMINI_API_KEY not set — required for QA bench".into()))?;
-    let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
-    let openrouter_key =
-        crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
-            .ok_or_else(|| {
-                CliError::Config(
-                    "OPENROUTER_API_KEY not set — required for LLM answerer + judge".into(),
-                )
-            })?;
-
-    let mut embedder = GeminiEmbedder::new(gemini_key);
-    if let Ok(model) = std::env::var("GEMINI_EMBED_MODEL") {
-        embedder = embedder.with_model(model);
-    }
-    let answerer = OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
-    let judge = OpenRouterClient::new(openrouter_key).with_model(judge_model.clone());
-
-    // Determine save path + per-question checkpoint up front so we can pass
-    // the checkpoint into run_qa(). The checkpoint sits next to the final
-    // report path with a .checkpoint.jsonl extension.
-    let benchmarks_dir = std::path::PathBuf::from("benchmarks");
-    let _ = std::fs::create_dir_all(&benchmarks_dir);
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-    let default_name = benchmarks_dir.join(format!("locomo-qa-{}.json", timestamp));
-    let save_path = save.unwrap_or(default_name);
-    let checkpoint_path = save_path.with_extension("checkpoint.jsonl");
-
-    // Run LoCoMo through the SAME hybrid pipeline as LongMemEval-QA:
-    // dense (Gemini Embed 2) + FTS5 BM25 + RRF fusion + optional reranker.
-    //
-    // Reranker provider is controlled by ENGRAM_RERANK_PROVIDER:
-    //   - "zerank2" : local zerank-2 sidecar (best quality on biomed/STEM)
-    //   - "cohere"  : Cohere Rerank 4 / rerank-v4.0-pro (default if COHERE_API_KEY set)
-    //   - "none"    : passthrough (no rerank)
-    let provider = std::env::var("ENGRAM_RERANK_PROVIDER").unwrap_or_else(|_| {
-        if cohere_key.is_some() {
-            "cohere".to_string()
-        } else {
-            "none".to_string()
-        }
-    });
-    let report = match provider.as_str() {
-        "zerank2" | "zerank-2" | "zerank_local" | "local" => {
-            let reranker = ZerankLocalReranker::new();
-            // Fail fast if the sidecar isn't reachable.
-            if !reranker.health_check().await.unwrap_or(false) {
-                return Err(CliError::Config(
-                    "ENGRAM_RERANK_PROVIDER=zerank2 but the sidecar is not reachable. \
-                     Start it with: uv run --with sentence-transformers --with torch \
-                     crates/engram-rerank/python/zerank_server.py"
-                        .into(),
-                ));
-            }
-            run_qa(
-                &dataset,
-                &embedder,
-                Some(&reranker),
-                &answerer,
-                &judge,
-                rrf_k,
-                top_k,
-                limit,
-                ragas,
-                Some(checkpoint_path.clone()),
-            )
-            .await?
-        }
-        "cohere" => {
-            let cohere = cohere_key.ok_or_else(|| {
-                CliError::Config("ENGRAM_RERANK_PROVIDER=cohere but COHERE_API_KEY not set".into())
-            })?;
-            let reranker = CohereReranker::new(cohere);
-            run_qa(
-                &dataset,
-                &embedder,
-                Some(&reranker),
-                &answerer,
-                &judge,
-                rrf_k,
-                top_k,
-                limit,
-                ragas,
-                Some(checkpoint_path.clone()),
-            )
-            .await?
-        }
-        "none" | "passthrough" | "off" => {
-            let no_rerank: Option<&PassthroughReranker> = None;
-            run_qa(
-                &dataset,
-                &embedder,
-                no_rerank,
-                &answerer,
-                &judge,
-                rrf_k,
-                top_k,
-                limit,
-                ragas,
-                Some(checkpoint_path.clone()),
-            )
-            .await?
-        }
-        other => {
-            return Err(CliError::BadInput(format!(
-                "unknown ENGRAM_RERANK_PROVIDER={other} (expected: zerank2 | cohere | none)"
-            )));
-        }
-    };
-
-    // Final transactional report (only written on full success).
-    if let Some(parent) = save_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&save_path, serde_json::to_string_pretty(&report)?)?;
-
-    let payload = json!({
-        "suite": "locomo-qa",
-        "questions_evaluated": report.questions_evaluated,
-        "accuracy": report.accuracy,
-        "correct": report.correct_count,
-        "ragas": report.ragas,
-        "mean_latency_ms": report.mean_latency_ms,
-        "p50_latency_ms": report.p50_latency_ms,
-        "p95_latency_ms": report.p95_latency_ms,
-        "answerer_model": answerer_model,
-        "judge_model": judge_model,
-        "answerer_prompt_tokens": report.answerer_total_prompt_tokens,
-        "answerer_completion_tokens": report.answerer_total_completion_tokens,
-        "judge_prompt_tokens": report.judge_total_prompt_tokens,
-        "judge_completion_tokens": report.judge_total_completion_tokens,
-        "by_category": report.by_question_type,
         "saved_to": save_path.to_string_lossy(),
     });
     print_success(ctx.format, payload, Metadata::default(), |data| {
@@ -891,6 +970,540 @@ async fn run_memoryagentbench_qa(
         "judge_completion_tokens": report.judge_total_completion_tokens,
         "by_question_type": report.by_question_type,
         "by_source": report.by_source,
+        "notes": report.notes,
+        "saved_to": save_path.to_string_lossy(),
+    });
+    print_success(ctx.format, payload, Metadata::default(), |data| {
+        println!("{}", serde_json::to_string_pretty(data).unwrap())
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_litqa2(
+    ctx: &AppContext,
+    mode_str: String,
+    limit: Option<usize>,
+    kb: Option<String>,
+    corpus_path: Option<std::path::PathBuf>,
+    top_k: usize,
+    answerer_model: String,
+    judge_model: String,
+    save: Option<std::path::PathBuf>,
+) -> Result<(), CliError> {
+    use engram_bench::litqa2::{default_path, LitQA2Dataset};
+    use engram_bench::qa::{run_litqa2_qa, LitQa2Mode};
+    use engram_rerank::passthrough::PassthroughReranker;
+
+    let mode = match mode_str.as_str() {
+        "closed-book" | "closed_book" | "closed" => LitQa2Mode::ClosedBook,
+        "fulltext" | "full-text" | "full_text" => LitQa2Mode::FullText,
+        other => {
+            return Err(CliError::BadInput(format!(
+                "unknown --mode {other} (expected: closed-book | fulltext)"
+            )))
+        }
+    };
+
+    let path = default_path();
+    if !path.exists() {
+        return Err(CliError::Config(format!(
+            "LitQA2 dataset not found at {}. The source dataset is GATED: first run \
+             `huggingface-cli login` and accept the terms at \
+             https://huggingface.co/datasets/futurehouse/lab-bench, then download with:\n\
+             huggingface-cli download futurehouse/lab-bench --repo-type dataset --include 'LitQA2*' --local-dir data/litqa2",
+            path.display()
+        )));
+    }
+    let dataset = LitQA2Dataset::load_from_file(&path)?;
+
+    // The judge model is reserved for future LitQA2 scoring hooks; choice
+    // grading is deterministic, so closed-book needs only the answerer API.
+    let _ = &judge_model;
+
+    let openrouter_key =
+        crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
+            .ok_or_else(|| {
+                CliError::Config("OPENROUTER_API_KEY not set — required for the LLM answerer".into())
+            })?;
+    let answerer =
+        OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
+
+    let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0);
+    let top_k = if top_k == 0 { LITQA2_DEFAULT_TOP_K } else { top_k };
+
+    // closed-book runs with NO embeddings / corpus; full-text builds the corpus
+    // and a Gemini embedder.
+    let corpus = match mode {
+        LitQa2Mode::ClosedBook => std::collections::HashMap::new(),
+        LitQa2Mode::FullText => build_corpus(ctx, kb.as_deref(), corpus_path.as_deref())?,
+    };
+
+    let benchmarks_dir = std::path::PathBuf::from("benchmarks");
+    let _ = std::fs::create_dir_all(&benchmarks_dir);
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let default_name = benchmarks_dir.join(format!("litqa2-{}-{}.json", mode_str, timestamp));
+    let save_path = save.unwrap_or(default_name);
+    let checkpoint_path = save_path.with_extension("checkpoint.jsonl");
+
+    let no_rerank: Option<&PassthroughReranker> = None;
+    let report = match mode {
+        LitQa2Mode::ClosedBook => {
+            // Closed-book: answerer only. Embedder is never invoked because the
+            // corpus is empty, but the generic call still needs a concrete type.
+            let embedder = StubEmbedder::default();
+            run_litqa2_qa(
+                &dataset,
+                &corpus,
+                mode,
+                &embedder,
+                no_rerank,
+                &answerer,
+                rrf_k,
+                top_k,
+                limit,
+                Some(checkpoint_path.clone()),
+            )
+            .await?
+        }
+        LitQa2Mode::FullText => {
+            let gemini_key =
+                crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
+                    .ok_or_else(|| {
+                        CliError::Config(
+                            "GEMINI_API_KEY not set — required for LitQA2 full-text retrieval".into(),
+                        )
+                    })?;
+            let mut embedder = GeminiEmbedder::new(gemini_key);
+            if let Ok(model) = std::env::var("GEMINI_EMBED_MODEL") {
+                embedder = embedder.with_model(model);
+            }
+            run_litqa2_qa(
+                &dataset,
+                &corpus,
+                mode,
+                &embedder,
+                no_rerank,
+                &answerer,
+                rrf_k,
+                top_k,
+                limit,
+                Some(checkpoint_path.clone()),
+            )
+            .await?
+        }
+    };
+
+    if let Some(parent) = save_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&save_path, serde_json::to_string_pretty(&report)?)?;
+
+    let s = &report.scores;
+    let payload = json!({
+        "suite": "litqa2",
+        "mode": report.mode,
+        "questions_evaluated": report.questions_evaluated,
+        "accuracy": s.accuracy,
+        "precision": s.precision,
+        // Strict precision counts empty/unparseable API responses as failed
+        // commitments (not safe abstentions), so a flaky API can't inflate the
+        // headline. Report both; no_response_rate exposes how much they differ.
+        "precision_strict": s.precision_strict,
+        "coverage": s.coverage,
+        "abstain_rate": s.abstain_rate,
+        "no_response_rate": s.no_response_rate,
+        "retrieval_success": s.retrieval_success,
+        "mean_latency_ms": report.mean_latency_ms,
+        "p50_latency_ms": report.p50_latency_ms,
+        "p95_latency_ms": report.p95_latency_ms,
+        "answerer_model": answerer_model,
+        "answerer_prompt_tokens": report.answerer_total_prompt_tokens,
+        "answerer_completion_tokens": report.answerer_total_completion_tokens,
+        "per_question": report.per_question,
+        "notes": report.notes,
+        "saved_to": save_path.to_string_lossy(),
+    });
+    print_success(ctx.format, payload, Metadata::default(), |data| {
+        println!("{}", serde_json::to_string_pretty(data).unwrap())
+    });
+    Ok(())
+}
+
+async fn run_beir(
+    ctx: &AppContext,
+    dataset_name: String,
+    rerank_str: String,
+    top_k: usize,
+    save: Option<std::path::PathBuf>,
+) -> Result<(), CliError> {
+    use chrono::TimeZone;
+    use engram_bench::beir::BeirDataset;
+    use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
+    use engram_core::types::{Memory, MemorySource, RetrievalSource};
+    use engram_embed::{Embedder, TaskMode};
+    use engram_rerank::cohere::CohereReranker;
+    use engram_rerank::{RerankCandidate, Reranker};
+    use engram_storage::SqliteStore;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    match dataset_name.as_str() {
+        "scifact" | "nfcorpus" | "trec-covid" | "scidocs" => {}
+        other => {
+            return Err(CliError::BadInput(format!(
+                "unknown --dataset {other} (expected: scifact | nfcorpus | trec-covid | scidocs)"
+            )))
+        }
+    }
+    let rerank_on = match rerank_str.as_str() {
+        "on" | "true" | "yes" => true,
+        "off" | "false" | "no" => false,
+        other => {
+            return Err(CliError::BadInput(format!(
+                "unknown --rerank {other} (expected: on | off)"
+            )))
+        }
+    };
+
+    let dir = std::path::PathBuf::from(format!("data/beir/{dataset_name}"));
+    if !dir.exists() {
+        return Err(CliError::Config(format!(
+            "BEIR dataset '{dataset_name}' not found at {}. Download with:\n\
+             uv run --with ir_datasets python scripts/download_beir.py {dataset_name}\n\
+             or fetch the BEIR release (corpus.jsonl, queries.jsonl, qrels/<split>.tsv) into {}",
+            dir.display(),
+            dir.display()
+        )));
+    }
+    let dataset = BeirDataset::load_from_dir(&dir)?;
+
+    let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0);
+    let top_k = if top_k == 0 { BEIR_DEFAULT_TOP_K } else { top_k };
+
+    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
+        .ok_or_else(|| {
+            CliError::Config("GEMINI_API_KEY not set — required for BEIR dense retrieval".into())
+        })?;
+    let mut embedder = GeminiEmbedder::new(gemini_key);
+    if let Ok(model) = std::env::var("GEMINI_EMBED_MODEL") {
+        embedder = embedder.with_model(model);
+    }
+    let reranker = if rerank_on {
+        let cohere = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere")
+            .ok_or_else(|| {
+                CliError::Config("--rerank on requires COHERE_API_KEY to be set".into())
+            })?;
+        Some(CohereReranker::new(cohere))
+    } else {
+        None
+    };
+
+    // Index the corpus once into an in-memory store, mirroring the bench crate's
+    // BEIR/QA retrieval plumbing (FTS5 lexical + dense cosine, fused with RRF).
+    let store = SqliteStore::open_in_memory()?;
+    let epoch = chrono::Utc.timestamp_opt(0, 0).single().unwrap();
+    let mut chunk_to_doc: HashMap<Uuid, String> = HashMap::new();
+    let mut chunk_embeddings: HashMap<Uuid, Vec<f32>> = HashMap::new();
+    let mut chunk_text: HashMap<Uuid, String> = HashMap::new();
+
+    let mut doc_ids: Vec<&String> = dataset.corpus.keys().collect();
+    doc_ids.sort_unstable();
+    let mut texts: Vec<String> = Vec::with_capacity(doc_ids.len());
+    let mut chunk_ids: Vec<Uuid> = Vec::with_capacity(doc_ids.len());
+    for doc_id in &doc_ids {
+        let (title, text) = &dataset.corpus[*doc_id];
+        let blob = if title.trim().is_empty() {
+            text.clone()
+        } else {
+            format!("{title}\n{text}")
+        };
+        let mem_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, format!("beir-mem:{doc_id}").as_bytes());
+        let chunk_id =
+            Uuid::new_v5(&Uuid::NAMESPACE_DNS, format!("beir-chunk:{doc_id}").as_bytes());
+        let m = Memory {
+            id: mem_id,
+            content: blob.clone(),
+            created_at: epoch,
+            event_time: None,
+            importance: 5,
+            emotional_weight: 0,
+            access_count: 0,
+            last_accessed: None,
+            stability: 1.0,
+            source: MemorySource::Conversation {
+                thread: (*doc_id).clone(),
+                turn: 0,
+            },
+            diary: "beir".into(),
+            valid_from: None,
+            valid_until: None,
+            tags: vec![],
+        };
+        store.insert_memory(&m)?;
+        store.insert_chunk(chunk_id, mem_id, &blob, 0, None)?;
+        chunk_to_doc.insert(chunk_id, (*doc_id).clone());
+        chunk_text.insert(chunk_id, blob.clone());
+        texts.push(blob);
+        chunk_ids.push(chunk_id);
+    }
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let doc_vecs = embedder
+        .embed_batch(&text_refs, TaskMode::RetrievalDocument)
+        .await?;
+    for (chunk_id, vec) in chunk_ids.iter().zip(doc_vecs) {
+        chunk_embeddings.insert(*chunk_id, vec);
+    }
+
+    // Two rankings per query: BM25-only (lexical) and hybrid (RRF of lexical +
+    // dense), with an optional rerank applied to the hybrid pool.
+    let mut bm25_rankings: HashMap<String, Vec<String>> = HashMap::new();
+    let mut hybrid_rankings: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (qid, qtext) in dataset.queries.iter() {
+        let fts_q = engram_bench::mini::build_fts_query(qtext);
+        let fts_hits = if fts_q.is_empty() {
+            Vec::new()
+        } else {
+            store.fts_search(&fts_q, 100).unwrap_or_default()
+        };
+        let bm25_ranked: Vec<String> = fts_hits
+            .iter()
+            .filter_map(|(id, _)| chunk_to_doc.get(id).cloned())
+            .collect();
+        bm25_rankings.insert(qid.clone(), bm25_ranked);
+
+        let lexical_run: Vec<RankedHit> = fts_hits
+            .iter()
+            .enumerate()
+            .map(|(i, (id, score))| RankedHit {
+                chunk_id: *id,
+                rank: i + 1,
+                raw_score: *score,
+                source: RetrievalSource::Lexical,
+            })
+            .collect();
+
+        let q_emb = embedder.embed_one(qtext, TaskMode::RetrievalQuery).await?;
+        let mut dense_scored: Vec<(Uuid, f32)> = chunk_embeddings
+            .iter()
+            .map(|(cid, emb)| {
+                let mut dot = 0f32;
+                let mut na = 0f32;
+                let mut nb = 0f32;
+                for (x, y) in q_emb.iter().zip(emb.iter()) {
+                    dot += x * y;
+                    na += x * x;
+                    nb += y * y;
+                }
+                let sim = if na == 0.0 || nb == 0.0 {
+                    0.0
+                } else {
+                    dot / (na.sqrt() * nb.sqrt())
+                };
+                (*cid, sim)
+            })
+            .collect();
+        dense_scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let dense_run: Vec<RankedHit> = dense_scored
+            .iter()
+            .take(100)
+            .enumerate()
+            .map(|(i, (id, score))| RankedHit {
+                chunk_id: *id,
+                rank: i + 1,
+                raw_score: *score,
+                source: RetrievalSource::Dense,
+            })
+            .collect();
+
+        let fused = reciprocal_rank_fusion(&[lexical_run, dense_run], rrf_k);
+        let hybrid_ranked: Vec<String> = if let Some(ref r) = reranker {
+            let cands: Vec<RerankCandidate> = fused
+                .iter()
+                .take(top_k.max(100))
+                .filter_map(|(id, _)| {
+                    chunk_text.get(id).map(|text| RerankCandidate {
+                        id: id.to_string(),
+                        text: text.clone(),
+                    })
+                })
+                .collect();
+            if cands.is_empty() {
+                Vec::new()
+            } else {
+                let reranked = r.rerank(qtext, &cands, cands.len()).await?;
+                reranked
+                    .into_iter()
+                    .filter_map(|rr| Uuid::parse_str(&rr.id).ok())
+                    .filter_map(|id| chunk_to_doc.get(&id).cloned())
+                    .collect()
+            }
+        } else {
+            fused
+                .iter()
+                .filter_map(|(id, _)| chunk_to_doc.get(id).cloned())
+                .collect()
+        };
+        hybrid_rankings.insert(qid.clone(), hybrid_ranked);
+    }
+
+    let bm25_report = dataset.score(&bm25_rankings);
+    let hybrid_report = dataset.score(&hybrid_rankings);
+
+    let benchmarks_dir = std::path::PathBuf::from("benchmarks");
+    let _ = std::fs::create_dir_all(&benchmarks_dir);
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let default_name =
+        benchmarks_dir.join(format!("beir-{}-{}.json", dataset_name, timestamp));
+    let save_path = save.unwrap_or(default_name);
+
+    let payload = json!({
+        "suite": "beir",
+        "dataset": dataset_name,
+        "rerank": if rerank_on { "on" } else { "off" },
+        "n_queries": hybrid_report.n_queries,
+        "rows": [
+            {
+                "system": "bm25",
+                "ndcg_at_10": bm25_report.ndcg_at_10,
+                "recall_at_10": bm25_report.recall_at_10,
+                "recall_at_100": bm25_report.recall_at_100,
+            },
+            {
+                "system": if rerank_on { "hybrid+rerank" } else { "hybrid" },
+                "ndcg_at_10": hybrid_report.ndcg_at_10,
+                "recall_at_10": hybrid_report.recall_at_10,
+                "recall_at_100": hybrid_report.recall_at_100,
+            }
+        ],
+        "saved_to": save_path.to_string_lossy(),
+    });
+    if let Some(parent) = save_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&save_path, serde_json::to_string_pretty(&payload)?)?;
+
+    print_success(ctx.format, payload, Metadata::default(), |data| {
+        println!("{}", serde_json::to_string_pretty(data).unwrap())
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_biogen(
+    ctx: &AppContext,
+    year: String,
+    kb: Option<String>,
+    corpus_path: Option<std::path::PathBuf>,
+    top_k: usize,
+    answerer_model: String,
+    judge_model: String,
+    save: Option<std::path::PathBuf>,
+) -> Result<(), CliError> {
+    use engram_bench::biogen::{default_path, BioGenTopics};
+    use engram_bench::qa::run_biogen as run_qa;
+    use engram_rerank::passthrough::PassthroughReranker;
+
+    match year.as_str() {
+        "2024" | "2025" => {}
+        other => {
+            return Err(CliError::BadInput(format!(
+                "unknown --year {other} (expected: 2024 | 2025)"
+            )))
+        }
+    }
+
+    let topics_path = default_path();
+    if !topics_path.exists() {
+        return Err(CliError::Config(format!(
+            "TREC BioGen {year} topics not found at {}. Download the topic file and corpus with:\n\
+             # topics:\n\
+             curl -sL 'https://trec.nist.gov/data/biogen/{year}/topics.json' -o {}\n\
+             # corpus (PubMed abstracts for the cited docs), then pass via --corpus or ingest into --kb",
+            topics_path.display(),
+            topics_path.display()
+        )));
+    }
+    let topics = BioGenTopics::load_from_file(&topics_path)?;
+
+    let corpus = build_corpus(ctx, kb.as_deref(), corpus_path.as_deref())?;
+
+    let openrouter_key =
+        crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
+            .ok_or_else(|| {
+                CliError::Config(
+                    "OPENROUTER_API_KEY not set — required for LLM answerer + judge".into(),
+                )
+            })?;
+    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
+        .ok_or_else(|| {
+            CliError::Config("GEMINI_API_KEY not set — required for BioGen retrieval".into())
+        })?;
+    let mut embedder = GeminiEmbedder::new(gemini_key);
+    if let Ok(model) = std::env::var("GEMINI_EMBED_MODEL") {
+        embedder = embedder.with_model(model);
+    }
+    let answerer =
+        OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
+    let judge = OpenRouterClient::new(openrouter_key).with_model(judge_model.clone());
+
+    let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0);
+
+    let benchmarks_dir = std::path::PathBuf::from("benchmarks");
+    let _ = std::fs::create_dir_all(&benchmarks_dir);
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let default_name = benchmarks_dir.join(format!("biogen-{}-{}.json", year, timestamp));
+    let save_path = save.unwrap_or(default_name);
+    let checkpoint_path = save_path.with_extension("checkpoint.jsonl");
+
+    let no_rerank: Option<&PassthroughReranker> = None;
+    let report = run_qa(
+        &topics,
+        &corpus,
+        &embedder,
+        no_rerank,
+        &answerer,
+        &judge,
+        rrf_k,
+        top_k,
+        None,
+        Some(checkpoint_path.clone()),
+    )
+    .await?;
+
+    if let Some(parent) = save_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&save_path, serde_json::to_string_pretty(&report)?)?;
+
+    let payload = json!({
+        "suite": "biogen",
+        "year": year,
+        "topics_evaluated": report.topics_evaluated,
+        "csr": report.csr,
+        "total_sentences": report.total_sentences,
+        "mean_latency_ms": report.mean_latency_ms,
+        "p50_latency_ms": report.p50_latency_ms,
+        "p95_latency_ms": report.p95_latency_ms,
+        "answerer_model": answerer_model,
+        "judge_model": judge_model,
+        "answerer_prompt_tokens": report.answerer_total_prompt_tokens,
+        "answerer_completion_tokens": report.answerer_total_completion_tokens,
+        "per_topic": report.per_topic,
         "notes": report.notes,
         "saved_to": save_path.to_string_lossy(),
     });

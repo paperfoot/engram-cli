@@ -409,11 +409,25 @@ impl Embedder for GeminiEmbedder {
                     })?;
                 break parsed;
             };
+            // Positional zip against the input texts downstream: a short
+            // batch would silently mis-align or drop chunks, so a count
+            // mismatch is a hard error, never a truncation.
+            if parsed.embeddings.len() != end - idx {
+                return Err(EmbedError::Api {
+                    provider: "gemini",
+                    message: format!(
+                        "batch embedding count mismatch: sent {} texts, got {} embeddings",
+                        end - idx,
+                        parsed.embeddings.len()
+                    ),
+                });
+            }
             for emb in parsed.embeddings {
                 out.push(emb.values);
             }
             idx = end;
         }
+        debug_assert_eq!(out.len(), texts.len());
         Ok(out)
     }
 }

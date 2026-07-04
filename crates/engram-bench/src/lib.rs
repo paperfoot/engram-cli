@@ -3,8 +3,12 @@
 //! Primary target: LongMemEval (https://github.com/xiaowu0162/LongMemEval).
 //! Same benchmark MemPalace uses, so numbers are directly comparable.
 
+pub mod beir;
+pub mod biogen;
+pub mod citation;
 pub mod error;
 pub mod judge;
+pub mod litqa2;
 pub mod locomo;
 pub mod locomo_plus;
 pub mod longmemeval;

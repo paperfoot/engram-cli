@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core types and pure logic for engram v2 (no I/O)"
+description = "Core types and pure logic for engram (no I/O)"
 
 [lib]
 name = "engram_core"

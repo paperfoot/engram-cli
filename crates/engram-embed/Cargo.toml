@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Embedding providers (Gemini Embed 2, local fallback) for engram v2"
+description = "Embedding providers (Gemini Embed 2, local fallback) for engram"
 
 [lib]
 name = "engram_embed"

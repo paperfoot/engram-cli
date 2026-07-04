@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "engram v2 — agent-native memory CLI"
+description = "engram — agent-native memory CLI"
 
 [lib]
 name = "engram_cli"
@@ -19,6 +19,7 @@ name = "engramd"
 path = "src/bin/engramd.rs"
 
 [dependencies]
+strsim = "0.11"
 engram-core.workspace = true
 engram-storage.workspace = true
 engram-embed.workspace = true

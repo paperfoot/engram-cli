@@ -1,6 +1,6 @@
 # Engram v2 — Design Spec
 
-**Author:** Paperfoot
+**Author:** paperfoot
 **Date:** 2026-04-07
 **Status:** Approved for implementation
 
@@ -18,7 +18,7 @@ It replaces engram v1 (TypeScript MCP server) and aims to match or exceed MemPal
 ## 2. Non-goals
 
 - No web UI for humans
-- No MCP server (CLI is the interface — see [agent-cli-framework](https://github.com/199-biotechnologies/agent-cli-framework))
+- No MCP server (CLI is the interface — see [agent-cli-framework](https://github.com/paperfoot/agent-cli-framework))
 - No separate Qdrant/Neo4j/external services — local-first, single binary
 - No interactive prompts — fully non-interactive, agent-native
 - No mandatory cloud APIs — local fallbacks must work
@@ -86,7 +86,7 @@ This is the **baseline**. The autoresearch loop iterates on every step.
 
 ### 4.4 CLI surface
 
-Following [agent-cli-framework](https://github.com/199-biotechnologies/agent-cli-framework) patterns. Every command has `--json`, auto-detects piped output, and uses semantic exit codes.
+Following [agent-cli-framework](https://github.com/paperfoot/agent-cli-framework) patterns. Every command has `--json`, auto-detects piped output, and uses semantic exit codes.
 
 | Command | Purpose |
 |---|---|
@@ -168,7 +168,7 @@ Every change measured against [LongMemEval](https://github.com/xiaowu0162/LongMe
 
 ## 8. Development methodology — autoresearch loops
 
-This project uses [autoresearch](https://github.com/199-biotechnologies/autoresearch) for autonomous component optimization. Each major component gets its own loop:
+This project uses [autoresearch](https://github.com/paperfoot/autoresearch) for autonomous component optimization. Each major component gets its own loop:
 
 | Component | Target file | Metric | Eval command |
 |---|---|---|---|

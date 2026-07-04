@@ -35,34 +35,19 @@ pub async fn run(
     let uuid =
         Uuid::parse_str(&id).map_err(|e| CliError::BadInput(format!("invalid UUID {id}: {e}")))?;
 
-    let updated = ctx
-        .store
-        .update_memory(uuid, content.as_deref(), importance)?;
-    if !updated {
-        return Err(CliError::BadInput(format!(
-            "no memory found for id {id} (already deleted?)"
-        )));
-    }
-
     let mut chunks_replaced = 0usize;
     if let Some(new_content) = content.as_deref() {
         let document_id = ctx.store.document_for_memory(uuid)?;
-        let kb = ctx.store.kb_for_memory(uuid)?;
-        // Tear down stale chunks/facts and rebuild so recall sees the edit
-        // and old extracted facts cannot outlive the updated memory.
-        ctx.store.delete_facts_for_memory(uuid)?;
-        ctx.store.delete_chunks_for_memory(uuid)?;
-        if document_id.is_some() {
-            if let Some(kb) = kb {
-                ctx.store.clear_derived_for_kb(&kb)?;
-            }
-        }
         let new_chunks = naive_split(new_content);
 
         let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
         let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
         let have_gemini = !force_stub && gemini_key.is_some();
 
+        // Embed the NEW content first. The old chunks are only torn down
+        // once the replacement vectors are in hand, so a transient embed
+        // failure can never strand the memory with no chunks (invisible to
+        // recall, unrecoverable).
         let chunk_texts: Vec<&str> = new_chunks.iter().map(|c| c.text.as_str()).collect();
         let (embeddings, model_name, dims, prompt_format): (Vec<Vec<f32>>, String, usize, String) =
             if have_gemini {
@@ -78,22 +63,44 @@ pub async fn run(
                     .await?;
                 (v, e.model(), e.dimensions(), e.prompt_format().to_string())
             };
-
-        for (chunk, emb) in new_chunks.iter().zip(embeddings.iter()) {
-            ctx.store.insert_chunk_with_embedding_meta(
-                Uuid::new_v4(),
-                uuid,
-                &chunk.text,
-                chunk.position,
-                chunk.section.as_deref(),
-                emb,
-                &model_name,
-                dims,
-                &prompt_format,
-                document_id,
-            )?;
-            chunks_replaced += 1;
+        if embeddings.len() != new_chunks.len() {
+            return Err(CliError::Transient(format!(
+                "embedder returned {} embeddings for {} chunks; aborting edit",
+                embeddings.len(),
+                new_chunks.len()
+            )));
         }
+
+        // Atomic swap: update content, tear down stale chunks/facts/derived
+        // claims, insert the new chunks — all or nothing.
+        chunks_replaced = ctx.store.with_tx(|store| {
+            let updated = store.update_memory(uuid, content.as_deref(), importance)?;
+            if !updated {
+                return Err(engram_storage::StorageError::NotFound(format!(
+                    "no memory found for id {uuid} (already deleted?)"
+                )));
+            }
+            store.delete_facts_for_memory(uuid)?;
+            store.delete_derived_for_memory_chunks(uuid)?;
+            store.delete_chunks_for_memory(uuid)?;
+            let mut replaced = 0usize;
+            for (chunk, emb) in new_chunks.iter().zip(embeddings.iter()) {
+                store.insert_chunk_with_embedding_meta(
+                    Uuid::new_v4(),
+                    uuid,
+                    &chunk.text,
+                    chunk.position,
+                    chunk.section.as_deref(),
+                    emb,
+                    &model_name,
+                    dims,
+                    &prompt_format,
+                    document_id,
+                )?;
+                replaced += 1;
+            }
+            Ok(replaced)
+        })?;
         if have_gemini && !chunk_texts.is_empty() {
             let tokens = estimated_tokens_for_texts(&chunk_texts);
             ctx.store.record_usage_event(
@@ -115,6 +122,14 @@ pub async fn run(
                     "estimated": true,
                 }),
             )?;
+        }
+    } else {
+        // Importance-only update: no chunk rebuild needed.
+        let updated = ctx.store.update_memory(uuid, None, importance)?;
+        if !updated {
+            return Err(CliError::BadInput(format!(
+                "no memory found for id {id} (already deleted?)"
+            )));
         }
     }
 

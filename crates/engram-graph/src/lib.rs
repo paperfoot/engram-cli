@@ -6,6 +6,7 @@
 //! - `expand`: bounded query-time graph traversal
 
 pub mod expand;
+pub mod gate;
 pub mod extract;
 pub mod facts;
 

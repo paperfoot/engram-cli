@@ -29,11 +29,12 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "kb create <name>": "Create/update a knowledge base. Flags: --description <text>",
             "kb list | kb show <name> | kb delete <name> --confirm": "Manage domain KBs.",
             "documents list|show|delete": "Inspect or remove ingested source documents. Flags: --kb <name>, --all-kbs, --limit <n>, --confirm",
-            "remember <content>": "Store a new memory. Flags: --importance 0-10, --tag <tag> (repeatable), --diary <name>, --kb <name>, --extract-facts. Fact extraction is opt-in because it may call an LLM.",
+            "remember <content>": "Store a new memory. Flags: --importance 0-10, --tag <tag> (repeatable), --diary <name>, --kb <name>, --extract-facts, --facts-json '<json array>', --autonomy full|assisted|strict, --allow-duplicate. Identical content in the same kb/diary is deduplicated (no second embedding) unless --allow-duplicate. Fact extraction is opt-in because it may call an LLM; prefer --facts-json when you already know the (subject, predicate, object) triple — it runs the same contradiction detection with zero LLM cost. Under the default --autonomy assisted, uncertain contradictions come back in `adjudication_needed` for YOU to resolve (you have the conversation context): run the included resolve_command. Safety slots (allergic_to, takes_medication, diagnosed_with) are never auto-superseded.",
             "memory add|search|update|delete|list": "Simple aliases for agent memory workflows. Prefer these when an agent wants CRUD semantics.",
-            "recall <query>": "Retrieve via cloud-quality hybrid search. Flags: --kb <name>, --mode evidence|raw|wiki|explore|agent, --profile cloud_quality|fast|offline, --top-k <n>, --allow-mixed-embeddings",
+            "recall <query>": "Retrieve via cloud-quality hybrid search. Flags: --kb <name>, --mode evidence|raw|wiki|explore|agent, --profile cloud_quality|fast|offline, --top-k <n>, --allow-mixed-embeddings, --since <rfc3339>, --until <rfc3339>. Output includes a `conflicts` array with two statuses: `superseded` (a fact was updated — cite the current value or surface the change) and `contested` (an UNRESOLVED contradiction: both values are listed — do not pick one silently; resolve it via the included resolve_command or surface both to the user).",
+            "facts list|show <subject>|conflicts|resolve": "Browse the fact store and contradiction record. `facts conflicts` lists resolved supersessions; `facts conflicts --open` lists CONTESTED pairs awaiting your decision; `facts resolve <id> --action supersede-old|keep-both|reject-new [--note]` records your verdict and applies the supersession (never a deletion). Facts are populated by `remember --extract-facts` / `--facts-json` and by `compile --llm`, KB-scoped.",
             "research <query>": "Evidence-first research retrieval pass. Returns query_plan, answer_context, evidence leads, and citation readiness.",
-            "ingest <path>": "Mine a file or scoped directory. Flags: --mode papers|takeaways|conversations|repos|general|auto, --diary <name>, --kb <name>, --compile evidence, --dry-run, --include <pattern>, --exclude <pattern>, --max-files <n>, --all",
+            "ingest <path>": "Mine a file or scoped directory. Flags: --mode papers|takeaways|conversations|repos|general|auto, --diary <name>, --kb <name>, --compile evidence, --dry-run, --include <pattern>, --exclude <pattern>, --max-files <n>, --all. Re-ingesting the same path is idempotent when content is unchanged, and REPLACES the prior version when the file changed (edited PDFs no longer go stale).",
             "compile --kb <name> --all": "Derive cited claims, entities, relations, takeaways, and wiki pages. Add --llm for Gemini 3.1 Flash-Lite extraction + Gemini 3.1 Pro synthesis via OpenRouter.",
             "jobs list|show": "Inspect compile job history.",
             "reindex --kb <name> | --all": "Re-embed chunks with Gemini Embedding 2 metadata guards.",
@@ -49,9 +50,9 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "export [--format json] [--kb <name>]": "Export memories as JSON",
             "import <file>": "Import memories from a JSON export",
             "entities [list|show <name>]": "Browse the entity graph. Alias: list|ls",
-            "bench <suite>": "Run a benchmark. Suites: mini | mini-fts | scientific-mini | longmemeval | longmemeval-qa | locomo-qa. Flags: --limit <n>, --download, --answerer, --judge",
+            "bench <suite>": "Run a benchmark. Suites: mini | mini-fts | scientific-mini | longmemeval | longmemeval-qa | locomo-plus | mab | litqa2 | beir | biogen. Flags: --limit <n>, --download, --mode closed-book|fulltext, --dataset <scifact|nfcorpus|trec-covid|scidocs>, --rerank on|off, --year 2024|2025, --top-k <n>, --kb <name>, --corpus <path>, --answerer <slug>, --judge <slug>, --save <path>",
             "config show": "Display effective configuration",
-            "config set <key> <value>": "Persist a configuration value to ~/.config/engram/config.toml",
+            "config set <key> <value>": "Persist a configuration value to the on-disk config file (exact path in `config_path` below).",
             "config check": "Validate configured API keys",
             "skill install | package | uninstall": "Install, package, or remove the agent skill. Installs SKILL.md plus Codex agents/openai.yaml metadata.",
             "update [--check]": "Check or apply distribution-aware updates. Output includes install_source, update_mode, release_url, upgrade_command, and post_update_commands."
@@ -64,8 +65,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "remember": {
                 "destructive": false,
                 "args": { "content": "string" },
-                "flags": { "importance": "0..10", "tag": "string[]", "diary": "string", "kb": "string", "extract_facts": "boolean" },
-                "output_data": { "id": "uuid", "stored": "boolean", "chunks": "integer", "kb": "string", "facts_added": "integer", "conflicts": "array" }
+                "flags": { "importance": "0..10", "tag": "string[]", "diary": "string", "kb": "string", "extract_facts": "boolean", "facts_json": "json string", "autonomy": "full|assisted|strict" },
+                "output_data": { "id": "uuid", "stored": "boolean", "chunks": "integer", "kb": "string", "facts_added": "integer", "facts_deduped": "integer", "conflicts": "array", "adjudication_needed": "array — unresolved conflicts with a ready-to-run resolve_command; handle them" }
             },
             "recall": {
                 "destructive": false,
@@ -170,7 +171,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "ENGRAM_UPDATE_HOMEBREW_FORMULA": "Homebrew formula used by brew updates. Default paperfoot/tap/engram.",
             "ENGRAM_EMBEDDER": "Force embedder: gemini|stub (default: gemini if key set)",
             "ENGRAM_COHERE_RERANK_MODEL": "Override the Cohere rerank model slug (default rerank-v4.0-pro; e.g. rerank-v4.0-fast).",
-            "ENGRAM_RERANK_PROVIDER": "Benchmark reranker selector: cohere|zerank2|none. recall/serve use Cohere when COHERE_API_KEY is set.",
+            "ENGRAM_RERANK_PROVIDER": "Reranker selector: cohere|zerank2|none. recall/research/serve use Cohere when COHERE_API_KEY is set; set `none` to disable reranking explicitly (e.g. Cohere billing failure) — retrieval then returns hybrid-fused order.",
             "ENGRAM_LME_SPLIT": "LongMemEval split: s|oracle (default: s)"
         },
         "config_keys": {
@@ -271,9 +272,9 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "longmemeval_s": {
                 "url": "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned",
                 "description": "500 questions × ~48 sessions/q, 96% distractors",
-                "engram_v2_R@1": 0.91,
-                "engram_v2_R@5": 0.99,
-                "engram_v2_R@10": 0.998
+                "engram_R@1": 0.91,
+                "engram_R@5": 0.99,
+                "engram_R@10": 0.998
             }
         },
         "framework": "https://github.com/paperfoot/agent-cli-framework"

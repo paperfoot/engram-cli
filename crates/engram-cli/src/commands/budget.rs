@@ -118,6 +118,73 @@ fn scope_for(kb: Option<&str>) -> String {
         .unwrap_or_else(|| "global".to_string())
 }
 
+/// Enforce spend guardrails BEFORE an operation makes paid API calls. Checks
+/// both the KB-scoped budget (if `kb` is set) and the global budget; if either
+/// daily or monthly recorded spend is already at/over its cap, returns a
+/// rate-limit error (exit code 4) so an autonomous agent actually stops instead
+/// of blowing past `--daily-usd`. A no-op when no budget is configured.
+///
+/// This is a guardrail over *recorded* usage estimates (provider invoices
+/// remain the source of truth), and it gates on spend already incurred — it
+/// does not pre-authorize the specific next call's cost.
+pub fn enforce_budget(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError> {
+    // Disable with ENGRAM_BUDGET_ENFORCE=off for a one-off override.
+    if std::env::var("ENGRAM_BUDGET_ENFORCE")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    for scope_kb in [kb, None] {
+        check_scope(ctx, scope_kb)?;
+        if scope_kb.is_none() {
+            break; // avoid checking global twice when kb is None
+        }
+    }
+    Ok(())
+}
+
+fn check_scope(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError> {
+    let scope = scope_for(kb);
+    let Some(budget) = ctx.store.get_usage_budget(&scope)? else {
+        return Ok(());
+    };
+    let now = Utc::now();
+    if let Some(cap) = budget.daily_usd {
+        let today_start = Utc
+            .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+            .single()
+            .unwrap()
+            .to_rfc3339();
+        let spent = totals(ctx, kb, &today_start)?.cost_usd_estimated;
+        if spent >= cap {
+            return Err(CliError::RateLimited(format!(
+                "daily budget for scope `{scope}` reached: ${spent:.4} spent of ${cap:.2} cap. \
+                 Raise it with `engram budget set {}--daily-usd <n>`, wait for the day to \
+                 roll over, or set ENGRAM_BUDGET_ENFORCE=off to override.",
+                kb.map(|k| format!("--kb {k} ")).unwrap_or_default()
+            )));
+        }
+    }
+    if let Some(cap) = budget.monthly_usd {
+        let month_start = Utc
+            .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+            .single()
+            .unwrap()
+            .to_rfc3339();
+        let spent = totals(ctx, kb, &month_start)?.cost_usd_estimated;
+        if spent >= cap {
+            return Err(CliError::RateLimited(format!(
+                "monthly budget for scope `{scope}` reached: ${spent:.4} spent of ${cap:.2} cap. \
+                 Raise it with `engram budget set {}--monthly-usd <n>` or set \
+                 ENGRAM_BUDGET_ENFORCE=off to override.",
+                kb.map(|k| format!("--kb {k} ")).unwrap_or_default()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct UsageTotals {
     requests: i64,

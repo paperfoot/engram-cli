@@ -322,7 +322,8 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let use_cloud = profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-    let use_cohere = profile != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub;
+    let use_cohere = profile != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
+        && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
     let rerank_candidates = req
         .rerank_top_n
@@ -335,7 +336,8 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
         filters: Filters {
             diary: req.diary.clone().filter(|d| d != "*"),
             kb: req.kb.clone().filter(|k| k != "*"),
-            valid_at: None,
+            since: None,
+            until: None,
         },
         mode: RecallMode::Explore,
         graph_hops: 2,
@@ -396,7 +398,8 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let use_cloud = profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-    let use_cohere = profile != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub;
+    let use_cohere = profile != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
+        && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
     let rerank_candidates = req
         .rerank_top_n
@@ -418,7 +421,8 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
         filters: Filters {
             diary: req_diary.clone().filter(|d| d != "*"),
             kb: req_kb.clone().filter(|k| k != "*"),
-            valid_at: None,
+            since: None,
+            until: None,
         },
         mode,
         graph_hops: req.graph_hops.unwrap_or(1),

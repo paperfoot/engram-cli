@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "LongMemEval and benchmark harness for engram v2"
+description = "LongMemEval and benchmark harness for engram"
 
 [lib]
 name = "engram_bench"

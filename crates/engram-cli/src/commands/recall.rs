@@ -41,8 +41,8 @@ pub async fn run(
     let layer_enum = parse_layer(&layer)?;
     let recall_mode = RecallMode::parse(&mode)?;
     let profile_enum = RetrievalProfile::parse(&profile)?;
-    let valid_at = parse_optional_time(&since)?;
-    let _valid_until = parse_optional_time(&until)?;
+    let since_dt = parse_optional_time(&since)?;
+    let until_dt = parse_optional_time(&until)?;
     let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -56,7 +56,8 @@ pub async fn run(
             Some(diary.clone())
         },
         kb: if all_kbs { None } else { Some(kb.clone()) },
-        valid_at,
+        since: since_dt,
+        until: until_dt,
     };
     let params = HybridParams {
         query: &query,
@@ -72,10 +73,31 @@ pub async fn run(
     let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
+
+    // A cloud profile (cloud_quality/fast) with no Gemini key used to fall back
+    // to the 64-dim hash stub SILENTLY — producing garbage similarity and, on a
+    // real gemini-indexed KB, misdiagnosing the missing key as an index
+    // mismatch. Fail loudly instead (exit code 2 = config). `--profile offline`
+    // and the bench stub-forcing env var opt into the stub explicitly.
+    if profile_enum != RetrievalProfile::Offline && gemini_key.is_none() && !force_stub {
+        return Err(CliError::Config(format!(
+            "profile `{}` needs a Gemini API key for real retrieval, but none is configured. \
+             Set it with `engram config set keys.gemini <KEY>` (or GEMINI_API_KEY), \
+             or run with `--profile offline` to use the deterministic offline stub.",
+            profile_enum.as_str()
+        )));
+    }
+
     let use_cloud_embedder =
         profile_enum != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
+
+    // Enforce spend guardrails before any paid embed/rerank call.
+    if use_cloud_embedder {
+        crate::commands::budget::enforce_budget(ctx, if all_kbs { None } else { Some(&kb) })?;
+    }
     let use_cohere =
-        profile_enum != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub;
+        profile_enum != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
+        && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
 
     let (results, embed_model, embed_dims, prompt_format) = if use_cloud_embedder {
@@ -105,21 +127,32 @@ pub async fn run(
         (results, meta.0, meta.1, meta.2)
     };
 
+    // The memory-layer token budget trims the returned set to fit an agent's
+    // context window. But it must never silently return FEWER than the caller's
+    // explicit --top-k: previously a default `topic` budget (800 tokens) capped
+    // a `--top-k 10` recall to ~2-4 paper chunks. Honor the smaller of what the
+    // user asked for and the budget, but always deliver at least top_k results
+    // when that many were retrieved.
     let budget = layer_enum.default_token_budget();
     let mut used_tokens = 0usize;
     let mut layered = Vec::new();
     for r in &results {
         let cost = approx_tokens(&r.content);
-        if used_tokens + cost > budget {
-            if layered.is_empty() {
-                layered.push(r);
-                used_tokens += cost;
-            }
+        // Always include up to top_k results regardless of budget; only the
+        // budget-driven trim beyond top_k applies.
+        if layered.len() >= top_k && used_tokens + cost > budget {
             break;
         }
         layered.push(r);
         used_tokens += cost;
     }
+
+    // Surface contradictions relevant to this query: if the KB records that a
+    // fact about a queried subject was superseded (or two active facts about it
+    // disagree), report it so the caller can "cite both / note the update"
+    // instead of unknowingly answering from a stale fact. This is the read-path
+    // half of the contradiction-resolution promise.
+    let conflicts = surface_conflicts(ctx, if all_kbs { None } else { Some(&kb) }, &query)?;
 
     let answer_context = build_answer_context(&layered);
     let results_json: Vec<_> = layered
@@ -246,6 +279,7 @@ pub async fn run(
             "status": status,
             "answer_context": answer_context,
             "results": results_json,
+            "conflicts": conflicts,
             "metadata": {
                 "profile": profile_enum.as_str(),
                 "embed_model": if use_cloud_embedder { DEFAULT_MODEL } else { embed_model.as_str() },
@@ -269,6 +303,91 @@ pub async fn run(
         },
     );
     Ok(())
+}
+
+/// Find contradictions relevant to the query and return them as JSON.
+/// Two kinds are surfaced: RESOLVED supersessions (a fact was updated —
+/// cite the current value) and CONTESTED pairs (an unresolved conflict is
+/// queued — both values are active and the caller should not pick one
+/// silently). The memory never pretends to know an answer it doesn't have.
+fn surface_conflicts(
+    ctx: &AppContext,
+    kb: Option<&str>,
+    query: &str,
+) -> Result<Vec<serde_json::Value>, CliError> {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let facts = ctx.store.facts_matching_terms(kb, &terms, 20)?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for f in facts {
+        // Only superseded facts represent a recorded contradiction/update.
+        let Some(superseded_by) = f.superseded_by else {
+            continue;
+        };
+        if !seen.insert(f.id) {
+            continue;
+        }
+        let new_object = ctx
+            .store
+            .get_fact(superseded_by)?
+            .map(|nf| nf.object)
+            .unwrap_or_default();
+        out.push(json!({
+            "status": "superseded",
+            "subject": f.subject,
+            "predicate": f.predicate,
+            "old_object": f.object,
+            "new_object": new_object,
+            "superseded_at": f.superseded_at.map(|t| t.to_rfc3339()),
+            "old_fact_id": f.id.to_string(),
+            "new_fact_id": superseded_by.to_string(),
+            "note": "this fact was updated in the knowledge base; cite the current value or surface the change",
+        }));
+    }
+
+    // Contested: open conflicts touching the query. Both values are active;
+    // report both rather than silently returning one side.
+    for (row, new_f, old_f) in ctx.store.open_conflicts_matching_terms(kb, &terms, 10)? {
+        out.push(json!({
+            "status": "contested",
+            "conflict_id": row.id.to_string(),
+            "subject": new_f.subject,
+            "predicate": new_f.predicate,
+            "values": [old_f.object, new_f.object],
+            "detector": row.detector,
+            "suggested_action": row.suggested,
+            "resolve_command": format!(
+                "engram facts resolve {} --action supersede-old|keep-both|reject-new",
+                row.id
+            ),
+            "note": "unresolved contradiction — do not pick a value silently; resolve it or surface both to the user",
+        }));
+    }
+    Ok(out)
+}
+
+/// Lowercase content tokens from a query (length >= 3, no stopwords) used to
+/// match fact subjects/objects.
+fn query_terms(query: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "what", "which", "how", "does", "are", "was", "were", "with", "that",
+        "this", "from", "into", "who", "why", "when", "where", "current", "latest", "value",
+    ];
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in query.split(|c: char| !c.is_alphanumeric()) {
+        let lower = raw.to_ascii_lowercase();
+        if lower.len() < 3 || STOP.contains(&lower.as_str()) {
+            continue;
+        }
+        if seen.insert(lower.clone()) {
+            out.push(lower);
+        }
+    }
+    out
 }
 
 fn build_answer_context(results: &[&crate::retrieval::HybridResult]) -> String {

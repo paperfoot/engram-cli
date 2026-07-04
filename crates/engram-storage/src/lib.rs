@@ -8,6 +8,7 @@ pub mod sqlite;
 
 pub use error::StorageError;
 pub use sqlite::{
-    ChunkRecord, ClaimRecord, DocumentRecord, EntityRecord, KnowledgeBase, RelationRecord,
-    SourceCitation, SqliteStore, StoredChunkEmbedding, WikiPageRecord,
+    ChunkExportRow, ChunkRecord, ClaimRecord, DocumentExportRow, DocumentRecord, EntityRecord,
+    FactExportRow, KbExportRow, KnowledgeBase, MemoryExportRow, RelationRecord, SourceCitation,
+    SqliteStore, StoredChunkEmbedding, WikiPageRecord,
 };

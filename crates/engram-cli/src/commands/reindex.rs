@@ -80,9 +80,20 @@ pub async fn reindex_store(
         )
     };
 
-    for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-        store.set_chunk_embedding_meta(chunk.chunk_id, emb, &model, dims, &prompt_format)?;
+    if embeddings.len() != chunks.len() {
+        return Err(CliError::Transient(format!(
+            "embedder returned {} embeddings for {} chunks; aborting reindex so no chunk is \
+             silently left on the old embedding",
+            embeddings.len(),
+            chunks.len()
+        )));
     }
+    store.with_tx(|store| {
+        for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
+            store.set_chunk_embedding_meta(chunk.chunk_id, emb, &model, dims, &prompt_format)?;
+        }
+        Ok(())
+    })?;
     if have_gemini && !texts.is_empty() {
         let tokens = estimated_tokens_for_texts(&texts);
         store.record_usage_event(

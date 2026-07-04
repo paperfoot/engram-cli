@@ -1,4 +1,4 @@
-//! engram v2 — agent-native memory CLI.
+//! engram — agent-native memory CLI.
 
 use clap::Parser;
 use engram_cli::{cli::Cli, dispatch};

@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Knowledge graph (deterministic edges + optional LLM triples) for engram v2"
+description = "Knowledge graph (deterministic edges + optional LLM triples) for engram"
 
 [lib]
 name = "engram_graph"

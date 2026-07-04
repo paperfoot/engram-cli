@@ -1,116 +1,69 @@
-# engram v2 benchmark results
+# engram benchmark results
 
-Raw JSON reports from `engram bench` runs, timestamped. Each file contains the
-full per-question result, model IDs, token counts, and summary stats so you can
-reproduce or post-hoc analyze any run.
+Raw JSON reports from `engram bench` runs, timestamped `<suite>-<YYYYMMDDTHHMMSS>-<n>.json`. Each file holds the per-question result, model IDs, token counts, and summary stats, so every run is reproducible and auditable. LitQA2 and BEIR reports are gitignored (they embed canary-protected question content and the CC-BY-NC SciFact corpus).
 
-## File naming
+Models: answerer `anthropic/claude-opus-4.8`, grader `google/gemini-3.1-pro-preview`, embeddings `gemini-embedding-2`, reranker `cohere rerank-v4.0-pro`. The [top-level README Benchmarks section](../README.md#benchmarks) explains what each axis measures and why.
 
-```
-<suite>-<YYYYMMDDTHHMMSS>-<question_count>.json
-```
+## Headline results
 
-- `longmemeval-qa-*` — LongMemEval S split, end-to-end QA (retrieve → answer → judge)
-- `longmemeval-*` (retrieval only) — early retrieval-only numbers
-- `locomo-qa-*` — LoCoMo dataset, end-to-end QA
-- `mini-*` — 10-question smoke bench (FTS5 only or hybrid)
+**Scientific-QA over a specialized corpus — LitQA2 (199 questions).** Ingest the answer-bearing passages as a bounded domain corpus and answer over it, versus a closed-book control:
 
-## Current headline numbers
+| Pipeline | Accuracy | Precision (abstention-adjusted) | Coverage | Retrieval-success |
+|---|---:|---:|---:|---:|
+| Closed-book (no retrieval) | 43.7% | 49.7% | 87.9% | — |
+| Full-text RAG (specialized corpus) | 87.9% | 99.4% | 88.4% | 97.0% |
 
-### Retrieval only (LongMemEval S full 500)
-- **R@1 = 0.910**
-- **R@5 = 0.990** ← beats MemPalace published 0.984
-- **R@10 = 0.998**
-- MRR = 0.946
-- Pipeline: Gemini Embed 2 + FTS5 + RRF (k=60), no reranker
-- File: main branch commit `571fc18`
+Retrieval adds +44 points of accuracy and pushes precision to 99.4%. On all 6 retrieval misses the system abstained ("Insufficient information") rather than answering wrong; the residual gap is the answerer (15/193 errors on correctly-retrieved evidence), not retrieval. For reference, PaperQA2 reports 66.0% accuracy / 85.2% precision over the full literature, and human experts score 67.7%.
 
-### End-to-end QA (with GPT-5.4 answerer + judge)
+**Retrieval ranking — BEIR-SciFact (300 test queries over 5,183 docs):**
 
-| Suite | Sample | Correct | Accuracy | Notes |
-|---|---|---|---|---|
-| LongMemEval-QA | 2 | 2 | **100%** | Trivial single-session questions |
-| LongMemEval-QA | 3 | 1 | **33%** | 1 interpretation error, 1 "I don't know" despite R@5=1.0 |
-| LoCoMo-QA | 5 | 2 | **40%** | Short session-by-session test |
-| LoCoMo-QA | 50 | 14 | **28%** | First stable QA number on LoCoMo |
-| LongMemEval-QA | 10 | _pending_ | | Running with top_k=5 |
+| Pipeline | nDCG@10 | Recall@10 | Recall@100 |
+|---|---:|---:|---:|
+| BM25 (lexical only) | 0.689 | 0.814 | 0.923 |
+| hybrid + Cohere rerank | 0.817 | 0.935 | 0.990 |
 
-### The 17% gap made visible
+The hybrid stack reaches nDCG@10 0.817, above the strong-dense reference (~0.74) and the BEIR BM25 baseline (~0.665).
 
-These QA numbers validate [@parcadei's LongMemEval critique](https://x.com/parcadei/status/2041479166764196206)
-of MemPalace: **retrieval being good isn't enough**. Our retrieval is perfect
-(MRR = 1.0 on the LongMemEval-QA sample), but answer generation accuracy is
-28–40% — not the 99% the retrieval number suggests.
-
-This is a known failure mode of the whole memory-system space, not a bug in
-engram's retrieval. The gap is in how the LLM interprets "daily commute" as
-round-trip (90 min) vs one-way (45 min), or refuses to answer when it could
-have extracted "Target" from the context.
+**Conversational-memory retrieval — LongMemEval S (500 questions, 96% distractors):** R@1 0.910, R@5 0.990, R@10 0.998, MRR 0.946 (Gemini Embed 2 + FTS5 + RRF). A retrieval sanity check, separate from the science evaluation.
 
 ## Reproducing
 
 ```bash
-engram bench longmemeval-qa --limit 50 --top-k 5 \
-  --answerer openai/gpt-5.4 --judge openai/gpt-5.4 --json
-
-engram bench locomo-qa --limit 50 --json
-
-# With RAGAS metrics (4 extra LLM calls/question — expensive):
-engram bench longmemeval-qa --limit 20 --ragas --json
-
-# Save to a specific path (otherwise goes to benchmarks/<auto-name>.json):
-engram bench longmemeval-qa --limit 100 --save benchmarks/my-run.json --json
+# Scientific-QA, full-text RAG over an ingested domain corpus:
+engram bench litqa2 --mode fulltext --kb <your-corpus> --limit 199 --json
+# Scientific-QA, closed-book control (answerer only, no retrieval):
+engram bench litqa2 --mode closed-book --limit 199 --json
+# Retrieval ranking:
+engram bench beir --dataset scifact --rerank on --json
+# Reference-free faithfulness (claim-decomposition RAGAS, add-on on any QA suite):
+engram bench litqa2 --mode fulltext --kb <your-corpus> --limit 50 --ragas --json
+# Conversational-memory retrieval sanity check:
+engram bench longmemeval --json
+# Save the report to a chosen path (it always also prints to stdout):
+engram bench litqa2 --mode closed-book --limit 199 --save benchmarks/my-run.json --json
 ```
 
-Requirements:
-- `GEMINI_API_KEY` in env or `~/.config/engram/config.toml` (embeddings)
-- `OPENROUTER_API_KEY` (answerer + judge LLMs)
-- `COHERE_API_KEY` (optional, adds rerank)
+Set `GEMINI_API_KEY` (embeddings), `OPENROUTER_API_KEY` (answerer/grader), and optionally `COHERE_API_KEY` (rerank) in the environment, or run `engram config set keys.<provider> <value>`. Datasets download on first run; the CLI prints the exact command when one is missing.
 
-## What the JSON reports contain
+## Report shape
 
 ```jsonc
 {
-  "suite": "longmemeval_qa",
-  "questions_evaluated": 10,
-  "correct_count": 3,
-  "accuracy": 0.3,
-  "recall_at_5": 1.0,          // retrieval
-  "mrr": 1.0,                   // retrieval
-  "ragas": null,                // { faithfulness, answer_relevance, ... } when --ragas
-  "mean_latency_ms": 159079.0,
-  "p50_latency_ms": 175745.0,
-  "answerer_total_prompt_tokens": 109311,
-  "answerer_total_completion_tokens": 63,
-  "judge_total_prompt_tokens": 1332,
-  "judge_total_completion_tokens": 60,
+  "suite": "litqa2",
+  "mode": "fulltext",
+  "questions_evaluated": 199,
+  "accuracy": 0.879,
+  "precision": 0.994,          // abstentions excluded from the denominator
+  "coverage": 0.884,
+  "abstain_rate": 0.116,
+  "retrieval_success": 0.97,   // target passage surfaced in top-k
+  "answerer_model": "anthropic/claude-opus-4.8",
   "per_question": [
-    {
-      "question_id": "...",
-      "question_type": "single-session-user",
-      "question": "...",
-      "gold_answer": "...",
-      "candidate_answer": "...",
-      "correct": false,
-      "recall_at_5": 1.0,
-      "mrr": 1.0,
-      "retrieved_sessions": [...],
-      "answer_session_ids": [...],
-      "ragas": null,
-      "latency_ms": 175745,
-      "answerer_prompt_tokens": 36437,
-      "answerer_completion_tokens": 21,
-      "judge_prompt_tokens": 444,
-      "judge_completion_tokens": 20
-    }
-  ],
-  "by_question_type": {
-    "single-session-user": { "total": 10, "correct": 3, "accuracy": 0.3 }
-  }
+    { "question_id": "...", "correct": true, "candidate_answer": "...",
+      "gold_answer": "...", "recall_at_5": 1.0, "retrieved_sessions": ["10.xxxx/..."],
+      "latency_ms": 1430, "answerer_prompt_tokens": 240, "answerer_completion_tokens": 7 }
+  ]
 }
 ```
 
-Every question has its full candidate answer, gold answer, retrieved session
-ids, and token counts preserved — so you can audit failures, compute cost
-per question, or rerun the judge with a different prompt without touching the
-retrieval step.
+Every question keeps its candidate answer, gold answer, retrieved sources, and token counts — enough to audit failures, compute per-question cost, or re-grade without re-running retrieval.

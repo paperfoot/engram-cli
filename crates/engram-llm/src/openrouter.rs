@@ -1,17 +1,17 @@
 //! OpenRouter chat client. OpenAI-compatible, routes to 350+ frontier models.
 //!
-//! Default model is `openai/gpt-4o-mini` — fast and cheap for judging.
-//! For better answer generation use `anthropic/claude-sonnet-4.5`
-//! or `openai/gpt-5` via the `with_model` builder.
+//! Default model is `anthropic/claude-opus-4.8`. Every benchmark/compiler call
+//! site overrides this with `with_model(...)`, so the default only applies to
+//! ad-hoc callers; pick an explicit slug via the `with_model` builder.
 
 use crate::{ChatLlm, ChatMessage, ChatResponse, LlmError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-// Default to the latest GPT flagship on OpenRouter for generic chat/bench
-// work. Compiler defaults are separated below so evidence extraction can use
-// a fast model while synthesis uses a stronger one.
-const DEFAULT_MODEL: &str = "openai/gpt-5.4";
+// Default to a current cross-family flagship for generic chat/bench work.
+// Compiler defaults are separated below so evidence extraction can use a fast
+// model while synthesis uses a stronger one.
+const DEFAULT_MODEL: &str = "anthropic/claude-opus-4.8";
 pub const DEFAULT_EXTRACTION_MODEL: &str = "google/gemini-3.1-flash-lite-preview";
 pub const DEFAULT_SYNTHESIS_MODEL: &str = "google/gemini-3.1-pro-preview";
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -178,7 +178,7 @@ impl OpenRouterClient {
             .post(ENDPOINT)
             .bearer_auth(&self.api_key)
             .header("HTTP-Referer", "https://github.com/paperfoot/engram-cli")
-            .header("X-Title", "engram v2 benchmark")
+            .header("X-Title", "engram benchmark")
             .json(body)
             .send()
             .await

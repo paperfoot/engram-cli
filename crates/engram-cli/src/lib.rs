@@ -5,6 +5,7 @@ pub mod cli;
 pub mod commands;
 pub mod context;
 pub mod error;
+pub mod fact_write;
 pub mod output;
 pub mod retrieval;
 
@@ -28,6 +29,9 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             kb,
             no_facts,
             extract_facts,
+            allow_duplicate,
+            autonomy,
+            facts_json,
         } => {
             commands::remember::run(
                 &ctx,
@@ -37,6 +41,9 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 diary,
                 kb,
                 extract_facts && !no_facts,
+                allow_duplicate,
+                autonomy,
+                facts_json,
             )
             .await
         }
@@ -176,9 +183,21 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 diary,
                 kb,
                 extract_facts,
+                allow_duplicate,
             } => {
-                commands::remember::run(&ctx, content, importance, tag, diary, kb, extract_facts)
-                    .await
+                commands::remember::run(
+                    &ctx,
+                    content,
+                    importance,
+                    tag,
+                    diary,
+                    kb,
+                    extract_facts,
+                    allow_duplicate,
+                    "assisted".to_string(),
+                    None,
+                )
+                .await
             }
             MemoryCommand::Search {
                 query,
@@ -251,7 +270,12 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             FactsCommand::Show { subject, diary, kb } => {
                 commands::facts::show(&ctx, subject, diary, kb)
             }
-            FactsCommand::Conflicts { limit } => commands::facts::conflicts(&ctx, limit),
+            FactsCommand::Conflicts { limit, open, diary, kb } => {
+                commands::facts::conflicts(&ctx, limit, open, diary, kb)
+            }
+            FactsCommand::Resolve { id, action, note } => {
+                commands::facts::resolve(&ctx, id, action, note)
+            }
         },
         Command::Export { format, kb } => commands::export::run(&ctx, format, kb),
         Command::Import { file } => commands::import::run(&ctx, file),
@@ -265,9 +289,32 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             ragas,
             top_k,
             save,
+            mode,
+            kb,
+            corpus,
+            dataset,
+            rerank,
+            year,
         } => {
             commands::bench::run(
-                &ctx, suite, mab_split, download, limit, answerer, judge, ragas, top_k, save,
+                &ctx,
+                commands::bench::BenchArgs {
+                    suite,
+                    mab_split,
+                    download,
+                    limit,
+                    answerer,
+                    judge,
+                    ragas,
+                    top_k,
+                    save,
+                    mode,
+                    kb,
+                    corpus,
+                    dataset,
+                    rerank,
+                    year,
+                },
             )
             .await
         }

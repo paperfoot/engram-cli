@@ -31,6 +31,30 @@ fn parse_stdout(out: &[u8]) -> Value {
     serde_json::from_slice(out).expect("valid JSON on stdout")
 }
 
+/// A second/third command against the same isolated home.
+fn cmd_in(tmp: &tempfile::TempDir) -> Command {
+    let mut cmd = engram();
+    cmd.env("HOME", tmp.path());
+    cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
+    cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
+    cmd.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    cmd
+}
+
+/// Store a memory with caller-supplied facts (no LLM), returning the
+/// envelope. `autonomy` is the conflict-resolution mode under test.
+fn remember_with_facts(tmp: &tempfile::TempDir, content: &str, facts: &str, autonomy: &str) -> Value {
+    let out = cmd_in(tmp)
+        .args(["remember", content, "--facts-json", facts, "--autonomy", autonomy])
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    parse_stdout(&out)
+}
+
 #[test]
 fn agent_info_returns_raw_manifest_not_enveloped() {
     let mut cmd = engram();
@@ -563,7 +587,10 @@ fn export_returns_envelope_with_count() {
         .clone();
     let v = parse_stdout(&out);
     assert_eq!(v["status"], "success");
-    assert!(v["data"]["count"].is_number());
+    assert_eq!(v["data"]["version"], 2);
+    assert!(v["data"]["counts"]["memories"].is_number());
+    assert!(v["data"]["chunks"].is_array());
+    assert!(v["data"]["kbs"].is_array());
 }
 
 #[test]
@@ -612,7 +639,11 @@ fn import_from_export_roundtrip() {
         .clone();
     let iv = parse_stdout(&import_out);
     assert_eq!(iv["status"], "success");
-    assert!(iv["data"]["imported"].as_u64().unwrap() >= 1);
+    assert_eq!(iv["data"]["format_version"], 2);
+    assert!(iv["data"]["imported"]["memories"].as_u64().unwrap() >= 1);
+    // v2 round-trip carries the chunks + embeddings, so dense search works
+    // without re-embedding.
+    assert!(iv["data"]["imported"]["chunks"].as_u64().unwrap() >= 1);
 }
 
 #[test]
@@ -806,6 +837,19 @@ fn document_delete_clears_derived_entities() {
     delete.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
     delete
         .args(["documents", "delete", document_id, "--confirm", "--json"])
+        .assert()
+        .success();
+
+    // Deleting one document no longer wipes the whole KB's compiled
+    // knowledge; entity aggregates go stale until the next compile.
+    // A fresh compile over the (now empty) KB must clear them.
+    let mut compile = engram();
+    compile.env("HOME", tmp.path());
+    compile.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
+    compile.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
+    compile.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    compile
+        .args(["compile", "--kb", "delete-clean", "--all", "--json"])
         .assert()
         .success();
 
@@ -1058,4 +1102,442 @@ fn directory_ingest_uses_configured_scope_defaults() {
         .as_str()
         .unwrap()
         .ends_with("keep.md"));
+}
+
+/// Helper: run a recall with extra args in an existing isolated home.
+fn recall_in(home: &std::path::Path, args: &[&str]) -> Value {
+    let mut cmd = engram();
+    cmd.env("HOME", home);
+    cmd.env("XDG_CONFIG_HOME", home.join(".config"));
+    cmd.env("XDG_DATA_HOME", home.join(".local/share"));
+    cmd.env("XDG_CACHE_HOME", home.join(".cache"));
+    let out = cmd.args(args).assert().get_output().stdout.clone();
+    parse_stdout(&out)
+}
+
+#[test]
+fn recall_since_until_actually_filter_by_time() {
+    let (tmp, mut add) = with_isolated_home();
+    add.args(["remember", "Rapamycin inhibits mTORC1 signalling."])
+        .arg("--json")
+        .assert()
+        .success();
+
+    // A window entirely in the past must exclude the just-stored memory.
+    let past = recall_in(
+        tmp.path(),
+        &[
+            "recall", "rapamycin mTORC1", "--diary", "*", "--until",
+            "2020-01-01T00:00:00Z", "--json",
+        ],
+    );
+    assert_eq!(
+        past["data"]["results"].as_array().unwrap().len(),
+        0,
+        "--until in the past should exclude a memory stored now"
+    );
+
+    // A window from the past onward must include it (the flag is wired).
+    let now_window = recall_in(
+        tmp.path(),
+        &[
+            "recall", "rapamycin mTORC1", "--diary", "*", "--since",
+            "2020-01-01T00:00:00Z", "--json",
+        ],
+    );
+    assert!(
+        !now_window["data"]["results"].as_array().unwrap().is_empty(),
+        "--since in the past should include a memory stored now"
+    );
+}
+
+#[test]
+fn recall_output_carries_conflicts_field() {
+    let (tmp, mut add) = with_isolated_home();
+    add.args(["remember", "The capital is Springfield."])
+        .arg("--json")
+        .assert()
+        .success();
+    let v = recall_in(tmp.path(), &["recall", "capital", "--diary", "*", "--json"]);
+    assert!(
+        v["data"]["conflicts"].is_array(),
+        "recall output must include a conflicts array"
+    );
+}
+
+#[test]
+fn recall_cloud_profile_without_key_errors_not_silent_stub() {
+    // No ENGRAM_BENCH_FORCE_STUB, no GEMINI key → a cloud profile must
+    // fail with a config error (exit 2), not silently use the 64-dim stub.
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let mut cmd = Command::cargo_bin("engram").expect("binary built");
+    cmd.env_remove("ENGRAM_BENCH_FORCE_STUB");
+    cmd.env_remove("GEMINI_API_KEY");
+    cmd.env("HOME", tmp.path());
+    cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
+    cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
+    cmd.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    let assert = cmd
+        .args(["recall", "anything", "--profile", "cloud_quality", "--json"])
+        .assert()
+        .failure()
+        .code(2);
+    let err = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        err.contains("Gemini API key") || err.contains("offline"),
+        "expected a config error about the missing key, got: {err}"
+    );
+}
+
+#[test]
+fn recall_offline_profile_without_key_works() {
+    // The explicit offline profile opts into the stub and must succeed.
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let mut cmd = Command::cargo_bin("engram").expect("binary built");
+    cmd.env_remove("ENGRAM_BENCH_FORCE_STUB");
+    cmd.env_remove("GEMINI_API_KEY");
+    cmd.env("HOME", tmp.path());
+    cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
+    cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
+    cmd.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    cmd.args(["recall", "anything", "--profile", "offline", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn remember_dedups_identical_content() {
+    let (tmp, mut c1) = with_isolated_home();
+    let out1 = c1
+        .args(["remember", "Rapamycin extends mouse lifespan.", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v1 = parse_stdout(&out1);
+    assert_eq!(v1["data"]["stored"], true);
+
+    // Second identical remember → deduplicated, not stored again.
+    let mut c2 = engram();
+    c2.env("HOME", tmp.path());
+    c2.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
+    c2.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
+    c2.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    let out2 = c2
+        .args(["remember", "Rapamycin extends mouse lifespan.", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v2 = parse_stdout(&out2);
+    assert_eq!(v2["data"]["stored"], false);
+    assert_eq!(v2["data"]["deduplicated"], true);
+    assert_eq!(v2["data"]["id"], v1["data"]["id"]);
+
+    // --allow-duplicate forces a second row.
+    let mut c3 = engram();
+    c3.env("HOME", tmp.path());
+    c3.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
+    c3.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
+    c3.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    let out3 = c3
+        .args(["remember", "Rapamycin extends mouse lifespan.", "--allow-duplicate", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v3 = parse_stdout(&out3);
+    assert_eq!(v3["data"]["stored"], true);
+    assert_ne!(v3["data"]["id"], v1["data"]["id"]);
+}
+
+#[test]
+fn budget_gate_blocks_over_cap_spend() {
+    // Set a $0 daily budget, then a cloud-embedder ingest must be refused with
+    // exit code 4 (rate limited) BEFORE spending — proven with a fake key so no
+    // real call is made. Uses a fake GEMINI key so use_cloud_embedder is true;
+    // the budget gate fires before the (would-be) network call.
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let env = |c: &mut Command| {
+        c.env_remove("ENGRAM_BENCH_FORCE_STUB");
+        c.env("GEMINI_API_KEY", "fake-key-not-used-because-budget-blocks-first");
+        c.env("HOME", tmp.path());
+        c.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        c.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
+        c.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    };
+    // First, record some usage so spent >= 0 and set a $0 cap → immediately over.
+    let mut setb = Command::cargo_bin("engram").unwrap();
+    env(&mut setb);
+    setb.args(["budget", "set", "--kb", "capped", "--daily-usd", "0", "--json"])
+        .assert()
+        .success();
+
+    let fixture = tmp.path().join("note.md");
+    std::fs::write(&fixture, "Some content to embed.").unwrap();
+    let mut ing = Command::cargo_bin("engram").unwrap();
+    env(&mut ing);
+    ing.args([
+        "ingest",
+        fixture.to_str().unwrap(),
+        "--kb",
+        "capped",
+        "--all",
+        "--json",
+    ])
+    .assert()
+    .failure()
+    .code(4);
+}
+
+// ----- Write-path v2: facts-json, slot policies, conflict queue, resolve -----
+
+#[test]
+fn facts_json_stores_typed_fact_without_llm() {
+    let (tmp, _cmd) = with_isolated_home();
+    let v = remember_with_facts(
+        &tmp,
+        "Ana moved to Lisbon in March.",
+        r#"[{"subject":"Ana","predicate":"lives_in","object":"Lisbon","confidence":1.0,"valid_from":"2026-03-01"}]"#,
+        "assisted",
+    );
+    assert_eq!(v["data"]["facts_added"], 1);
+    assert_eq!(v["data"]["conflicts"].as_array().unwrap().len(), 0);
+
+    let out = cmd_in(&tmp)
+        .args(["facts", "list", "--subject", "Ana"])
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    let facts = v["data"]["facts"].as_array().expect("facts array");
+    assert_eq!(facts.len(), 1);
+    // lives_in is a known profile slot; valid_from came from the caller.
+    assert_eq!(facts[0]["fact_type"], "profile_slot");
+    assert!(facts[0]["valid_from"].as_str().unwrap().starts_with("2026-03-01"));
+}
+
+#[test]
+fn slot_last_writer_wins_supersedes_and_recall_reports_update() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_with_facts(
+        &tmp,
+        "Ana lives in Porto.",
+        r#"[{"subject":"Ana","predicate":"lives_in","object":"Porto"}]"#,
+        "assisted",
+    );
+    // Same slot, synonym predicate, new value: canonicalized to lives_in and
+    // superseded last-writer-wins with zero LLM involvement.
+    let v = remember_with_facts(
+        &tmp,
+        "Ana now resides in Lisbon.",
+        r#"[{"subject":"Ana","predicate":"resides_in","object":"Lisbon"}]"#,
+        "assisted",
+    );
+    let conflicts = v["data"]["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "LWW slot update must report the supersession");
+    assert_eq!(conflicts[0]["old_object"], "Porto");
+    assert_eq!(conflicts[0]["new_object"], "Lisbon");
+    assert_eq!(conflicts[0]["resolution"], "slot_lww");
+
+    // recall surfaces the resolved update.
+    let out = cmd_in(&tmp)
+        .args(["recall", "where does Ana live", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    let recall_conflicts = v["data"]["conflicts"].as_array().unwrap();
+    assert!(
+        recall_conflicts.iter().any(|c| c["status"] == "superseded"
+            && c["old_object"] == "Porto"
+            && c["new_object"] == "Lisbon"),
+        "recall must report the superseded value: {recall_conflicts:?}"
+    );
+}
+
+#[test]
+fn safety_slot_queues_conflict_and_recall_reports_contested() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_with_facts(
+        &tmp,
+        "Ana is allergic to penicillin.",
+        r#"[{"subject":"Ana","predicate":"allergic_to","object":"penicillin"}]"#,
+        "assisted",
+    );
+    // A different allergy value must NOT auto-supersede (await-confirmation):
+    // both stay active and the conflict queues for the caller.
+    let v = remember_with_facts(
+        &tmp,
+        "Actually Ana is allergic to amoxicillin.",
+        r#"[{"subject":"Ana","predicate":"allergic_to","object":"amoxicillin"}]"#,
+        "assisted",
+    );
+    let queued = v["data"]["adjudication_needed"].as_array().unwrap();
+    assert_eq!(queued.len(), 1, "safety slot must queue, not supersede");
+    assert_eq!(queued[0]["status"], "contested");
+    let conflict_id = queued[0]["conflict_id"].as_str().unwrap().to_string();
+
+    // Both values active.
+    let out = cmd_in(&tmp)
+        .args(["facts", "list", "--subject", "Ana", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["data"]["facts"].as_array().unwrap().len(), 2);
+
+    // recall flags the subject as contested with both values.
+    let out = cmd_in(&tmp)
+        .args(["recall", "Ana penicillin allergy", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    let contested: Vec<&Value> = v["data"]["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["status"] == "contested")
+        .collect();
+    assert_eq!(contested.len(), 1, "recall must mark the allergy contested");
+    let values = contested[0]["values"].as_array().unwrap();
+    assert!(values.iter().any(|v| v == "penicillin"));
+    assert!(values.iter().any(|v| v == "amoxicillin"));
+
+    // conflicts --open lists it; resolve applies the caller's decision.
+    let out = cmd_in(&tmp)
+        .args(["facts", "conflicts", "--open", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["data"]["count"], 1);
+
+    let out = cmd_in(&tmp)
+        .args([
+            "facts",
+            "resolve",
+            &conflict_id,
+            "--action",
+            "supersede-old",
+            "--note",
+            "user confirmed the correction",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["data"]["resolved"], true);
+
+    // Queue is empty; only the new value remains active with resolution=caller.
+    let out = cmd_in(&tmp)
+        .args(["facts", "conflicts", "--open", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(parse_stdout(&out)["data"]["count"], 0);
+    let out = cmd_in(&tmp)
+        .args(["facts", "list", "--subject", "Ana", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let facts = parse_stdout(&out)["data"]["facts"].as_array().unwrap().clone();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0]["object"], "amoxicillin");
+}
+
+#[test]
+fn reasserted_fact_dedupes_into_confirmation() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_with_facts(
+        &tmp,
+        "Ana works at Acme.",
+        r#"[{"subject":"Ana","predicate":"works_at","object":"Acme"}]"#,
+        "assisted",
+    );
+    let v = remember_with_facts(
+        &tmp,
+        "As mentioned, Ana works at Acme.",
+        r#"[{"subject":"Ana","predicate":"works_at","object":"Acme"}]"#,
+        "assisted",
+    );
+    assert_eq!(v["data"]["facts_added"], 0);
+    assert_eq!(v["data"]["facts_deduped"], 1);
+
+    let out = cmd_in(&tmp)
+        .args(["facts", "list", "--subject", "Ana", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let facts = parse_stdout(&out)["data"]["facts"].as_array().unwrap().clone();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0]["confirmations"], 1);
+}
+
+#[test]
+fn strict_autonomy_queues_even_plain_slot_updates() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_with_facts(
+        &tmp,
+        "Ana works at Acme.",
+        r#"[{"subject":"Ana","predicate":"works_at","object":"Acme"}]"#,
+        "strict",
+    );
+    let v = remember_with_facts(
+        &tmp,
+        "Ana works at Beta Corp now.",
+        r#"[{"subject":"Ana","predicate":"works_at","object":"Beta Corp"}]"#,
+        "strict",
+    );
+    assert_eq!(v["data"]["conflicts"].as_array().unwrap().len(), 0);
+    assert_eq!(v["data"]["adjudication_needed"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn facts_json_invalid_is_bad_input_exit_3() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    cmd.args(["remember", "x", "--facts-json", "not json", "--json"])
+        .assert()
+        .failure()
+        .code(3);
+}
+
+#[test]
+fn resolve_unknown_conflict_is_bad_input() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    cmd.args([
+        "facts",
+        "resolve",
+        "00000000-0000-0000-0000-000000000000",
+        "--action",
+        "keep-both",
+        "--json",
+    ])
+    .assert()
+    .failure()
+    .code(3);
 }

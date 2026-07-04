@@ -38,6 +38,8 @@ pub fn naive_split(text: &str) -> Vec<PendingChunk> {
 /// - Setext headings (`Title\n===` / `Title\n---`)
 /// - Numbered scientific section titles (`1 Introduction`, `2.3 Cell culture`)
 ///   that live on their own line in ALL CAPS or Title Case.
+/// - Unnumbered canonical section titles (`Methods`, `Results`, `References`)
+///   alone on a short line — common once a PDF loses its section numbers.
 pub fn section_aware_split(text: &str) -> Vec<PendingChunk> {
     let mut out = Vec::new();
     let mut pos = 0u32;
@@ -78,6 +80,17 @@ pub fn section_aware_split(text: &str) -> Vec<PendingChunk> {
         if let Some((level, title)) = parse_numbered_heading(line) {
             flush_chunk(&mut buf, &mut out, &mut pos, &headings);
             push_heading(&mut headings, level, &title);
+            i += 1;
+            continue;
+        }
+
+        // Unnumbered canonical section heading alone on a short line
+        // (`Methods`, `Results`, `References`, `Materials and Methods`, ...).
+        // Real extracted PDFs frequently drop the section number, so these must
+        // still register as breadcrumbs. Treated as top-level (level 1).
+        if let Some(title) = parse_unnumbered_heading(line) {
+            flush_chunk(&mut buf, &mut out, &mut pos, &headings);
+            push_heading(&mut headings, 1, &title);
             i += 1;
             continue;
         }
@@ -128,6 +141,68 @@ pub fn merge_small_chunks(chunks: Vec<PendingChunk>, target_chars: usize) -> Vec
     if let Some(mut acc) = cur {
         acc.position = pos;
         out.push(acc);
+    }
+    out
+}
+
+/// Enforce a hard upper bound on chunk size. Any chunk whose text exceeds
+/// `max_chars` is broken into several chunks at real sentence boundaries;
+/// chunks already within the cap pass through untouched. Positions are
+/// renumbered sequentially and the section breadcrumb is preserved on each piece.
+///
+/// This is the ceiling both paper and general chunking rely on. The downstream
+/// embedder silently truncates anything past its token window, so a merged
+/// reference list or a badly-extracted full page must be split here or its tail
+/// becomes permanently unretrievable.
+pub fn split_oversized(chunks: Vec<PendingChunk>, max_chars: usize) -> Vec<PendingChunk> {
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut position = 0u32;
+    for chunk in chunks {
+        for text in pack_sentences(&chunk.text, max_chars) {
+            out.push(PendingChunk {
+                text,
+                position,
+                section: chunk.section.clone(),
+            });
+            position += 1;
+        }
+    }
+    out
+}
+
+/// Pack `text` into pieces of at most `max_chars` bytes, cutting ONLY at real
+/// sentence boundaries (via `crate::sentences::split`) so no numeric fact
+/// ("0.1 nM", "p < 0.05") or abbreviation is ever severed. Returns the trimmed
+/// input as a single piece when it already fits. A lone sentence longer than
+/// `max_chars` is emitted whole rather than sliced mid-token — rare in real
+/// prose, and one oversized piece beats a corrupted p-value.
+pub fn pack_sentences(text: &str, max_chars: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.len() <= max_chars {
+        return vec![trimmed.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    for sentence in crate::sentences::split(trimmed) {
+        // Start a new piece before this sentence would overflow the cap; never
+        // flush an empty buffer, so an over-cap lone sentence lands whole.
+        if !buf.is_empty() && buf.len() + 1 + sentence.len() > max_chars {
+            out.push(buf.trim().to_string());
+            buf.clear();
+        }
+        if !buf.is_empty() {
+            buf.push(' ');
+        }
+        buf.push_str(&sentence);
+    }
+    let tail = buf.trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    // Safety net: if segmentation yielded nothing (e.g. no detectable
+    // boundaries) keep the original text rather than dropping it.
+    if out.is_empty() {
+        out.push(trimmed.to_string());
     }
     out
 }
@@ -196,6 +271,14 @@ fn parse_numbered_heading(line: &str) -> Option<(usize, String)> {
     if title.is_empty() {
         return None;
     }
+    // Reject reference / citation lines that merely START with a number, e.g.
+    // "1 Smith AB, Jones CD, Brown E. Nature 2020". Left unchecked they parse as
+    // headings and corrupt the breadcrumb stack for every chunk that follows.
+    // Author lists carry a year, "et al", many commas, or repeated
+    // Surname-Initials pairs — genuine section titles carry none of these.
+    if looks_like_reference(title) {
+        return None;
+    }
     // Heuristic: only treat as a heading if the title is <= 8 words and
     // mostly Title Case or ALL CAPS (typical for paper sections).
     let words: Vec<&str> = title.split_whitespace().collect();
@@ -211,6 +294,96 @@ fn parse_numbered_heading(line: &str) -> Option<(usize, String)> {
         return None;
     }
     Some((depth, title.to_string()))
+}
+
+/// Canonical scientific section titles that appear unnumbered on their own line.
+/// Lowercased for case-insensitive comparison. Deliberately small: a false
+/// heading shatters the breadcrumb stack, so we only accept titles that are
+/// almost always real section boundaries.
+const UNNUMBERED_SECTIONS: &[&str] = &[
+    "abstract",
+    "introduction",
+    "background",
+    "related work",
+    "materials and methods",
+    "materials and method",
+    "methods",
+    "method",
+    "methodology",
+    "experimental procedures",
+    "results",
+    "results and discussion",
+    "discussion",
+    "conclusion",
+    "conclusions",
+    "references",
+    "bibliography",
+    "acknowledgements",
+    "acknowledgments",
+    "supplementary material",
+    "supplementary materials",
+];
+
+/// Recognize a canonical unnumbered section heading (`Methods`, `Results`,
+/// `Materials and Methods`, ...) alone on a short line. Case-insensitive, at
+/// most 5 words, tolerant of a trailing `:` or `.`. Returns the title with its
+/// original casing so the breadcrumb reads naturally.
+fn parse_unnumbered_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // A heading is a short label, never a sentence.
+    let word_count = trimmed.split_whitespace().count();
+    if word_count == 0 || word_count > 5 {
+        return None;
+    }
+    let cleaned = trimmed.trim_end_matches([':', '.']).trim();
+    if UNNUMBERED_SECTIONS.contains(&cleaned.to_ascii_lowercase().as_str()) {
+        Some(cleaned.to_string())
+    } else {
+        None
+    }
+}
+
+/// Does `title` look like a bibliography / citation line rather than a section
+/// title? Used to stop numbered reference entries ("1 Smith AB, Jones CD, ...")
+/// from being mistaken for numbered headings. Conservative on the side of
+/// rejecting: missing a real heading is far cheaper than corrupting the stack.
+fn looks_like_reference(title: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    // "et al" is an unambiguous citation marker.
+    if lower.contains("et al") {
+        return true;
+    }
+    // A 4-digit year (1xxx / 2xxx) is a citation signal; section titles have none.
+    if title
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|t| t.len() == 4 && matches!(t.as_bytes().first(), Some(b'1' | b'2')))
+    {
+        return true;
+    }
+    // Author lists carry several commas; genuine section titles essentially never do.
+    if title.matches(',').count() >= 2 {
+        return true;
+    }
+    // Two or more "Surname AB" pairs (a Capitalized word directly followed by a
+    // short all-uppercase initials token) => an author list.
+    let tokens: Vec<&str> = title.split_whitespace().collect();
+    let mut pairs = 0usize;
+    for w in tokens.windows(2) {
+        let name = w[0].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let initials = w[1].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let name_ok = name.len() >= 2
+            && name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+            && name.chars().skip(1).any(|c| c.is_ascii_lowercase());
+        let initials_ok = (1..=3).contains(&initials.len())
+            && initials.chars().all(|c| c.is_ascii_uppercase());
+        if name_ok && initials_ok {
+            pairs += 1;
+        }
+    }
+    pairs >= 2
 }
 
 fn push_heading(headings: &mut Vec<String>, level: usize, title: &str) {
@@ -278,6 +451,66 @@ mod tests {
         assert!(mice.is_some());
         // Sections stored in chunk metadata — exact nesting depends on depth heuristic.
         assert!(mice.unwrap().section.is_some());
+    }
+
+    #[test]
+    fn section_aware_detects_unnumbered_headings() {
+        // A lone "Methods"/"Results" with no leading digit must still become a
+        // breadcrumb on the prose beneath it.
+        let text = "Methods\n\nHeLa cells were grown in DMEM.\n\nResults\n\nWe observed lifespan extension.";
+        let chunks = section_aware_split(text);
+        let m = chunks
+            .iter()
+            .find(|c| c.text.contains("HeLa"))
+            .expect("finds methods body");
+        assert_eq!(m.section.as_deref(), Some("Methods"));
+        let r = chunks
+            .iter()
+            .find(|c| c.text.contains("lifespan"))
+            .expect("finds results body");
+        assert_eq!(r.section.as_deref(), Some("Results"));
+    }
+
+    #[test]
+    fn unnumbered_multiword_heading_detected() {
+        assert_eq!(
+            parse_unnumbered_heading("Materials and Methods"),
+            Some("Materials and Methods".to_string())
+        );
+        assert_eq!(
+            parse_unnumbered_heading("REFERENCES"),
+            Some("REFERENCES".to_string())
+        );
+        assert_eq!(
+            parse_unnumbered_heading("Methods:"),
+            Some("Methods".to_string())
+        );
+        // A real sentence that merely starts with a section word is not a heading.
+        assert_eq!(parse_unnumbered_heading("Results were significant here."), None);
+    }
+
+    #[test]
+    fn reference_line_rejected_as_numbered_heading() {
+        // The bug: this parsed as a heading "Smith AB, Jones CD, ..." and poisoned
+        // every following chunk's breadcrumb.
+        assert!(parse_numbered_heading("1 Smith AB, Jones CD, Brown E. Nature 2020").is_none());
+        assert!(parse_numbered_heading("12 Doe J, Roe R. et al. Cell 2019;5:1-10").is_none());
+        // Genuine numbered headings still parse.
+        assert!(parse_numbered_heading("2 Methods").is_some());
+        assert!(parse_numbered_heading("2.1 Cell Culture").is_some());
+        assert!(parse_numbered_heading("3 Results").is_some());
+    }
+
+    #[test]
+    fn reference_line_does_not_corrupt_breadcrumbs() {
+        let text = "Results\n\nWe saw an effect.\n\n1 Smith AB, Jones CD, Brown E. Nature 2020";
+        let chunks = section_aware_split(text);
+        let refc = chunks
+            .iter()
+            .find(|c| c.text.contains("Smith AB"))
+            .expect("reference kept as body");
+        // Stays under the real heading, not promoted into its own section.
+        assert_eq!(refc.section.as_deref(), Some("Results"));
     }
 
     #[test]

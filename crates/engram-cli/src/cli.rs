@@ -59,6 +59,26 @@ pub enum Command {
         /// This may make a network LLM call when OPENROUTER_API_KEY is configured.
         #[arg(long)]
         extract_facts: bool,
+
+        /// Store even if identical content already exists in this kb/diary.
+        /// By default an exact duplicate is a no-op (no second embedding).
+        #[arg(long)]
+        allow_duplicate: bool,
+
+        /// Conflict-resolution authority: `assisted` (default) queues
+        /// uncertain contradictions for YOU to resolve via `facts resolve`
+        /// (you have the conversation context); `full` lets engram
+        /// adjudicate with its own LLM call; `strict` never auto-supersedes.
+        #[arg(long, default_value = "assisted")]
+        autonomy: String,
+
+        /// Store facts directly from a JSON array (same shape as extraction
+        /// output: [{"subject","predicate","object","confidence","fact_type",
+        /// "valid_from"}]). Skips the extraction LLM call entirely — use this
+        /// when you already know the triple. Runs the same contradiction
+        /// detection as --extract-facts.
+        #[arg(long)]
+        facts_json: Option<String>,
     },
 
     /// Retrieve relevant memories via hybrid search (dense + lexical + rerank).
@@ -353,7 +373,7 @@ Examples:
 
     /// Run a benchmark suite.
     Bench {
-        /// Benchmark name: mini | mini-fts | scientific-mini | longmemeval | longmemeval-qa | locomo-qa | locomo-plus | mab
+        /// Benchmark name: mini | mini-fts | scientific-mini | longmemeval | longmemeval-qa | locomo-plus | mab | litqa2 | beir | biogen
         #[arg(default_value = "mini")]
         suite: String,
 
@@ -365,29 +385,55 @@ Examples:
         #[arg(long)]
         download: bool,
 
-        /// Limit the number of questions (LongMemEval / LoCoMo).
+        /// Limit the number of questions (LongMemEval / LoCoMo / LitQA2).
         #[arg(long)]
         limit: Option<usize>,
 
-        /// Answerer model (OpenRouter slug, default openai/gpt-5.4).
-        #[arg(long, default_value = "openai/gpt-5.4")]
+        /// Answerer model (OpenRouter slug, default anthropic/claude-opus-4.8).
+        #[arg(long, default_value = "anthropic/claude-opus-4.8")]
         answerer: String,
 
-        /// Judge model (OpenRouter slug, default openai/gpt-5.4).
-        #[arg(long, default_value = "openai/gpt-5.4")]
+        /// Judge model (OpenRouter slug, default google/gemini-3.1-pro-preview).
+        #[arg(long, default_value = "google/gemini-3.1-pro-preview")]
         judge: String,
 
         /// Compute RAGAS metrics (4 extra LLM calls per question).
         #[arg(long)]
         ragas: bool,
 
-        /// Top-k chunks to pass to the answerer.
-        #[arg(long, default_value_t = 5)]
+        /// Top-k chunks to pass to the answerer / retriever. 0 = use the
+        /// per-suite default (5 for the QA suites, 30 for litqa2 / beir).
+        #[arg(long, default_value_t = 0)]
         top_k: usize,
 
         /// Save the report JSON to this path (in addition to stdout).
         #[arg(long)]
         save: Option<std::path::PathBuf>,
+
+        /// LitQA2 retrieval mode: closed-book | fulltext. closed-book needs only
+        /// an answerer API; fulltext additionally retrieves over --kb/--corpus.
+        #[arg(long, default_value = "closed-book")]
+        mode: String,
+
+        /// Knowledge base to build the retrieval corpus from (LitQA2 fulltext / BioGen).
+        #[arg(long)]
+        kb: Option<String>,
+
+        /// Corpus file (JSON/JSONL, doc-id -> text) to retrieve over instead of a KB.
+        #[arg(long)]
+        corpus: Option<std::path::PathBuf>,
+
+        /// BEIR dataset: scifact | nfcorpus | trec-covid | scidocs.
+        #[arg(long, default_value = "scifact")]
+        dataset: String,
+
+        /// BEIR reranking: on | off. When on, the hybrid row is reranked with Cohere.
+        #[arg(long, default_value = "off")]
+        rerank: String,
+
+        /// TREC BioGen edition: 2024 | 2025.
+        #[arg(long, default_value = "2024")]
+        year: String,
     },
 
     /// Manage engram configuration.
@@ -477,6 +523,9 @@ pub enum MemoryCommand {
         kb: String,
         #[arg(long)]
         extract_facts: bool,
+        /// Store even if identical content already exists in this kb/diary.
+        #[arg(long)]
+        allow_duplicate: bool,
     },
     /// Search durable memories.
     #[command(visible_alias = "find")]
@@ -640,9 +689,34 @@ pub enum FactsCommand {
         kb: String,
     },
     /// Show recent contradictions: facts that were superseded by newer claims.
+    /// With --open: unresolved (contested) conflicts awaiting your decision.
     Conflicts {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// List OPEN conflicts (contested facts awaiting resolution) instead
+        /// of the resolved supersession history.
+        #[arg(long)]
+        open: bool,
+        /// Filter open conflicts by diary.
+        #[arg(long)]
+        diary: Option<String>,
+        /// Filter open conflicts by KB.
+        #[arg(long)]
+        kb: Option<String>,
+    },
+    /// Resolve a queued fact conflict. You (the calling agent) have the
+    /// conversation context — decide and engram records it.
+    Resolve {
+        /// Conflict id from `facts conflicts --open` or a remember response.
+        id: String,
+        /// supersede-old: the new value replaces the old. keep-both: both are
+        /// true (not actually a contradiction). reject-new: the old value
+        /// stands; the new fact was wrong.
+        #[arg(long)]
+        action: String,
+        /// Optional note recorded with the resolution (e.g. "user confirmed").
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 

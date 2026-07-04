@@ -257,3 +257,13 @@ pub fn resolve_setting(env: &str, toml_path: &str, default: &str) -> String {
 fn _keep_write_import(mut w: impl Write) {
     let _ = writeln!(w, "");
 }
+
+/// True when the user explicitly disabled reranking
+/// (ENGRAM_RERANK_PROVIDER=none). Lets recall keep working when the
+/// Cohere account is broken (e.g. 402 billing) without silently changing
+/// behavior for anyone else: reranker API errors still fail loud by default.
+pub fn rerank_disabled() -> bool {
+    std::env::var("ENGRAM_RERANK_PROVIDER")
+        .map(|v| v.eq_ignore_ascii_case("none"))
+        .unwrap_or(false)
+}

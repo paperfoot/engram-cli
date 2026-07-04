@@ -10,6 +10,7 @@ pub mod general;
 pub mod papers;
 pub mod pdf;
 pub mod repos;
+pub mod sentences;
 
 pub use error::IngestError;
 

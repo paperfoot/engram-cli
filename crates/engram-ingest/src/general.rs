@@ -1,48 +1,13 @@
 //! General mode -- section-aware chunks for mixed notes and Markdown.
 
-use crate::chunker::{section_aware_split, PendingChunk};
+use crate::chunker::{section_aware_split, split_oversized, PendingChunk};
 
 const MAX_CHARS: usize = 1800;
 
 pub fn chunk_general(text: &str) -> Vec<PendingChunk> {
-    let chunks = section_aware_split(text);
-    split_oversized(chunks, MAX_CHARS)
-}
-
-fn split_oversized(chunks: Vec<PendingChunk>, max_chars: usize) -> Vec<PendingChunk> {
-    let mut out = Vec::new();
-    let mut position = 0u32;
-    for chunk in chunks {
-        for text in split_text(&chunk.text, max_chars) {
-            out.push(PendingChunk {
-                text,
-                position,
-                section: chunk.section.clone(),
-            });
-            position += 1;
-        }
-    }
-    out
-}
-
-fn split_text(text: &str, max_chars: usize) -> Vec<String> {
-    let trimmed = text.trim();
-    if trimmed.len() <= max_chars {
-        return vec![trimmed.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    for sentence in trimmed.split_inclusive(['.', '!', '?', '\n']) {
-        if !buf.is_empty() && buf.len() + sentence.len() > max_chars {
-            out.push(buf.trim().to_string());
-            buf.clear();
-        }
-        buf.push_str(sentence);
-    }
-    if !buf.trim().is_empty() {
-        out.push(buf.trim().to_string());
-    }
-    out
+    // `split_oversized` cuts only at real sentence boundaries (shared with paper
+    // mode), so an oversized note never severs a decimal like "0.1 nM".
+    split_oversized(section_aware_split(text), MAX_CHARS)
 }
 
 #[cfg(test)]
@@ -67,5 +32,17 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|chunk| chunk.section.as_deref() == Some("Notes")));
+    }
+
+    #[test]
+    fn general_oversized_split_preserves_decimals() {
+        // An oversized note built from decimal-bearing sentences must split into
+        // bounded chunks without ever cutting "0.05" in half.
+        let text = format!("# Notes\n\n{}", "The p value was 0.05 here. ".repeat(120));
+        let chunks = chunk_general(&text);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.text.len() <= MAX_CHARS));
+        let total: usize = chunks.iter().map(|c| c.text.matches("0.05").count()).sum();
+        assert_eq!(total, 120, "a decimal was split or lost");
     }
 }

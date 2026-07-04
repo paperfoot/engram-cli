@@ -126,6 +126,12 @@ pub async fn run(
     let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let have_gemini = gemini_key.is_some() && !force_stub;
+
+    // Enforce spend guardrails before embedding (and, when --compile is set,
+    // before the compiler's own paid calls).
+    if have_gemini {
+        crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
+    }
     let (model_name, dims, prompt_format) = if have_gemini {
         let e = GeminiEmbedder::new(gemini_key.clone().unwrap());
         (e.model(), e.dimensions(), e.prompt_format().to_string())
@@ -165,11 +171,19 @@ pub async fn run(
         };
 
         let source_path = file.display().to_string();
+        let mut stale_document: Option<Uuid> = None;
         if let Some(existing_id) = ctx.store.document_id_for_source_path(&kb, &source_path)? {
             let (active_memories, active_chunks) = ctx.store.active_document_counts(existing_id)?;
             if active_memories > 0 || active_chunks > 0 {
-                skipped_existing += 1;
-                continue;
+                // The file was ingested before. If its content is UNCHANGED,
+                // skip (idempotent). If it CHANGED (edited PDF/notes), replace
+                // the stale document so the corpus doesn't silently go stale —
+                // the old no-op-on-same-path behaviour left edits invisible.
+                if ctx.store.document_content_matches(existing_id, &text)? {
+                    skipped_existing += 1;
+                    continue;
+                }
+                stale_document = Some(existing_id);
             }
         }
         let doc_title = file
@@ -177,18 +191,11 @@ pub async fn run(
             .and_then(|s| s.to_str())
             .unwrap_or("untitled")
             .to_string();
-        let document_id = ctx.store.insert_document(
-            &kb,
-            &doc_title,
-            Some(&source_path),
-            &format!("{:?}", resolved_mode).to_ascii_lowercase(),
-            json!({ "ingested_from": source_path }),
-        )?;
 
         let source = match resolved_mode {
             Mode::Papers => MemorySource::Paper {
                 doi: None,
-                title: doc_title,
+                title: doc_title.clone(),
                 section: None,
             },
             Mode::Takeaways => MemorySource::General,
@@ -209,10 +216,11 @@ pub async fn run(
             _ => MemorySource::General,
         };
 
+        let ingested_at = Utc::now();
         let memory = Memory {
             id: Uuid::new_v4(),
             content: text.clone(),
-            created_at: Utc::now(),
+            created_at: ingested_at,
             event_time: None,
             importance: 5,
             emotional_weight: 0,
@@ -221,11 +229,10 @@ pub async fn run(
             stability: 1.0,
             source,
             diary: diary.clone(),
-            valid_from: None,
+            valid_from: Some(ingested_at),
             valid_until: None,
             tags: vec![file.display().to_string()],
         };
-        ctx.store.insert_memory_with_kb(&memory, &kb)?;
 
         let chunks: Vec<PendingChunk> = match resolved_mode {
             Mode::Papers => papers::chunk_paper(&text),
@@ -235,50 +242,65 @@ pub async fn run(
             _ => general_mode::chunk_general(&text),
         };
 
-        // Batch-embed all chunks. If embedding fails (rate limit, network,
-        // etc.) roll back the memory row so we don't leave an orphan with
-        // no chunks — recall would find nothing anyway and the count would
-        // be misleading.
+        // Embed BEFORE touching the database: a rate-limit or network
+        // failure here leaves no orphan document/memory rows behind.
         let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
         let embed_chars: usize = chunk_texts.iter().map(|t| t.len()).sum();
-        let embed_result: Result<Vec<Vec<f32>>, CliError> = if chunk_texts.is_empty() {
-            Ok(Vec::new())
+        let embeddings: Vec<Vec<f32>> = if chunk_texts.is_empty() {
+            Vec::new()
         } else if have_gemini {
             let e = GeminiEmbedder::new(gemini_key.clone().unwrap());
             e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-                .await
-                .map_err(CliError::from)
+                .await?
         } else {
             let e = StubEmbedder::default();
             e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-                .await
-                .map_err(CliError::from)
+                .await?
         };
-
-        let embeddings = match embed_result {
-            Ok(v) => v,
-            Err(e) => {
-                // Roll back the orphan memory row and bubble the error up.
-                let _ = ctx.store.hard_delete_memory(memory.id);
-                return Err(e);
-            }
-        };
-
-        for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-            ctx.store.insert_chunk_with_embedding_meta(
-                Uuid::new_v4(),
-                memory.id,
-                &chunk.text,
-                chunk.position,
-                chunk.section.as_deref(),
-                emb,
-                &model_name,
-                dims,
-                &prompt_format,
-                Some(document_id),
-            )?;
-            chunks_created += 1;
+        if embeddings.len() != chunks.len() {
+            return Err(CliError::Transient(format!(
+                "embedder returned {} embeddings for {} chunks ({}); aborting so no chunk is \
+                 silently indexed without a vector",
+                embeddings.len(),
+                chunks.len(),
+                file.display()
+            )));
         }
+
+        // All writes for this file are one atomic unit: (drop stale doc) +
+        // document + memory + chunks either all land or none do.
+        let file_chunks = ctx.store.with_tx(|store| {
+            if let Some(old_id) = stale_document {
+                // Content changed: remove the previous version so recall sees
+                // only the current file, then fall through to insert the new
+                // one (same transaction — never a window with neither).
+                store.delete_document(old_id)?;
+            }
+            let document_id = store.insert_document(
+                &kb,
+                &doc_title,
+                Some(&source_path),
+                &format!("{:?}", resolved_mode).to_ascii_lowercase(),
+                json!({ "ingested_from": source_path }),
+            )?;
+            store.insert_memory_with_kb(&memory, &kb)?;
+            for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
+                store.insert_chunk_with_embedding_meta(
+                    Uuid::new_v4(),
+                    memory.id,
+                    &chunk.text,
+                    chunk.position,
+                    chunk.section.as_deref(),
+                    emb,
+                    &model_name,
+                    dims,
+                    &prompt_format,
+                    Some(document_id),
+                )?;
+            }
+            Ok(chunks.len())
+        })?;
+        chunks_created += file_chunks as u32;
         total_embedded_chars += embed_chars;
         memories_created += 1;
     }
