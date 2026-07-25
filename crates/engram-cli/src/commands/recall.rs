@@ -4,7 +4,9 @@ use crate::commands::usage::{cohere_rerank_cost_usd, estimated_tokens, gemini_em
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_envelope, Metadata};
-use crate::retrieval::{hybrid_recall, Filters, HybridParams, RecallMode, RetrievalProfile};
+use crate::retrieval::{
+    hybrid_recall, resolve_kb_scope, Filters, HybridParams, RecallMode, RetrievalProfile,
+};
 use chrono::{DateTime, Utc};
 use engram_core::layers::approx_tokens;
 use engram_core::types::Layer;
@@ -24,7 +26,7 @@ pub async fn run(
     layer: String,
     mode: String,
     profile: String,
-    kb: String,
+    kb: Option<String>,
     all_kbs: bool,
     diary: String,
     rerank_top_n: Option<usize>,
@@ -48,6 +50,11 @@ pub async fn run(
         .and_then(|v| v.parse().ok())
         .unwrap_or(60.0);
 
+    // Scope resolution: explicit --kb > retrieval.default_kb > every KB.
+    // The old default ("default") meant a plain recall searched a single,
+    // usually near-empty namespace and missed everything filed elsewhere.
+    let scope = resolve_kb_scope(kb.as_deref(), all_kbs);
+
     let rerank_candidates = rerank_top_n.unwrap_or_else(|| profile_enum.default_rerank_top_n());
     let filters = Filters {
         diary: if diary == "*" {
@@ -55,7 +62,7 @@ pub async fn run(
         } else {
             Some(diary.clone())
         },
-        kb: if all_kbs { None } else { Some(kb.clone()) },
+        kb: scope.kb.clone(),
         since: since_dt,
         until: until_dt,
     };
@@ -93,14 +100,14 @@ pub async fn run(
 
     // Enforce spend guardrails before any paid embed/rerank call.
     if use_cloud_embedder {
-        crate::commands::budget::enforce_budget(ctx, if all_kbs { None } else { Some(&kb) })?;
+        crate::commands::budget::enforce_budget(ctx, scope.as_deref())?;
     }
     let use_cohere =
         profile_enum != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
         && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
 
-    let (results, embed_model, embed_dims, prompt_format) = if use_cloud_embedder {
+    let (outcome, embed_model, embed_dims, prompt_format) = if use_cloud_embedder {
         let embedder = GeminiEmbedder::new(gemini_key.clone().unwrap());
         let meta = (
             embedder.model(),
@@ -127,6 +134,9 @@ pub async fn run(
         (results, meta.0, meta.1, meta.2)
     };
 
+    let results = outcome.results;
+    let notes = outcome.notes;
+
     // The memory-layer token budget trims the returned set to fit an agent's
     // context window. But it must never silently return FEWER than the caller's
     // explicit --top-k: previously a default `topic` budget (800 tokens) capped
@@ -152,7 +162,7 @@ pub async fn run(
     // disagree), report it so the caller can "cite both / note the update"
     // instead of unknowingly answering from a stale fact. This is the read-path
     // half of the contradiction-resolution promise.
-    let conflicts = surface_conflicts(ctx, if all_kbs { None } else { Some(&kb) }, &query)?;
+    let conflicts = surface_conflicts(ctx, scope.as_deref(), &query)?;
 
     let answer_context = build_answer_context(&layered);
     let results_json: Vec<_> = layered
@@ -193,7 +203,7 @@ pub async fn run(
             "gemini",
             "recall_query_embed",
             Some(&embed_model),
-            if all_kbs { None } else { Some(&kb) },
+            scope.as_deref(),
             if diary == "*" { None } else { Some(&diary) },
             1,
             1,
@@ -213,7 +223,7 @@ pub async fn run(
             "cohere",
             "recall_rerank",
             Some(cohere_model.as_str()),
-            if all_kbs { None } else { Some(&kb) },
+            scope.as_deref(),
             if diary == "*" { None } else { Some(&diary) },
             1,
             rerank_candidates as i64,
@@ -232,7 +242,14 @@ pub async fn run(
     meta.elapsed_ms = start.elapsed().as_millis() as u64;
     meta.add("profile", profile_enum.as_str());
     meta.add("mode", recall_mode.as_str());
-    meta.add("kb", if all_kbs { "*" } else { kb.as_str() });
+    meta.add("kb", scope.label());
+    meta.add("kb_scope", scope.origin.as_str());
+    meta.add("diary", if diary == "*" { "*" } else { diary.as_str() });
+    // Report anything the diary-isolation guard withheld, so a narrowed result
+    // set is explained rather than silently short.
+    if let Some(isolation) = notes.diary_isolation_json() {
+        meta.add("diary_isolation", isolation);
+    }
     meta.add(
         "retriever",
         if use_cloud_embedder {
@@ -286,7 +303,10 @@ pub async fn run(
                 "embed_dims": if use_cloud_embedder { DEFAULT_DIMS } else { embed_dims },
                 "prompt_format": if use_cloud_embedder { PROMPT_FORMAT } else { prompt_format.as_str() },
                 "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
-                "candidates_considered": rerank_candidates
+                "candidates_considered": rerank_candidates,
+                "kb": scope.label(),
+                "kb_scope": scope.origin.as_str(),
+                "diary_isolation": notes.diary_isolation_json()
             }
         }),
         meta,

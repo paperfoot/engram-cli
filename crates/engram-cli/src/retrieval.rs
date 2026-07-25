@@ -11,12 +11,15 @@ use engram_embed::{Embedder, TaskMode};
 use engram_graph::extract_entities;
 use engram_rerank::{passthrough::PassthroughReranker, RerankCandidate, Reranker};
 use engram_storage::{SourceCitation, SqliteStore, StoredChunkEmbedding};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Filters {
     pub diary: Option<String>,
+    /// KB to search. `None` means EVERY KB — that is the default scope for
+    /// recall, because a memory is only findable if the search reaches the KB
+    /// it was written to and callers rarely know that name at read time.
     pub kb: Option<String>,
     /// Inclusive lower/upper bounds on each memory's effective event time
     /// (`COALESCE(event_time, created_at)`). `recall --since/--until` map here
@@ -107,6 +110,139 @@ pub struct HybridResult {
     pub sources: Vec<RetrievalSource>,
 }
 
+/// Config key (and env override) that pins the default KB for reads.
+pub const DEFAULT_KB_CONFIG_KEY: &str = "retrieval.default_kb";
+pub const DEFAULT_KB_ENV: &str = "ENGRAM_DEFAULT_KB";
+
+/// Where a recall's KB scope came from. Reported in response metadata so an
+/// agent can tell an all-KB search from a pinned one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KbScopeOrigin {
+    /// An explicit `--kb <name>`.
+    Flag,
+    /// `retrieval.default_kb` (or `ENGRAM_DEFAULT_KB`).
+    Config,
+    /// Every KB: the default, or an explicit `--all-kbs` / `--kb '*'`.
+    AllKbs,
+}
+
+impl KbScopeOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::Config => "config",
+            Self::AllKbs => "all_kbs",
+        }
+    }
+}
+
+/// The KB a read command will search. `kb == None` means every KB.
+#[derive(Debug, Clone)]
+pub struct KbScope {
+    pub kb: Option<String>,
+    pub origin: KbScopeOrigin,
+}
+
+impl KbScope {
+    pub fn as_deref(&self) -> Option<&str> {
+        self.kb.as_deref()
+    }
+
+    /// Human/JSON label: the KB name, or `*` for an all-KB search.
+    pub fn label(&self) -> &str {
+        self.kb.as_deref().unwrap_or("*")
+    }
+}
+
+/// Resolve the KB scope of a read command.
+///
+/// Precedence: explicit `--kb <name>` > `retrieval.default_kb` config > all KBs.
+///
+/// Searching every KB is the default because the previous default — the KB
+/// literally named "default" — made a plain `engram recall` miss any memory
+/// written with `--kb <something>`: the read side has no way to guess which
+/// namespace a fact was filed under. `--all-kbs` and `--kb '*'` stay as
+/// explicit ways to say "everything" even when a default KB is pinned.
+pub fn resolve_kb_scope(explicit: Option<&str>, all_kbs: bool) -> KbScope {
+    if all_kbs {
+        return KbScope {
+            kb: None,
+            origin: KbScopeOrigin::AllKbs,
+        };
+    }
+    if let Some(name) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return if name == "*" {
+            KbScope {
+                kb: None,
+                origin: KbScopeOrigin::AllKbs,
+            }
+        } else {
+            KbScope {
+                kb: Some(name.to_string()),
+                origin: KbScopeOrigin::Flag,
+            }
+        };
+    }
+    let configured = std::env::var(DEFAULT_KB_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| crate::commands::config::resolve_config_string(DEFAULT_KB_CONFIG_KEY));
+    match configured.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() && name != "*" => KbScope {
+            kb: Some(name.to_string()),
+            origin: KbScopeOrigin::Config,
+        },
+        _ => KbScope {
+            kb: None,
+            origin: KbScopeOrigin::AllKbs,
+        },
+    }
+}
+
+/// Non-result diagnostics from a recall: what the pipeline deliberately
+/// withheld. Callers surface this in response metadata so a dropped retrieval
+/// source is visible to the agent instead of silently missing.
+#[derive(Debug, Clone, Default)]
+pub struct RecallNotes {
+    /// Diary this recall was confined to. `None` = every diary.
+    pub diary_scope: Option<String>,
+    /// Candidates withheld by the diary-isolation guard, keyed by source name.
+    pub diary_excluded: BTreeMap<&'static str, usize>,
+}
+
+impl RecallNotes {
+    fn exclude(&mut self, source: &'static str, count: usize) {
+        if count > 0 {
+            *self.diary_excluded.entry(source).or_insert(0) += count;
+        }
+    }
+
+    /// JSON for response metadata, or `None` when nothing was withheld.
+    pub fn diary_isolation_json(&self) -> Option<serde_json::Value> {
+        if self.diary_excluded.is_empty() {
+            return None;
+        }
+        let excluded: serde_json::Map<String, serde_json::Value> = self
+            .diary_excluded
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), serde_json::json!(v)))
+            .collect();
+        Some(serde_json::json!({
+            "diary": self.diary_scope,
+            "excluded_candidates": excluded,
+            "reason": "derived content (claims, wiki pages, entities, relations) \
+                       that could not be proven to come from this diary's memories",
+        }))
+    }
+}
+
+/// A recall's results plus the diagnostics that explain them.
+#[derive(Debug, Clone, Default)]
+pub struct RecallOutcome {
+    pub results: Vec<HybridResult>,
+    pub notes: RecallNotes,
+}
+
 #[derive(Debug, Clone)]
 pub struct HybridParams<'a> {
     pub query: &'a str,
@@ -175,7 +311,7 @@ pub async fn hybrid_recall<E, R>(
     embedder: &E,
     reranker: Option<&R>,
     params: HybridParams<'_>,
-) -> Result<Vec<HybridResult>, crate::error::CliError>
+) -> Result<RecallOutcome, crate::error::CliError>
 where
     E: Embedder + ?Sized,
     R: Reranker + ?Sized,
@@ -185,6 +321,30 @@ where
     let expected_prompt = embedder.prompt_format().to_string();
     let kb = params.filters.kb.as_deref();
     let diary = params.filters.diary.as_deref();
+
+    let mut notes = RecallNotes {
+        diary_scope: params.filters.diary.clone(),
+        ..RecallNotes::default()
+    };
+
+    // DIARY ISOLATION INVARIANT: a diary-scoped recall never returns content
+    // derived solely from another diary's memories.
+    //
+    // Raw chunks are filtered by `m.diary` in SQL, but the derived layers are
+    // not: claims and wiki pages are LLM/compiler rewrites of chunk text, and
+    // entities/relations are aggregates over it. Returning one of those for a
+    // recall scoped to diary X could hand back a paraphrase of diary Y's
+    // private memory. Claims carry provenance
+    // (claim_evidence -> chunks -> memories.diary) so they are filtered
+    // exactly; wiki pages, entities and relations record only a `kb`, so the
+    // only sound test available is KB-level confinement — a KB whose live
+    // memories all belong to X can only have produced X-derived artifacts.
+    // Anything withheld is reported in `RecallNotes` rather than dropped
+    // silently.
+    let mixed_diary_kbs = match diary {
+        Some(d) => Some(store.kbs_with_memories_outside_diary(d)?),
+        None => None,
+    };
 
     let mut candidate_records: HashMap<Uuid, CandidateRecord> = HashMap::new();
     let mut source_map: HashMap<Uuid, HashSet<RetrievalSource>> = HashMap::new();
@@ -270,13 +430,22 @@ where
             RecallMode::Evidence | RecallMode::Explore | RecallMode::Agent
         )
     {
-        let claims = match store.claim_fts_search(&fts_q, kb, params.rerank_top_n) {
+        let mut claims = match store.claim_fts_search(&fts_q, kb, params.rerank_top_n) {
             Ok(hits) => hits,
             Err(e) => {
                 tracing::warn!("claim search failed, continuing without it: {e}");
                 Vec::new()
             }
         };
+        // Diary isolation (see invariant above): keep only claims whose
+        // evidence resolves into the requested diary.
+        if let Some(d) = diary {
+            let ids: Vec<Uuid> = claims.iter().map(|(id, _)| *id).collect();
+            let visible = store.claims_visible_in_diary(&ids, d)?;
+            let before = claims.len();
+            claims.retain(|(id, _)| visible.contains(id));
+            notes.exclude("claim", before - claims.len());
+        }
         for (id, _) in &claims {
             if let Some(claim) = store.get_claim(*id)? {
                 // Claims found via their own FTS index are a distinct
@@ -312,21 +481,37 @@ where
                 Vec::new()
             }
         };
-        for (id, _) in &wiki_hits {
-            if let Some(page) = store.get_wiki_page_by_id(*id)? {
-                candidate_records.insert(
-                    *id,
-                    CandidateRecord {
-                        kind: "wiki_page".to_string(),
-                        content: page.content,
-                        kb: page.kb,
-                        citations: Vec::new(),
-                        parent_chunk: None,
-                    },
-                );
+        // Diary isolation (see invariant above): a wiki page records only its
+        // KB, so it is admissible only when that KB is confined to the
+        // requested diary. Filtering happens BEFORE ranking so the surviving
+        // pages get contiguous ranks in the fused run.
+        let mut kept_wiki: Vec<(Uuid, f32)> = Vec::with_capacity(wiki_hits.len());
+        let mut wiki_excluded = 0usize;
+        for (id, score) in wiki_hits {
+            let Some(page) = store.get_wiki_page_by_id(id)? else {
+                continue;
+            };
+            if mixed_diary_kbs
+                .as_ref()
+                .is_some_and(|mixed| mixed.contains(&page.kb))
+            {
+                wiki_excluded += 1;
+                continue;
             }
+            candidate_records.insert(
+                id,
+                CandidateRecord {
+                    kind: "wiki_page".to_string(),
+                    content: page.content,
+                    kb: page.kb,
+                    citations: Vec::new(),
+                    parent_chunk: None,
+                },
+            );
+            kept_wiki.push((id, score));
         }
-        let wiki_run = ranked_run(&wiki_hits, RetrievalSource::Wiki, params.rerank_top_n);
+        notes.exclude("wiki", wiki_excluded);
+        let wiki_run = ranked_run(&kept_wiki, RetrievalSource::Wiki, params.rerank_top_n);
         mark_sources(&mut source_map, &wiki_run);
         runs.push(wiki_run);
     }
@@ -337,13 +522,20 @@ where
         kb,
         params.mode,
         params.graph_hops,
-        &mut candidate_records,
-        &mut source_map,
-        &mut runs,
+        mixed_diary_kbs.as_ref(),
+        &mut CandidateSink {
+            records: &mut candidate_records,
+            sources: &mut source_map,
+            runs: &mut runs,
+            notes: &mut notes,
+        },
     )?;
 
     if runs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RecallOutcome {
+            results: Vec::new(),
+            notes,
+        });
     }
 
     let fused = reciprocal_rank_fusion(&runs, params.rrf_k);
@@ -370,7 +562,10 @@ where
     }
 
     if rerank_candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RecallOutcome {
+            results: Vec::new(),
+            notes,
+        });
     }
 
     // Rerank the full candidate pool (not just top_k) so the diversity cap
@@ -400,11 +595,11 @@ where
     };
 
     let using_reranker = reranker.is_some();
-    let mut out = Vec::with_capacity(params.top_k);
+    let mut results = Vec::with_capacity(params.top_k);
     let mut per_doc: HashMap<Uuid, usize> = HashMap::new();
     let mut emitted_chunks: HashSet<Uuid> = HashSet::new();
     for r in reranked {
-        if out.len() >= params.top_k {
+        if results.len() >= params.top_k {
             break;
         }
         let id = candidate_ids
@@ -473,7 +668,7 @@ where
             sources.push(RetrievalSource::Reranker);
         }
         sources.sort_by_key(source_rank);
-        out.push(HybridResult {
+        results.push(HybridResult {
             id,
             kind,
             content,
@@ -485,7 +680,7 @@ where
         });
     }
 
-    Ok(out)
+    Ok(RecallOutcome { results, notes })
 }
 
 fn source_rank(s: &RetrievalSource) -> u8 {
@@ -533,7 +728,7 @@ fn guard_embedding_compatibility(
         .collect::<Vec<_>>()
         .join("; ");
     Err(crate::error::CliError::Config(format!(
-        "embedding metadata mismatch; refusing mixed retrieval. Expected model={expected_model} dims={expected_dims} prompt={expected_prompt}. Examples: {examples}. Run `engram reindex --kb <name>` or pass --allow-mixed-embeddings."
+        "embedding metadata mismatch; refusing mixed retrieval. Expected model={expected_model} dims={expected_dims} prompt={expected_prompt}. Examples: {examples}. Run `engram reindex --all` (recall now searches every KB by default), scope the search with `--kb <name>`, or pass --allow-mixed-embeddings."
     )))
 }
 
@@ -560,21 +755,35 @@ fn mark_sources(source_map: &mut HashMap<Uuid, HashSet<RetrievalSource>>, run: &
     }
 }
 
+/// Mutable collectors threaded through candidate generation.
+struct CandidateSink<'a> {
+    records: &'a mut HashMap<Uuid, CandidateRecord>,
+    sources: &'a mut HashMap<Uuid, HashSet<RetrievalSource>>,
+    runs: &'a mut Vec<Vec<RankedHit>>,
+    notes: &'a mut RecallNotes,
+}
+
+/// Maximum entity rows pulled per query term. In cross-KB mode one term can
+/// legitimately match one entity per KB; the cap keeps a common word from
+/// flooding the fused ranking.
+const ENTITY_MATCHES_PER_TERM: usize = 8;
+
 fn add_entity_and_graph_candidates(
     store: &SqliteStore,
     query: &str,
     kb: Option<&str>,
     mode: RecallMode,
     graph_hops: u8,
-    candidate_records: &mut HashMap<Uuid, CandidateRecord>,
-    source_map: &mut HashMap<Uuid, HashSet<RetrievalSource>>,
-    runs: &mut Vec<Vec<RankedHit>>,
+    mixed_diary_kbs: Option<&HashSet<String>>,
+    sink: &mut CandidateSink<'_>,
 ) -> Result<(), crate::error::CliError> {
-    if mode == RecallMode::Raw || kb.is_none() {
+    // Raw mode is chunks-only by definition. Every other mode runs entity and
+    // graph retrieval — including the unscoped (all-KBs) case, which used to
+    // bail out here and silently lose two of the pipeline's five sources.
+    if mode == RecallMode::Raw {
         return Ok(());
     }
-    let kb = kb.unwrap();
-    // Match entity names from the query. `find_entity` already lowercases both
+    // Match entity names from the query. `find_entities` already lowercases both
     // sides, so a lowercased query term matches a Title-Case entity. Also try
     // individual query tokens, so "rapamycin dose" matches the entity
     // "Rapamycin" even though extract_entities (which wants capitalization)
@@ -591,12 +800,20 @@ fn add_entity_and_graph_candidates(
     let mut entity_scored = Vec::new();
     let mut graph_scored = Vec::new();
     let mut seen_entities: HashSet<Uuid> = HashSet::new();
+    let mut excluded = 0usize;
     for name in entity_names {
-        if let Some(entity) = store.find_entity(Some(kb), &name)? {
+        for entity in store.find_entities(kb, &name, ENTITY_MATCHES_PER_TERM)? {
             if !seen_entities.insert(entity.id) {
                 continue;
             }
-            candidate_records.insert(
+            // Diary isolation: an entity row is an aggregate over a KB's chunks
+            // and carries no diary, so it is admissible only when its KB holds
+            // nothing but the requested diary's memories.
+            if mixed_diary_kbs.is_some_and(|mixed| mixed.contains(&entity.kb)) {
+                excluded += 1;
+                continue;
+            }
+            sink.records.insert(
                 entity.id,
                 CandidateRecord {
                     kind: "entity".to_string(),
@@ -616,10 +833,12 @@ fn add_entity_and_graph_candidates(
             // fused ranking of a precision recall (evidence/agent) let a
             // frequently-co-mentioned but irrelevant entity displace a real
             // passage. In Explore (a browsing mode) they're useful context.
+            // Expansion runs inside the matched entity's own KB, so an
+            // unscoped recall walks each KB's graph without merging them.
             if mode == RecallMode::Explore {
                 let hops = graph_hops.clamp(1, 3);
-                for rel in store.graph_neighbors(kb, &entity.canonical_name, hops)? {
-                    candidate_records.insert(
+                for rel in store.graph_neighbors(&entity.kb, &entity.canonical_name, hops)? {
+                    sink.records.insert(
                         rel.id,
                         CandidateRecord {
                             kind: "relation".to_string(),
@@ -637,15 +856,93 @@ fn add_entity_and_graph_candidates(
             }
         }
     }
+    sink.notes.exclude("entity", excluded);
+    // Highest mention count first: `find_entities` orders within a term, but
+    // candidates from different terms/KBs still have to be ranked against
+    // each other before the fused run is built.
+    entity_scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    graph_scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let entity_run = ranked_run(&entity_scored, RetrievalSource::Entity, 20);
-    mark_sources(source_map, &entity_run);
+    mark_sources(sink.sources, &entity_run);
     if !entity_run.is_empty() {
-        runs.push(entity_run);
+        sink.runs.push(entity_run);
     }
     let graph_run = ranked_run(&graph_scored, RetrievalSource::Graph, 20);
-    mark_sources(source_map, &graph_run);
+    mark_sources(sink.sources, &graph_run);
     if !graph_run.is_empty() {
-        runs.push(graph_run);
+        sink.runs.push(graph_run);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // NOTE: only the branches that resolve WITHOUT consulting config are unit
+    // tested here — reading `retrieval.default_kb` touches the user's real
+    // config file, so that precedence step is covered by the CLI integration
+    // tests (which run against an isolated HOME).
+
+    #[test]
+    fn explicit_kb_flag_wins() {
+        let scope = resolve_kb_scope(Some("relationships"), false);
+        assert_eq!(scope.kb.as_deref(), Some("relationships"));
+        assert_eq!(scope.origin, KbScopeOrigin::Flag);
+        assert_eq!(scope.label(), "relationships");
+    }
+
+    #[test]
+    fn all_kbs_flag_overrides_an_explicit_kb() {
+        let scope = resolve_kb_scope(Some("relationships"), true);
+        assert!(scope.kb.is_none());
+        assert_eq!(scope.origin, KbScopeOrigin::AllKbs);
+        assert_eq!(scope.label(), "*");
+    }
+
+    #[test]
+    fn star_kb_means_every_kb() {
+        let scope = resolve_kb_scope(Some("*"), false);
+        assert!(scope.kb.is_none());
+        assert_eq!(scope.origin, KbScopeOrigin::AllKbs);
+    }
+
+    #[test]
+    fn blank_kb_is_not_treated_as_a_name() {
+        // `--kb ''` must not scope retrieval to a KB literally named "".
+        let scope = resolve_kb_scope(Some("   "), true);
+        assert!(scope.kb.is_none());
+    }
+
+    #[test]
+    fn notes_report_nothing_when_no_source_was_withheld() {
+        let notes = RecallNotes {
+            diary_scope: Some("work".into()),
+            ..RecallNotes::default()
+        };
+        assert!(notes.diary_isolation_json().is_none());
+    }
+
+    #[test]
+    fn notes_report_each_withheld_source() {
+        let mut notes = RecallNotes {
+            diary_scope: Some("work".into()),
+            ..RecallNotes::default()
+        };
+        notes.exclude("claim", 2);
+        notes.exclude("claim", 1);
+        notes.exclude("wiki", 0);
+        let json = notes.diary_isolation_json().expect("exclusions reported");
+        assert_eq!(json["diary"], "work");
+        assert_eq!(json["excluded_candidates"]["claim"], 3);
+        assert!(json["excluded_candidates"].get("wiki").is_none());
+    }
 }

@@ -79,10 +79,14 @@ pub async fn run(
         );
         let results = if use_cohere {
             let reranker = CohereReranker::new(cohere_key.clone().unwrap());
-            hybrid_recall(&ctx.store, &embedder, Some(&reranker), params).await?
+            hybrid_recall(&ctx.store, &embedder, Some(&reranker), params)
+                .await?
+                .results
         } else {
             let reranker: Option<&PassthroughReranker> = None;
-            hybrid_recall(&ctx.store, &embedder, reranker, params).await?
+            hybrid_recall(&ctx.store, &embedder, reranker, params)
+                .await?
+                .results
         };
         (results, meta.0, meta.1, meta.2)
     } else {
@@ -93,7 +97,9 @@ pub async fn run(
             embedder.prompt_format().to_string(),
         );
         let reranker: Option<&PassthroughReranker> = None;
-        let results = hybrid_recall(&ctx.store, &embedder, reranker, params).await?;
+        let results = hybrid_recall(&ctx.store, &embedder, reranker, params)
+            .await?
+            .results;
         (results, meta.0, meta.1, meta.2)
     };
 
