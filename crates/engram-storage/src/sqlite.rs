@@ -164,6 +164,10 @@ pub struct RelationRecord {
     pub predicate: String,
     pub weight: f32,
     pub provenance: serde_json::Value,
+    /// Endpoint ids, so callers can traverse the graph without re-resolving
+    /// names (two people can share a display name; ids cannot collide).
+    pub from_entity_id: Uuid,
+    pub to_entity_id: Uuid,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2654,40 +2658,176 @@ impl SqliteStore {
         kind: &str,
         increment: u32,
     ) -> Result<Uuid, StorageError> {
+        self.upsert_entity_with_aliases(kb, canonical_name, kind, increment, &[])
+    }
+
+    /// Upsert an entity together with the alternate spellings that resolve to
+    /// it ("Elias's", "Dr Jane Doe", a bare first name).
+    ///
+    /// Resolution is by canonical name OR by any registered alias, both
+    /// case-folded, so a recompile converges on ONE row per real-world entity
+    /// instead of accumulating near-duplicates. The stored `kind` only ever
+    /// gets more specific (`concept` → `person`), never less: whichever chunk
+    /// carried the evidence wins regardless of chunk order.
+    pub fn upsert_entity_with_aliases(
+        &self,
+        kb: &str,
+        canonical_name: &str,
+        kind: &str,
+        increment: u32,
+        aliases: &[String],
+    ) -> Result<Uuid, StorageError> {
+        let canonical_norm = canonical_name.to_ascii_lowercase();
         let existing = self
             .conn
             .query_row(
-                "SELECT id FROM entities WHERE kb = ?1 AND lower(canonical_name) = lower(?2) LIMIT 1",
-                params![kb, canonical_name],
+                "SELECT e.id FROM entities e
+                 LEFT JOIN entity_aliases a ON a.entity_id = e.id AND a.kb = e.kb
+                 WHERE e.kb = ?1 AND (lower(e.canonical_name) = ?2 OR a.alias_norm = ?2)
+                 LIMIT 1",
+                params![kb, canonical_norm],
                 |r| r.get::<_, String>(0),
             )
             .optional()?;
-        if let Some(id_str) = existing {
+        let id = match existing {
+            Some(id_str) => {
+                let current_kind: String = self.conn.query_row(
+                    "SELECT kind FROM entities WHERE id = ?1",
+                    params![id_str],
+                    |r| r.get(0),
+                )?;
+                let merged_kind = if kind_rank(kind) > kind_rank(&current_kind) {
+                    kind
+                } else {
+                    current_kind.as_str()
+                };
+                self.conn.execute(
+                    "UPDATE entities SET mention_count = mention_count + ?1, kind = ?2
+                     WHERE id = ?3",
+                    params![increment as i64, merged_kind, id_str],
+                )?;
+                Uuid::parse_str(&id_str).unwrap_or(Uuid::nil())
+            }
+            None => {
+                let id = Uuid::new_v4();
+                self.conn.execute(
+                    "INSERT INTO entities(id, kb, canonical_name, aliases_json, kind, mention_count)
+                     VALUES (?1, ?2, ?3, '[]', ?4, ?5)",
+                    params![id.to_string(), kb, canonical_name, kind, increment as i64],
+                )?;
+                id
+            }
+        };
+
+        for alias in std::iter::once(canonical_name).chain(aliases.iter().map(|s| s.as_str())) {
+            let alias = alias.trim();
+            if alias.is_empty() {
+                continue;
+            }
             self.conn.execute(
-                "UPDATE entities SET mention_count = mention_count + ?1 WHERE id = ?2",
-                params![increment as i64, id_str],
+                "INSERT OR IGNORE INTO entity_aliases(id, kb, entity_id, alias, alias_norm)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    kb,
+                    id.to_string(),
+                    alias,
+                    alias.to_ascii_lowercase()
+                ],
             )?;
-            return Ok(Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()));
         }
-        let id = Uuid::new_v4();
-        self.conn.execute(
-            "INSERT INTO entities(id, kb, canonical_name, aliases_json, kind, mention_count)
-             VALUES (?1, ?2, ?3, '[]', ?4, ?5)",
-            params![id.to_string(), kb, canonical_name, kind, increment as i64],
+        // Mirror the alias set onto the entity row so `entities show` and the
+        // JSON envelope carry it without a second query. The exclusion is on
+        // the entity's OWN canonical name, not the name this call arrived
+        // with — an upsert that came in under an alias must not drop that
+        // alias from the list or promote the canonical name into it.
+        let stored_canonical: String = self.conn.query_row(
+            "SELECT canonical_name FROM entities WHERE id = ?1",
+            params![id.to_string()],
+            |r| r.get(0),
         )?;
-        let alias_norm = canonical_name.to_ascii_lowercase();
+        let mut stored: Vec<String> = self
+            .conn
+            .prepare(
+                "SELECT alias FROM entity_aliases
+                 WHERE kb = ?1 AND entity_id = ?2 AND lower(alias) != lower(?3)
+                 ORDER BY alias ASC",
+            )?
+            .query_map(params![kb, id.to_string(), stored_canonical], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        stored.dedup();
         self.conn.execute(
-            "INSERT OR IGNORE INTO entity_aliases(id, kb, entity_id, alias, alias_norm)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                Uuid::new_v4().to_string(),
-                kb,
-                id.to_string(),
-                canonical_name,
-                alias_norm
-            ],
+            "UPDATE entities SET aliases_json = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&stored)?, id.to_string()],
         )?;
         Ok(id)
+    }
+
+    /// Insert or reinforce a relation, ACCUMULATING provenance instead of
+    /// overwriting it.
+    ///
+    /// Every typed person edge must stay verifiable: if three memories say
+    /// "Avi introduced me to Noemi", all three sources stay attached to the
+    /// single `introduced_by` edge, so `people show` can print each receipt.
+    /// Sources are deduplicated on `chunk_id` and capped so one chatty KB
+    /// cannot grow an unbounded JSON blob.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_relation_with_source(
+        &self,
+        kb: &str,
+        from_entity_id: Uuid,
+        to_entity_id: Uuid,
+        predicate: &str,
+        weight: f32,
+        source: serde_json::Value,
+        source_span_id: Option<Uuid>,
+    ) -> Result<Uuid, StorageError> {
+        const MAX_SOURCES: usize = 25;
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT provenance_json FROM relations
+                 WHERE kb = ?1 AND from_entity_id = ?2 AND to_entity_id = ?3 AND predicate = ?4",
+                params![
+                    kb,
+                    from_entity_id.to_string(),
+                    to_entity_id.to_string(),
+                    predicate
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut sources: Vec<serde_json::Value> = existing
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| {
+                v.get("sources")
+                    .and_then(|s| s.as_array())
+                    .map(|a| a.to_vec())
+            })
+            .unwrap_or_default();
+        let already = sources.iter().any(|existing| {
+            existing.get("chunk_id") == source.get("chunk_id")
+                && existing.get("sentence") == source.get("sentence")
+        });
+        if !already && sources.len() < MAX_SOURCES {
+            sources.push(source);
+        }
+        let provenance = serde_json::json!({
+            "extracted_by": "person_graph",
+            "sources": sources,
+        });
+        self.insert_relation(
+            kb,
+            from_entity_id,
+            to_entity_id,
+            predicate,
+            weight,
+            provenance,
+            source_span_id,
+        )
     }
 
     pub fn insert_relation(
@@ -2751,6 +2891,108 @@ impl SqliteStore {
                 .collect::<Result<Vec<_>, _>>()?
         };
         Ok(rows)
+    }
+
+    /// Entities of one kind (e.g. `person`), most-mentioned first.
+    pub fn list_entities_by_kind(
+        &self,
+        kb: Option<&str>,
+        kind: &str,
+        limit: usize,
+        min_mentions: u32,
+    ) -> Result<Vec<EntityRecord>, StorageError> {
+        let sql = if kb.is_some() {
+            "SELECT id, kb, canonical_name, aliases_json, kind, mention_count
+             FROM entities WHERE kb = ?1 AND kind = ?2 AND mention_count >= ?3
+             ORDER BY mention_count DESC, canonical_name ASC LIMIT ?4"
+        } else {
+            "SELECT id, kb, canonical_name, aliases_json, kind, mention_count
+             FROM entities WHERE kind = ?1 AND mention_count >= ?2
+             ORDER BY mention_count DESC, canonical_name ASC LIMIT ?3"
+        };
+        // `usize::MAX as i64` would wrap to -1; clamp so an "unbounded" call
+        // asks for everything explicitly rather than by accident.
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = if let Some(k) = kb {
+            stmt.query_map(
+                params![k, kind, min_mentions as i64, limit],
+                parse_entity_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![kind, min_mentions as i64, limit], parse_entity_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(rows)
+    }
+
+    /// Direct (one-hop) relations touching `entity_id`, heaviest first.
+    pub fn relations_for_entity(
+        &self,
+        kb: &str,
+        entity_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<RelationRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.kb, f.canonical_name, t.canonical_name, r.predicate,
+                    r.weight, r.provenance_json, r.from_entity_id, r.to_entity_id
+             FROM relations r
+             JOIN entities f ON f.id = r.from_entity_id
+             JOIN entities t ON t.id = r.to_entity_id
+             WHERE r.kb = ?1 AND (r.from_entity_id = ?2 OR r.to_entity_id = ?2)
+             ORDER BY r.weight DESC, r.predicate ASC LIMIT ?3",
+        )?;
+        let id = entity_id.to_string();
+        let rows = stmt.query_map(params![kb, id, limit as i64], parse_relation_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Live chunks in `kb` whose text contains `needle` (case-insensitive).
+    ///
+    /// Used to attach readable memory snippets to a person without an
+    /// embedding call, so `people show` works with no API key at all.
+    pub fn chunks_containing(
+        &self,
+        kb: &str,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<ChunkRecord>, StorageError> {
+        let escaped = needle
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.memory_id, c.content, c.position, c.section, m.diary, m.kb,
+                    c.document_id, COALESCE(d.source_path, json_extract(m.source_json, '$.path'))
+             FROM chunks c
+             JOIN memories m ON m.id = c.memory_id
+             LEFT JOIN documents d ON d.id = c.document_id
+             WHERE m.deleted = 0 AND m.kb = ?1
+               AND lower(c.content) LIKE lower(?2) ESCAPE '\\'
+             ORDER BY c.position ASC, c.id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![kb, pattern, limit as i64], parse_chunk_record_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Fetch one chunk by id, if its memory is still live.
+    pub fn get_chunk_record(&self, chunk_id: Uuid) -> Result<Option<ChunkRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.memory_id, c.content, c.position, c.section, m.diary, m.kb,
+                    c.document_id, COALESCE(d.source_path, json_extract(m.source_json, '$.path'))
+             FROM chunks c
+             JOIN memories m ON m.id = c.memory_id
+             LEFT JOIN documents d ON d.id = c.document_id
+             WHERE c.id = ?1 AND m.deleted = 0",
+        )?;
+        stmt.query_row(params![chunk_id.to_string()], parse_chunk_record_row)
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn find_entity(
@@ -3025,10 +3267,7 @@ impl SqliteStore {
                    AND superseded_by IS NULL
              ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(
-            params![subject_norm, predicate, diary, kb],
-            parse_fact_row,
-        )?;
+        let rows = stmt.query_map(params![subject_norm, predicate, diary, kb], parse_fact_row)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -3122,12 +3361,20 @@ impl SqliteStore {
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool, StorageError> {
         let now = chrono::Utc::now().to_rfc3339();
-        let until = valid_until.map(|t| t.to_rfc3339()).unwrap_or_else(|| now.clone());
+        let until = valid_until
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| now.clone());
         let n = self.conn.execute(
             "UPDATE facts SET superseded_by = ?1, superseded_at = ?2,
                     resolution = ?3, valid_until = COALESCE(valid_until, ?4)
              WHERE id = ?5 AND superseded_by IS NULL",
-            params![new_id.to_string(), now, resolution, until, old_id.to_string()],
+            params![
+                new_id.to_string(),
+                now,
+                resolution,
+                until,
+                old_id.to_string()
+            ],
         )?;
         Ok(n > 0)
     }
@@ -3170,7 +3417,8 @@ impl SqliteStore {
                 f32_bytes_to_vec(&blob),
             ))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     /// A re-asserted duplicate bumps the existing fact's confirmation count
@@ -3218,7 +3466,8 @@ impl SqliteStore {
         let rows = stmt.query_map(params![diary, kb], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     // ----- Fact conflict queue (cooperative adjudication) -----
@@ -3288,7 +3537,8 @@ impl SqliteStore {
              ORDER BY created_at DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![diary, kb, limit as i64], parse_conflict_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     /// Mark a queued conflict resolved. Returns false when the row was not
@@ -3322,8 +3572,14 @@ impl SqliteStore {
         kb: Option<&str>,
         terms: &[String],
         limit: usize,
-    ) -> Result<Vec<(FactConflictRow, engram_core::types::Fact, engram_core::types::Fact)>, StorageError>
-    {
+    ) -> Result<
+        Vec<(
+            FactConflictRow,
+            engram_core::types::Fact,
+            engram_core::types::Fact,
+        )>,
+        StorageError,
+    > {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -3360,7 +3616,10 @@ impl SqliteStore {
         sql.push_str(&clauses.join(" OR "));
         sql.push(')');
         binds.push(Box::new(limit as i64));
-        sql.push_str(&format!(" ORDER BY q.created_at DESC LIMIT ?{}", binds.len()));
+        sql.push_str(&format!(
+            " ORDER BY q.created_at DESC LIMIT ?{}",
+            binds.len()
+        ));
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
@@ -3370,8 +3629,10 @@ impl SqliteStore {
             .collect::<Result<Vec<_>, _>>()?;
         let mut out = Vec::new();
         for row in rows {
-            let (Some(nf), Some(of)) = (self.get_fact(row.new_fact_id)?, self.get_fact(row.old_fact_id)?)
-            else {
+            let (Some(nf), Some(of)) = (
+                self.get_fact(row.new_fact_id)?,
+                self.get_fact(row.old_fact_id)?,
+            ) else {
                 continue;
             };
             out.push((row, nf, of));
@@ -3661,7 +3922,10 @@ impl SqliteStore {
             .map_err(StorageError::from)
     }
 
-    pub fn export_documents(&self, kb: Option<&str>) -> Result<Vec<DocumentExportRow>, StorageError> {
+    pub fn export_documents(
+        &self,
+        kb: Option<&str>,
+    ) -> Result<Vec<DocumentExportRow>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kb, title, source_path, source_url, doi, authors_json, year, mode,
                     created_at, metadata_json
@@ -3735,8 +3999,7 @@ impl SqliteStore {
                 content: r.get(2)?,
                 position: r.get(3)?,
                 section: r.get(4)?,
-                embedding_b64: blob
-                    .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+                embedding_b64: blob.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
                 embed_model: r.get(6)?,
                 embed_dimensions: r.get(7)?,
                 embed_prompt_format: r.get(8)?,
@@ -4069,6 +4332,18 @@ fn parse_citation_row(r: &rusqlite::Row) -> rusqlite::Result<SourceCitation> {
     })
 }
 
+/// Specificity of an entity kind. A recompile may see the same name in two
+/// chunks — one with the evidence that it names a human, one without — so the
+/// stored kind keeps the most specific reading rather than the last one.
+fn kind_rank(kind: &str) -> u8 {
+    match kind {
+        "person" => 3,
+        "organization" => 2,
+        "gene_or_protein" => 1,
+        _ => 0,
+    }
+}
+
 fn parse_entity_row(r: &rusqlite::Row) -> rusqlite::Result<EntityRecord> {
     let id_str: String = r.get(0)?;
     let aliases_json: String = r.get(3)?;
@@ -4083,9 +4358,14 @@ fn parse_entity_row(r: &rusqlite::Row) -> rusqlite::Result<EntityRecord> {
     })
 }
 
+/// Parse a relation row selected as
+/// `(id, kb, from_name, to_name, predicate, weight, provenance_json,
+///   from_entity_id, to_entity_id)`.
 fn parse_relation_row(r: &rusqlite::Row) -> rusqlite::Result<RelationRecord> {
     let id_str: String = r.get(0)?;
     let provenance_json: String = r.get(6)?;
+    let from_id: String = r.get(7)?;
+    let to_id: String = r.get(8)?;
     Ok(RelationRecord {
         id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
         kb: r.get(1)?,
@@ -4094,6 +4374,8 @@ fn parse_relation_row(r: &rusqlite::Row) -> rusqlite::Result<RelationRecord> {
         predicate: r.get(4)?,
         weight: r.get(5)?,
         provenance: serde_json::from_str(&provenance_json).unwrap_or(serde_json::Value::Null),
+        from_entity_id: Uuid::parse_str(&from_id).unwrap_or(Uuid::nil()),
+        to_entity_id: Uuid::parse_str(&to_id).unwrap_or(Uuid::nil()),
     })
 }
 
@@ -4204,7 +4486,12 @@ mod tests {
         assert_eq!(store.count_memories().unwrap(), 0);
     }
 
-    fn test_fact(store: &SqliteStore, subject: &str, predicate: &str, object: &str) -> engram_core::types::Fact {
+    fn test_fact(
+        store: &SqliteStore,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> engram_core::types::Fact {
         let m = fact(&format!("{subject} {predicate} {object}"));
         store.insert_memory(&m).unwrap();
         engram_core::types::Fact {
@@ -4270,7 +4557,9 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let f = test_fact(&store, "Ana", "works_at", "Acme");
         store.insert_fact(&f).unwrap();
-        store.set_fact_embedding(f.id, &[0.1, 0.2, 0.3], "test-model").unwrap();
+        store
+            .set_fact_embedding(f.id, &[0.1, 0.2, 0.3], "test-model")
+            .unwrap();
         let got = store
             .active_fact_embeddings("default", "default", "test-model")
             .unwrap();
@@ -4301,11 +4590,29 @@ mod tests {
         store.insert_fact(&new_f).unwrap();
         let qid = Uuid::new_v4();
         assert!(store
-            .insert_fact_conflict(qid, new_f.id, old_f.id, "default", "default", "slot", Some(0.9), "await_confirmation")
+            .insert_fact_conflict(
+                qid,
+                new_f.id,
+                old_f.id,
+                "default",
+                "default",
+                "slot",
+                Some(0.9),
+                "await_confirmation"
+            )
             .unwrap());
         // Same (new, old) pair queues once.
         assert!(!store
-            .insert_fact_conflict(Uuid::new_v4(), new_f.id, old_f.id, "default", "default", "slot", None, "await_confirmation")
+            .insert_fact_conflict(
+                Uuid::new_v4(),
+                new_f.id,
+                old_f.id,
+                "default",
+                "default",
+                "slot",
+                None,
+                "await_confirmation"
+            )
             .unwrap());
         let open = store.list_open_fact_conflicts(None, None, 10).unwrap();
         assert_eq!(open.len(), 1);
@@ -4325,9 +4632,14 @@ mod tests {
         assert_eq!(hits[0].2.id, old_f.id);
 
         // Resolve closes it; a second resolve is a no-op.
-        assert!(store.resolve_fact_conflict(qid, "caller", Some("user confirmed")).unwrap());
+        assert!(store
+            .resolve_fact_conflict(qid, "caller", Some("user confirmed"))
+            .unwrap());
         assert!(!store.resolve_fact_conflict(qid, "caller", None).unwrap());
-        assert!(store.list_open_fact_conflicts(None, None, 10).unwrap().is_empty());
+        assert!(store
+            .list_open_fact_conflicts(None, None, 10)
+            .unwrap()
+            .is_empty());
         let row = store.get_fact_conflict(qid).unwrap().unwrap();
         assert_eq!(row.status, "resolved");
         assert_eq!(row.note.as_deref(), Some("user confirmed"));
@@ -4382,5 +4694,122 @@ mod tests {
         assert!(rels
             .iter()
             .any(|rel| rel.from_entity == "Gamma" && rel.to_entity == "Alpha"));
+        // Endpoint ids travel with the record so callers can traverse without
+        // re-resolving display names.
+        let edge = rels
+            .iter()
+            .find(|rel| rel.from_entity == "Alpha")
+            .expect("edge");
+        assert_eq!(edge.from_entity_id, a);
+        assert_eq!(edge.to_entity_id, b);
+    }
+
+    #[test]
+    fn aliases_resolve_to_one_entity_and_kind_only_sharpens() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("kb", None).unwrap();
+        let first = store
+            .upsert_entity_with_aliases("kb", "Elias", "concept", 1, &["Elias's".to_string()])
+            .unwrap();
+        // Same human, seen later with the evidence that they are a person and
+        // written in another case: one row, not three.
+        let second = store
+            .upsert_entity_with_aliases("kb", "elias", "person", 2, &[])
+            .unwrap();
+        // …and via an alias spelling only.
+        let third = store
+            .upsert_entity_with_aliases("kb", "Elias's", "concept", 1, &[])
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, third);
+
+        let entity = store.find_entity(Some("kb"), "ELIAS'S").unwrap().unwrap();
+        assert_eq!(entity.canonical_name, "Elias");
+        assert_eq!(entity.mention_count, 4);
+        // A later "concept" reading must never downgrade a proven person.
+        assert_eq!(entity.kind, "person");
+        assert!(entity.aliases.contains(&"Elias's".to_string()));
+
+        let people = store
+            .list_entities_by_kind(Some("kb"), "person", 10, 1)
+            .unwrap();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].canonical_name, "Elias");
+    }
+
+    #[test]
+    fn relation_sources_accumulate_and_dedup() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("kb", None).unwrap();
+        let noemi = store.upsert_entity("kb", "Noemi", "person", 1).unwrap();
+        let avi = store.upsert_entity("kb", "Avi Roy", "person", 1).unwrap();
+
+        let source = |chunk: &str, sentence: &str| serde_json::json!({ "chunk_id": chunk, "sentence": sentence, "memory_id": "m1" });
+        store
+            .insert_relation_with_source(
+                "kb",
+                noemi,
+                avi,
+                "introduced_by",
+                1.0,
+                source("c1", "Avi Roy introduced me to Noemi."),
+                None,
+            )
+            .unwrap();
+        // Same evidence again (a recompile): no duplicate receipt.
+        store
+            .insert_relation_with_source(
+                "kb",
+                noemi,
+                avi,
+                "introduced_by",
+                1.0,
+                source("c1", "Avi Roy introduced me to Noemi."),
+                None,
+            )
+            .unwrap();
+        // A second memory saying the same thing: a second receipt.
+        store
+            .insert_relation_with_source(
+                "kb",
+                noemi,
+                avi,
+                "introduced_by",
+                1.0,
+                source("c2", "Avi introduced Noemi to me last year."),
+                None,
+            )
+            .unwrap();
+
+        let rels = store.relations_for_entity("kb", noemi, 10).unwrap();
+        assert_eq!(rels.len(), 1, "one edge, many sources");
+        let sources = rels[0].provenance["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0]["chunk_id"], "c1");
+        assert_eq!(sources[1]["chunk_id"], "c2");
+    }
+
+    #[test]
+    fn chunks_containing_matches_case_insensitively() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("default", None).unwrap();
+        let m = fact("parent");
+        store.insert_memory(&m).unwrap();
+        let chunk_id = Uuid::new_v4();
+        store
+            .insert_chunk(chunk_id, m.id, "Noemi Kostova joined the call.", 0, None)
+            .unwrap();
+
+        let hits = store
+            .chunks_containing("default", "noemi kostova", 5)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk_id, chunk_id);
+        assert_eq!(hits[0].memory_id, m.id);
+        // LIKE wildcards in the needle must not turn into a match-everything.
+        assert!(store
+            .chunks_containing("default", "%", 5)
+            .unwrap()
+            .is_empty());
     }
 }
