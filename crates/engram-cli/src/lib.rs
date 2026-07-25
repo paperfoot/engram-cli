@@ -11,7 +11,7 @@ pub mod retrieval;
 
 use crate::cli::{
     BudgetCommand, Cli, Command, ConfigCommand, DocumentsCommand, EntitiesCommand, FactsCommand,
-    GraphCommand, JobsCommand, KbCommand, MemoryCommand,
+    GraphCommand, JobsCommand, KbCommand, MemoryCommand, PeopleCommand,
 };
 use crate::error::CliError;
 
@@ -168,7 +168,9 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 hops,
                 min_weight,
-            } => commands::graph::neighbors(&ctx, name, kb, hops, min_weight),
+                limit,
+                typed_only,
+            } => commands::graph::neighbors(&ctx, name, kb, hops, min_weight, limit, typed_only),
         },
         Command::Doctor {
             compiler,
@@ -258,6 +260,16 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
             } => commands::entities::list(&ctx, limit, min_mentions, kb),
             EntitiesCommand::Show { name, kb } => commands::entities::show(&ctx, name, kb),
+        },
+        Command::People(sub) => match sub {
+            PeopleCommand::List {
+                kb,
+                limit,
+                min_mentions,
+            } => commands::people::list(&ctx, kb, limit, min_mentions),
+            PeopleCommand::Show { name, kb, snippets } => {
+                commands::people::show(&ctx, name, kb, snippets)
+            }
         },
         Command::Facts(sub) => match sub {
             FactsCommand::List {

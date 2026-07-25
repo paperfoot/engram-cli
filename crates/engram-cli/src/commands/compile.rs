@@ -9,7 +9,6 @@ use crate::commands::usage::estimated_tokens;
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
-use engram_graph::extract_entities;
 use engram_llm::openrouter::{OpenRouterClient, DEFAULT_EXTRACTION_MODEL, DEFAULT_SYNTHESIS_MODEL};
 use engram_llm::{ChatLlm, ChatMessage};
 use serde::{Deserialize, Serialize};
@@ -23,7 +22,13 @@ pub struct CompileStats {
     pub source_spans: usize,
     pub claims: usize,
     pub entities: usize,
+    /// Entities typed as `person` after this compile.
+    #[serde(default)]
+    pub people: usize,
     pub relations: usize,
+    /// Typed person↔person edges written (introduced_by, friend_of, …).
+    #[serde(default)]
+    pub person_relations: usize,
     pub takeaways: usize,
     pub wiki_pages: usize,
     pub llm_enabled: bool,
@@ -197,7 +202,9 @@ async fn compile_within_tx(
         source_spans: 0,
         claims: 0,
         entities: 0,
+        people: 0,
         relations: 0,
+        person_relations: 0,
         takeaways: 0,
         wiki_pages: 0,
         llm_enabled: options.llm,
@@ -215,6 +222,7 @@ async fn compile_within_tx(
     };
 
     let mut entity_ids: HashMap<String, uuid::Uuid> = HashMap::new();
+    let mut entity_display: HashMap<String, String> = HashMap::new();
     let mut entity_mentions: BTreeMap<String, usize> = BTreeMap::new();
     let mut doc_takeaway_done: HashSet<Option<uuid::Uuid>> = HashSet::new();
     let mut span_by_chunk: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
@@ -237,15 +245,46 @@ async fn compile_within_tx(
         stats.source_spans += 1;
         span_by_chunk.insert(chunk.chunk_id, chunk_span_id);
 
-        let entities = extract_entities(&chunk.content);
+        // Person-aware extraction: hygienic entity surfaces (no contractions,
+        // possessives folded onto their owner), person typing, and typed
+        // person↔person edges — all deterministic and offline.
+        let extraction = engram_graph::people::analyze(&chunk.content);
         let mut local_entities = Vec::new();
-        for name in entities.into_iter().take(16) {
-            let id = ctx
-                .store
-                .upsert_entity(kb, &name, infer_entity_kind(&name), 1)?;
-            entity_ids.insert(name.clone(), id);
-            *entity_mentions.entry(name.clone()).or_insert(0) += 1;
-            local_entities.push((name, id));
+        let mut kept_other = 0usize;
+        let mut kept_people = 0usize;
+        for mention in extraction.entities.iter() {
+            // People get their own budget: a chunk dense in domain terms must
+            // not push the humans out of the graph (and with them their
+            // relationship edges, which need both endpoints present).
+            let is_person = mention.kind == engram_graph::people::KIND_PERSON;
+            if is_person {
+                if kept_people >= MAX_PEOPLE_PER_CHUNK {
+                    continue;
+                }
+                kept_people += 1;
+            } else {
+                if kept_other >= MAX_ENTITIES_PER_CHUNK {
+                    continue;
+                }
+                kept_other += 1;
+            }
+            let id = ctx.store.upsert_entity_with_aliases(
+                kb,
+                &mention.name,
+                mention.kind,
+                mention.mentions as u32,
+                &mention.aliases,
+            )?;
+            // Key on the case-folded name so a recompile counts one entity per
+            // real-world thing, whatever casing each chunk happened to use.
+            let key = mention.name.to_lowercase();
+            let display = entity_display
+                .entry(key.clone())
+                .or_insert_with(|| mention.name.clone())
+                .clone();
+            entity_ids.insert(key, id);
+            *entity_mentions.entry(display).or_insert(0) += mention.mentions;
+            local_entities.push((mention.name.clone(), id));
         }
 
         for pair in local_entities.windows(2) {
@@ -263,6 +302,48 @@ async fn compile_within_tx(
                 )?;
                 stats.relations += 1;
             }
+        }
+
+        // Typed relationship edges. Each carries the sentence it was read
+        // from plus the chunk/memory/document ids, so `people show` can prove
+        // every edge instead of asserting it.
+        let by_name: HashMap<String, uuid::Uuid> = local_entities
+            .iter()
+            .map(|(name, id)| (name.to_lowercase(), *id))
+            .collect();
+        for edge in &extraction.edges {
+            let (Some(from_id), Some(to_id)) = (
+                by_name.get(&edge.from.to_lowercase()),
+                by_name.get(&edge.to.to_lowercase()),
+            ) else {
+                continue;
+            };
+            if from_id == to_id {
+                continue;
+            }
+            let mut source = json!({
+                "chunk_id": chunk.chunk_id.to_string(),
+                "memory_id": chunk.memory_id.to_string(),
+                "sentence": edge.sentence,
+                "cue": edge.cue,
+            });
+            if let Some(document_id) = chunk.document_id {
+                source["document_id"] = json!(document_id.to_string());
+            }
+            if let Some(context) = &edge.context {
+                source["context"] = json!(context);
+            }
+            ctx.store.insert_relation_with_source(
+                kb,
+                *from_id,
+                *to_id,
+                edge.predicate,
+                1.0,
+                source,
+                Some(chunk_span_id),
+            )?;
+            stats.relations += 1;
+            stats.person_relations += 1;
         }
 
         // Deterministic claims: real sentence segmentation (never splits a
@@ -324,9 +405,22 @@ async fn compile_within_tx(
     }
 
     stats.entities = entity_ids.len();
+    stats.people = ctx
+        .store
+        .list_entities_by_kind(Some(kb), engram_graph::people::KIND_PERSON, usize::MAX, 1)?
+        .len();
     stats.wiki_pages = write_wiki(ctx, kb, chunks, &entity_mentions)?;
     Ok(stats)
 }
+
+/// Non-person entities kept per chunk. The chunker caps chunks at ~1800
+/// chars, so this is generous for personal notes while bounding the
+/// co-occurrence fan-out on dense scientific text.
+const MAX_ENTITIES_PER_CHUNK: usize = 16;
+
+/// People kept per chunk, budgeted separately. A note listing everyone at a
+/// dinner is exactly the note a networker cares about most.
+const MAX_PEOPLE_PER_CHUNK: usize = 32;
 
 /// A cloud-usage record buffered during a compile transaction. Usage is
 /// flushed AFTER commit/rollback so a rolled-back compile still accounts for
@@ -512,17 +606,26 @@ fn insert_llm_evidence(
 ) -> Result<(), CliError> {
     let mut ids: HashMap<String, uuid::Uuid> = HashMap::new();
     for entity in evidence.entities {
-        if entity.name.trim().is_empty() {
+        // LLM-proposed names go through the SAME hygiene as the offline path:
+        // a model that answers with "She's" or "Elias's" must not be able to
+        // create junk nodes the deterministic extractor would have rejected.
+        let Some(canonical) = engram_graph::canonicalize_surface(&entity.name) else {
             continue;
+        };
+        let mut aliases = canonical.aliases.clone();
+        for alias in entity.aliases.into_iter().flatten() {
+            if let Some(clean) = engram_graph::canonicalize_surface(&alias) {
+                if clean.name != canonical.name && !aliases.contains(&clean.name) {
+                    aliases.push(clean.name);
+                }
+            }
         }
-        let id = ctx.store.upsert_entity(
-            kb,
-            entity.name.trim(),
-            entity.kind.as_deref().unwrap_or("concept"),
-            1,
-        )?;
-        ids.insert(entity.name.clone(), id);
-        *entity_mentions.entry(entity.name).or_insert(0) += 1;
+        let kind = normalize_llm_kind(entity.kind.as_deref(), &canonical.name);
+        let id = ctx
+            .store
+            .upsert_entity_with_aliases(kb, &canonical.name, kind, 1, &aliases)?;
+        ids.insert(canonical.name.to_lowercase(), id);
+        *entity_mentions.entry(canonical.name).or_insert(0) += 1;
         stats.llm_entities += 1;
     }
     for claim in evidence.claims {
@@ -571,30 +674,44 @@ fn insert_llm_evidence(
         stats.llm_takeaways += 1;
     }
     for relation in evidence.relations {
-        if relation.from.trim().is_empty() || relation.to.trim().is_empty() {
+        let (Some(from), Some(to)) = (
+            engram_graph::canonicalize_surface(&relation.from),
+            engram_graph::canonicalize_surface(&relation.to),
+        ) else {
+            continue;
+        };
+        if from.name.eq_ignore_ascii_case(&to.name) {
             continue;
         }
-        let from_id = if let Some(id) = ids.get(&relation.from).copied() {
-            id
-        } else {
-            ctx.store
-                .upsert_entity(kb, relation.from.trim(), "concept", 1)?
+        let mut resolve = |canonical: &engram_graph::Canonical| -> Result<uuid::Uuid, CliError> {
+            if let Some(id) = ids.get(&canonical.name.to_lowercase()).copied() {
+                return Ok(id);
+            }
+            let kind = normalize_llm_kind(None, &canonical.name);
+            let id = ctx.store.upsert_entity_with_aliases(
+                kb,
+                &canonical.name,
+                kind,
+                1,
+                &canonical.aliases,
+            )?;
+            ids.insert(canonical.name.to_lowercase(), id);
+            Ok(id)
         };
-        let to_id = if let Some(id) = ids.get(&relation.to).copied() {
-            id
-        } else {
-            ctx.store
-                .upsert_entity(kb, relation.to.trim(), "concept", 1)?
-        };
-        ctx.store.insert_relation(
+        let from_id = resolve(&from)?;
+        let to_id = resolve(&to)?;
+        let predicate = normalize_predicate(relation.predicate.as_deref());
+        ctx.store.insert_relation_with_source(
             kb,
             from_id,
             to_id,
-            relation.predicate.as_deref().unwrap_or("related_to"),
+            &predicate,
             relation.weight.unwrap_or(1.0).clamp(0.1, 10.0),
             json!({
                 "chunk_id": chunk.chunk_id.to_string(),
-                "extracted_by": "llm_compiler",
+                "memory_id": chunk.memory_id.to_string(),
+                "sentence": relation.evidence.unwrap_or_default(),
+                "cue": "llm_compiler",
             }),
             span_id,
         )?;
@@ -722,6 +839,10 @@ struct LlmClaim {
 struct LlmEntity {
     name: String,
     kind: Option<String>,
+    /// Alternate spellings the model saw for the same entity ("Elias",
+    /// "Elias D."), folded onto one node instead of creating rivals.
+    #[serde(default)]
+    aliases: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -730,6 +851,60 @@ struct LlmRelation {
     to: String,
     predicate: Option<String>,
     weight: Option<f32>,
+    /// Sentence the model read the relation from; stored as provenance so the
+    /// edge stays checkable.
+    #[serde(default)]
+    evidence: Option<String>,
+}
+
+/// Entity kinds the compiler is willing to store. Anything else the model
+/// invents is mapped back through the offline heuristics, so `kind` stays a
+/// small closed vocabulary that `people list` can filter on.
+const ALLOWED_KINDS: &[&str] = &[
+    "person",
+    "organization",
+    "gene_or_protein",
+    "drug",
+    "place",
+    "event",
+    "method",
+    "species",
+    "dataset",
+    "concept",
+];
+
+fn normalize_llm_kind(kind: Option<&str>, name: &str) -> &'static str {
+    let heuristic = infer_entity_kind(name);
+    let Some(kind) = kind.map(|k| k.trim().to_ascii_lowercase()) else {
+        return heuristic;
+    };
+    let matched = ALLOWED_KINDS.iter().find(|k| **k == kind);
+    match matched {
+        // A model calling someone a person is trusted (it has the sentence);
+        // the reverse — a model calling a person a concept — is not, so the
+        // more specific of the two readings wins.
+        Some(k) => engram_graph::people::merge_kind(k, heuristic),
+        None => heuristic,
+    }
+}
+
+/// Typed relation predicates. Free-form model output is snake_cased and
+/// checked against the person vocabulary so the graph stays queryable.
+fn normalize_predicate(predicate: Option<&str>) -> String {
+    let Some(raw) = predicate else {
+        return "related_to".to_string();
+    };
+    let cleaned: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let cleaned = cleaned.trim_matches('_').to_string();
+    if cleaned.is_empty() {
+        return "related_to".to_string();
+    }
+    cleaned
 }
 
 fn parse_llm_evidence(text: &str) -> Result<LlmEvidence, serde_json::Error> {
@@ -853,7 +1028,7 @@ fn claim_grounded_in_chunk(claim: &str, chunk: &str) -> bool {
 
 fn extraction_prompt(kb: &str, chunk: &engram_storage::ChunkRecord) -> String {
     format!(
-        "KB: {kb}\nChunk id: {chunk_id}\nDocument id: {document_id}\nSection: {section}\nSource: {source}\n\nExtract evidence from the chunk below.\nReturn JSON only with this shape:\n{{\"claims\":[{{\"content\":\"short factual claim with numbers if present\",\"evidence_level\":\"review|meta_analysis|rct|human_observational|animal|in_vitro|preprint|news|opinion|unknown\",\"confidence\":0.0}}],\"entities\":[{{\"name\":\"canonical entity\",\"kind\":\"gene|protein|pathway|person|organization|drug|concept|method|species|dataset\"}}],\"relations\":[{{\"from\":\"entity\",\"to\":\"entity\",\"predicate\":\"typed_relation\",\"weight\":1.0}}],\"takeaways\":[\"short cited takeaway\"],\"facts\":[{{\"subject\":\"entity\",\"predicate\":\"snake_case_relation\",\"object\":\"value or entity\",\"confidence\":0.0}}]}}\nEvery claim and fact must be directly supported by this chunk. Emit a fact only for a stable, checkable assertion (a dosage, a target, an effect direction), not vague prose. Do not invent citations.\n\nChunk:\n{content}",
+        "KB: {kb}\nChunk id: {chunk_id}\nDocument id: {document_id}\nSection: {section}\nSource: {source}\n\nExtract evidence from the chunk below.\nReturn JSON only with this shape:\n{{\"claims\":[{{\"content\":\"short factual claim with numbers if present\",\"evidence_level\":\"review|meta_analysis|rct|human_observational|animal|in_vitro|preprint|news|opinion|unknown\",\"confidence\":0.0}}],\"entities\":[{{\"name\":\"canonical entity\",\"kind\":\"person|organization|gene_or_protein|drug|place|event|method|species|dataset|concept\",\"aliases\":[\"other spellings of the SAME entity in this chunk\"]}}],\"relations\":[{{\"from\":\"entity\",\"to\":\"entity\",\"predicate\":\"typed_relation\",\"weight\":1.0,\"evidence\":\"the sentence this relation came from\"}}],\"takeaways\":[\"short cited takeaway\"],\"facts\":[{{\"subject\":\"entity\",\"predicate\":\"snake_case_relation\",\"object\":\"value or entity\",\"confidence\":0.0}}]}}\nPeople matter: type every human as \"person\", give their full name as `name` and shorter forms (first name only, possessive, titled) as `aliases`. Never emit a pronoun, contraction (\"She's\", \"I'm\"), weekday, month, or bare common word as an entity.\nFor two people, prefer these predicates: introduced_by (from = the person who was introduced, to = the introducer), friend_of, married_to, dating, family_of, works_with, colleague_of, investor_in, client_of, met_at, knows.\nEvery claim and fact must be directly supported by this chunk. Emit a fact only for a stable, checkable assertion (a dosage, a target, an effect direction), not vague prose. Do not invent citations.\n\nChunk:\n{content}",
         chunk_id = chunk.chunk_id,
         document_id = chunk
             .document_id
@@ -974,33 +1149,10 @@ fn infer_evidence_level(text: &str) -> &'static str {
     }
 }
 
+/// Kind inference without surrounding text (LLM path, entity backfill).
+/// The context-aware version lives in `engram_graph::people`.
 fn infer_entity_kind(name: &str) -> &'static str {
-    // A short all-caps/alphanumeric token with a digit or hyphen looks like a
-    // gene/protein symbol (BRCA1, IL-6, p53, mTORC1). Bare all-caps words
-    // (DNA, USA, FDA, ELISA) are NOT genes — the old rule labeled every one
-    // "gene". Keep it conservative and default to "concept".
-    let letters: String = name.chars().filter(|c| c.is_ascii_alphabetic()).collect();
-    let has_digit = name.chars().any(|c| c.is_ascii_digit());
-    let is_symbolish = name.len() <= 12
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        && has_digit
-        && letters.chars().any(|c| c.is_ascii_uppercase());
-    if is_symbolish {
-        "gene_or_protein"
-    } else if name.ends_with(" Inc")
-        || name.ends_with(" Ltd")
-        || name.ends_with(" Labs")
-        || name.ends_with(" Corp")
-        || name.ends_with(" LLC")
-        || name.ends_with(" University")
-        || name.ends_with(" Institute")
-    {
-        "organization"
-    } else {
-        "concept"
-    }
+    engram_graph::people::infer_kind(name, false)
 }
 
 fn slugify(name: &str) -> String {
