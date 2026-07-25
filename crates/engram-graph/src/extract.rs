@@ -18,220 +18,17 @@
 //! kept. Adjacency is decided on the raw separators, so punctuation breaks a
 //! phrase: "New York, New Jersey" yields two entities, never one.
 //!
+//! Every surviving surface form is then put through [`crate::hygiene`], which
+//! rejects pronoun contractions ("I'm", "She's"), folds possessives onto their
+//! owner ("Elias's" → "Elias"), drops standalone month/weekday names, and
+//! case-folds the dedup key.
+//!
 //! This is intentionally cheap and fast. Phase 4+ can layer LLM-extracted
 //! triples on top, but this baseline already populates the entities table
 //! for co-occurrence edges.
 
+use crate::hygiene::{self, Canonical};
 use std::collections::HashSet;
-
-const COMMON_WORDS: &[&str] = &[
-    // Pronouns and articles
-    "The",
-    "A",
-    "An",
-    "This",
-    "That",
-    "These",
-    "Those",
-    "I",
-    "We",
-    "You",
-    "It",
-    "He",
-    "She",
-    "They",
-    "My",
-    "Your",
-    "Our",
-    "His",
-    "Her",
-    "Their",
-    // Auxiliaries
-    "Is",
-    "Are",
-    "Was",
-    "Were",
-    "Has",
-    "Have",
-    "Had",
-    "Be",
-    "Been",
-    "Do",
-    "Does",
-    "Did",
-    "Will",
-    "Would",
-    "Should",
-    "Can",
-    "Could",
-    "May",
-    "Might",
-    // Prepositions / conjunctions capitalized at sentence start
-    "In",
-    "On",
-    "At",
-    "As",
-    "By",
-    "For",
-    "From",
-    "Of",
-    "To",
-    "With",
-    "Us",
-    "If",
-    "Then",
-    "When",
-    "While",
-    "After",
-    "Before",
-    "Where",
-    "Which",
-    "Who",
-    "Why",
-    "How",
-    "What",
-    "Also",
-    "Only",
-    "Not",
-    "But",
-    "And",
-    "Or",
-    "So",
-    "Such",
-    "Both",
-    "Either",
-    "Neither",
-    "All",
-    "Any",
-    "Some",
-    "Each",
-    "Every",
-    "Most",
-    "More",
-    "Less",
-    "First",
-    "Second",
-    "Third",
-    "Last",
-    "Next",
-    "Previous",
-    "Following",
-    // Common imperative verbs that open sentences in papers/docs
-    "See",
-    "Show",
-    "Shows",
-    "Shown",
-    "Find",
-    "Found",
-    "Take",
-    "Takes",
-    "Get",
-    "Gets",
-    "Make",
-    "Makes",
-    "Use",
-    "Uses",
-    "Used",
-    "Note",
-    "Consider",
-    "Observe",
-    "Assume",
-    "Suppose",
-    "Recall",
-    "Remember",
-    "Respond",
-    "Responds",
-    "Reply",
-    "Replies",
-    "Return",
-    "Returns",
-    "Let",
-    "Given",
-    "Set",
-    "Put",
-    "Apply",
-    "Applied",
-    "Call",
-    "Called",
-    // Logical / rhetorical connectives at sentence start
-    "Thus",
-    "Therefore",
-    "Hence",
-    "However",
-    "Moreover",
-    "Furthermore",
-    "Additionally",
-    "Nonetheless",
-    "Nevertheless",
-    "Indeed",
-    "Instead",
-    "Finally",
-    "Accordingly",
-    "Consequently",
-    "Specifically",
-    "Namely",
-    "Otherwise",
-    "Similarly",
-    "Likewise",
-    "Meanwhile",
-    "Overall",
-    // Sentence-opening subjects / lab nouns (capitalized only at sentence head).
-    // These never legitimately head a multi-word entity, so stop-listing them
-    // is safe and prevents "Mice", "Patients", … leaking in as entities.
-    "Here",
-    "There",
-    "Together",
-    "Altogether",
-    "Mice",
-    "Mouse",
-    "Rats",
-    "Rat",
-    "Patients",
-    "Subjects",
-    "Participants",
-    "Controls",
-    // Paper structural words — typically in "Table 1", "Figure 2", etc.
-    "Table",
-    "Figure",
-    "Fig",
-    "Section",
-    "Appendix",
-    "Abstract",
-    "Introduction",
-    "Methods",
-    "Results",
-    "Discussion",
-    "Conclusion",
-    "References",
-    "Acknowledgments",
-    "Appendices",
-    "Equation",
-    "Eq",
-    // Citation metadata noise
-    "Proceedings",
-    "Conference",
-    "Journal",
-    "Workshop",
-    "Symposium",
-    "Volume",
-    "Issue",
-    "Page",
-    "Pages",
-    "Chapter",
-    "Vol",
-    "URL",
-    "DOI",
-    "ISBN",
-    "ISSN",
-    // Generic ALL-CAPS roman-numeral noise ("Section III", "Type II")
-    "II",
-    "III",
-    "IV",
-    "VI",
-    "VII",
-    "VIII",
-    "IX",
-];
 
 /// Lowercase connective particles that may sit *inside* a proper-name phrase
 /// ("Centers for Disease Control", "Bank of America", "Ludwig van Beethoven").
@@ -250,17 +47,21 @@ fn is_word_char(c: char) -> bool {
 }
 
 #[derive(Clone)]
-struct Token {
-    text: String,
+pub(crate) struct Token {
+    pub(crate) text: String,
     /// The gap since the previous token was pure whitespace (no punctuation).
     /// Phrases may only span tokens that are whitespace-adjacent.
-    space_before: bool,
+    pub(crate) space_before: bool,
     /// This token begins a new sentence (start of text, or preceded by `.!?`).
-    sentence_start: bool,
+    pub(crate) sentence_start: bool,
+    /// Byte offset of this token's first char in the source text.
+    pub(crate) start: usize,
+    /// Byte offset one past this token's last char in the source text.
+    pub(crate) end: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     /// Capitalized, non-stop token: can head or join a phrase, or stand alone.
     PhraseCap,
     /// Non-capitalized standalone entity (mTORC1, mRNA, p53) — never a phrase member.
@@ -273,28 +74,55 @@ enum Kind {
     Skip,
 }
 
-/// Split `text` into tokens, tracking whitespace-adjacency and sentence starts.
-fn tokenize(text: &str) -> Vec<Token> {
+/// Split `text` into tokens, tracking whitespace-adjacency, sentence starts,
+/// and byte offsets back into `text` (used to quote the exact source sentence
+/// when a relation is extracted).
+pub(crate) fn tokenize(text: &str) -> Vec<Token> {
     let mut toks: Vec<Token> = Vec::new();
     let mut cur = String::new();
+    let mut cur_start = 0usize;
     let mut gap_pure_ws = true;
     let mut pending_sentence = true;
 
-    for c in text.chars() {
+    let push_token = |toks: &mut Vec<Token>,
+                      cur: &str,
+                      cur_start: usize,
+                      cur_end: usize,
+                      gap_pure_ws: bool,
+                      pending_sentence: bool| {
+        let trimmed = cur.trim_matches(|c: char| matches!(c, '-' | '_' | '\''));
+        if trimmed.is_empty() {
+            return;
+        }
+        // Re-anchor the offsets onto the trimmed slice.
+        let lead = cur.find(trimmed).unwrap_or(0);
+        toks.push(Token {
+            text: trimmed.to_string(),
+            space_before: gap_pure_ws,
+            sentence_start: pending_sentence,
+            start: cur_start + lead,
+            end: (cur_start + lead + trimmed.len()).min(cur_end),
+        });
+    };
+
+    for (idx, c) in text.char_indices() {
         if is_word_char(c) {
+            if cur.is_empty() {
+                cur_start = idx;
+            }
             cur.push(c);
             continue;
         }
         // Non-word char: close the current token, if any.
         if !cur.is_empty() {
-            let trimmed = cur.trim_matches(|c: char| matches!(c, '-' | '_' | '\''));
-            if !trimmed.is_empty() {
-                toks.push(Token {
-                    text: trimmed.to_string(),
-                    space_before: gap_pure_ws,
-                    sentence_start: pending_sentence,
-                });
-            }
+            push_token(
+                &mut toks,
+                &cur,
+                cur_start,
+                idx,
+                gap_pure_ws,
+                pending_sentence,
+            );
             cur.clear();
             // Open a fresh gap for the next token.
             gap_pure_ws = true;
@@ -309,20 +137,20 @@ fn tokenize(text: &str) -> Vec<Token> {
         }
     }
     if !cur.is_empty() {
-        let trimmed = cur.trim_matches(|c: char| matches!(c, '-' | '_' | '\''));
-        if !trimmed.is_empty() {
-            toks.push(Token {
-                text: trimmed.to_string(),
-                space_before: gap_pure_ws,
-                sentence_start: pending_sentence,
-            });
-        }
+        push_token(
+            &mut toks,
+            &cur,
+            cur_start,
+            text.len(),
+            gap_pure_ws,
+            pending_sentence,
+        );
     }
     toks
 }
 
 /// Classify a token for phrase assembly and standalone emission.
-fn classify(t: &Token) -> Kind {
+pub(crate) fn classify(t: &Token) -> Kind {
     let text = t.text.as_str();
     let len = text.chars().count();
 
@@ -371,7 +199,10 @@ fn classify(t: &Token) -> Kind {
     let simple_title = first_upper && !has_digit && !internal_upper;
     let adverb_opener = t.sentence_start && simple_title && len >= 6 && text.ends_with("ly");
 
-    if COMMON_WORDS.contains(&text) || adverb_opener {
+    // Stop-words are matched case-insensitively (so `THE` is dropped like
+    // `The`), and pronoun contractions ("I'm", "She's", "It'll") never head or
+    // join a phrase — they used to leak straight into the entities table.
+    if hygiene::is_stopword(text) || hygiene::is_contraction(text) || adverb_opener {
         return Kind::Skip;
     }
     if len < 2 {
@@ -389,21 +220,33 @@ fn classify(t: &Token) -> Kind {
     Kind::Skip
 }
 
-/// Return a deduplicated, first-appearance-ordered list of entity surface
-/// forms found in `text`.
-pub fn extract_entities(text: &str) -> Vec<String> {
-    let toks = tokenize(text);
-    let kinds: Vec<Kind> = toks.iter().map(classify).collect();
+/// One candidate entity occurrence, with the token span it covers so callers
+/// (the person/relationship layer) can look at the surrounding words.
+#[derive(Debug, Clone)]
+pub(crate) struct Phrase {
+    /// Raw surface form exactly as written ("Avi Roy's").
+    pub(crate) surface: String,
+    /// Index of the first token of the phrase.
+    pub(crate) start: usize,
+    /// Index one past the last token of the phrase.
+    pub(crate) end: usize,
+    /// Zero-based sentence index within the analyzed text.
+    pub(crate) sentence: usize,
+}
+
+/// Assemble candidate entity occurrences in reading order, without dedup.
+pub(crate) fn phrases(toks: &[Token], kinds: &[Kind]) -> Vec<Phrase> {
     let n = toks.len();
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<String> = Vec::new();
-    let push = |seen: &mut HashSet<String>, out: &mut Vec<String>, s: String| {
-        if seen.insert(s.clone()) {
-            out.push(s);
+    let mut sentence_of = vec![0usize; n];
+    let mut sentence = 0usize;
+    for (idx, tok) in toks.iter().enumerate() {
+        if tok.sentence_start && idx > 0 {
+            sentence += 1;
         }
-    };
+        sentence_of[idx] = sentence;
+    }
 
+    let mut out: Vec<Phrase> = Vec::new();
     let mut i = 0;
     while i < n {
         match kinds[i] {
@@ -434,28 +277,60 @@ pub fn extract_entities(text: &str) -> Vec<String> {
                         _ => break,
                     }
                 }
-
-                if members.len() >= 2 {
-                    let phrase = members
-                        .iter()
-                        .map(|&m| toks[m].text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    push(&mut seen, &mut out, phrase);
-                } else {
-                    // Lone capitalized token. Stop-words / sentence-opening
-                    // adverbs were already filtered to Skip during classify,
-                    // so any surviving PhraseCap is a genuine surface form.
-                    push(&mut seen, &mut out, toks[i].text.clone());
-                }
+                let surface = members
+                    .iter()
+                    .map(|&m| toks[m].text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let end = members[members.len() - 1] + 1;
+                out.push(Phrase {
+                    surface,
+                    start: i,
+                    end,
+                    sentence: sentence_of[i],
+                });
                 i = j;
             }
             Kind::Solo => {
-                push(&mut seen, &mut out, toks[i].text.clone());
+                out.push(Phrase {
+                    surface: toks[i].text.clone(),
+                    start: i,
+                    end: i + 1,
+                    sentence: sentence_of[i],
+                });
                 i += 1;
             }
             // Skip / stray Connector / stray Number: dropped.
             _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Canonicalized candidate entities in reading order (duplicates included).
+pub(crate) fn candidates(text: &str) -> (Vec<Token>, Vec<(Phrase, Canonical)>) {
+    let toks = tokenize(text);
+    let kinds: Vec<Kind> = toks.iter().map(classify).collect();
+    let found = phrases(&toks, &kinds)
+        .into_iter()
+        .filter_map(|p| hygiene::canonicalize_surface(&p.surface).map(|c| (p, c)))
+        .collect();
+    (toks, found)
+}
+
+/// Return a deduplicated, first-appearance-ordered list of entity surface
+/// forms found in `text`.
+///
+/// Surfaces are hygienic: contractions are gone, possessives are folded onto
+/// their owner ("Elias's" → "Elias"), standalone month/weekday names are
+/// dropped, and dedup is case-folded so "Rapamycin"/"rapamycin" is one entity.
+pub fn extract_entities(text: &str) -> Vec<String> {
+    let (_, found) = candidates(text);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for (_, canonical) in found {
+        if seen.insert(hygiene::dedup_key(&canonical.name)) {
+            out.push(canonical.name);
         }
     }
     out
@@ -528,6 +403,51 @@ mod tests {
         assert!(ents.contains(&"Ohio".to_string()));
         // The comma-separated names must never merge across the punctuation.
         assert!(!ents.contains(&"New York New Jersey".to_string()));
+    }
+
+    #[test]
+    fn pronoun_contractions_never_become_entities() {
+        let ents = extract_entities(
+            "I'm meeting Noemi tomorrow. She's bringing Avi. It's going to be useful. I'll confirm.",
+        );
+        for junk in ["I'm", "She's", "It's", "I'll", "I", "She", "It"] {
+            assert!(
+                !ents.contains(&junk.to_string()),
+                "{junk} leaked in: {ents:?}"
+            );
+        }
+        assert!(ents.contains(&"Noemi".to_string()));
+        assert!(ents.contains(&"Avi".to_string()));
+    }
+
+    #[test]
+    fn possessive_merges_with_owner() {
+        let ents = extract_entities("Elias's calendar. Elias confirmed the date.");
+        assert_eq!(
+            ents.iter().filter(|e| e.starts_with("Elias")).count(),
+            1,
+            "Elias and Elias's must be one entity: {ents:?}"
+        );
+        assert!(ents.contains(&"Elias".to_string()));
+    }
+
+    #[test]
+    fn standalone_months_and_weekdays_are_dropped() {
+        let ents = extract_entities("We spoke on Monday. July was quiet.");
+        assert!(!ents.contains(&"Monday".to_string()));
+        assert!(!ents.contains(&"July".to_string()));
+    }
+
+    #[test]
+    fn dedup_is_case_folded() {
+        let ents = extract_entities("HeLa cells. hela cells again.");
+        assert_eq!(
+            ents.iter()
+                .filter(|e| e.eq_ignore_ascii_case("hela"))
+                .count(),
+            1,
+            "case variants must collapse: {ents:?}"
+        );
     }
 
     #[test]
