@@ -738,16 +738,26 @@ pub fn triage(
             return;
         }
         println!(
-            "{}{resolved} of {scanned} open conflicts auto-resolved ({:.1}%), {} left for review \
-             ({safety_kept} safety slots)",
+            "{}{resolved} of {scanned} open conflicts auto-resolved ({:.1}%), {} left for review",
             if dry_run { "[dry run] " } else { "" },
             ratio * 100.0,
             remaining.max(0),
         );
-        let mut rules: Vec<_> = resolved_by_rule.iter().collect();
-        rules.sort_by(|a, b| b.1.cmp(a.1));
-        for (rule, n) in rules {
-            println!("  {n:>6}  {rule}");
+        // Both breakdowns, because the interesting question after a bulk
+        // sweep is not only what went but what is still waiting.
+        for (heading, counts) in [
+            ("resolved", &resolved_by_rule),
+            ("left for review", &kept_by_reason),
+        ] {
+            if counts.is_empty() {
+                continue;
+            }
+            println!("  {heading}:");
+            let mut rules: Vec<_> = counts.iter().collect();
+            rules.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            for (rule, n) in rules {
+                println!("  {n:>6}  {rule}");
+            }
         }
     });
     Ok(())
