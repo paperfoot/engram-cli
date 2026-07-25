@@ -59,6 +59,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
     let gemini_source = describe_key_source("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere_source = describe_key_source("COHERE_API_KEY", &file_cfg, "keys.cohere");
     let openrouter_source = describe_key_source("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
+    let chunking = crate::commands::chunks::resolve_policy();
 
     print_success(
         ctx.format,
@@ -85,6 +86,16 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
                     .filter(|v| !v.trim().is_empty())
                     .or_else(|| resolve_config_string(crate::retrieval::DEFAULT_KB_CONFIG_KEY)),
                 "default_kb_effective_scope": crate::retrieval::resolve_kb_scope(None, false).label(),
+            },
+            // Chunk shape. `min_chars` is the hard floor: a fragment shorter
+            // than this is merged into a neighbour instead of becoming its own
+            // retrievable chunk, because a bare "Sep 16, 2025" outranks real
+            // answers in recall. A memory that is entirely that short is still
+            // stored as one chunk.
+            "chunking": {
+                "min_chars": chunking.min_chars,
+                "target_chars": chunking.target_chars,
+                "max_chars": chunking.max_chars,
             },
             "embedding": {
                 "provider": "gemini",

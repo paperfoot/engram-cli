@@ -27,7 +27,7 @@ use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::facts::{extract_facts, ExtractedFact};
-use engram_ingest::chunker::naive_split;
+use engram_ingest::memory::chunk_memory;
 use serde_json::json;
 use std::time::Instant;
 use uuid::Uuid;
@@ -233,27 +233,41 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     };
     ctx.store.insert_memory_with_kb(&memory, &kb)?;
 
-    let chunks = naive_split(&content);
+    // CHUNKING. This used to be a bare `naive_split`: paragraph split, no
+    // merge, no size cap, no floor. Fed real content (a pasted WhatsApp thread,
+    // a doc with date headers) it turned every stray line into its own embedded
+    // chunk — a live store reached 986 chunks under 40 characters, and they
+    // beat real answers in recall because a tiny chunk is nearly pure signal
+    // for the few tokens it holds. `chunk_memory` merges fragments into their
+    // neighbours, enforces a floor and a ceiling, and keeps every character.
+    let policy = crate::commands::chunks::resolve_policy();
+    let chunks = chunk_memory(&content, policy);
     let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
 
     // Embed every chunk. Gemini if available (env or config file), stub otherwise.
     let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let have_gemini = !force_stub && gemini_key.is_some();
-    let (embeddings, model_name, dims, prompt_format): (Vec<Vec<f32>>, String, usize, String) =
-        if have_gemini {
-            let e = GeminiEmbedder::new(gemini_key.unwrap());
-            let v = e
-                .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-                .await?;
-            (v, e.model(), e.dimensions(), e.prompt_format().to_string())
-        } else {
-            let e = StubEmbedder::default();
-            let v = e
-                .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-                .await?;
-            (v, e.model(), e.dimensions(), e.prompt_format().to_string())
-        };
+    let embedder: Box<dyn Embedder> = if have_gemini {
+        Box::new(GeminiEmbedder::new(gemini_key.unwrap()))
+    } else {
+        Box::new(StubEmbedder::default())
+    };
+    // A chunk longer than the provider's window loses its tail with no vector
+    // coverage — silently, before this. The cap above makes it unreachable
+    // unless someone widened `chunking.max_chars`; if they did, say so.
+    let truncation_note = crate::commands::chunks::warn_on_truncation(
+        ctx,
+        embedder.as_ref(),
+        &chunk_texts,
+        "remember",
+    );
+    let model_name = embedder.model();
+    let dims = embedder.dimensions();
+    let prompt_format = embedder.prompt_format().to_string();
+    let embeddings = embedder
+        .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
+        .await?;
 
     for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
         ctx.store.insert_chunk_with_embedding_meta(
@@ -387,6 +401,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     };
     meta.add("memory_id", memory.id.to_string());
     meta.add("chunks_stored", chunks.len());
+    if let Some(note) = &truncation_note {
+        meta.add("embed_truncation_note", note.clone());
+    }
     meta.add("embedder", model_name.clone());
     meta.add("embed_dimensions", dims);
     meta.add("embed_prompt_format", prompt_format.clone());
@@ -412,6 +429,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             "id": memory.id,
             "stored": true,
             "chunks": chunks.len(),
+            "embed_truncation_note": truncation_note,
             "kb": kb,
             "event_time": event_time.map(|t| t.to_rfc3339()),
             "fact_extraction": status.as_str(),

@@ -207,6 +207,170 @@ pub fn pack_sentences(text: &str, max_chars: usize) -> Vec<String> {
     out
 }
 
+/// Hard floor on what may become its own retrievable chunk.
+///
+/// THE BUG THIS FIXES. A paragraph split over real-world notes and exported
+/// documents emits fragments — a bare `Sep 16, 2025` date header, a lone
+/// `Elias:` speaker label, a trailing `Thanks!`. Each one became a standalone
+/// embedded chunk. A 12-character chunk is nearly pure signal for whatever few
+/// tokens it contains, so it scores 1.0 against any query mentioning those
+/// tokens and outranks the paragraph that actually answers the question. A live
+/// store ended up with 986 sub-40-character chunks doing exactly that.
+///
+/// So: any chunk shorter than `min_chars` is merged into a neighbour instead of
+/// standing alone. Preference order, chosen so a breadcrumb is disturbed only
+/// when there is no alternative:
+///   1. the previous emitted chunk, when it carries the same section;
+///   2. the next chunk (the fragment is carried forward and prepended) — this
+///      is the date-header case, where the header belongs to what follows;
+///   3. the previous emitted chunk regardless of section (end of input);
+///   4. nothing — a memory that is *entirely* this short is legitimate
+///      ("Lira's birthday is 12 March" is 27 characters) and is kept as-is.
+///
+/// Positions are renumbered sequentially. Merging can push a chunk up to
+/// `min_chars` past a previously enforced maximum; that slack is deliberate and
+/// tiny next to the embedder's own input window.
+pub fn enforce_min_chunk_chars(chunks: Vec<PendingChunk>, min_chars: usize) -> Vec<PendingChunk> {
+    if chunks.len() <= 1 || min_chars == 0 {
+        return renumber(chunks);
+    }
+    let mut out: Vec<PendingChunk> = Vec::with_capacity(chunks.len());
+    // A fragment with no usable predecessor waits here for the next chunk.
+    let mut carry: Option<PendingChunk> = None;
+
+    for chunk in chunks {
+        let mut chunk = match carry.take() {
+            None => chunk,
+            Some(mut pending) => {
+                pending.text.push_str("\n\n");
+                pending.text.push_str(&chunk.text);
+                // The receiving chunk's breadcrumb wins: the fragment was a
+                // header or stray line belonging to the body below it.
+                pending.section = chunk.section;
+                pending
+            }
+        };
+        if chunk.text.len() >= min_chars {
+            out.push(chunk);
+            continue;
+        }
+        match out.last_mut() {
+            Some(prev) if prev.section == chunk.section => {
+                prev.text.push_str("\n\n");
+                prev.text.push_str(&chunk.text);
+            }
+            _ => {
+                chunk.position = 0;
+                carry = Some(chunk);
+            }
+        }
+    }
+
+    if let Some(mut leftover) = carry {
+        match out.last_mut() {
+            // Trailing fragment with no same-section home: attach it anyway.
+            // A blurred breadcrumb beats a standalone date-stamp in recall.
+            Some(prev) => {
+                prev.text.push_str("\n\n");
+                prev.text.push_str(&leftover.text);
+            }
+            // Everything we were given was sub-threshold: this is a short
+            // memory, not a fragment. Keep it.
+            None => {
+                leftover.position = 0;
+                out.push(leftover);
+            }
+        }
+    }
+    renumber(out)
+}
+
+/// Enforce `max_chars` with no escape hatch.
+///
+/// [`split_oversized`] cuts at sentence boundaries and deliberately emits an
+/// over-cap lone sentence whole rather than severing a numeric fact. That is
+/// the right trade for papers, but a personal note is often one unbroken run of
+/// text with no sentence boundary at all — and the embedder silently truncates
+/// anything past its input window, so "emit whole" there means "lose the tail
+/// forever". This adds the fallback: a piece still over the cap after sentence
+/// packing is wrapped at whitespace (never mid-word unless a single token is
+/// itself over the cap).
+pub fn enforce_max_chunk_chars(chunks: Vec<PendingChunk>, max_chars: usize) -> Vec<PendingChunk> {
+    if max_chars == 0 {
+        return renumber(chunks);
+    }
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        for piece in pack_sentences(&chunk.text, max_chars) {
+            for part in hard_wrap(&piece, max_chars) {
+                out.push(PendingChunk {
+                    text: part,
+                    position: 0,
+                    section: chunk.section.clone(),
+                });
+            }
+        }
+    }
+    renumber(out)
+}
+
+/// Split `text` into pieces of at most `max_chars` bytes at whitespace
+/// boundaries. Returns the input untouched when it already fits. A single token
+/// longer than `max_chars` (a URL, a base64 blob) is cut at a char boundary —
+/// losing it entirely to embedder truncation is strictly worse.
+fn hard_wrap(text: &str, max_chars: usize) -> Vec<String> {
+    if text.len() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    for word in text.split_whitespace() {
+        if !buf.is_empty() && buf.len() + 1 + word.len() > max_chars {
+            out.push(std::mem::take(&mut buf));
+        }
+        if word.len() > max_chars {
+            // Unbreakable token: flush what we have, then slice it.
+            if !buf.is_empty() {
+                out.push(std::mem::take(&mut buf));
+            }
+            let mut rest = word;
+            while rest.len() > max_chars {
+                let mut cut = max_chars;
+                while cut > 0 && !rest.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                if cut == 0 {
+                    break;
+                }
+                out.push(rest[..cut].to_string());
+                rest = &rest[cut..];
+            }
+            buf.push_str(rest);
+            continue;
+        }
+        if !buf.is_empty() {
+            buf.push(' ');
+        }
+        buf.push_str(word);
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    if out.is_empty() {
+        out.push(text.to_string());
+    }
+    out
+}
+
+/// Renumber positions 0..n so downstream ordering stays contiguous after any
+/// merge or split pass.
+fn renumber(mut chunks: Vec<PendingChunk>) -> Vec<PendingChunk> {
+    for (i, chunk) in chunks.iter_mut().enumerate() {
+        chunk.position = i as u32;
+    }
+    chunks
+}
+
 fn flush_chunk(buf: &mut String, out: &mut Vec<PendingChunk>, pos: &mut u32, headings: &[String]) {
     let trimmed = buf.trim();
     if !trimmed.is_empty() {
@@ -564,6 +728,114 @@ mod tests {
         assert_eq!(merged[0].section.as_deref(), Some("Intro"));
         assert_eq!(merged[1].section.as_deref(), Some("Methods"));
         assert_eq!(merged[1].position, 1);
+    }
+
+    fn chunk(text: &str, section: Option<&str>) -> PendingChunk {
+        PendingChunk {
+            text: text.to_string(),
+            position: 0,
+            section: section.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn min_floor_merges_trailing_fragment_backwards() {
+        let out = enforce_min_chunk_chars(
+            vec![chunk(&"a".repeat(200), None), chunk("Sep 16, 2025", None)],
+            60,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].text.ends_with("Sep 16, 2025"));
+        assert_eq!(out[0].position, 0);
+    }
+
+    #[test]
+    fn min_floor_carries_leading_fragment_forward() {
+        // A date header at position 0 has no predecessor; it must attach to the
+        // entry it introduces rather than becoming its own chunk.
+        let out = enforce_min_chunk_chars(
+            vec![chunk("Sep 16, 2025", None), chunk(&"b".repeat(200), None)],
+            60,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].text.starts_with("Sep 16, 2025"));
+    }
+
+    #[test]
+    fn min_floor_keeps_a_lone_short_chunk() {
+        // A memory that is entirely short is legitimate, not a fragment.
+        let out = enforce_min_chunk_chars(vec![chunk("Lira's birthday is 12 March", None)], 60);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "Lira's birthday is 12 March");
+    }
+
+    #[test]
+    fn min_floor_keeps_input_when_everything_is_short() {
+        let out = enforce_min_chunk_chars(vec![chunk("hi", None), chunk("there", None)], 60);
+        assert_eq!(out.len(), 1, "all-fragment input collapses to one chunk");
+        assert!(out[0].text.contains("hi") && out[0].text.contains("there"));
+    }
+
+    #[test]
+    fn min_floor_prefers_a_same_section_neighbour() {
+        let out = enforce_min_chunk_chars(
+            vec![
+                chunk(&"a".repeat(200), Some("Intro")),
+                chunk(&"b".repeat(200), Some("Methods")),
+                chunk("tiny", Some("Methods")),
+            ],
+            60,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].section.as_deref(), Some("Intro"));
+        assert!(out[1].text.ends_with("tiny"));
+        assert_eq!(out[1].section.as_deref(), Some("Methods"));
+    }
+
+    #[test]
+    fn min_floor_is_idempotent() {
+        let once = enforce_min_chunk_chars(
+            vec![
+                chunk("Sep 16, 2025", None),
+                chunk(&"a".repeat(200), None),
+                chunk("ok", None),
+            ],
+            60,
+        );
+        let twice = enforce_min_chunk_chars(once.clone(), 60);
+        let texts_once: Vec<&str> = once.iter().map(|c| c.text.as_str()).collect();
+        let texts_twice: Vec<&str> = twice.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts_once, texts_twice);
+    }
+
+    #[test]
+    fn max_cap_splits_text_with_no_sentence_boundaries() {
+        // `split_oversized` alone emits this whole (no boundary to cut at), so
+        // the embedder would truncate it. The hard wrap must kick in.
+        let text = "word ".repeat(1000);
+        let lenient = split_oversized(vec![chunk(&text, None)], 200);
+        assert_eq!(lenient.len(), 1, "baseline: sentence packing cannot split");
+        let strict = enforce_max_chunk_chars(vec![chunk(&text, None)], 200);
+        assert!(strict.len() > 20);
+        assert!(strict.iter().all(|c| c.text.len() <= 200));
+        let joined: Vec<&str> = strict
+            .iter()
+            .flat_map(|c| c.text.split_whitespace())
+            .collect();
+        assert_eq!(joined.len(), 1000, "words lost while wrapping");
+    }
+
+    #[test]
+    fn max_cap_slices_an_unbreakable_token() {
+        let text = "x".repeat(500);
+        let out = enforce_max_chunk_chars(vec![chunk(&text, None)], 100);
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|c| c.text.len() <= 100));
+        assert_eq!(
+            out.iter().map(|c| c.text.len()).sum::<usize>(),
+            500,
+            "characters lost while slicing"
+        );
     }
 
     #[test]
