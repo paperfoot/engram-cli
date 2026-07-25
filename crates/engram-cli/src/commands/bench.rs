@@ -565,9 +565,12 @@ async fn run_personal(
         let latency_ms = start.elapsed().as_millis() as u64;
         let retrieved = to_items(&results.results, &seeded);
 
-        // Hint-less queries are also run unfiltered to record the ceiling the
-        // default-KB behaviour is currently leaving on the table.
-        let retrieved_all_kbs = if q.kb_hint.is_none() {
+        // Hint-less queries are also run pinned to the legacy `kb=default`
+        // floor. The headline run above already measures production behaviour,
+        // so re-running it unfiltered would just duplicate it; what is worth
+        // recording is what the OLD default would have scored — a regression
+        // tripwire for the day someone re-narrows the recall scope.
+        let retrieved_legacy_default = if q.kb_hint.is_none() {
             let results = hybrid_recall(
                 &store,
                 embedder.as_ref(),
@@ -579,7 +582,7 @@ async fn run_personal(
                     rerank_top_n,
                     filters: Filters {
                         diary: Some(personal::DIARY.to_string()),
-                        kb: None,
+                        kb: Some(personal::DEFAULT_KB.to_string()),
                         since,
                         until,
                     },
@@ -601,7 +604,7 @@ async fn run_personal(
             kb_filter,
             gold: q.gold,
             retrieved,
-            retrieved_all_kbs,
+            retrieved_legacy_default,
             latency_ms,
         });
     }
@@ -699,9 +702,9 @@ fn print_personal_table(report: &engram_bench::personal::PersonalReport) {
     ]);
     println!("{table}");
 
-    if let Some(cmp) = &report.all_kbs_comparison {
+    if let Some(cmp) = &report.legacy_default_comparison {
         println!(
-            "hint-less queries reran with no KB filter ({} queries): R@1 {} R@5 {} R@10 {} MRR {}",
+            "legacy kb=default floor ({} hint-less queries): R@1 {} R@5 {} R@10 {} MRR {}",
             cmp.queries,
             fmt3(cmp.recall_at_1),
             fmt3(cmp.recall_at_5),
@@ -1897,7 +1900,7 @@ mod tests {
                     score: 0.5,
                 })
                 .collect(),
-            retrieved_all_kbs: None,
+            retrieved_legacy_default: None,
             latency_ms: 1,
         }
     }

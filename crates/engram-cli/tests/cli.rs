@@ -2653,14 +2653,31 @@ fn bench_personal_runs_offline_and_reports_sane_structure() {
         assert!(q["latency_ms"].is_number());
     }
 
-    // Hint-less queries were rerun without a KB filter for the ceiling row.
-    let cmp = &d["all_kbs_comparison"];
+    // Headline metrics are production behaviour (recall spans every KB).
+    // Hint-less queries were additionally rerun pinned to the legacy
+    // `kb=default` floor — the regression tripwire, not the ceiling.
+    let cmp = &d["legacy_default_comparison"];
     assert!(cmp["queries"].as_u64().unwrap() >= 1);
     let hintless = per_query
         .iter()
-        .filter(|q| q["all_kbs"].is_object())
+        .filter(|q| q["legacy_default"].is_object())
         .count();
     assert_eq!(cmp["queries"].as_u64().unwrap() as usize, hintless);
+    // The legacy floor must not beat production on the queries it was run for
+    // — if it does, the all-KB default has stopped paying for itself.
+    assert!(
+        cmp["recall_at_10"].as_f64().unwrap() <= m["recall_at_10"].as_f64().unwrap() + 1e-6,
+        "legacy kb=default floor outscored the production default: {cmp}"
+    );
+    // The comparison run is a genuinely different scope, so it must not be a
+    // verbatim copy of the headline row for every hint-less query.
+    let differs = per_query.iter().any(|q| {
+        q["legacy_default"].is_object() && q["legacy_default"]["recall_at_10"] != q["recall_at_10"]
+    });
+    assert!(
+        differs,
+        "legacy_default mirrored the production run on every query — the comparison is redundant"
+    );
 }
 
 #[test]

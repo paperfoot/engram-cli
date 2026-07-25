@@ -1385,10 +1385,11 @@ pub struct QueryRun {
     pub kb_filter: Option<String>,
     pub gold: &'static [&'static str],
     pub retrieved: Vec<RetrievedItem>,
-    /// Second run of the same query with the KB filter removed. Only set for
-    /// hint-less queries, where it measures the ceiling the default-KB path
-    /// is currently leaving on the table.
-    pub retrieved_all_kbs: Option<Vec<RetrievedItem>>,
+    /// Second run of the same query pinned to the legacy `kb=default` floor.
+    /// Only set for hint-less queries, where the headline run takes the
+    /// production all-KB default; this row is the regression tripwire showing
+    /// what the old single-KB default would have scored.
+    pub retrieved_legacy_default: Option<Vec<RetrievedItem>>,
     pub latency_ms: u64,
 }
 
@@ -1401,8 +1402,8 @@ pub struct QueryResult {
     pub gold: Vec<String>,
     #[serde(flatten)]
     pub score: ScoreRow,
-    /// Same query without the KB filter, when it was run.
-    pub all_kbs: Option<ScoreRow>,
+    /// Same query pinned to the legacy `kb=default` floor, when it was run.
+    pub legacy_default: Option<ScoreRow>,
     pub results_returned: usize,
     /// True for a negative control that returned nothing at all.
     pub abstained: bool,
@@ -1446,10 +1447,12 @@ pub struct PersonalMetrics {
     pub p95_latency_ms: f32,
 }
 
-/// Recall of the hint-less queries when the KB filter is dropped — the ceiling
-/// the current default-KB behaviour is measured against.
+/// Recall of the hint-less queries when pinned to the legacy `kb=default`
+/// floor. The headline metrics measure production behaviour (recall spans
+/// every KB); this is the regression tripwire — if it ever catches up with the
+/// headline, the all-KB default has stopped paying for itself.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AllKbsComparison {
+pub struct LegacyDefaultComparison {
     pub queries: usize,
     pub recall_at_1: f32,
     pub recall_at_5: f32,
@@ -1470,7 +1473,7 @@ pub struct PersonalReport {
     pub queries_evaluated: usize,
     pub metrics: PersonalMetrics,
     pub per_category: Vec<CategoryScore>,
-    pub all_kbs_comparison: Option<AllKbsComparison>,
+    pub legacy_default_comparison: Option<LegacyDefaultComparison>,
     pub per_query: Vec<QueryResult>,
     pub notes: Vec<String>,
 }
@@ -1489,7 +1492,7 @@ pub fn aggregate(
     for run in runs {
         let ranking = collapse_to_memories(&run.retrieved);
         let score = score_ranking(&ranking, run.gold);
-        let all_kbs = run.retrieved_all_kbs.as_ref().map(|items| {
+        let legacy_default = run.retrieved_legacy_default.as_ref().map(|items| {
             let r = collapse_to_memories(items);
             score_ranking(&r, run.gold)
         });
@@ -1501,7 +1504,7 @@ pub fn aggregate(
             kb_filter: run.kb_filter.clone(),
             gold: run.gold.iter().map(|g| (*g).to_string()).collect(),
             score,
-            all_kbs,
+            legacy_default,
             results_returned: run.retrieved.len(),
             abstained: run.retrieved.is_empty(),
             top_score,
@@ -1567,24 +1570,26 @@ pub fn aggregate(
         });
     }
 
-    let with_all_kbs: Vec<&ScoreRow> = per_query
+    let with_legacy_default: Vec<&ScoreRow> = per_query
         .iter()
-        .filter_map(|q| q.all_kbs.as_ref())
+        .filter_map(|q| q.legacy_default.as_ref())
         .collect();
-    let all_kbs_comparison = (!with_all_kbs.is_empty()).then(|| AllKbsComparison {
-        queries: with_all_kbs.len(),
-        recall_at_1: mean(with_all_kbs.iter().map(|s| s.recall_at_1)),
-        recall_at_5: mean(with_all_kbs.iter().map(|s| s.recall_at_5)),
-        recall_at_10: mean(with_all_kbs.iter().map(|s| s.recall_at_10)),
-        mrr_at_10: mean(with_all_kbs.iter().map(|s| s.mrr_at_10)),
-    });
+    let legacy_default_comparison =
+        (!with_legacy_default.is_empty()).then(|| LegacyDefaultComparison {
+            queries: with_legacy_default.len(),
+            recall_at_1: mean(with_legacy_default.iter().map(|s| s.recall_at_1)),
+            recall_at_5: mean(with_legacy_default.iter().map(|s| s.recall_at_5)),
+            recall_at_10: mean(with_legacy_default.iter().map(|s| s.recall_at_10)),
+            mrr_at_10: mean(with_legacy_default.iter().map(|s| s.mrr_at_10)),
+        });
 
     let notes = vec![
         "Synthetic personal-memory suite; all people, companies and dates are fictional."
             .to_string(),
         format!(
-            "Hint-less queries run against kb={DEFAULT_KB} (the `recall` default); \
-             `all_kbs_comparison` reruns them with no KB filter."
+            "Headline metrics are production behaviour: hint-less queries take the `recall` \
+             default, which spans every KB. `legacy_default_comparison` reruns them pinned to \
+             kb={DEFAULT_KB} — the old default, kept as a regression tripwire."
         ),
         "Negative controls are scored by abstention, not recall: they have no gold memories."
             .to_string(),
@@ -1603,7 +1608,7 @@ pub fn aggregate(
         queries_evaluated: per_query.len(),
         metrics,
         per_category,
-        all_kbs_comparison,
+        legacy_default_comparison,
         per_query,
         notes,
     }
@@ -1830,7 +1835,7 @@ mod tests {
                     score: 1.0 - i as f32 / 10.0,
                 })
                 .collect(),
-            retrieved_all_kbs: None,
+            retrieved_legacy_default: None,
             latency_ms: 5,
         }
     }
@@ -1873,14 +1878,17 @@ mod tests {
             .find(|c| c.category == "person_fact")
             .unwrap();
         assert_eq!(pf.queries, 2);
-        assert!(report.all_kbs_comparison.is_none());
+        assert!(report.legacy_default_comparison.is_none());
     }
 
+    /// The headline row is production behaviour (all KBs); the comparison row
+    /// is the legacy `kb=default` floor, which is expected to score WORSE.
     #[test]
-    fn aggregate_reports_the_all_kbs_ceiling() {
-        let mut r = run("ck", QueryCategory::CrossKb, &["g1"], &["x", "y"]);
-        r.retrieved_all_kbs = Some(vec![RetrievedItem {
-            dataset_id: Some("g1".into()),
+    fn aggregate_reports_the_legacy_default_floor() {
+        let mut r = run("ck", QueryCategory::CrossKb, &["g1"], &["g1"]);
+        // The old single-KB default could not see the gold memory at all.
+        r.retrieved_legacy_default = Some(vec![RetrievedItem {
+            dataset_id: Some("x".into()),
             kind: "chunk".into(),
             score: 1.0,
         }]);
@@ -1893,10 +1901,13 @@ mod tests {
             10,
             &SeededDataset::default(),
         );
-        assert_eq!(report.metrics.recall_at_10, 0.0);
-        let cmp = report.all_kbs_comparison.expect("comparison present");
+        assert_eq!(report.metrics.recall_at_1, 1.0);
+        let cmp = report
+            .legacy_default_comparison
+            .expect("comparison present");
         assert_eq!(cmp.queries, 1);
-        assert_eq!(cmp.recall_at_1, 1.0);
+        assert_eq!(cmp.recall_at_1, 0.0);
+        assert_eq!(cmp.recall_at_10, 0.0);
     }
 
     #[tokio::test]
