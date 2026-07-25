@@ -571,26 +571,58 @@ pub struct PersonIndex {
     by_part: HashMap<String, Vec<String>>,
 }
 
+/// Accumulates the first pass one chunk at a time.
+///
+/// The compiler must not keep every chunk's [`Extraction`] alive just to learn
+/// the KB's names — the edges inside them carry a full source sentence each,
+/// which on a large corpus is hundreds of megabytes held for the length of the
+/// compile transaction. Only the name/kind aggregate is needed, so feed
+/// extractions through here and drop each one immediately.
+#[derive(Debug, Clone, Default)]
+pub struct PersonIndexBuilder {
+    spellings: HashMap<String, HashMap<String, usize>>,
+    kinds: HashMap<String, &'static str>,
+}
+
+impl PersonIndexBuilder {
+    /// Fold one chunk's entities into the aggregate.
+    pub fn add(&mut self, extraction: &Extraction) {
+        for mention in &extraction.entities {
+            let key = hygiene::dedup_key(&mention.name);
+            *self
+                .spellings
+                .entry(key.clone())
+                .or_default()
+                .entry(mention.name.clone())
+                .or_insert(0) += mention.mentions.max(1);
+            let kind = self.kinds.entry(key).or_insert(mention.kind);
+            *kind = merge_kind(kind, mention.kind);
+        }
+    }
+
+    /// Freeze the aggregate into the lookup index.
+    pub fn finish(self) -> PersonIndex {
+        PersonIndex::from_parts(self.spellings, self.kinds)
+    }
+}
+
 impl PersonIndex {
     /// Build the index from a first pass over every chunk of a KB.
     pub fn build<'a, I>(extractions: I) -> Self
     where
         I: IntoIterator<Item = &'a Extraction>,
     {
-        let mut spellings: HashMap<String, HashMap<String, usize>> = HashMap::new();
-        let mut kinds: HashMap<String, &'static str> = HashMap::new();
+        let mut builder = PersonIndexBuilder::default();
         for extraction in extractions {
-            for mention in &extraction.entities {
-                let key = hygiene::dedup_key(&mention.name);
-                *spellings
-                    .entry(key.clone())
-                    .or_default()
-                    .entry(mention.name.clone())
-                    .or_insert(0) += mention.mentions.max(1);
-                let kind = kinds.entry(key).or_insert(mention.kind);
-                *kind = merge_kind(kind, mention.kind);
-            }
+            builder.add(extraction);
         }
+        builder.finish()
+    }
+
+    fn from_parts(
+        spellings: HashMap<String, HashMap<String, usize>>,
+        kinds: HashMap<String, &'static str>,
+    ) -> Self {
         let display: HashMap<String, String> = spellings
             .iter()
             .map(|(key, votes)| (key.clone(), best_spelling(votes)))

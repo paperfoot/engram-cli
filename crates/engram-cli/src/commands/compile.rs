@@ -235,11 +235,13 @@ async fn compile_within_tx(
     // folds into the one full name it can belong to, and stays its own node
     // when two full names compete for it (see `PersonIndex`).
     let person_index = {
-        let first_pass: Vec<engram_graph::Extraction> = chunks
-            .iter()
-            .map(|chunk| engram_graph::people::analyze(&chunk.content))
-            .collect();
-        engram_graph::people::PersonIndex::build(&first_pass)
+        let mut builder = engram_graph::people::PersonIndexBuilder::default();
+        for chunk in chunks {
+            // Each extraction is folded in and dropped: only the name/kind
+            // aggregate is kept, never every chunk's edges and sentences.
+            builder.add(&engram_graph::people::analyze(&chunk.content));
+        }
+        builder.finish()
     };
 
     for chunk in chunks {
