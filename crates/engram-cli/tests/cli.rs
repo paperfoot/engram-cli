@@ -4874,3 +4874,259 @@ fn chunks_repair_leaves_a_healthy_store_untouched() {
     assert_eq!(v["data"]["chunks_reembedded"], 0);
     assert_eq!(stored_chunks(&tmp, "chunkfix"), before);
 }
+
+// ---------------------------------------------------------------------------
+// Entity hygiene v3 — the two defects the first hygiene pass left behind,
+// measured on the real 737-person store:
+//   1. leading non-name words still produced people ("Partner Rosalie" 64,
+//      "Wants Elias" 28, "Said" 11, "Says" 8, "Chelsea Flower" 24)
+//   2. the KB-wide unification left BOTH rows ("Noemi" 119 / "Noemi Varkoni"
+//      54, "Maria" 432 / "Maria Marenova" 21), with the bare form usually
+//      winning the display name because it had more mentions
+// ---------------------------------------------------------------------------
+
+/// One memory per line, so the KB has many chunks and the bare first names
+/// land in chunks that never see the full name — the shape that produced the
+/// duplicate rows.
+const HYGIENE_V3_FIXTURE: &[&str] = &[
+    // The shouted WhatsApp header comes FIRST on purpose: it is the chunk
+    // whose fold used to fail, so the bare row was created before any chunk
+    // had ever said "Maria Marenova".
+    "MARIA: call me back when you get a chance this evening.",
+    "Maria cooked dinner tonight and it was completely excellent.",
+    "Maria Microsoft London Tech sent the invoice over this morning.",
+    "Chelsea Flower Show tickets arrived in the post for Maria today.",
+    "Maria Marenova is my partner and we have lived together for years.",
+    "Partner Rosalie called about the flat and the deposit this week.",
+    "Rosalie is coming over on Thursday to collect the spare keys.",
+    "Wants Elias to confirm the restaurant booking before the weekend.",
+    "Elias is my brother and he confirmed the booking straight away.",
+    "Said the quarterly meeting is at noon in the upstairs room.",
+    "Says the investor deck is finally ready for a proper review.",
+    "Noemi sent the deck this morning and she was thrilled with it.",
+    "Noemi Varkoni introduced me to Avi Roy at the Longevity Summit.",
+    "Laura Corvo is a good friend from the Barcelona trip last year.",
+    "Laura Quiroz is someone I met through a dating app in October.",
+    "Laura texted me about dinner and asked to move it to Sunday.",
+    "Jisoo Park is my colleague and Jordan Peterson wrote back today.",
+];
+
+/// Seed the fixture into an isolated home and compile it.
+fn hygiene_v3_kb() -> tempfile::TempDir {
+    let (tmp, _) = with_isolated_home();
+    for line in HYGIENE_V3_FIXTURE {
+        cmd_in(&tmp)
+            .args([
+                "remember",
+                line,
+                "--kb",
+                "hygiene3",
+                "--no-extract-facts",
+                "--json",
+            ])
+            .assert()
+            .success();
+    }
+    json_cmd(&tmp, &["compile", "--kb", "hygiene3", "--all"]);
+    tmp
+}
+
+/// Every entity in the KB as (canonical_name, kind, mention_count, aliases).
+fn hygiene_v3_entities(tmp: &tempfile::TempDir) -> Vec<(String, String, u64, Vec<String>)> {
+    let v = json_cmd(
+        tmp,
+        &["entities", "list", "--kb", "hygiene3", "--limit", "500"],
+    );
+    v["data"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["canonical_name"].as_str().unwrap_or("").to_string(),
+                e["kind"].as_str().unwrap_or("").to_string(),
+                e["mention_count"].as_u64().unwrap_or(0),
+                e["aliases"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn leading_non_name_words_never_reach_the_person_graph() {
+    let tmp = hygiene_v3_kb();
+    let entities = hygiene_v3_entities(&tmp);
+    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
+
+    // A relationship word, a clause-opening verb, and a truncated event name
+    // are not humans — and the bare role word is not an entity at all.
+    for junk in [
+        "Partner Rosalie",
+        "Wants Elias",
+        "Said",
+        "Says",
+        "Partner",
+        "Chelsea Flower Show",
+    ] {
+        assert!(
+            !names.contains(&junk),
+            "junk entity {junk} survived: {names:?}"
+        );
+    }
+    // "Chelsea Flower" may still be a concept, but never a person.
+    for (name, kind, ..) in &entities {
+        if name == "Chelsea Flower" {
+            assert_ne!(kind, "person", "Chelsea Flower is an event, not a human");
+        }
+    }
+
+    // The humans behind the prefixes are real, and carry the prefixed mention.
+    let person = |wanted: &str| {
+        entities
+            .iter()
+            .find(|(n, ..)| n == wanted)
+            .unwrap_or_else(|| panic!("{wanted} missing from {names:?}"))
+    };
+    let (_, rosalie_kind, rosalie_mentions, rosalie_aliases) = person("Rosalie");
+    assert_eq!(rosalie_kind, "person");
+    assert_eq!(
+        *rosalie_mentions, 2,
+        "the mention behind 'Partner Rosalie' must count for her"
+    );
+    let (_, elias_kind, elias_mentions, elias_aliases) = person("Elias");
+    assert_eq!(elias_kind, "person");
+    assert_eq!(*elias_mentions, 2, "'Wants Elias' must count for Elias");
+
+    // A prefix is nobody's name, so it must not be hoarded as a spelling.
+    for (name, _, _, aliases) in &entities {
+        for junk in ["Partner Rosalie", "Wants Elias", "Said", "Says"] {
+            assert!(
+                !aliases.iter().any(|a| a == junk),
+                "{name} kept junk alias {junk}: {aliases:?}"
+            );
+        }
+    }
+    assert!(rosalie_aliases.is_empty(), "{rosalie_aliases:?}");
+    assert!(elias_aliases.is_empty(), "{elias_aliases:?}");
+
+    // The conservative half: real two-part names are untouched.
+    for real in ["Jisoo Park", "Jordan Peterson"] {
+        assert!(names.contains(&real), "{real} was lost: {names:?}");
+    }
+}
+
+#[test]
+fn a_bare_first_name_and_its_full_name_are_one_person() {
+    let tmp = hygiene_v3_kb();
+    let entities = hygiene_v3_entities(&tmp);
+    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
+
+    // ONE row per woman, canonicalised to the name that identifies her, with
+    // every spelling's mentions summed onto it.
+    for (bare, full, expected_mentions) in [
+        ("Noemi", "Noemi Varkoni", 2),
+        ("Maria", "Maria Marenova", 5),
+    ] {
+        let matching: Vec<&(String, String, u64, Vec<String>)> = entities
+            .iter()
+            .filter(|(n, ..)| n.to_lowercase().starts_with(&bare.to_lowercase()))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{bare}/{full} must collapse to one entity, got {matching:?}"
+        );
+        let (name, kind, mentions, aliases) = matching[0];
+        assert_eq!(name, full, "the full name must win the display name");
+        assert_eq!(kind, "person");
+        assert_eq!(
+            *mentions, expected_mentions,
+            "mentions from every spelling must be summed: {matching:?}"
+        );
+        assert!(
+            aliases.iter().any(|a| a == bare),
+            "the bare form must stay resolvable: {aliases:?}"
+        );
+    }
+
+    // …including the messaging-app contact label.
+    let maria = entities
+        .iter()
+        .find(|(n, ..)| n == "Maria Marenova")
+        .expect("Maria Marenova");
+    assert!(
+        maria.3.iter().any(|a| a == "Maria Microsoft London Tech"),
+        "the contact label must resolve to her: {:?}",
+        maria.3
+    );
+    assert!(
+        !names.contains(&"Maria Microsoft London Tech"),
+        "the label must not stand up a rival node: {names:?}"
+    );
+
+    // Every spelling resolves to the same person through the CLI.
+    for spelling in ["Maria", "Maria Marenova", "Maria Microsoft London Tech"] {
+        let v = json_cmd(&tmp, &["people", "show", spelling, "--kb", "hygiene3"]);
+        assert_eq!(
+            v["data"]["person"]["name"], "Maria Marenova",
+            "{spelling} resolved elsewhere"
+        );
+    }
+}
+
+#[test]
+fn two_people_who_share_a_first_name_are_never_fused() {
+    let tmp = hygiene_v3_kb();
+    let entities = hygiene_v3_entities(&tmp);
+    let lauras: Vec<&String> = entities
+        .iter()
+        .map(|(n, ..)| n)
+        .filter(|n| n.starts_with("Laura"))
+        .collect();
+    assert!(lauras.contains(&&"Laura Corvo".to_string()), "{lauras:?}");
+    assert!(lauras.contains(&&"Laura Quiroz".to_string()), "{lauras:?}");
+    // The ambiguous bare name belongs to neither, so it never becomes their
+    // alias and the two humans stay two humans.
+    for (name, _, _, aliases) in &entities {
+        if name.starts_with("Laura ") {
+            assert!(
+                !aliases.iter().any(|a| a == "Laura"),
+                "{name} absorbed the ambiguous bare name: {aliases:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hygiene_v3_recompile_is_stable() {
+    let tmp = hygiene_v3_kb();
+    let before = hygiene_v3_entities(&tmp);
+    json_cmd(&tmp, &["compile", "--kb", "hygiene3", "--all"]);
+    json_cmd(&tmp, &["compile", "--kb", "hygiene3", "--all"]);
+    let after = hygiene_v3_entities(&tmp);
+
+    let fingerprint = |rows: &[(String, String, u64, Vec<String>)]| -> Vec<String> {
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|(name, kind, mentions, aliases)| {
+                let mut aliases = aliases.clone();
+                aliases.sort();
+                format!("{name}|{kind}|{mentions}|{}", aliases.join(","))
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        fingerprint(&before),
+        fingerprint(&after),
+        "recompiling must converge, not drift"
+    );
+}
