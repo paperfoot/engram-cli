@@ -11,8 +11,8 @@ pub mod output;
 pub mod retrieval;
 
 use crate::cli::{
-    BudgetCommand, Cli, Command, ConfigCommand, DocumentsCommand, EntitiesCommand, FactsCommand,
-    GraphCommand, JobsCommand, KbCommand, MemoryCommand, PeopleCommand,
+    BudgetCommand, ChunksCommand, Cli, Command, ConfigCommand, DocumentsCommand, EntitiesCommand,
+    FactsCommand, GraphCommand, JobsCommand, KbCommand, MemoryCommand, PeopleCommand,
 };
 use crate::error::CliError;
 
@@ -373,5 +373,12 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         },
         Command::Skill(sub) => commands::skill::run(&ctx, sub),
         Command::Update { check } => commands::update::run(&ctx, check).await,
+        Command::Chunks(sub) => match sub {
+            ChunksCommand::Repair {
+                kb,
+                all_kbs,
+                dry_run,
+            } => commands::chunks::repair(&ctx, kb, all_kbs, dry_run).await,
+        },
     }
 }

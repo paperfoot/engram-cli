@@ -479,6 +479,32 @@ Examples:
         #[arg(long)]
         check: bool,
     },
+
+    /// Inspect and repair stored chunks.
+    #[command(subcommand)]
+    Chunks(ChunksCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ChunksCommand {
+    /// Merge degenerate sub-threshold chunks into their neighbours and
+    /// re-embed the result.
+    ///
+    /// Stores written before chunking enforced a minimum size hold fragments —
+    /// bare date stamps, speaker labels, sign-offs — that each became their own
+    /// retrievable chunk and outrank the memories that actually answer a query.
+    /// Idempotent: a repaired store reports zero on the next run.
+    Repair {
+        /// Knowledge base to repair.
+        #[arg(long)]
+        kb: Option<String>,
+        /// Repair every KB instead of one.
+        #[arg(long)]
+        all_kbs: bool,
+        /// Report what would change without writing or embedding anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

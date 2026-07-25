@@ -7,6 +7,7 @@ pub mod chunker;
 pub mod conversations;
 pub mod error;
 pub mod general;
+pub mod memory;
 pub mod papers;
 pub mod pdf;
 pub mod repos;

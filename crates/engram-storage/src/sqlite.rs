@@ -1742,6 +1742,45 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Every live chunk, grouped by parent memory and ordered by position.
+    ///
+    /// `list_chunks_for_kb` orders by `position` globally, which interleaves
+    /// chunks from different memories — useless to anything that needs a
+    /// memory's chunk SEQUENCE, such as `chunks repair` merging a degenerate
+    /// fragment into the neighbour it actually belongs next to. `None` spans
+    /// every KB.
+    pub fn list_chunks_by_memory(
+        &self,
+        kb: Option<&str>,
+    ) -> Result<Vec<ChunkRecord>, StorageError> {
+        let sql = if kb.is_some() {
+            "SELECT c.id, c.memory_id, c.content, c.position, c.section, m.diary, m.kb,
+                    c.document_id, COALESCE(d.source_path, json_extract(m.source_json, '$.path'))
+             FROM chunks c
+             JOIN memories m ON m.id = c.memory_id
+             LEFT JOIN documents d ON d.id = c.document_id
+             WHERE m.deleted = 0 AND m.kb = ?1
+             ORDER BY c.memory_id ASC, c.position ASC, c.id ASC"
+        } else {
+            "SELECT c.id, c.memory_id, c.content, c.position, c.section, m.diary, m.kb,
+                    c.document_id, COALESCE(d.source_path, json_extract(m.source_json, '$.path'))
+             FROM chunks c
+             JOIN memories m ON m.id = c.memory_id
+             LEFT JOIN documents d ON d.id = c.document_id
+             WHERE m.deleted = 0
+             ORDER BY c.memory_id ASC, c.position ASC, c.id ASC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = if let Some(k) = kb {
+            stmt.query_map(params![k], parse_chunk_record_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], parse_chunk_record_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(rows)
+    }
+
     /// Fetch chunk content by id.
     pub fn get_chunk_content(&self, chunk_id: Uuid) -> Result<Option<String>, StorageError> {
         let r = self

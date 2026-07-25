@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_MODEL: &str = "gemini-embedding-2";
 pub const DEFAULT_DIMS: usize = 1536;
 pub const PROMPT_FORMAT: &str = "gemini-embedding-2-v1";
+/// Longest input we ship per text: ~1,950 tokens, under Gemini's 2,048 cap.
+/// Anything longer is truncated client-side — loudly, see `embed_batch`.
+pub const MAX_INPUT_CHARS: usize = 7800;
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
 pub struct GeminiEmbedder {
@@ -140,6 +143,10 @@ impl Embedder for GeminiEmbedder {
 
     fn prompt_format(&self) -> &'static str {
         PROMPT_FORMAT
+    }
+
+    fn max_input_chars(&self) -> Option<usize> {
+        Some(MAX_INPUT_CHARS)
     }
 
     async fn embed_one(&self, text: &str, mode: TaskMode) -> Result<Vec<f32>, EmbedError> {
@@ -298,10 +305,15 @@ impl Embedder for GeminiEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        const MAX_CHARS_PER_TEXT: usize = 7800; // ~1950 tokens, under the 2048 cap
+        const MAX_CHARS_PER_TEXT: usize = MAX_INPUT_CHARS; // ~1950 tokens, under the 2048 cap
         const MAX_CHARS_PER_BATCH: usize = 60_000; // ~15000 tokens, under the 20K cap
         const MAX_TEXTS_PER_BATCH: usize = 100;
 
+        // Truncation is DATA LOSS, not a formatting detail: the tail of the
+        // text never reaches the index and is unretrievable forever. It used to
+        // happen silently. Chunking now caps far below this window, so every
+        // hit here is a real problem — say so.
+        let mut truncations = 0usize;
         let truncated: Vec<String> = texts
             .iter()
             .map(|t| {
@@ -313,10 +325,26 @@ impl Embedder for GeminiEmbedder {
                     while !t.is_char_boundary(end) && end > 0 {
                         end -= 1;
                     }
+                    truncations += 1;
+                    tracing::warn!(
+                        "gemini embed: input of {} chars exceeds the {} char window; \
+                         {} chars were DROPPED and are not retrievable — lower \
+                         ENGRAM_CHUNK_MAX_CHARS or re-chunk this content",
+                        t.len(),
+                        MAX_CHARS_PER_TEXT,
+                        t.len() - end,
+                    );
                     format_input(&t[..end], mode)
                 }
             })
             .collect();
+        if truncations > 0 {
+            tracing::warn!(
+                "gemini embed: {} of {} inputs were truncated",
+                truncations,
+                texts.len()
+            );
+        }
 
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         let url = format!(

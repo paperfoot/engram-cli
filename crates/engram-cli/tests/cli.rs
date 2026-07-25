@@ -4609,3 +4609,268 @@ fn triage_scopes_to_the_requested_kb() {
     let v = run_json(&mut cmd_in(&tmp), &["facts", "triage", "--kb", "personal"]);
     assert!(v["data"]["resolved"].as_i64().unwrap() > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Chunking: degenerate chunks must never reach the index.
+//
+// `remember` chunked with a bare paragraph split — no merge, no size cap, no
+// minimum. Real content (a pasted thread, a doc with date headers) turned every
+// stray line into its own embedded, retrievable chunk. A live store reached 986
+// chunks under 40 characters, and a recall for a person's birthday returned two
+// bare date fragments at score 1.0 ABOVE the memory that held the birthday.
+// ---------------------------------------------------------------------------
+
+/// Chunk texts for one KB, in storage order.
+fn stored_chunks(tmp: &tempfile::TempDir, kb: &str) -> Vec<String> {
+    let v = run_json(
+        &mut cmd_in(tmp),
+        &["export", "--format", "json", "--kb", kb],
+    );
+    v["data"]["chunks"]
+        .as_array()
+        .expect("export carries chunks")
+        .iter()
+        .map(|c| c["content"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A document whose paragraphs alternate date header / entry — the exact shape
+/// that produced the 986 fragments.
+fn dated_document() -> String {
+    let mut doc = String::new();
+    for day in 16..24 {
+        doc.push_str(&format!("Sep {day}, 2025\n\n"));
+        doc.push_str(&format!(
+            "Met Noemi at the Belgrade summit on day {day} and she mentioned her birthday is \
+             on the 3rd of April, which is worth remembering because she throws a party every \
+             year at the family house outside the city.\n\n"
+        ));
+    }
+    doc.push_str("Oct 2, 2025");
+    doc
+}
+
+#[test]
+fn remember_never_stores_a_bare_date_as_its_own_chunk() {
+    let (tmp, mut cmd) = with_isolated_home();
+    cmd.args([
+        "remember",
+        &dated_document(),
+        "--kb",
+        "chunkfix",
+        "--no-extract-facts",
+        "--json",
+    ])
+    .assert()
+    .success();
+
+    let chunks = stored_chunks(&tmp, "chunkfix");
+    assert!(chunks.len() > 1, "a 2k-character doc should split");
+    for chunk in &chunks {
+        assert!(
+            chunk.len() >= 60,
+            "degenerate chunk reached the index: {chunk:?}"
+        );
+    }
+    assert!(
+        !chunks.iter().any(|c| c.trim() == "Sep 16, 2025"),
+        "a bare date became its own retrievable chunk"
+    );
+    // The header rides along with the entry it introduces rather than vanishing.
+    assert!(chunks.iter().any(|c| c.contains("Sep 16, 2025")));
+}
+
+#[test]
+fn remember_keeps_a_legitimately_short_memory_as_one_chunk() {
+    let (tmp, mut cmd) = with_isolated_home();
+    // 27 characters: under the floor, but it is the WHOLE memory, so it stands.
+    let out = cmd
+        .args([
+            "remember",
+            "Lira's birthday is 12 March",
+            "--kb",
+            "chunkfix",
+            "--no-extract-facts",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(parse_stdout(&out)["data"]["chunks"], 1);
+
+    let chunks = stored_chunks(&tmp, "chunkfix");
+    assert_eq!(chunks, vec!["Lira's birthday is 12 March".to_string()]);
+}
+
+#[test]
+fn remember_chunks_a_long_unbroken_note_instead_of_truncating_it() {
+    let (tmp, mut cmd) = with_isolated_home();
+    // No blank lines and no sentence boundaries: previously this went to the
+    // embedder in one piece and everything past ~7,800 characters was dropped.
+    let note = "reminder ".repeat(2_000);
+    assert!(note.len() > 7_800);
+    cmd.args([
+        "remember",
+        &note,
+        "--kb",
+        "chunkfix",
+        "--no-extract-facts",
+        "--json",
+    ])
+    .assert()
+    .success();
+
+    let chunks = stored_chunks(&tmp, "chunkfix");
+    assert!(
+        chunks.len() > 5,
+        "long note must be split, got {}",
+        chunks.len()
+    );
+    for chunk in &chunks {
+        assert!(chunk.len() <= 1800 + 60, "chunk over cap: {}", chunk.len());
+    }
+    let words: usize = chunks.iter().map(|c| c.split_whitespace().count()).sum();
+    assert_eq!(words, 2_000, "content was lost while chunking");
+}
+
+/// Write a memory with the floor disabled, reproducing a pre-fix store.
+fn remember_unchunked(tmp: &tempfile::TempDir, content: &str, kb: &str) {
+    cmd_in(tmp)
+        .env("ENGRAM_CHUNK_MIN_CHARS", "1")
+        .env("ENGRAM_CHUNK_TARGET_CHARS", "1")
+        .args([
+            "remember",
+            content,
+            "--kb",
+            kb,
+            "--no-extract-facts",
+            "--json",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn chunk_policy_env_overrides_are_honored_and_reported() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_unchunked(&tmp, &dated_document(), "legacy");
+    let chunks = stored_chunks(&tmp, "legacy");
+    assert!(
+        chunks.iter().any(|c| c.trim() == "Sep 16, 2025"),
+        "ENGRAM_CHUNK_MIN_CHARS=1 must disable the floor so the fixture is degenerate"
+    );
+
+    let mut cmd = cmd_in(&tmp);
+    cmd.env("ENGRAM_CHUNK_MIN_CHARS", "123");
+    let v = run_json(&mut cmd, &["config", "show"]);
+    assert_eq!(v["data"]["chunking"]["min_chars"], 123);
+    let v = run_json(&mut cmd_in(&tmp), &["config", "show"]);
+    assert_eq!(v["data"]["chunking"]["min_chars"], 60);
+}
+
+#[test]
+fn chunks_repair_merges_degenerate_chunks_and_is_idempotent() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_unchunked(&tmp, &dated_document(), "legacy");
+    let before = stored_chunks(&tmp, "legacy");
+    let degenerate_before = before.iter().filter(|c| c.len() < 60).count();
+    assert!(degenerate_before > 0, "fixture must start degenerate");
+
+    let v = run_json(&mut cmd_in(&tmp), &["chunks", "repair", "--kb", "legacy"]);
+    assert_eq!(v["data"]["dry_run"], false);
+    assert_eq!(v["data"]["degenerate_chunks_before"], degenerate_before);
+    assert_eq!(v["data"]["degenerate_chunks_after"], 0);
+    assert_eq!(v["data"]["memories_repaired"], 1);
+    assert!(v["data"]["chunks_reembedded"].as_u64().unwrap() > 0);
+
+    let after = stored_chunks(&tmp, "legacy");
+    assert!(after.iter().all(|c| c.len() >= 60), "{after:?}");
+    assert!(after.len() < before.len());
+    // Nothing invented, nothing dropped: the same words in the same order.
+    let words = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .flat_map(|c| {
+                c.split_whitespace()
+                    .map(|w| w.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    assert_eq!(words(&before), words(&after));
+
+    // Idempotent: a repaired store has nothing left to do.
+    let v = run_json(&mut cmd_in(&tmp), &["chunks", "repair", "--kb", "legacy"]);
+    assert_eq!(v["data"]["memories_repaired"], 0);
+    assert_eq!(v["data"]["degenerate_chunks_before"], 0);
+    assert_eq!(v["data"]["chunks_reembedded"], 0);
+    assert_eq!(stored_chunks(&tmp, "legacy"), after);
+}
+
+#[test]
+fn chunks_repair_dry_run_writes_nothing() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_unchunked(&tmp, &dated_document(), "legacy");
+    let before = stored_chunks(&tmp, "legacy");
+
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["chunks", "repair", "--kb", "legacy", "--dry-run"],
+    );
+    assert_eq!(v["data"]["dry_run"], true);
+    assert!(v["data"]["memories_repaired"].as_u64().unwrap() > 0);
+    assert_eq!(v["data"]["chunks_reembedded"], 0);
+    assert!(v["data"]["next_step"]
+        .as_str()
+        .unwrap()
+        .contains("--dry-run"));
+    assert_eq!(
+        stored_chunks(&tmp, "legacy"),
+        before,
+        "dry-run mutated store"
+    );
+
+    // Reported counts are stable, and the real run still has work to do.
+    let again = run_json(
+        &mut cmd_in(&tmp),
+        &["chunks", "repair", "--kb", "legacy", "--dry-run"],
+    );
+    assert_eq!(again["data"], v["data"]);
+    let applied = run_json(&mut cmd_in(&tmp), &["chunks", "repair", "--all-kbs"]);
+    assert_eq!(
+        applied["data"]["memories_repaired"],
+        v["data"]["memories_repaired"]
+    );
+    assert_ne!(stored_chunks(&tmp, "legacy"), before);
+}
+
+#[test]
+fn chunks_repair_requires_an_explicit_scope() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    cmd.args(["chunks", "repair", "--json"])
+        .assert()
+        .failure()
+        .code(3);
+}
+
+#[test]
+fn chunks_repair_leaves_a_healthy_store_untouched() {
+    let (tmp, mut cmd) = with_isolated_home();
+    cmd.args([
+        "remember",
+        &dated_document(),
+        "--kb",
+        "chunkfix",
+        "--no-extract-facts",
+        "--json",
+    ])
+    .assert()
+    .success();
+    let before = stored_chunks(&tmp, "chunkfix");
+
+    let v = run_json(&mut cmd_in(&tmp), &["chunks", "repair", "--kb", "chunkfix"]);
+    assert_eq!(v["data"]["memories_repaired"], 0);
+    assert_eq!(v["data"]["chunks_reembedded"], 0);
+    assert_eq!(stored_chunks(&tmp, "chunkfix"), before);
+}

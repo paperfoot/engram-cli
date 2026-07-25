@@ -2,6 +2,7 @@ use crate::error::CliError;
 
 pub mod bench;
 pub mod budget;
+pub mod chunks;
 pub mod compile;
 pub mod config;
 pub mod doctor;
