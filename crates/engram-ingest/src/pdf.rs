@@ -26,9 +26,11 @@ pub fn extract_text(path: &Path) -> Result<String, IngestError> {
 /// Best-effort extraction for a PDF byte slice. Cleans the raw text like
 /// [`extract_text`].
 pub fn extract_text_from_bytes(bytes: &[u8]) -> Result<String, IngestError> {
-    let raw = catch_unwind(AssertUnwindSafe(|| pdf_extract::extract_text_from_mem(bytes)))
-        .map_err(|_| IngestError::Invalid("pdf extract: parser panicked".to_string()))?
-        .map_err(|e| IngestError::Invalid(format!("pdf extract: {e}")))?;
+    let raw = catch_unwind(AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem(bytes)
+    }))
+    .map_err(|_| IngestError::Invalid("pdf extract: parser panicked".to_string()))?
+    .map_err(|e| IngestError::Invalid(format!("pdf extract: {e}")))?;
     Ok(clean_extracted_text(&raw))
 }
 
@@ -105,8 +107,8 @@ fn is_page_number_line(trimmed: &str) -> bool {
         return false;
     }
     // Strip surrounding dash/whitespace decoration.
-    let core = trimmed
-        .trim_matches(|c: char| c == '-' || c == '—' || c == '–' || c.is_whitespace());
+    let core =
+        trimmed.trim_matches(|c: char| c == '-' || c == '—' || c == '–' || c.is_whitespace());
     // Optional leading "page" / "p." label.
     let lower = core.to_ascii_lowercase();
     let digits = lower
@@ -161,7 +163,10 @@ mod tests {
     fn dehyphenates_across_line_break() {
         let cleaned = clean_extracted_text("The mito-\nchondria produce ATP.");
         assert!(cleaned.contains("mitochondria"), "got {cleaned:?}");
-        assert!(!cleaned.contains("mito-"), "hyphen not removed: {cleaned:?}");
+        assert!(
+            !cleaned.contains("mito-"),
+            "hyphen not removed: {cleaned:?}"
+        );
     }
 
     #[test]
@@ -178,13 +183,19 @@ mod tests {
         assert!(a.contains("well-being"), "got {a:?}");
         // Uppercase after the break (e.g. "T-\nCell") is NOT joined blindly.
         let b = clean_extracted_text("The anti-\nCD3 antibody bound.");
-        assert!(b.contains("anti-"), "should not merge into uppercase: {b:?}");
+        assert!(
+            b.contains("anti-"),
+            "should not merge into uppercase: {b:?}"
+        );
     }
 
     #[test]
     fn strips_bare_page_numbers() {
         let cleaned = clean_extracted_text("Body text here.\n12\nMore body text.");
-        assert!(!cleaned.lines().any(|l| l.trim() == "12"), "got {cleaned:?}");
+        assert!(
+            !cleaned.lines().any(|l| l.trim() == "12"),
+            "got {cleaned:?}"
+        );
         assert!(cleaned.contains("Body text here."));
         assert!(cleaned.contains("More body text."));
     }

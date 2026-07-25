@@ -320,7 +320,12 @@ fn first_letter_choice(text: &str, n_options: usize) -> Option<usize> {
 fn bare_letter_choice(line: &str, n_options: usize) -> Option<usize> {
     let core: String = line
         .chars()
-        .filter(|c| !matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '*' | '"' | '\'' | ' '))
+        .filter(|c| {
+            !matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '*' | '"' | '\'' | ' '
+            )
+        })
         .collect();
     let mut chars = core.chars();
     let letter = chars.next()?;
@@ -493,7 +498,10 @@ mod tests {
     fn single_option_plus_abstain() {
         // Only the ideal, no distractors -> [IDEAL, ABSTAIN].
         let q = LitQA2Question::from_raw(raw("solo", "ONLY", &[]));
-        assert_eq!(q.options, vec!["ONLY".to_string(), ABSTAIN_OPTION.to_string()]);
+        assert_eq!(
+            q.options,
+            vec!["ONLY".to_string(), ABSTAIN_OPTION.to_string()]
+        );
         assert_eq!(q.ideal_idx, 0);
         assert_eq!(q.abstain_idx, 1);
     }
@@ -603,7 +611,10 @@ mod tests {
     #[test]
     fn parse_choice_rejects_prose_and_out_of_range() {
         // Prose that merely starts with a capital letter is not a choice.
-        assert_eq!(parse_choice("A study of mitochondria showed growth.", 5), None);
+        assert_eq!(
+            parse_choice("A study of mitochondria showed growth.", 5),
+            None
+        );
         // Letter beyond the option count is rejected.
         assert_eq!(parse_choice("Answer: F", 5), None);
         assert_eq!(parse_choice("Z", 5), None);
@@ -640,18 +651,26 @@ mod tests {
         let recs = vec![
             rec(true, false, true),
             rec(true, false, true),
-            rec(false, false, true),   // answered, wrong
-            rec(false, true, false),   // principled abstain
-            rec_no_response(false),    // empty API response
+            rec(false, false, true), // answered, wrong
+            rec(false, true, false), // principled abstain
+            rec_no_response(false),  // empty API response
         ];
         let s = score(&recs);
         // Lenient precision excludes BOTH the abstain and the no_response: 2/3.
         assert!((s.precision - 2.0 / 3.0).abs() < 1e-6);
         // Strict precision counts the no_response as a failed commitment: 2/4.
-        assert!((s.precision_strict - 2.0 / 4.0).abs() < 1e-6, "got {}", s.precision_strict);
+        assert!(
+            (s.precision_strict - 2.0 / 4.0).abs() < 1e-6,
+            "got {}",
+            s.precision_strict
+        );
         // abstain_rate counts only the principled abstention (1/5), not the
         // no_response, which has its own rate (1/5).
-        assert!((s.abstain_rate - 1.0 / 5.0).abs() < 1e-6, "got {}", s.abstain_rate);
+        assert!(
+            (s.abstain_rate - 1.0 / 5.0).abs() < 1e-6,
+            "got {}",
+            s.abstain_rate
+        );
         assert!((s.no_response_rate - 1.0 / 5.0).abs() < 1e-6);
     }
 
@@ -662,9 +681,9 @@ mod tests {
         let recs = vec![
             rec(true, false, true),
             rec(true, false, true),
-            rec(false, false, true),  // answered, wrong
-            rec(false, true, false),  // abstained
-            rec(false, true, false),  // abstained
+            rec(false, false, true), // answered, wrong
+            rec(false, true, false), // abstained
+            rec(false, true, false), // abstained
         ];
         let s = score(&recs);
         assert_eq!(s.n, 5);

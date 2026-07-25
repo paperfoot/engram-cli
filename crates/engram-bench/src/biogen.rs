@@ -78,17 +78,15 @@ impl BioGenTopics {
 
         let mut topics = Vec::with_capacity(arr.len());
         for entry in &arr {
-            let obj = entry.as_object().ok_or_else(|| {
-                BenchError::InvalidDataset("topic entry is not an object".into())
-            })?;
+            let obj = entry
+                .as_object()
+                .ok_or_else(|| BenchError::InvalidDataset("topic entry is not an object".into()))?;
             let id = obj
                 .get("id")
                 .or_else(|| obj.get("topic_id"))
                 .or_else(|| obj.get("number"))
                 .map(value_to_id)
-                .ok_or_else(|| {
-                    BenchError::InvalidDataset("topic entry missing id".into())
-                })?;
+                .ok_or_else(|| BenchError::InvalidDataset("topic entry missing id".into()))?;
             let question = obj
                 .get("question")
                 .or_else(|| obj.get("text"))
@@ -352,9 +350,21 @@ mod tests {
         .unwrap();
         let topics = BioGenTopics::load_from_file(&path).unwrap();
         assert_eq!(topics.0.len(), 2);
-        assert_eq!(topics.0[0], BioGenTopic { id: "1".into(), question: "What causes scurvy?".into() });
+        assert_eq!(
+            topics.0[0],
+            BioGenTopic {
+                id: "1".into(),
+                question: "What causes scurvy?".into()
+            }
+        );
         // Falls back to topic_id + text, and trims trailing whitespace.
-        assert_eq!(topics.0[1], BioGenTopic { id: "2".into(), question: "How does aspirin work?".into() });
+        assert_eq!(
+            topics.0[1],
+            BioGenTopic {
+                id: "2".into(),
+                question: "How does aspirin work?".into()
+            }
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -370,7 +380,13 @@ mod tests {
         let topics = BioGenTopics::load_from_file(&path).unwrap();
         assert_eq!(topics.0.len(), 1);
         // Numeric id coerced to string, narrative used as the question.
-        assert_eq!(topics.0[0], BioGenTopic { id: "7".into(), question: "Define homeostasis.".into() });
+        assert_eq!(
+            topics.0[0],
+            BioGenTopic {
+                id: "7".into(),
+                question: "Define homeostasis.".into()
+            }
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -392,8 +408,14 @@ mod tests {
 
     #[test]
     fn extract_ids_handles_groups_dedup_and_cap() {
-        assert_eq!(extract_citation_ids("Plain sentence with no cite."), Vec::<String>::new());
-        assert_eq!(extract_citation_ids("Vitamin C prevents scurvy [doc1]."), vec!["doc1"]);
+        assert_eq!(
+            extract_citation_ids("Plain sentence with no cite."),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            extract_citation_ids("Vitamin C prevents scurvy [doc1]."),
+            vec!["doc1"]
+        );
         // Grouped, comma/semicolon separated, de-duplicated in first-seen order.
         assert_eq!(
             extract_citation_ids("Claim [a, b; a] and again [b]."),
@@ -411,7 +433,14 @@ mod tests {
     #[test]
     fn csr_empty_answer_is_zero_one_topic() {
         let r = block_on(citation_support_rate(stub_entails, "   ", &chunks(&[]))).unwrap();
-        assert_eq!(r, BioGenReport { csr: 0.0, n_sentences: 0, n_topics: 1 });
+        assert_eq!(
+            r,
+            BioGenReport {
+                csr: 0.0,
+                n_sentences: 0,
+                n_topics: 1
+            }
+        );
     }
 
     #[test]
@@ -421,7 +450,8 @@ mod tests {
             ("d1", "vitamin c deficiency causes scurvy in humans"),
             ("d2", "aspirin inhibits cyclooxygenase enzymes"),
         ]);
-        let answer = "Vitamin C deficiency causes scurvy [d1]. Aspirin inhibits cyclooxygenase [d2].";
+        let answer =
+            "Vitamin C deficiency causes scurvy [d1]. Aspirin inhibits cyclooxygenase [d2].";
         let r = block_on(citation_support_rate(stub_entails, answer, &c)).unwrap();
         assert_eq!(r.n_sentences, 2);
         assert_eq!(r.n_topics, 1);
@@ -493,8 +523,16 @@ mod tests {
     fn aggregate_micro_averages_over_sentences() {
         // Report A: 2/4 supported. Report B: 3/3 supported.
         // Micro CSR = (2 + 3) / (4 + 3) = 5/7.
-        let a = BioGenReport { csr: 0.5, n_sentences: 4, n_topics: 1 };
-        let b = BioGenReport { csr: 1.0, n_sentences: 3, n_topics: 1 };
+        let a = BioGenReport {
+            csr: 0.5,
+            n_sentences: 4,
+            n_topics: 1,
+        };
+        let b = BioGenReport {
+            csr: 1.0,
+            n_sentences: 3,
+            n_topics: 1,
+        };
         let agg = aggregate(&[a, b]);
         assert_eq!(agg.n_topics, 2);
         assert_eq!(agg.n_sentences, 7);
@@ -504,10 +542,28 @@ mod tests {
     #[test]
     fn aggregate_empty_is_default_like() {
         let agg = aggregate(&[]);
-        assert_eq!(agg, BioGenReport { csr: 0.0, n_sentences: 0, n_topics: 0 });
+        assert_eq!(
+            agg,
+            BioGenReport {
+                csr: 0.0,
+                n_sentences: 0,
+                n_topics: 0
+            }
+        );
         // A topic with zero sentences still counts as a topic but adds no
         // sentences and contributes 0 to CSR.
-        let agg2 = aggregate(&[BioGenReport { csr: 0.0, n_sentences: 0, n_topics: 1 }]);
-        assert_eq!(agg2, BioGenReport { csr: 0.0, n_sentences: 0, n_topics: 1 });
+        let agg2 = aggregate(&[BioGenReport {
+            csr: 0.0,
+            n_sentences: 0,
+            n_topics: 1,
+        }]);
+        assert_eq!(
+            agg2,
+            BioGenReport {
+                csr: 0.0,
+                n_sentences: 0,
+                n_topics: 1
+            }
+        );
     }
 }

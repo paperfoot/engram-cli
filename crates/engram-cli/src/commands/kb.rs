@@ -60,6 +60,45 @@ pub fn delete(ctx: &AppContext, name: String, confirm: bool) -> Result<(), CliEr
     Ok(())
 }
 
+/// Heal a store whose KB registry fell out of sync with its content.
+///
+/// Writing through `remember --kb <name>` registers the KB today, but stores
+/// created by earlier builds carry memories in KBs that `kb list` never shows
+/// — so those memories are invisible to anyone enumerating KBs. This registers
+/// them. Additive only: no memory, chunk or fact is touched.
+pub fn repair(ctx: &AppContext, dry_run: bool) -> Result<(), CliError> {
+    let missing = if dry_run {
+        ctx.store.unregistered_kbs()?
+    } else {
+        ctx.store.repair_kb_registry()?
+    };
+
+    let mut meta = Metadata::default();
+    meta.add("unregistered", missing.len());
+    meta.add("dry_run", dry_run);
+    let registered = if dry_run { 0 } else { missing.len() };
+    meta.add("registered", registered);
+
+    print_success(
+        ctx.format,
+        json!({
+            "unregistered_kbs": missing,
+            "registered": registered,
+            "dry_run": dry_run,
+            "note": if missing.is_empty() {
+                "KB registry already matches stored content; nothing to repair."
+            } else if dry_run {
+                "Re-run without --dry-run to register these KBs."
+            } else {
+                "Registered. These KBs now appear in `engram kb list`."
+            },
+        }),
+        meta,
+        |data| println!("{}", serde_json::to_string_pretty(data).unwrap()),
+    );
+    Ok(())
+}
+
 fn validate_kb_name(name: &str) -> Result<(), CliError> {
     if name.is_empty()
         || !name

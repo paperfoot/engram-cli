@@ -503,6 +503,16 @@ pub enum KbCommand {
         #[arg(long)]
         confirm: bool,
     },
+    /// Register KBs that hold memories but are missing from `kb list`.
+    ///
+    /// Stores written by builds that predated write-time KB registration have
+    /// content in KBs the registry never learned about. Idempotent and
+    /// non-destructive: it only ever adds rows.
+    Repair {
+        /// Report what would be registered without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -68,7 +68,10 @@ pub fn reciprocal_rank<T: PartialEq>(retrieved: &[T], relevant: &[T], k: usize) 
 /// IDCG = same, over the qrels grades sorted descending (top 10)
 /// nDCG = DCG / IDCG          (0.0 when IDCG == 0)
 /// ```
-pub fn ndcg_at_10(retrieved_doc_ids: &[String], qrels: &std::collections::HashMap<String, u32>) -> f32 {
+pub fn ndcg_at_10(
+    retrieved_doc_ids: &[String],
+    qrels: &std::collections::HashMap<String, u32>,
+) -> f32 {
     fn dcg(grades: impl Iterator<Item = u32>) -> f32 {
         grades
             .take(10)
@@ -145,7 +148,10 @@ mod tests {
         // No retrieved docs -> DCG 0 -> nDCG 0.
         assert_eq!(ndcg_at_10(&[], &q), 0.0);
         // No qrels -> IDCG 0 -> nDCG 0 by the IDCG==0 guard.
-        assert_eq!(ndcg_at_10(&ids(&["a"]), &std::collections::HashMap::new()), 0.0);
+        assert_eq!(
+            ndcg_at_10(&ids(&["a"]), &std::collections::HashMap::new()),
+            0.0
+        );
     }
 
     #[test]
@@ -165,8 +171,17 @@ mod tests {
     fn ndcg_ignores_docs_beyond_rank_10() {
         // 11 relevant docs but only top-10 count; the 11th (grade 5) must be ignored.
         let q = qrels(&[
-            ("d0", 1), ("d1", 1), ("d2", 1), ("d3", 1), ("d4", 1), ("d5", 1),
-            ("d6", 1), ("d7", 1), ("d8", 1), ("d9", 1), ("d10", 5),
+            ("d0", 1),
+            ("d1", 1),
+            ("d2", 1),
+            ("d3", 1),
+            ("d4", 1),
+            ("d5", 1),
+            ("d6", 1),
+            ("d7", 1),
+            ("d8", 1),
+            ("d9", 1),
+            ("d10", 5),
         ]);
         let retrieved = ids(&[
             "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "d10",

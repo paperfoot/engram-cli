@@ -25,12 +25,10 @@ pub struct Sentence {
 /// match is case-insensitive on the token immediately before the period.
 const ABBREVIATIONS: &[&str] = &[
     // Latin / scholarly
-    "e.g", "i.e", "et al", "etc", "cf", "vs", "viz", "al", "ibid", "op",
-    // Titles
-    "dr", "prof", "mr", "mrs", "ms", "st",
-    // Scientific structure
-    "fig", "figs", "eq", "eqs", "ref", "refs", "no", "nos", "vol", "pp",
-    "ch", "sec", "tab", "approx", "ca", "min", "max", "avg", "std",
+    "e.g", "i.e", "et al", "etc", "cf", "vs", "viz", "al", "ibid", "op", // Titles
+    "dr", "prof", "mr", "mrs", "ms", "st", // Scientific structure
+    "fig", "figs", "eq", "eqs", "ref", "refs", "no", "nos", "vol", "pp", "ch", "sec", "tab",
+    "approx", "ca", "min", "max", "avg", "std",
     // Units that are sometimes written with a trailing dot
     "mol", "conc", "temp", "wt", "vol",
 ];
@@ -47,8 +45,7 @@ pub fn segment(text: &str) -> Vec<Sentence> {
     while i < chars.len() {
         let c = chars[i];
         let is_terminator = c == '.' || c == '!' || c == '?';
-        let is_double_newline = c == '\n'
-            && chars.get(i + 1).copied() == Some('\n');
+        let is_double_newline = c == '\n' && chars.get(i + 1).copied() == Some('\n');
 
         if is_terminator && is_boundary(&chars, i) {
             let end = i + 1; // include the terminator
@@ -115,7 +112,11 @@ fn is_boundary(chars: &[char], i: usize) -> bool {
     }
     // From here c == '.'.
     // 1. Decimal point: digit '.' digit  → not a boundary.
-    let prev = if i > 0 { chars.get(i - 1).copied() } else { None };
+    let prev = if i > 0 {
+        chars.get(i - 1).copied()
+    } else {
+        None
+    };
     let next = chars.get(i + 1).copied();
     if matches!(prev, Some(p) if p.is_ascii_digit())
         && matches!(next, Some(n) if n.is_ascii_digit())
@@ -132,8 +133,7 @@ fn is_boundary(chars: &[char], i: usize) -> bool {
     }
     // 4. Single-letter initial ("A. Smith", "S. cerevisiae"): a lone capital
     //    letter before the dot is usually an initial, not a sentence end.
-    if matches!(prev, Some(p) if p.is_ascii_uppercase())
-        && (i < 2 || chars[i - 2].is_whitespace())
+    if matches!(prev, Some(p) if p.is_ascii_uppercase()) && (i < 2 || chars[i - 2].is_whitespace())
     {
         return false;
     }

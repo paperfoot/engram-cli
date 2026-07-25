@@ -224,8 +224,10 @@ pub async fn adjudicate<L: ChatLlm + ?Sized>(
 
 EXISTING facts:
 {}",
-        candidates.join("
-")
+        candidates.join(
+            "
+"
+        )
     );
     let resp = llm
         .chat(&[

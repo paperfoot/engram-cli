@@ -41,7 +41,10 @@ mod tests {
             chunks.iter().map(|c| c.text.len()).collect::<Vec<_>>()
         );
         // Every decimal survives intact and none was dropped at a boundary.
-        let total: usize = chunks.iter().map(|c| c.text.matches("0.5 nM").count()).sum();
+        let total: usize = chunks
+            .iter()
+            .map(|c| c.text.matches("0.5 nM").count())
+            .sum();
         assert_eq!(total, 200, "a decimal was split across chunks or lost");
         // Positions are contiguous from 0.
         for (i, c) in chunks.iter().enumerate() {
@@ -54,6 +57,8 @@ mod tests {
         let text = "# Methods\n\nHeLa cells were grown in DMEM at 37 °C.\n\n# Results\n\nLifespan rose 24%.";
         let chunks = chunk_paper(text);
         assert!(chunks.iter().all(|c| c.text.len() <= PAPER_CHUNK_MAX_CHARS));
-        assert!(chunks.iter().any(|c| c.section.as_deref() == Some("Methods")));
+        assert!(chunks
+            .iter()
+            .any(|c| c.section.as_deref() == Some("Methods")));
     }
 }

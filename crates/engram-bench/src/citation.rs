@@ -214,15 +214,16 @@ mod tests {
     /// lowercase whitespace token of the hypothesis appears in the premise's
     /// lowercase token set. No network, fully reproducible.
     async fn stub_entails(premise: String, hypothesis: String) -> Result<bool, BenchError> {
-        let prem: std::collections::HashSet<String> =
-            premise.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
+        let prem: std::collections::HashSet<String> = premise
+            .to_lowercase()
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
         let mut hyp = hypothesis.to_lowercase();
         // Tokens compare bare words; strip trailing sentence punctuation so
         // "blue." matches "blue" in the premise.
         hyp.retain(|c| !matches!(c, '.' | '!' | '?' | ',' | ';' | ':'));
-        let ok = hyp
-            .split_whitespace()
-            .all(|tok| prem.contains(tok));
+        let ok = hyp.split_whitespace().all(|tok| prem.contains(tok));
         Ok(ok)
     }
 
@@ -251,13 +252,19 @@ mod tests {
         let out = split_sentences("The dose is 3.5 mg. Take it daily.");
         assert_eq!(
             out,
-            vec!["The dose is 3.5 mg.".to_string(), "Take it daily.".to_string()]
+            vec![
+                "The dose is 3.5 mg.".to_string(),
+                "Take it daily.".to_string()
+            ]
         );
     }
 
     #[test]
     fn split_sentences_handles_no_terminator_and_whitespace() {
-        assert_eq!(split_sentences("no terminator here"), vec!["no terminator here".to_string()]);
+        assert_eq!(
+            split_sentences("no terminator here"),
+            vec!["no terminator here".to_string()]
+        );
         assert!(split_sentences("   \n  ").is_empty());
         assert!(split_sentences("").is_empty());
         // Collapses runs of terminators into one boundary.
@@ -269,8 +276,7 @@ mod tests {
 
     #[test]
     fn empty_statements_yield_default() {
-        let scores =
-            futures_executor_block_on(citation_scores(stub_entails, &[])).unwrap();
+        let scores = futures_executor_block_on(citation_scores(stub_entails, &[])).unwrap();
         assert_eq!(scores, CitationScores::default());
     }
 
@@ -283,8 +289,7 @@ mod tests {
             stmt("the sky is blue", &["the sky is blue today"]),
             stmt("grass is green", &["fresh grass is green"]),
         ];
-        let scores =
-            futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
+        let scores = futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
         assert_eq!(scores.n, 2);
         assert!((scores.recall - 1.0).abs() < 1e-6);
         assert!((scores.precision - 1.0).abs() < 1e-6);
@@ -297,8 +302,7 @@ mod tests {
             stmt("the sky is blue", &["the sky is blue today"]),
             stmt("grass is green", &[]),
         ];
-        let scores =
-            futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
+        let scores = futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
         assert_eq!(scores.n, 2);
         assert!((scores.recall - 0.5).abs() < 1e-6);
         // The empty-citation statement contributes 0 to the denominator (ALCE
@@ -313,8 +317,7 @@ mod tests {
         // citation, so (ALCE) total_citations == 1 while the numerator stays 0
         // -> precision 0/1 = 0.0.
         let statements = vec![stmt("the sky is blue", &["water is wet"])];
-        let scores =
-            futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
+        let scores = futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
         assert_eq!(scores.n, 1);
         assert_eq!(scores.recall, 0.0);
         assert_eq!(scores.precision, 0.0);
@@ -333,10 +336,13 @@ mod tests {
             stmt("the sky is blue", &["the sky is blue"]),
             stmt("the sky is blue", &["water is wet"]),
         ];
-        let scores =
-            futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
+        let scores = futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
         assert_eq!(scores.n, 2);
-        assert!((scores.recall - 0.5).abs() < 1e-6, "recall {}", scores.recall);
+        assert!(
+            (scores.recall - 0.5).abs() < 1e-6,
+            "recall {}",
+            scores.recall
+        );
         assert!(
             (scores.precision - 0.5).abs() < 1e-6,
             "precision {} (expected ALCE 0.5, not recall-gated 1.0)",
@@ -352,12 +358,18 @@ mod tests {
         //        still supports it -> irrelevant -> not load-bearing.
         // concat(C0,C1) still contains all statement tokens -> recall 1.
         // precision = 1 load-bearing / 2 total = 0.5.
-        let statements = vec![stmt("the sky is blue", &["the sky is blue", "water is wet"])];
-        let scores =
-            futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
+        let statements = vec![stmt(
+            "the sky is blue",
+            &["the sky is blue", "water is wet"],
+        )];
+        let scores = futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
         assert_eq!(scores.n, 1);
         assert!((scores.recall - 1.0).abs() < 1e-6);
-        assert!((scores.precision - 0.5).abs() < 1e-6, "got {}", scores.precision);
+        assert!(
+            (scores.precision - 0.5).abs() < 1e-6,
+            "got {}",
+            scores.precision
+        );
     }
 
     #[test]
@@ -366,8 +378,7 @@ mod tests {
         // and removing either breaks entailment, so neither is irrelevant.
         // precision = 2/2 = 1.0, recall = 1.0.
         let statements = vec![stmt("sky blue grass green", &["sky blue", "grass green"])];
-        let scores =
-            futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
+        let scores = futures_executor_block_on(citation_scores(stub_entails, &statements)).unwrap();
         assert!((scores.recall - 1.0).abs() < 1e-6);
         assert!((scores.precision - 1.0).abs() < 1e-6);
     }

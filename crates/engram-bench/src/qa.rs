@@ -1042,12 +1042,7 @@ where
         // extractive QA judge: generate a summary, then ask the judge which gold
         // keypoints it covers (recall) and which of its sentences correspond to
         // some gold keypoint (precision). A row counts as correct iff F1 >= 0.5.
-        if let Some(keypoints) = row
-            .metadata
-            .keypoints
-            .as_ref()
-            .filter(|k| !k.is_empty())
-        {
+        if let Some(keypoints) = row.metadata.keypoints.as_ref().filter(|k| !k.is_empty()) {
             use engram_llm::ChatMessage;
             for (q_idx, question) in row.questions.iter().enumerate() {
                 if questions_seen >= max_questions {
@@ -1111,7 +1106,12 @@ where
                     }
                 }
 
-                let f1 = keypoint_f1(present_gold, keypoints.len(), matching_sentences, sentences.len());
+                let f1 = keypoint_f1(
+                    present_gold,
+                    keypoints.len(),
+                    matching_sentences,
+                    sentences.len(),
+                );
                 // Threshold: a summary is "correct" iff keypoint-F1 >= 0.5 — i.e.
                 // it must, on balance, both cover the gold keypoints (recall) and
                 // stay on-topic (precision). Documented per the ∞Bench-Sum spec.
@@ -1583,8 +1583,8 @@ where
     R: Reranker + ?Sized,
     A: ChatLlm + ?Sized,
 {
-    use std::io::Write as _;
     use engram_llm::ChatMessage;
+    use std::io::Write as _;
 
     let questions = &dataset.0;
     let n = limit
@@ -1673,113 +1673,113 @@ where
         let run_start = Instant::now();
 
         // Retrieval (full-text only).
-        let (context, retrieval_hit, retrieved_docs) = if mode == LitQa2Mode::FullText && !pending_chunks.is_empty()
-        {
-            let q_emb = embedder
-                .embed_one(&q.question, TaskMode::RetrievalQuery)
-                .await?;
-            let mut dense_scored: Vec<(Uuid, f32)> = chunk_to_doi
-                .keys()
-                .map(|cid| {
-                    let emb = chunk_embeddings.get(cid).expect("seeded");
-                    (*cid, cosine_sim(&q_emb, emb))
-                })
-                .collect();
-            dense_scored.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            let dense_run: Vec<RankedHit> = dense_scored
-                .iter()
-                .take(50)
-                .enumerate()
-                .map(|(rank, (id, score))| RankedHit {
-                    chunk_id: *id,
-                    rank: rank + 1,
-                    raw_score: *score,
-                    source: RetrievalSource::Dense,
-                })
-                .collect();
-
-            let fts_q = build_fts_query(&q.question);
-            let fts_hits = if fts_q.is_empty() {
-                Vec::new()
-            } else {
-                store.fts_search(&fts_q, 50).unwrap_or_default()
-            };
-            let lexical_run: Vec<RankedHit> = fts_hits
-                .iter()
-                .enumerate()
-                .map(|(rank, (id, score))| RankedHit {
-                    chunk_id: *id,
-                    rank: rank + 1,
-                    raw_score: *score,
-                    source: RetrievalSource::Lexical,
-                })
-                .collect();
-
-            let fused = reciprocal_rank_fusion(&[lexical_run, dense_run], rrf_k);
-            let top_ids: Vec<Uuid> = if let Some(r) = reranker {
-                let cands: Vec<RerankCandidate> = fused
+        let (context, retrieval_hit, retrieved_docs) =
+            if mode == LitQa2Mode::FullText && !pending_chunks.is_empty() {
+                let q_emb = embedder
+                    .embed_one(&q.question, TaskMode::RetrievalQuery)
+                    .await?;
+                let mut dense_scored: Vec<(Uuid, f32)> = chunk_to_doi
+                    .keys()
+                    .map(|cid| {
+                        let emb = chunk_embeddings.get(cid).expect("seeded");
+                        (*cid, cosine_sim(&q_emb, emb))
+                    })
+                    .collect();
+                dense_scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                let dense_run: Vec<RankedHit> = dense_scored
                     .iter()
                     .take(50)
-                    .filter_map(|(id, _)| {
+                    .enumerate()
+                    .map(|(rank, (id, score))| RankedHit {
+                        chunk_id: *id,
+                        rank: rank + 1,
+                        raw_score: *score,
+                        source: RetrievalSource::Dense,
+                    })
+                    .collect();
+
+                let fts_q = build_fts_query(&q.question);
+                let fts_hits = if fts_q.is_empty() {
+                    Vec::new()
+                } else {
+                    store.fts_search(&fts_q, 50).unwrap_or_default()
+                };
+                let lexical_run: Vec<RankedHit> = fts_hits
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, (id, score))| RankedHit {
+                        chunk_id: *id,
+                        rank: rank + 1,
+                        raw_score: *score,
+                        source: RetrievalSource::Lexical,
+                    })
+                    .collect();
+
+                let fused = reciprocal_rank_fusion(&[lexical_run, dense_run], rrf_k);
+                let top_ids: Vec<Uuid> = if let Some(r) = reranker {
+                    let cands: Vec<RerankCandidate> = fused
+                        .iter()
+                        .take(50)
+                        .filter_map(|(id, _)| {
+                            pending_chunks
+                                .iter()
+                                .find(|(cid, _)| cid == id)
+                                .map(|(cid, text)| RerankCandidate {
+                                    id: cid.to_string(),
+                                    text: text.clone(),
+                                })
+                        })
+                        .collect();
+                    if cands.is_empty() {
+                        Vec::new()
+                    } else {
+                        r.rerank(&q.question, &cands, top_k)
+                            .await?
+                            .into_iter()
+                            .filter_map(|rr| Uuid::parse_str(&rr.id).ok())
+                            .collect()
+                    }
+                } else {
+                    fused.iter().take(top_k).map(|(id, _)| *id).collect()
+                };
+
+                // retrieval_hit: any top-K chunk drawn from the target DOI.
+                let hit = match &q.target_doi {
+                    Some(doi) => top_ids
+                        .iter()
+                        .any(|id| chunk_to_doi.get(id).map(|d| d == doi).unwrap_or(false)),
+                    None => false,
+                };
+                let ctx: String = top_ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(rank, id)| {
                         pending_chunks
                             .iter()
                             .find(|(cid, _)| cid == id)
-                            .map(|(cid, text)| RerankCandidate {
-                                id: cid.to_string(),
-                                text: text.clone(),
-                            })
+                            .map(|(_, text)| format!("[passage {}]\n{}", rank + 1, text))
                     })
-                    .collect();
-                if cands.is_empty() {
-                    Vec::new()
-                } else {
-                    r.rerank(&q.question, &cands, top_k)
-                        .await?
-                        .into_iter()
-                        .filter_map(|rr| Uuid::parse_str(&rr.id).ok())
-                        .collect()
-                }
-            } else {
-                fused.iter().take(top_k).map(|(id, _)| *id).collect()
-            };
-
-            // retrieval_hit: any top-K chunk drawn from the target DOI.
-            let hit = match &q.target_doi {
-                Some(doi) => top_ids
-                    .iter()
-                    .any(|id| chunk_to_doi.get(id).map(|d| d == doi).unwrap_or(false)),
-                None => false,
-            };
-            let ctx: String = top_ids
-                .iter()
-                .enumerate()
-                .filter_map(|(rank, id)| {
-                    pending_chunks
-                        .iter()
-                        .find(|(cid, _)| cid == id)
-                        .map(|(_, text)| format!("[passage {}]\n{}", rank + 1, text))
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            // Record the DOCs actually retrieved (dedup, order-preserving) so a
-            // failure can be audited without re-running retrieval. Previously
-            // the report echoed the gold DOI, hiding what was really retrieved.
-            let mut retrieved_docs: Vec<String> = Vec::new();
-            for id in &top_ids {
-                if let Some(doi) = chunk_to_doi.get(id) {
-                    if !retrieved_docs.contains(doi) {
-                        retrieved_docs.push(doi.clone());
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                // Record the DOCs actually retrieved (dedup, order-preserving) so a
+                // failure can be audited without re-running retrieval. Previously
+                // the report echoed the gold DOI, hiding what was really retrieved.
+                let mut retrieved_docs: Vec<String> = Vec::new();
+                for id in &top_ids {
+                    if let Some(doi) = chunk_to_doi.get(id) {
+                        if !retrieved_docs.contains(doi) {
+                            retrieved_docs.push(doi.clone());
+                        }
                     }
                 }
-            }
-            (ctx, hit, retrieved_docs)
-        } else {
-            (String::new(), false, Vec::new())
-        };
+                (ctx, hit, retrieved_docs)
+            } else {
+                (String::new(), false, Vec::new())
+            };
 
         // Answer.
         let answerer_msgs = match mode {
@@ -1789,7 +1789,11 @@ where
             ],
             LitQa2Mode::FullText => vec![
                 ChatMessage::system(LITQA2_SYSTEM),
-                ChatMessage::user(build_litqa2_fulltext_user(&q.question, &q.options, &context)),
+                ChatMessage::user(build_litqa2_fulltext_user(
+                    &q.question,
+                    &q.options,
+                    &context,
+                )),
             ],
         };
         let answer_resp = answerer
@@ -1988,8 +1992,8 @@ where
     A: ChatLlm + ?Sized,
     J: ChatLlm + ?Sized,
 {
-    use std::io::Write as _;
     use engram_llm::ChatMessage;
+    use std::io::Write as _;
 
     let all_topics = &topics.0;
     let n = limit

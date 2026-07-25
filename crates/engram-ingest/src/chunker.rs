@@ -375,10 +375,13 @@ fn looks_like_reference(title: &str) -> bool {
         let name = w[0].trim_matches(|c: char| !c.is_ascii_alphanumeric());
         let initials = w[1].trim_matches(|c: char| !c.is_ascii_alphanumeric());
         let name_ok = name.len() >= 2
-            && name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+            && name
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_uppercase())
             && name.chars().skip(1).any(|c| c.is_ascii_lowercase());
-        let initials_ok = (1..=3).contains(&initials.len())
-            && initials.chars().all(|c| c.is_ascii_uppercase());
+        let initials_ok =
+            (1..=3).contains(&initials.len()) && initials.chars().all(|c| c.is_ascii_uppercase());
         if name_ok && initials_ok {
             pairs += 1;
         }
@@ -486,7 +489,10 @@ mod tests {
             Some("Methods".to_string())
         );
         // A real sentence that merely starts with a section word is not a heading.
-        assert_eq!(parse_unnumbered_heading("Results were significant here."), None);
+        assert_eq!(
+            parse_unnumbered_heading("Results were significant here."),
+            None
+        );
     }
 
     #[test]

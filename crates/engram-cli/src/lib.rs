@@ -119,6 +119,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             KbCommand::List => commands::kb::list(&ctx),
             KbCommand::Show { name } => commands::kb::show(&ctx, name),
             KbCommand::Delete { name, confirm } => commands::kb::delete(&ctx, name, confirm),
+            KbCommand::Repair { dry_run } => commands::kb::repair(&ctx, dry_run),
         },
         Command::Compile {
             kb,

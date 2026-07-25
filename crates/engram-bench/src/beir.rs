@@ -24,11 +24,11 @@
 
 use crate::error::BenchError;
 use crate::metrics::ndcg_at_10;
+use chrono::TimeZone;
 use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
 use engram_core::types::{Memory, MemorySource, RetrievalSource};
 use engram_embed::{Embedder, TaskMode};
 use engram_storage::SqliteStore;
-use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -138,11 +138,7 @@ fn load_corpus(path: &Path) -> Result<HashMap<String, (String, String)>, BenchEr
             continue;
         }
         let row: CorpusRow = serde_json::from_str(line).map_err(|e| {
-            BenchError::InvalidDataset(format!(
-                "corpus.jsonl line {}: {}",
-                idx + 1,
-                e
-            ))
+            BenchError::InvalidDataset(format!("corpus.jsonl line {}: {}", idx + 1, e))
         })?;
         corpus.insert(row.id, (row.title, row.text));
     }
@@ -158,11 +154,7 @@ fn load_queries(path: &Path) -> Result<Vec<(String, String)>, BenchError> {
             continue;
         }
         let row: QueryRow = serde_json::from_str(line).map_err(|e| {
-            BenchError::InvalidDataset(format!(
-                "queries.jsonl line {}: {}",
-                idx + 1,
-                e
-            ))
+            BenchError::InvalidDataset(format!("queries.jsonl line {}: {}", idx + 1, e))
         })?;
         queries.push((row.id, row.text));
     }
@@ -480,7 +472,10 @@ mod tests {
         assert_eq!(ds.corpus["d2"].0, "");
 
         assert_eq!(ds.queries.len(), 2);
-        assert_eq!(ds.queries[0], ("q1".into(), "does rapamycin extend lifespan".into()));
+        assert_eq!(
+            ds.queries[0],
+            ("q1".into(), "does rapamycin extend lifespan".into())
+        );
 
         assert_eq!(ds.qrels.len(), 2);
         assert_eq!(ds.qrels["q1"]["d1"], 1);
@@ -498,8 +493,16 @@ mod tests {
         let dir = temp_dir("badqrels");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("qrels")).unwrap();
-        std::fs::write(dir.join("corpus.jsonl"), "{\"_id\":\"d1\",\"text\":\"x\"}\n").unwrap();
-        std::fs::write(dir.join("queries.jsonl"), "{\"_id\":\"q1\",\"text\":\"y\"}\n").unwrap();
+        std::fs::write(
+            dir.join("corpus.jsonl"),
+            "{\"_id\":\"d1\",\"text\":\"x\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("queries.jsonl"),
+            "{\"_id\":\"q1\",\"text\":\"y\"}\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("qrels").join("test.tsv"),
             "query-id\tcorpus-id\tscore\nq1\td1\n",
@@ -532,41 +535,41 @@ mod tests {
     #[test]
     fn recall_at_k_is_fraction_of_relevant_found() {
         // 2 relevant docs (grade>0), one grade-0 (judged non-relevant).
-        let q: HashMap<String, u32> =
-            [("a", 1u32), ("b", 2), ("c", 0)].iter().map(|(d, g)| (d.to_string(), *g)).collect();
+        let q: HashMap<String, u32> = [("a", 1u32), ("b", 2), ("c", 0)]
+            .iter()
+            .map(|(d, g)| (d.to_string(), *g))
+            .collect();
         // Top-2 contains a (relevant) and c (non-relevant) -> 1/2 of relevant.
         let retrieved: Vec<String> = ["a", "c", "z", "b"].iter().map(|s| s.to_string()).collect();
         assert!((recall_at_k(&retrieved, &q, 2) - 0.5).abs() < 1e-6);
         // Top-4 captures both a and b -> full recall.
         assert!((recall_at_k(&retrieved, &q, 4) - 1.0).abs() < 1e-6);
         // No relevant docs at all -> 0.
-        let none: HashMap<String, u32> = [("a", 0u32)].iter().map(|(d, g)| (d.to_string(), *g)).collect();
+        let none: HashMap<String, u32> = [("a", 0u32)]
+            .iter()
+            .map(|(d, g)| (d.to_string(), *g))
+            .collect();
         assert_eq!(recall_at_k(&retrieved, &none, 4), 0.0);
     }
 
     #[test]
     fn perfect_ranking_scores_one() {
-        let q = qrels(&[
-            ("q1", &[("d1", 2), ("d2", 1)]),
-            ("q2", &[("d3", 1)]),
-        ]);
-        let r = ranking(&[
-            ("q1", &["d1", "d2"]),
-            ("q2", &["d3"]),
-        ]);
+        let q = qrels(&[("q1", &[("d1", 2), ("d2", 1)]), ("q2", &[("d3", 1)])]);
+        let r = ranking(&[("q1", &["d1", "d2"]), ("q2", &["d3"])]);
         let report = score_rankings(&q, &r);
         assert_eq!(report.n_queries, 2);
-        assert!((report.ndcg_at_10 - 1.0).abs() < 1e-6, "ndcg {}", report.ndcg_at_10);
+        assert!(
+            (report.ndcg_at_10 - 1.0).abs() < 1e-6,
+            "ndcg {}",
+            report.ndcg_at_10
+        );
         assert!((report.recall_at_10 - 1.0).abs() < 1e-6);
         assert!((report.recall_at_100 - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn missing_and_empty_rankings_score_zero_but_count() {
-        let q = qrels(&[
-            ("q1", &[("d1", 1)]),
-            ("q2", &[("d2", 1)]),
-        ]);
+        let q = qrels(&[("q1", &[("d1", 1)]), ("q2", &[("d2", 1)])]);
         // q1 retrieves its relevant doc; q2 is absent from the run entirely.
         let r = ranking(&[("q1", &["d1"])]);
         let report = score_rankings(&q, &r);
@@ -600,6 +603,10 @@ mod tests {
         // nDCG: q1 perfect (1.0); q2 has its single grade-2 doc at rank 2 ->
         // DCG = 3/log2(3) = 1.8927, IDCG = 3/log2(2) = 3 -> 0.63092975.
         // Mean = (1.0 + 0.63092975)/2 = 0.81546487.
-        assert!((report.ndcg_at_10 - 0.815_464_9).abs() < 1e-5, "ndcg {}", report.ndcg_at_10);
+        assert!(
+            (report.ndcg_at_10 - 0.815_464_9).abs() < 1e-5,
+            "ndcg {}",
+            report.ndcg_at_10
+        );
     }
 }

@@ -35,6 +35,10 @@ pub struct IntegrityReport {
     pub orphan_chunks: i64,
     pub empty_kbs_with_derived: Vec<KbDerivedResidue>,
     pub duplicate_source_documents: Vec<DocumentDuplicateRecord>,
+    /// KBs that hold content but never got a registry row — invisible to
+    /// `kb list`. Healed by `engram kb repair`, not by `engram repair`:
+    /// registration only ever adds rows.
+    pub unregistered_kbs: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1110,6 +1114,46 @@ impl SqliteStore {
             params![name, description, now],
         )?;
         Ok(())
+    }
+
+    /// KB names that hold live memories but have no row in `knowledge_bases`.
+    ///
+    /// Stores written by builds that predated write-time registration have
+    /// memories in KBs that `kb list` cannot see — invisible to anyone
+    /// browsing the store, and silently absent from any workflow that
+    /// enumerates KBs.
+    ///
+    /// Deliberately keyed on non-deleted memories only. `delete_kb` drops the
+    /// registry row and soft-deletes the memories but leaves `documents` rows
+    /// in place, so scanning documents (or any table `delete_kb` does not
+    /// clear) would make repair silently resurrect a KB the user deleted.
+    /// Chunks need no separate scan: they hang off memories.
+    pub fn unregistered_kbs(&self) -> Result<Vec<String>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT kb FROM memories
+             WHERE deleted = 0 AND kb IS NOT NULL AND kb <> ''
+               AND kb NOT IN (SELECT name FROM knowledge_bases)
+             ORDER BY kb ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Register every KB that owns content but is missing from the registry.
+    /// Idempotent: a healed store reports an empty list on the next run.
+    pub fn repair_kb_registry(&self) -> Result<Vec<String>, StorageError> {
+        let missing = self.unregistered_kbs()?;
+        if missing.is_empty() {
+            return Ok(missing);
+        }
+        self.with_tx(|s| {
+            for name in &missing {
+                s.ensure_kb(name, Some("Recovered by `engram kb repair`"))?;
+            }
+            Ok(())
+        })?;
+        Ok(missing)
     }
 
     pub fn list_kbs(&self) -> Result<Vec<KnowledgeBase>, StorageError> {
@@ -2513,16 +2557,19 @@ impl SqliteStore {
         )?;
         let empty_kbs_with_derived = self.empty_kbs_with_derived()?;
         let duplicate_source_documents = self.duplicate_source_documents()?;
+        let unregistered_kbs = self.unregistered_kbs()?;
         let ok = stale_facts_from_deleted_memories == 0
             && orphan_chunks == 0
             && empty_kbs_with_derived.is_empty()
-            && duplicate_source_documents.is_empty();
+            && duplicate_source_documents.is_empty()
+            && unregistered_kbs.is_empty();
         Ok(IntegrityReport {
             ok,
             stale_facts_from_deleted_memories,
             orphan_chunks,
             empty_kbs_with_derived,
             duplicate_source_documents,
+            unregistered_kbs,
         })
     }
 
@@ -4796,6 +4843,89 @@ mod tests {
         assert_eq!(store.count_memories().unwrap(), 0);
     }
 
+    /// Writing to a KB must register it, or the memory is stored somewhere
+    /// `kb list` cannot see. This is the invariant that older builds broke.
+    #[test]
+    fn writing_a_memory_registers_its_kb() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .insert_memory_with_kb(&fact("a song lyric worth keeping"), "songs")
+            .unwrap();
+        assert!(store.list_kbs().unwrap().iter().any(|k| k.name == "songs"));
+        assert!(store.unregistered_kbs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kb_repair_registers_kbs_orphaned_by_older_builds() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for (kb, content) in [
+            ("songs", "a lyric"),
+            ("personal", "a birthday"),
+            ("business", "a decision"),
+        ] {
+            store.insert_memory_with_kb(&fact(content), kb).unwrap();
+        }
+        // Recreate the legacy state: content present, registry row missing.
+        store
+            .conn
+            .execute(
+                "DELETE FROM knowledge_bases WHERE name IN ('songs','personal','business')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.unregistered_kbs().unwrap(),
+            vec!["business", "personal", "songs"]
+        );
+        assert!(!store.integrity_report().unwrap().ok);
+
+        let repaired = store.repair_kb_registry().unwrap();
+        assert_eq!(repaired, vec!["business", "personal", "songs"]);
+        let names: Vec<String> = store
+            .list_kbs()
+            .unwrap()
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        for kb in ["songs", "personal", "business"] {
+            assert!(names.contains(&kb.to_string()), "{kb} still missing");
+        }
+        // Memory counts survive the repair — registration is additive.
+        let songs = store.get_kb("songs").unwrap().unwrap();
+        assert_eq!(songs.memory_count, 1);
+
+        // Idempotent: a second pass finds nothing.
+        assert!(store.repair_kb_registry().unwrap().is_empty());
+        assert!(store.integrity_report().unwrap().ok);
+    }
+
+    /// `kb delete` drops the registry row on purpose. Repair must not undo it,
+    /// or deleting a KB would be silently reversed by the next repair run.
+    #[test]
+    fn kb_repair_does_not_resurrect_a_deleted_kb() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .insert_memory_with_kb(&fact("throwaway note"), "throwaway")
+            .unwrap();
+        store
+            .insert_document(
+                "throwaway",
+                "doc",
+                Some("/tmp/doc.md"),
+                "general",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(store.delete_kb("throwaway").unwrap());
+
+        assert!(
+            store.unregistered_kbs().unwrap().is_empty(),
+            "deleted KB reappeared as unregistered"
+        );
+        assert!(store.repair_kb_registry().unwrap().is_empty());
+        assert!(store.get_kb("throwaway").unwrap().is_none());
+    }
+
     fn test_fact(
         store: &SqliteStore,
         subject: &str,
@@ -5026,7 +5156,10 @@ mod tests {
         let pending = store
             .list_memories_pending_fact_extraction("personal", None, None)
             .unwrap();
-        assert_eq!(pending.iter().map(|m| m.id).collect::<Vec<_>>(), vec![newest.id]);
+        assert_eq!(
+            pending.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![newest.id]
+        );
         assert_eq!(
             store.fact_extraction_coverage("personal", None).unwrap(),
             (3, 1)

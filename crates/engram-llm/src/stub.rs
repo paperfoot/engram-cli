@@ -153,7 +153,8 @@ mod tests {
 
     #[test]
     fn longest_rule_wins() {
-        let llm = ScriptedChatLlm::parse(r#"{"ab": "short", "abcd": "long", "*": "none"}"#).unwrap();
+        let llm =
+            ScriptedChatLlm::parse(r#"{"ab": "short", "abcd": "long", "*": "none"}"#).unwrap();
         assert_eq!(llm.response_for("xx abcd yy"), "long");
         assert_eq!(llm.response_for("xx abz yy"), "short");
         assert_eq!(llm.response_for("nothing"), "none");

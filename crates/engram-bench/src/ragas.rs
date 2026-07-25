@@ -270,8 +270,8 @@ pub async fn compute_all<J: ChatLlm + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
     use engram_llm::ChatResponse;
+    use std::future::Future;
 
     // ---- pure parser tests (no LLM) -------------------------------------
 

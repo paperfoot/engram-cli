@@ -539,6 +539,138 @@ fn usage_command_returns_summary_envelope() {
     assert_eq!(v["data"]["totals"]["events"], 0);
 }
 
+/// The live-store bug this closes: memories written with `--kb <name>` were
+/// invisible to `kb list` because nothing registered the KB.
+#[test]
+fn remembering_into_a_new_kb_registers_it_for_kb_list() {
+    let (tmp, mut cmd) = with_isolated_home();
+    cmd.args([
+        "remember",
+        "Practised the bridge of Bohemian Rhapsody.",
+        "--kb",
+        "songs",
+        "--no-facts",
+        "--json",
+    ])
+    .assert()
+    .success();
+
+    let out = cmd_in(&tmp)
+        .args(["kb", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    let kbs = v["data"]["knowledge_bases"].as_array().unwrap();
+    let songs = kbs
+        .iter()
+        .find(|k| k["name"] == "songs")
+        .expect("songs KB registered by the write");
+    assert_eq!(songs["memory_count"], 1);
+}
+
+#[test]
+fn kb_repair_is_a_no_op_on_a_healthy_store() {
+    let (tmp, mut cmd) = with_isolated_home();
+    cmd.args([
+        "remember",
+        "A decision worth keeping.",
+        "--kb",
+        "business",
+        "--no-facts",
+        "--json",
+    ])
+    .assert()
+    .success();
+
+    for args in [
+        vec!["kb", "repair", "--dry-run", "--json"],
+        vec!["kb", "repair", "--json"],
+    ] {
+        let out = cmd_in(&tmp)
+            .args(&args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = parse_stdout(&out);
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["data"]["unregistered_kbs"].as_array().unwrap().len(), 0);
+        assert_eq!(v["data"]["registered"], 0);
+    }
+
+    // A healthy store also passes the integrity gate that surfaces the fault.
+    let out = cmd_in(&tmp)
+        .args(["doctor", "--integrity", "--json"])
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(
+        v["data"]["integrity"]["unregistered_kbs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+/// `kb repair` must not undo `kb delete` — deletion removes the registry row
+/// deliberately, and repair is only for KBs that never had one.
+#[test]
+fn kb_repair_leaves_a_deleted_kb_deleted() {
+    let (tmp, mut cmd) = with_isolated_home();
+    cmd.args(["kb", "create", "throwaway", "--json"])
+        .assert()
+        .success();
+    cmd_in(&tmp)
+        .args([
+            "remember",
+            "Temporary note in a doomed KB.",
+            "--kb",
+            "throwaway",
+            "--no-facts",
+            "--json",
+        ])
+        .assert()
+        .success();
+    cmd_in(&tmp)
+        .args(["kb", "delete", "throwaway", "--confirm", "--json"])
+        .assert()
+        .success();
+
+    let out = cmd_in(&tmp)
+        .args(["kb", "repair", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["data"]["registered"], 0);
+
+    let out = cmd_in(&tmp)
+        .args(["kb", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert!(
+        !v["data"]["knowledge_bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["name"] == "throwaway"),
+        "kb repair resurrected a deleted KB"
+    );
+}
+
 #[test]
 fn update_check_reports_agent_runnable_command_without_executing() {
     let (_tmp, mut cmd) = with_isolated_home();

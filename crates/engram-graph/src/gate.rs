@@ -49,7 +49,10 @@ pub fn novelty_gate(
 
     match scored.first() {
         None => GateDecision::Novel,
-        Some(&(id, top)) if top >= dup_threshold => GateDecision::Duplicate { fact_id: id, score: top },
+        Some(&(id, top)) if top >= dup_threshold => GateDecision::Duplicate {
+            fact_id: id,
+            score: top,
+        },
         Some(&(_, top)) if top < novel_threshold => GateDecision::Novel,
         _ => GateDecision::Uncertain {
             candidates: scored
@@ -85,7 +88,12 @@ mod tests {
     #[test]
     fn empty_store_is_novel() {
         assert_eq!(
-            novelty_gate(&[1.0, 0.0], &[], DEFAULT_DUP_THRESHOLD, DEFAULT_NOVEL_THRESHOLD),
+            novelty_gate(
+                &[1.0, 0.0],
+                &[],
+                DEFAULT_DUP_THRESHOLD,
+                DEFAULT_NOVEL_THRESHOLD
+            ),
             GateDecision::Novel
         );
     }
@@ -136,8 +144,7 @@ mod tests {
 
     #[test]
     fn candidates_capped_at_max() {
-        let existing: Vec<(Uuid, Vec<f32>)> =
-            (0..10).map(|i| (id(i), vec![1.0, 0.5])).collect();
+        let existing: Vec<(Uuid, Vec<f32>)> = (0..10).map(|i| (id(i), vec![1.0, 0.5])).collect();
         match novelty_gate(&[1.0, 0.0], &existing, 0.99, 0.5) {
             GateDecision::Uncertain { candidates } => {
                 assert_eq!(candidates.len(), MAX_CANDIDATES);
