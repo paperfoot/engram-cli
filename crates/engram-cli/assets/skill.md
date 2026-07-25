@@ -22,8 +22,6 @@ engram remember "Sarah prefers async standups; sync only for incidents." --kb pe
 engram remember "Chose Postgres over DynamoDB: relational reporting beat write throughput." --kb business --importance 9 --tag decision
 ```
 
-That is the whole loop. Everything below is detail.
-
 ## Recall searches everything — don't narrow it
 
 `engram recall "<query>"` spans **every KB**. No `--kb` needed, and adding one to "find" something is a mistake: you cannot know which namespace a fact was filed under, because the write chose it, not you.
@@ -46,7 +44,7 @@ Anything with a real date — birthdays, anniversaries, when a decision was made
 engram remember "Mum's birthday is 14 March." --kb personal --event-time 1958-03-14 --importance 9
 ```
 
-Then time works: `engram recall "what happened last March?" --since 2026-03-01 --until 2026-03-31` (same on `memory search`). Both take RFC3339 or a bare `YYYY-MM-DD` — `--since D` is the start of that UTC day, `--until D` the end, so `--since D --until D` is all of day D. They read `event_time` falling back to write time, so a dated memory saved without `--event-time` looks like it happened the day you typed it.
+Then time works: `engram recall "what happened last March?" --since 2026-03-01 --until 2026-03-31` (same on `memory search`). Both take RFC3339 or a bare `YYYY-MM-DD` — `--since D` is the start of that UTC day, `--until D` the end, so `--since D --until D` is all of day D. They read `event_time` falling back to write time, so a dated memory saved without `--event-time` looks like it happened the day it was written.
 
 **A window narrows retrieval to raw memory chunks.** Claims, wiki, entities and relations have no event time, so they cannot be placed in or out of the window and are withheld — reported in `metadata.temporal_scope` (absent when no window is set). A thin windowed result is not "the store knows nothing"; re-run without the window before concluding that.
 
@@ -70,7 +68,7 @@ engram facts backfill --dry-run                     # sweep every KB, oldest fir
 engram facts backfill --kb personal --limit 50      # bounded, scoped pass
 ```
 
-`facts list` spans every KB unless you pass `--kb`, and reports `kb_scope`. **An empty KB-scoped listing means the scope was wrong, not that extraction produced nothing.** `facts backfill --kb` is optional now, but an unscoped sweep costs one LLM call per memory — pair it with `--dry-run` or `--limit`. Idempotent; resumes where it stopped.
+`facts list` spans every KB unless you pass `--kb`, and reports `kb_scope`. **An empty KB-scoped listing means the scope was wrong, not that extraction produced nothing.** `facts backfill --kb` is optional, but an unscoped sweep costs one LLM call per memory — pair it with `--dry-run` or `--limit`. Idempotent; resumes where it stopped.
 
 When `remember` returns a non-empty `adjudication_needed`, **you** are the adjudicator — you have the conversation context engram lacks. Run each entry's `resolve_command` with `--action supersede-old` | `keep-both` | `reject-new`, plus `--note "why"`. Can't tell? Leave it queued and say so. Safety slots (`allergic_to`, `takes_medication`, `diagnosed_with`) are never auto-superseded.
 
@@ -88,11 +86,11 @@ engram graph neighbors "Sarah Chen" --kb personal --typed-only --limit 20
 
 `--typed-only` drops weak `co_occurs_with` edges, leaving the real relationship graph rather than co-mention noise. `people show` resolves any known alias, case-insensitively.
 
-**Pass `--kb '*'` unless you mean one KB** — unlike `recall`, these still default to `--kb default`, where a person written to `personal` is simply absent. Under `--kb '*'` the person is *merged* across KBs rather than picking whichever ranked first: `kbs` lists every KB they appear in, `relations_by_kb` keeps the per-KB breakdown, so work and personal relationships arrive as one view.
+Both span every KB by default, and a person found in several is *merged* rather than resolved to whichever ranked first: `kbs` lists every KB they appear in, `relations_by_kb` keeps the per-KB breakdown, so work and personal relationships arrive as one view.
 
 ## Quality gate
 
-`engram bench personal --json` is offline and deterministic — hash embedder, no network, no keys, and it never touches your store. Run it before and after any retrieval change. Headline metrics are production behaviour; `legacy_default_comparison` is what the old single-KB default would have scored, kept as a regression tripwire.
+`engram bench personal --json` is offline and deterministic — hash embedder, no network, no keys, and it never touches the user's store. Run it before and after any retrieval change. Headline metrics are production behaviour; `legacy_default_comparison` is what the old single-KB default would have scored, kept as a regression tripwire.
 
 ## Document corpora (secondary)
 
@@ -106,9 +104,9 @@ An unscoped directory ingest is refused by default: `--dry-run --include '...' -
 
 - **Errors are JSON on stderr**, never stdout. Exit codes: 1 transient (retry with backoff), 2 config (`engram config check`), 3 bad input (fix args, don't retry identically), 4 rate limited (wait).
 - Every command returns `{version, status, data, metadata}`; `--json` is automatic when stdout is piped.
-- **Memories missing from `engram kb list`?** Older builds wrote to KBs without registering them. Run `engram kb repair --dry-run`, then without the flag. Additive, idempotent, and it won't resurrect a KB you deleted.
+- **Memories missing from `engram kb list`?** Run `engram kb repair --dry-run`, then without the flag. Additive, idempotent, and it won't resurrect a KB you deleted.
 - **`forget` does not unseal another diary's derived content** — a KB's compiled wiki/entities stay withheld until a post-deletion `compile` purges them; `recall` reports it in `metadata.diary_isolation`. Schema is v8 (`doctor --json` → `data.db.schema_version`).
 - **After changing embedding model/dimensions/prompt format, run `engram reindex --kb <name>`** — legacy embeddings are refused by default.
 - `engram forget <id>` requires `--confirm`. `engram update` (without `--check`) mutates the install — only on user request.
 - `engram skill install` refuses to overwrite a SKILL.md you edited by hand; pass `--force` if you mean it.
-- No Gemini key configured → recall silently falls back to a deterministic offline stub (fine for tests, useless for quality). `engram doctor --json` to verify; `--integrity` also flags unregistered KBs.
+- No Gemini key configured → recall silently falls back to a deterministic offline stub (deterministic, but not real retrieval quality). `engram doctor --json` to verify; `--integrity` also flags unregistered KBs.

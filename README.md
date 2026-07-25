@@ -67,7 +67,7 @@ The important split is: **KBs are domains** — personal, business, a project, o
 
 engram is built to make agents *hallucination-resistant* over a **specialized corpus** — you ingest the papers/protocols for your domain and query *those*, not the entire literature. The benchmarks below test that realistic setup: precision retrieval, grounded answering, and **abstention instead of guessing**, over a bounded domain corpus.
 
-> **Framing rule:** No single benchmark proves hallucination-resistance — read the axes together: **retrieval quality**, **answer accuracy**, **abstention/precision** (refuse rather than guess), and **citation faithfulness**. A system strong on one axis but weak on another is not hallucination-resistant; treat any single number in isolation as noise.
+> No single benchmark proves hallucination-resistance — read the axes together: **retrieval quality**, **answer accuracy**, **abstention/precision** (refuse rather than guess), and **citation faithfulness**. A system strong on one axis but weak on another is not hallucination-resistant; treat any single number in isolation as noise.
 
 Numbers below were produced with answerer `anthropic/claude-opus-4.8`, grader `google/gemini-3.1-pro-preview`, embeddings `gemini-embedding-2`, reranker `cohere rerank-v4.0-pro` (June 2026). Full per-question detail, tokens, and model IDs are logged to `benchmarks/` for audit.
 
@@ -82,10 +82,10 @@ Numbers below were produced with answerer `anthropic/claude-opus-4.8`, grader `g
 | *ref — PaperQA2 (full literature)* | *66.0%* | *85.2%* | — | — | — |
 | *ref — human experts* | *67.7%* | — | — | — | — |
 
-Retrieval adds **+44 points of accuracy**. Two precision numbers, reported honestly:
+Retrieval adds **+44 points of accuracy**. Two precision numbers:
 
 - **Precision, abstention-adjusted = 99.4%** — of the answers where the model *committed* to an option, it was almost never wrong. This excludes both principled abstentions and empty/unparseable API responses from the denominator (the PaperQA2/LitQA2 convention).
-- **Precision, strict = 92.1%** — the same, but counting empty/unparseable answerer responses as failed commitments rather than safe declines. In the logged 199-question run, 14 of 23 "abstentions" were zero-token API responses, not principled declines; the strict number is what you get when those count against you. The bench now records `no_response_rate` and both precision figures so this can never be hidden again.
+- **Precision, strict = 92.1%** — the same, but counting empty/unparseable answerer responses as failed commitments rather than safe declines. In the logged 199-question run, 14 of 23 "abstentions" were zero-token API responses, not principled declines; the strict number is what you get when those count against you. The bench records `no_response_rate` and both precision figures.
 
 **Where it wins / where it doesn't** (199-question decomposition):
 
@@ -93,7 +93,7 @@ Retrieval adds **+44 points of accuracy**. Two precision numbers, reported hones
 - **Genuine hallucination resistance** — on all **6/6** true retrieval misses it selected "Insufficient information" (real, token-bearing responses), with **0 wrong answers**.
 - **The remaining gap is the answerer** — of the non-correct questions, most are answer errors on correctly-retrieved evidence (accuracy given a retrieval hit ≈ 90.7%). The lever is answer interpretation, not retrieval.
 
-> *Comparability:* the 87.9% is over a curated specialized corpus (answer-bearing passages present) — engram's design point — and is **not** apples-to-apples with PaperQA2's 66% (which searches a far larger, noisier corpus). Retrieval-success 97% is likewise an easy find-1-of-181 task, not open-literature retrieval. The robust, honest reads are: the +44-pt accuracy lift over closed-book (same model, same prompt — a fair comparison), and strict precision 92.1%.
+> *Comparability:* the 87.9% is over a curated specialized corpus (answer-bearing passages present) — engram's design point — and is **not** apples-to-apples with PaperQA2's 66% (which searches a far larger, noisier corpus). Retrieval-success 97% is likewise an easy find-1-of-181 task, not open-literature retrieval. The robust reads are: the +44-pt accuracy lift over closed-book (same model, same prompt — a fair comparison), and strict precision 92.1%.
 
 ```bash
 engram bench litqa2 --mode fulltext --corpus data/litqa2/corpus.json --limit 199 --json  # RAG over your corpus
@@ -117,18 +117,18 @@ engram's full hybrid stack reaches **nDCG@10 = 0.817 on SciFact — above the st
 engram bench beir --dataset scifact --rerank on --json
 ```
 
-### Axis 3 — Citation faithfulness (wired): ALCE citation P/R + repaired RAGAS
+### Axis 3 — Citation faithfulness (implemented; no published score yet): ALCE citation P/R + repaired RAGAS
 
 **What it measures.** Whether each answer sentence is *actually supported by the source it cites* — over **your own retrieved corpus**, not a fixed external answer set.
 
 - **ALCE citation precision / recall** ([arXiv:2305.14627](https://arxiv.org/abs/2305.14627)) — recall: is a statement's cited evidence sufficient to entail it; precision: how many carried citations are load-bearing. The denominator is aligned to the reference `eval.py` (an early divergence was caught and fixed in review). Implemented in [`citation.rs`](crates/engram-bench/src/citation.rs); scores once a domain corpus + held-out QA set is configured.
-- **Repaired RAGAS faithfulness** ([arXiv:2309.15217](https://arxiv.org/abs/2309.15217)) — claim-decomposition + per-claim entailment to the retrieved context (the upstream single-score version was replaced). Runs **live today** as an add-on on any QA suite:
+- **Repaired RAGAS faithfulness** ([arXiv:2309.15217](https://arxiv.org/abs/2309.15217)) — claim-decomposition + per-claim entailment to the retrieved context. Runs **live today** as an add-on on any QA suite:
 
 ```bash
 engram bench litqa2 --mode fulltext --corpus data/litqa2/corpus.json --limit 50 --ragas --json
 ```
 
-> *Dropped — TREC-BioGen citation-support:* it requires retrieving over the **full PubMed corpus**, which is not engram's specialized-corpus model. ALCE-over-your-own-corpus is the relevant attribution check; the abstention behaviour in Axis 1 (0 wrong answers on 6 retrieval misses) is the live hallucination-resistance evidence.
+> *Scope — TREC-BioGen citation-support:* the `biogen` suite scores citation support over a loaded corpus, not the full PubMed index the original task assumes, so its numbers are not comparable to published TREC results. ALCE-over-your-own-corpus is the attribution check that matches engram's model; the abstention behaviour in Axis 1 (0 wrong answers on 6 retrieval misses) is the live hallucination-resistance evidence.
 
 ### Supporting retrieval result — LongMemEval S (500 questions, 96% distractors)
 
@@ -180,12 +180,7 @@ One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no servic
 cargo install --path crates/engram-cli --locked
 ```
 
-**Planned (not yet published — no crates.io release or Homebrew tap exists yet):**
-
-```bash
-cargo install engram --locked                        # planned
-brew install paperfoot/tap/engram           # planned
-```
+Not yet published to crates.io or Homebrew — install from source.
 
 `engram update --check --json` reports the current/latest version, detected install source, release URL, and runnable upgrade command. `engram update --json` runs the package-manager update only when `update.mode=auto` and an update is available. Configure with `update.mode`, `update.channel`, and optional `update.install_source` (or the matching `ENGRAM_UPDATE_*` env vars). The crates.io package name is `engram` because `engram-cli` is already owned by another project on crates.io.
 
@@ -515,7 +510,7 @@ Research direction for contributors: [`program.md`](program.md). Design rational
 - Person-typed entities with hygiene filters, typed person↔person relationships with accumulating provenance, `people list`/`people show`, and person-centric `graph neighbors --typed-only`
 - Entity extraction, graph browsing, and graph expansion during recall
 - `engram bench personal`: an offline, deterministic personal-memory suite (no keys, no network, no writes to the live store)
-- `engram kb repair` to register KBs orphaned by builds that predated write-time registration
+- `engram kb repair` to register KBs that hold memories but are missing from `kb list`
 - Document/job/budget UX plus local daemon endpoints for KBs, recall, research, compile, reindex, documents, entities, jobs, usage, and budgets
 - Optional LLM compiler pass: Gemini 3.1 Flash-Lite Preview extraction + Gemini 3.1 Pro Preview synthesis via OpenRouter
 - Hallucination-resistance harness (loaders + scorers + unit tests): LitQA2 precision-with-abstention, BEIR-sci nDCG@10, BioGen CSR, ALCE citation P/R, repaired RAGAS faithfulness
