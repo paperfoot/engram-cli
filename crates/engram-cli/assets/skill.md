@@ -81,8 +81,8 @@ When `remember` returns a non-empty `adjudication_needed`, **you** are the adjud
 People are first-class entities with typed relationships and provenance:
 
 ```bash
-engram people list --kb '*' --min-mentions 2        # who you know: aliases, mention counts, top relations
-engram people show "Sarah Chen" --kb '*'            # relations WITH sources + the memories mentioning her
+engram people list --min-mentions 2                 # who you know: aliases, mention counts, top relations (all KBs)
+engram people show "Sarah Chen"                     # relations WITH sources + the memories mentioning her
 engram graph neighbors "Sarah Chen" --kb personal --typed-only --limit 20
 ```
 

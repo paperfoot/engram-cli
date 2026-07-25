@@ -109,8 +109,13 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
     // KBs, never hundreds.
     let matches = ctx.store.find_entities(kb_filter, &name, 64)?;
     let Some(primary) = matches.first().cloned() else {
+        let scope = if kb == "*" {
+            "any kb".to_string()
+        } else {
+            format!("kb {kb:?}")
+        };
         return Err(CliError::BadInput(format!(
-            "no entity named {name:?} in kb {kb:?} — run `engram people list --kb {kb}`"
+            "no entity named {name:?} in {scope} — run `engram people list` to browse"
         )));
     };
 

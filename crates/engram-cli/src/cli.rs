@@ -708,8 +708,8 @@ pub enum PeopleCommand {
     /// List people with their aliases, mention counts, and top relations.
     #[command(visible_aliases = ["ls"])]
     List {
-        /// Knowledge base/domain namespace. Pass "*" for all.
-        #[arg(long, default_value = "default")]
+        /// Knowledge base/domain namespace. Defaults to all KBs ("*").
+        #[arg(long, default_value = "*")]
         kb: String,
         /// Max people to return.
         #[arg(long, default_value_t = 50)]
@@ -724,8 +724,8 @@ pub enum PeopleCommand {
     Show {
         /// Person name or any known alias (case-insensitive).
         name: String,
-        /// Knowledge base/domain namespace. Pass "*" for all.
-        #[arg(long, default_value = "default")]
+        /// Knowledge base/domain namespace. Defaults to all KBs ("*").
+        #[arg(long, default_value = "*")]
         kb: String,
         /// How many memory snippets to include.
         #[arg(long, default_value_t = 5)]
