@@ -281,6 +281,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Import { file } => commands::import::run(&ctx, file),
         Command::Bench {
             suite,
+            profile,
             mab_split,
             download,
             limit,
@@ -300,6 +301,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 &ctx,
                 commands::bench::BenchArgs {
                     suite,
+                    profile,
                     mab_split,
                     download,
                     limit,
