@@ -22,6 +22,7 @@
 //! a sentence a human can read.
 
 use crate::extract::{candidates, Phrase, Token};
+use crate::gazetteer;
 use crate::hygiene::{self, Canonical};
 use std::collections::HashMap;
 
@@ -376,6 +377,12 @@ fn name_token(token: &str) -> bool {
     if NAME_PARTICLES.contains(&lower.as_str()) {
         return true;
     }
+    // Employer/industry/service tags ("Microsoft", "Tech", "Gym") only ever
+    // appear in a messaging-app contact label, never in a human's name. Place
+    // words are deliberately NOT rejected here — "Jordan Peterson" is a person.
+    if gazetteer::is_contact_label_word(&lower) {
+        return false;
+    }
     if is_non_person_word(&lower) || hygiene::is_stopword(token) || hygiene::is_temporal(token) {
         return false;
     }
@@ -400,7 +407,16 @@ fn name_token(token: &str) -> bool {
 }
 
 /// Could `name` be a human name at all (before context is considered)?
+///
+/// A candidate whose WHOLE name is a place, religion, language, or
+/// nationality is refused outright: "we met in Ibiza" and "Islam came up over
+/// dinner" put those words in exactly the interpersonal contexts that type a
+/// bare token as a person, which is how the real store ended up with London
+/// (84 mentions), Ibiza (49), Singapore (48) and Islam (32) in `people list`.
 pub fn looks_like_person_name(name: &str) -> bool {
+    if gazetteer::is_never_person(name) {
+        return false;
+    }
     let tokens: Vec<&str> = name.split_whitespace().collect();
     if tokens.is_empty() || tokens.len() > 4 {
         return false;
@@ -522,6 +538,132 @@ impl Extraction {
             .find(|e| hygiene::dedup_key(&e.name) == key)
             .map(|e| e.kind)
     }
+}
+
+/// What a whole KB knows about the people it talks about.
+///
+/// NAME FRAGMENTATION is invisible from inside one chunk. A message that says
+/// only "Noemi sent the deck" cannot know whether the KB elsewhere calls her
+/// "Noemi Varkoni", so the per-chunk pass left the real store with Noemi (106
+/// mentions) and Noemi Varkoni (66) as two unrelated nodes — and the same for
+/// Avi/Avi Roy, Francisco/Francisco Ferró, Patrick/Patrick Ashcomb Pruett.
+///
+/// The compiler therefore scans every chunk once to build this index, then
+/// re-analyzes each chunk with it so a bare first name folds into the full
+/// person KB-wide.
+///
+/// SAFETY — the index exists as much to BLOCK merges as to make them. A short
+/// name only folds when the whole KB has exactly ONE full-name person starting
+/// with it. Two Lauras (Laura Corvo, a friend, and a different Laura from a
+/// dating thread) make "Laura" ambiguous everywhere at once, so neither full
+/// name absorbs the bare mentions and the two humans stay two humans. That
+/// verdict has to be KB-wide: a per-chunk pass sees only one Laura per chunk
+/// and would happily fuse them.
+#[derive(Debug, Clone, Default)]
+pub struct PersonIndex {
+    /// Case-folded key → the spelling the KB should display.
+    display: HashMap<String, String>,
+    /// Case-folded keys of every multi-token person in the KB, sorted.
+    full_names: Vec<String>,
+}
+
+impl PersonIndex {
+    /// Build the index from a first pass over every chunk of a KB.
+    pub fn build<'a, I>(extractions: I) -> Self
+    where
+        I: IntoIterator<Item = &'a Extraction>,
+    {
+        let mut spellings: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        let mut kinds: HashMap<String, &'static str> = HashMap::new();
+        for extraction in extractions {
+            for mention in &extraction.entities {
+                let key = hygiene::dedup_key(&mention.name);
+                *spellings
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(mention.name.clone())
+                    .or_insert(0) += mention.mentions.max(1);
+                let kind = kinds.entry(key).or_insert(mention.kind);
+                *kind = merge_kind(kind, mention.kind);
+            }
+        }
+        let display: HashMap<String, String> = spellings
+            .iter()
+            .map(|(key, votes)| (key.clone(), best_spelling(votes)))
+            .collect();
+        let mut full_names: Vec<String> = kinds
+            .iter()
+            .filter(|(key, kind)| **kind == KIND_PERSON && key.split(' ').count() >= 2)
+            .map(|(key, _)| key.clone())
+            .collect();
+        full_names.sort();
+        Self {
+            display,
+            full_names,
+        }
+    }
+
+    /// True when nothing is known yet (a plain single-chunk `analyze`).
+    pub fn is_empty(&self) -> bool {
+        self.display.is_empty()
+    }
+
+    /// The spelling this KB should display for `name`.
+    ///
+    /// Folds case variants: a WhatsApp export that shouts "MARIA MARENOVA"
+    /// and a note that writes "Maria Marenova" are one person, shown the way a
+    /// human writes a name.
+    pub fn display_name(&self, name: &str) -> String {
+        self.display
+            .get(&hygiene::dedup_key(name))
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    fn name_for_key(&self, key: &str) -> Option<&str> {
+        self.display.get(key).map(|s| s.as_str())
+    }
+}
+
+/// How badly a spelling reads as a written name: SHOUTED tokens first ("MARIA
+/// MARENOVA"), then tokens that were never capitalized at all. Lower is better.
+fn spelling_penalty(name: &str) -> (usize, usize) {
+    let shouty = name
+        .split_whitespace()
+        .filter(|t| t.chars().count() >= 2 && t.chars().all(|c| !c.is_lowercase()))
+        .count();
+    let muted = name
+        .split_whitespace()
+        .filter(|t| t.chars().next().is_some_and(|c| c.is_lowercase()))
+        .count()
+        .saturating_sub(
+            // Name particles ("van", "de") are lowercase on purpose.
+            name.split_whitespace()
+                .filter(|t| NAME_PARTICLES.contains(&t.to_lowercase().as_str()))
+                .count(),
+        );
+    (shouty, muted)
+}
+
+/// Is `candidate` a better-written spelling of the same name than `current`?
+/// Ties keep `current`, so first appearance wins and the result is stable.
+fn prefer_spelling(current: &str, candidate: &str) -> bool {
+    spelling_penalty(candidate) < spelling_penalty(current)
+}
+
+/// Pick the spelling to show for one entity: best-written first, then the most
+/// frequent, then alphabetical so the result never depends on hash order.
+fn best_spelling(votes: &HashMap<String, usize>) -> String {
+    votes
+        .iter()
+        .min_by(|(a_name, a_votes), (b_name, b_votes)| {
+            spelling_penalty(a_name)
+                .cmp(&spelling_penalty(b_name))
+                .then_with(|| b_votes.cmp(a_votes))
+                .then_with(|| a_name.cmp(b_name))
+        })
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default()
 }
 
 /// Window (in tokens) scanned on each side of a mention for person evidence.
@@ -706,7 +848,19 @@ fn venue_after(
 
 /// Analyze one block of text: hygienic entities, their kinds, and the typed
 /// person↔person edges the text supports.
+///
+/// This is the single-chunk view (no KB context). The compiler uses
+/// [`analyze_with_index`] so bare first names resolve KB-wide.
 pub fn analyze(text: &str) -> Extraction {
+    analyze_with_index(text, &PersonIndex::default())
+}
+
+/// [`analyze`] with everything the KB already knows about its people.
+///
+/// The index changes exactly two things: a bare first name folds into the full
+/// person even when that full name appears in a DIFFERENT chunk, and a name
+/// the KB writes several ways is emitted with one spelling.
+pub fn analyze_with_index(text: &str, index: &PersonIndex) -> Extraction {
     let (toks, found) = candidates(text);
     if found.is_empty() {
         return Extraction::default();
@@ -731,7 +885,11 @@ pub fn analyze(text: &str) -> Extraction {
     let mut acc: HashMap<String, Acc> = HashMap::new();
     let mut occurrences: Vec<(Phrase, String)> = Vec::new();
     for (phrase, canonical) in &found {
-        let Canonical { name, aliases } = canonical;
+        let Canonical {
+            name,
+            aliases,
+            person_hint,
+        } = canonical;
         // A title inside the surface ("Dr Patel") is stripped from the
         // canonical name, so check it before it is gone.
         let titled = phrase
@@ -740,8 +898,13 @@ pub fn analyze(text: &str) -> Extraction {
             .next()
             .map(hygiene::is_honorific)
             .unwrap_or(false);
-        let evidence =
-            titled || person_evidence(&toks, phrase.start, phrase.end, bounds_of(phrase.sentence));
+        // A greeting ("Heyy Elias") or a contact label ("Maria Microsoft
+        // London Tech") addresses a human by construction — that is evidence
+        // in its own right, and without it a repaired one-token name would
+        // fall back to `concept` and vanish from the networking surface.
+        let evidence = titled
+            || *person_hint
+            || person_evidence(&toks, phrase.start, phrase.end, bounds_of(phrase.sentence));
         let kind = infer_kind(name, evidence);
         let key = hygiene::dedup_key(name);
         let next_order = acc.len();
@@ -754,6 +917,12 @@ pub fn analyze(text: &str) -> Extraction {
         });
         entry.mentions += 1;
         entry.kind = merge_kind(entry.kind, kind);
+        // A WhatsApp export shouts the contact name on every line
+        // ("BRANISLAVA MARENOVIC:") and the prose around it writes it
+        // normally. Same person, so keep the spelling a human would write.
+        if prefer_spelling(&entry.name, name) {
+            entry.name = name.clone();
+        }
         for alias in aliases {
             if !entry.aliases.iter().any(|a| a == alias) {
                 entry.aliases.push(alias.clone());
@@ -762,14 +931,23 @@ pub fn analyze(text: &str) -> Extraction {
         occurrences.push((phrase.clone(), key));
     }
 
-    // Pass 2 — fold a bare first/last name into the full person it belongs to
+    // Pass 2 — fold a bare first name into the full person it belongs to
     // ("Avi" → alias of "Avi Roy"), so the graph has one node per human.
-    let people_keys: Vec<String> = acc
+    //
+    // Candidates are this chunk's full names PLUS every full name the KB
+    // knows, which is what makes the fold work across chunks — and what makes
+    // the ambiguity test honest: two Lauras anywhere in the KB block the fold
+    // in every chunk, including the ones that mention only one of them.
+    let mut people_keys: Vec<String> = acc
         .values()
         .filter(|a| a.kind == KIND_PERSON && a.name.split_whitespace().count() >= 2)
         .map(|a| hygiene::dedup_key(&a.name))
         .collect();
-    let mut redirect: HashMap<String, String> = HashMap::new();
+    people_keys.extend(index.full_names.iter().cloned());
+    people_keys.sort();
+    people_keys.dedup();
+
+    let mut redirect: Vec<(String, String)> = Vec::new();
     for (key, entry) in acc.iter() {
         if entry.name.split_whitespace().count() != 1 {
             continue;
@@ -777,27 +955,90 @@ pub fn analyze(text: &str) -> Extraction {
         if entry.kind == KIND_ORGANIZATION || entry.kind == KIND_GENE_OR_PROTEIN {
             continue;
         }
-        let mut matches = people_keys
+        // A place or a creed never folds into a person, whatever it resembles.
+        if !looks_like_person_name(&entry.name) {
+            continue;
+        }
+        // Preferred rule: the short form is the person's FIRST name.
+        let first: Vec<&String> = people_keys
             .iter()
-            .filter(|full| full.split(' ').any(|part| part == key));
-        if let Some(full) = matches.next() {
-            // Ambiguous ("Avi" inside both "Avi Roy" and "Avi Chen") → leave
-            // the standalone node alone rather than guess wrong.
-            if matches.next().is_none() {
-                redirect.insert(key.clone(), full.clone());
+            .filter(|full| full.split(' ').next() == Some(key.as_str()))
+            .collect();
+        let target = match first.len() {
+            // Ambiguous ("Laura" inside both "Laura Corvo" and "Laura
+            // Moreno") → leave the bare node alone rather than fuse two
+            // humans. This is the whole point of the "exactly one" rule.
+            1 => Some(first[0]),
+            0 => {
+                // Fall back to a bare surname ("Pruett" → "Patrick Ashcomb
+                // Pruett"), under the same exactly-one rule.
+                let mut any = people_keys
+                    .iter()
+                    .filter(|full| full.split(' ').any(|part| part == key));
+                any.next().filter(|_| any.next().is_none())
+            }
+            _ => None,
+        };
+        if let Some(full) = target {
+            redirect.push((key.clone(), full.clone()));
+        }
+    }
+    // Sorted, so a chunk compiles to the same graph on every run.
+    redirect.sort();
+    let redirect: HashMap<String, String> = redirect.into_iter().collect();
+
+    let mut merge_order: Vec<(String, String)> = redirect
+        .iter()
+        .map(|(short, full)| (short.clone(), full.clone()))
+        .collect();
+    merge_order.sort();
+    for (short_key, full_key) in merge_order {
+        let Some(short) = acc.remove(&short_key) else {
+            continue;
+        };
+        match acc.get_mut(&full_key) {
+            Some(full) => {
+                full.mentions += short.mentions;
+                for alias in std::iter::once(short.name.clone()).chain(short.aliases) {
+                    if !full.aliases.iter().any(|a| a == &alias) && alias != full.name {
+                        full.aliases.push(alias);
+                    }
+                }
+            }
+            None => {
+                // The full name lives in another chunk. Re-key this mention
+                // onto it — dropping it (the old behaviour, which assumed the
+                // target was local) would lose the mention entirely.
+                let name = index
+                    .name_for_key(&full_key)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| short.name.clone());
+                let mut aliases = short.aliases.clone();
+                if short.name != name && !aliases.contains(&short.name) {
+                    aliases.push(short.name.clone());
+                }
+                aliases.retain(|a| a != &name);
+                acc.insert(
+                    full_key,
+                    Acc {
+                        name,
+                        aliases,
+                        kind: KIND_PERSON,
+                        mentions: short.mentions,
+                        order: short.order,
+                    },
+                );
             }
         }
     }
-    for (short_key, full_key) in &redirect {
-        let Some(short) = acc.remove(short_key) else {
-            continue;
-        };
-        if let Some(full) = acc.get_mut(full_key) {
-            full.mentions += short.mentions;
-            for alias in std::iter::once(short.name.clone()).chain(short.aliases) {
-                if !full.aliases.iter().any(|a| a == &alias) && alias != full.name {
-                    full.aliases.push(alias);
-                }
+
+    // One spelling per person, KB-wide ("MARIA MARENOVA" → "Maria Marenova").
+    if !index.is_empty() {
+        for entry in acc.values_mut() {
+            let display = index.display_name(&entry.name);
+            if display != entry.name {
+                entry.aliases.retain(|a| a != &display);
+                entry.name = display;
             }
         }
     }
@@ -1155,6 +1396,188 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.predicate == "introduced_by" && e.from == "Amara Osei" && e.to == "Elias"));
+    }
+
+    #[test]
+    fn places_and_creeds_are_never_people() {
+        // Every one of these was a top-25 `person` in the real store.
+        let k = kinds(
+            "I met Lira in London last month. We flew to Ibiza with my friend Avi. \
+             Singapore was next. Islam came up over dinner with her.",
+        );
+        for junk in ["London", "Ibiza", "Singapore", "Islam"] {
+            assert_ne!(
+                k.get(junk).copied(),
+                Some(KIND_PERSON),
+                "{junk} must not be person-typed: {k:?}"
+            );
+        }
+        // …and the actual humans in the same sentences survive.
+        assert_eq!(k.get("Lira").copied(), Some(KIND_PERSON));
+        assert_eq!(k.get("Avi").copied(), Some(KIND_PERSON));
+    }
+
+    #[test]
+    fn chat_filler_never_reaches_the_graph() {
+        let ex = analyze("Oh nice. Good morning Elias. Thanks Elias! Ok sure. Heyy Elias.");
+        for junk in [
+            "Oh",
+            "Good",
+            "Thanks",
+            "Ok",
+            "Sure",
+            "Morning",
+            "Heyy Elias",
+        ] {
+            assert!(
+                !ex.entities.iter().any(|e| e.name == junk),
+                "{junk} leaked: {:?}",
+                ex.entities
+            );
+        }
+        let elias = ex
+            .entities
+            .iter()
+            .find(|e| e.name == "Elias")
+            .expect("Elias survives every salutation");
+        assert_eq!(e_kind(&ex, "Elias"), Some(KIND_PERSON));
+        assert_eq!(
+            elias.mentions, 3,
+            "every greeting must count for the person: {elias:?}"
+        );
+    }
+
+    fn e_kind(ex: &Extraction, name: &str) -> Option<&'static str> {
+        ex.kind_of(name)
+    }
+
+    #[test]
+    fn a_contact_label_resolves_to_the_person_it_names() {
+        let ex = analyze("Maria Microsoft London Tech sent the deck over.");
+        let maria = ex
+            .entities
+            .iter()
+            .find(|e| e.name == "Maria")
+            .expect("the label's personal-name prefix is the node");
+        assert_eq!(maria.kind, KIND_PERSON, "a contact label names a human");
+        assert!(maria
+            .aliases
+            .contains(&"Maria Microsoft London Tech".to_string()));
+        assert!(
+            !ex.entities
+                .iter()
+                .any(|e| e.name == "Maria Microsoft London Tech"),
+            "the label must not stand up a rival node: {:?}",
+            ex.entities
+        );
+    }
+
+    /// The KB-wide pass: the same person written two ways in two chunks.
+    #[test]
+    fn kb_wide_index_folds_a_bare_first_name_across_chunks() {
+        let chunks = [
+            "Noemi Varkoni introduced me to Avi Roy at the summit.",
+            "Noemi sent the deck this morning.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+        let second = analyze_with_index(chunks[1], &index);
+
+        assert!(
+            !second.entities.iter().any(|e| e.name == "Noemi"),
+            "the bare first name must not stand up a second node: {:?}",
+            second.entities
+        );
+        let noemi = second
+            .entities
+            .iter()
+            .find(|e| e.name == "Noemi Varkoni")
+            .expect("folded onto the full person");
+        assert_eq!(noemi.kind, KIND_PERSON);
+        assert_eq!(noemi.mentions, 1, "the mention must survive the fold");
+        assert!(noemi.aliases.contains(&"Noemi".to_string()));
+    }
+
+    /// SAFETY: two different humans share a first name. Merging them would
+    /// silently fuse a friend with someone from a dating thread.
+    #[test]
+    fn two_full_names_sharing_a_first_name_never_fuse() {
+        let chunks = [
+            "Laura Corvo is a friend from the Barcelona trip.",
+            "Laura Quiroz is someone I am dating.",
+            "Laura texted me about dinner.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+
+        let bare = analyze_with_index(chunks[2], &index);
+        assert!(
+            bare.entities.iter().any(|e| e.name == "Laura"),
+            "the ambiguous bare name must stay its own node: {:?}",
+            bare.entities
+        );
+        for chunk in &chunks {
+            let ex = analyze_with_index(chunk, &index);
+            for person in &ex.entities {
+                assert!(
+                    !person.aliases.iter().any(|a| a == "Laura"),
+                    "{} absorbed the ambiguous bare name: {:?}",
+                    person.name,
+                    person.aliases
+                );
+            }
+        }
+        // Both full names survive, separately.
+        let corvo = analyze_with_index(chunks[0], &index);
+        assert!(corvo.entities.iter().any(|e| e.name == "Laura Corvo"));
+        let moreno = analyze_with_index(chunks[1], &index);
+        assert!(moreno.entities.iter().any(|e| e.name == "Laura Quiroz"));
+    }
+
+    #[test]
+    fn case_variants_of_one_name_collapse_to_the_written_spelling() {
+        let chunks = [
+            "MARIA MARENOVA: call me back.",
+            "Maria Marenova is my cousin and she called on Sunday.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+        assert_eq!(index.display_name("MARIA MARENOVA"), "Maria Marenova");
+        let shouted = analyze_with_index(chunks[0], &index);
+        assert!(
+            shouted.entities.iter().any(|e| e.name == "Maria Marenova"),
+            "the shouted spelling must display like a name: {:?}",
+            shouted.entities
+        );
+    }
+
+    #[test]
+    fn indexed_analysis_is_deterministic() {
+        let chunks = [
+            "Avi Roy introduced me to Noemi Varkoni at the summit.",
+            "Avi emailed me. Noemi replied to Patrick Ashcomb Pruett.",
+            "Patrick asked about the raise.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+        for chunk in &chunks {
+            let a = analyze_with_index(chunk, &index);
+            let b = analyze_with_index(chunk, &index);
+            assert_eq!(
+                a.entities.iter().map(|e| &e.name).collect::<Vec<_>>(),
+                b.entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+            assert_eq!(a.edges, b.edges);
+        }
+        // The bare surname folds onto the one person carrying it.
+        let last = analyze_with_index(chunks[2], &index);
+        assert!(
+            last.entities
+                .iter()
+                .any(|e| e.name == "Patrick Ashcomb Pruett"),
+            "{:?}",
+            last.entities
+        );
     }
 
     #[test]
