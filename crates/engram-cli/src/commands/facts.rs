@@ -77,9 +77,12 @@ pub fn list(
         v
     };
 
+    let diary_scope = if diary == "*" { "all_diaries" } else { "flag" };
     let payload = json!({
         "kb": kb_label,
         "kb_scope": if kb_filter.is_some() { "flag" } else { "all_kbs" },
+        "diary": diary,
+        "diary_scope": diary_scope,
         "count": facts.len(),
         "facts": facts.iter().map(labelled).collect::<Vec<_>>(),
     });
@@ -94,6 +97,8 @@ pub fn list(
             "all_kbs"
         },
     );
+    meta.add("diary", diary.clone());
+    meta.add("diary_scope", diary_scope);
     print_success(ctx.format, payload, meta, |data| {
         let rows = data["facts"].as_array().cloned().unwrap_or_default();
         if rows.is_empty() {

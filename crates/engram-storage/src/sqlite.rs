@@ -746,9 +746,11 @@ CREATE TABLE IF NOT EXISTS fact_extraction_log (
 ///
 /// The timestamps are compared as strings, which is exact here: every writer
 /// of `compile_jobs.created_at` and `memories.deleted_at` is
-/// `chrono::Utc::now().to_rfc3339()`, so both are fixed-width RFC3339 in UTC
-/// (`+00:00`) and lexicographic order is chronological order, to the
-/// nanosecond. A NULL `deleted_at` (deletion time unknown) compares against a
+/// `chrono::Utc::now().to_rfc3339()` — UTC (`+00:00`) with a variable number
+/// of fractional-second digits (AutoSi: 0/3/6/9), which still sorts
+/// chronologically because `+` (0x2B) is below every ASCII digit, so a
+/// shorter timestamp truncated at the offset sign orders correctly against a
+/// longer one. A NULL `deleted_at` (deletion time unknown) compares against a
 /// far-future sentinel, so it can never be proven purged — the v8 migration
 /// backfills it precisely to avoid gating legacy stores forever.
 const MEMORY_CONSTRAINS_DERIVED: &str = "(
@@ -1009,7 +1011,9 @@ impl SqliteStore {
         )?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_kb_diary_deleted
-                 ON memories(kb, diary, deleted);",
+                 ON memories(kb, diary, deleted);
+             CREATE INDEX IF NOT EXISTS idx_compile_jobs_kb_status_created
+                 ON compile_jobs(kb, status, created_at);",
         )?;
         Ok(())
     }
@@ -2560,7 +2564,7 @@ impl SqliteStore {
         self.conn.execute(
             "UPDATE compile_jobs
              SET status = ?1, message = ?2, metadata_json = ?3, updated_at = ?4
-             WHERE id = ?5",
+             WHERE id = ?5 AND status = 'running'",
             params![
                 status,
                 message,

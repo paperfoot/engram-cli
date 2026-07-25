@@ -767,8 +767,8 @@ pub enum FactsCommand {
         /// Filter to a specific subject (case-insensitive).
         #[arg(long)]
         subject: Option<String>,
-        /// Diary scope. Default is "default".
-        #[arg(long, default_value = "default")]
+        /// Diary scope. Defaults to all diaries ("*").
+        #[arg(long, default_value = "*")]
         diary: String,
         /// Knowledge base/domain namespace. Omit (or pass "*") to list facts
         /// from EVERY KB — the same default as `recall`, because facts written

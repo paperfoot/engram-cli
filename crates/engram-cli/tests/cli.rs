@@ -3816,3 +3816,38 @@ fn writing_to_the_diary_wildcard_is_rejected() {
     let v = run_json(&mut cmd_in(&tmp), &["memory", "list", "--diary", "*"]);
     assert_eq!(v["data"]["memories"].as_array().map(|a| a.len()), Some(0));
 }
+
+/// The diary axis of `facts list` must not resurrect the trap the KB axis
+/// escaped: a fact written under a non-default diary has to be visible to an
+/// unscoped listing, with the scope spelled out in the envelope.
+#[test]
+fn facts_list_spans_every_diary_by_default_and_says_so() {
+    let (tmp, mut cmd) = with_isolated_home();
+    cmd.args([
+        "remember",
+        "Priya Raman is Northwind's co-founder.",
+        "--kb",
+        "relationships",
+        "--diary",
+        "work",
+        "--facts-json",
+        r#"[{"subject":"Priya Raman","predicate":"has_role","object":"co-founder at Northwind","confidence":1.0,"fact_type":"profile_slot"}]"#,
+        "--json",
+    ])
+    .assert()
+    .success();
+
+    // Unscoped: the work-diary fact must appear, labelled with its scope.
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "list"]);
+    assert_eq!(v["data"]["count"], 1, "unscoped facts list must span diaries");
+    assert_eq!(v["data"]["diary"], "*");
+    assert_eq!(v["data"]["diary_scope"], "all_diaries");
+    assert_eq!(v["data"]["facts"][0]["subject"], "Priya Raman");
+
+    // Narrowing still works, and the envelope says it was a flag.
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "list", "--diary", "work"]);
+    assert_eq!(v["data"]["count"], 1);
+    assert_eq!(v["data"]["diary_scope"], "flag");
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "list", "--diary", "personal"]);
+    assert_eq!(v["data"]["count"], 0);
+}

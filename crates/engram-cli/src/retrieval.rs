@@ -259,7 +259,9 @@ impl RecallNotes {
             "diary": self.diary_scope,
             "excluded_candidates": excluded,
             "reason": "derived content (claims, wiki pages, entities, relations) \
-                       that could not be proven to come from this diary's memories",
+                       that could not be proven to come from this diary's memories; \
+                       a full `engram compile --kb <kb> --all` rebuilds the derived \
+                       layer from live memories and lifts this exclusion",
         }))
     }
 }
