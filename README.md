@@ -1,6 +1,6 @@
 # engram
 
-> **The knowledge engine for AI agents.** Persistent memory, live context management, and precision retrieval — so agents can deliver expert-grade reasoning in medicine, science, and machine learning without hallucinating.
+> **The memory engine for AI agents.** Durable personal and business memory — people, decisions, relationships, dated events — plus source-backed domain corpora, retrieved precisely enough that an agent cites instead of hallucinating.
 
 [![rust](https://img.shields.io/badge/rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -15,39 +15,46 @@ cargo install --path crates/engram-cli --locked
 engram skill install          # tells Claude Code, Codex, Gemini CLI, and .agents clients it exists
 engram config set keys.gemini $GEMINI_API_KEY
 engram config set keys.cohere $COHERE_API_KEY
-engram kb create ageing-biology --description "Ageing biology and longevity science"
-engram remember "Rapamycin extends mouse lifespan via mTORC1 inhibition."
-engram recall "what drug extends lifespan" --kb ageing-biology --mode evidence
+
+# Write: --kb files the memory under a domain and registers the KB.
+engram remember "Sarah prefers async standups; sync only for incidents." --kb personal --importance 8
+engram remember "Mum's birthday is 14 March." --kb personal --event-time 1958-03-14 --importance 9
+
+# Read: no --kb needed. recall spans every KB by default.
+engram recall "what does Sarah prefer for standups"
+engram people show "Sarah Chen" --kb '*'
 ```
 
 ---
 
 ## What engram is
 
-engram is a **knowledge engine** that gives AI agents three things they currently lack:
+engram is a **memory engine** that gives AI agents three things they currently lack:
 
-1. **Persistent memory that updates itself.** Not a static vector store — a live knowledge base that tracks fact supersession and temporal validity. When you store a fact that disagrees with an existing one for the same subject, the old value is superseded (not deleted — the history stays queryable), and `recall` surfaces the change so an agent cites the current value instead of the stale one. Detection is semantic, not string-matching: predicate synonyms canonicalize (`employed_by` ≡ `works_at`), subjects resolve through an alias/fuzzy cascade, and an embedding novelty gate catches paraphrased contradictions. Routine profile slots update last-writer-wins; safety-critical slots (allergies, medication) are **never auto-superseded** — both values stay active as *contested* and the conflict is handed to the calling agent (`adjudication_needed` + `facts resolve`), which has the conversation context engram lacks. Facts run on the `remember --extract-facts` / `--facts-json` and `compile --llm` paths (KB-scoped); chunk-level "which paper overturned which" is on the roadmap.
+1. **Persistent memory that updates itself.** Not a static vector store — a live knowledge base that tracks fact supersession and temporal validity. When you store a fact that disagrees with an existing one for the same subject, the old value is superseded (not deleted — the history stays queryable), and `recall` surfaces the change so an agent cites the current value instead of the stale one. Detection is semantic, not string-matching: predicate synonyms canonicalize (`employed_by` ≡ `works_at`), subjects resolve through an alias/fuzzy cascade, and an embedding novelty gate catches paraphrased contradictions. Routine profile slots update last-writer-wins; safety-critical slots (allergies, medication) are **never auto-superseded** — both values stay active as *contested* and the conflict is handed to the calling agent (`adjudication_needed` + `facts resolve`), which has the conversation context engram lacks. Fact extraction runs **by default** on `remember` / `memory add` whenever an OpenRouter key resolves (opt out with `--no-extract-facts`), and `engram facts backfill --kb K` idempotently extracts from memories stored before it was on.
 
-2. **Precision retrieval for science.** Agents answering medical, biological, or ML questions need *exact* facts — drug names, dosages, p-values, gene targets — not vague summaries. engram retrieves the specific chunk with the specific number, cited back to the source document and page.
+2. **A personal memory that answers "who" and "when".** People are typed entities with aliases and typed relationships carrying provenance — `engram people list`, `engram people show "<name>"`, `engram graph neighbors "<name>" --typed-only` give you the network view rather than a bag of text. `--event-time` records when something actually happened (a birthday, a decision), so `recall --since/--until` can answer "what happened last March?" instead of matching on wording.
 
-3. **Expert context delivery.** Feed an agent 50 papers on rapamycin and it becomes a rapamycin expert. Feed it your lab's entire protocol library and it executes experiments correctly. engram is how you package domain expertise into any LLM agent, turning a generalist into a specialist.
+3. **Precision retrieval, cited.** For source corpora — papers, protocols, product docs — agents need *exact* facts: drug names, dosages, p-values, gene targets, not vague summaries. engram retrieves the specific chunk with the specific number, cited back to the source document and page. Feed an agent 50 papers and it answers from them instead of from training data.
 
 The interface is a Rust CLI plus an optional local daemon. Your agent shells out to `engram recall` / `engram remember` / `engram ingest` the same way it already uses `gh` and `jq`, or calls `engram serve` on `127.0.0.1:8768` for always-on integrations. No MCP server. No cloud dependency for the store. One `agent-info` call and the agent knows every command.
 
 ## What you can build with it
 
-engram is not only a personal memory tool and not only a science RAG. It is a local-first way to package **specialized domain expertise** for any agent:
+Personal memory first, domain corpora second — both in one local-first store:
 
 | Use case | What goes in | How agents use it |
 |---|---|---|
+| **Personal memory** | People, family, preferences, health notes, birthdays and anniversaries | `remember --kb personal --event-time`, then a plain `recall` (it spans every KB). `people show "<name>"` for the relationship view. |
+| **Business/company memory** | Decisions with rationale, competitor and market intel, deals, operational facts | `remember --kb business --tag decision`; `recall "..." --kb business` when you deliberately want to exclude everything else. |
 | **Medicine and clinical research** | Guidelines, trial papers, protocols, safety notes, curated takeaways | Retrieve cited evidence, exact numbers, cohorts, dosages, contraindications, and source spans. engram is an evidence tool, not a clinician. |
 | **Science and research papers** | PDFs, review papers, lab notes, methods sections, tables, hypotheses, contradictions | Build a domain KB such as `ageing-biology`, compile claims/entities/relations, then answer with citations. |
 | **Coding and tool expertise** | API docs, repos, release notes, architecture decisions, migration guides | Give agents a KB such as `swiftui-ios`, `bioinformatics-tools`, or `coding-agents` so they use current local docs instead of stale model memory. |
 | **Customer support** | Help center docs, product policies, resolved ticket takeaways, troubleshooting runbooks | Turn a support agent into a product specialist. Use KBs for product knowledge and diaries for agent/team memory. |
-| **Company/project memory** | Decisions, preferences, release notes, handoffs, operational facts | Use `remember` for durable facts and `recall --mode agent` before doing work. |
-| **Multi-domain expert agents** | Separate KBs for each source corpus | Query one KB for precision, or use `--all-kbs` only when a cross-domain answer is intended. |
+| **Project memory** | Release notes, handoffs, architecture decisions, operational facts | One KB per project; `recall --mode agent` before doing work. |
+| **Multi-domain expert agents** | Separate KBs for each source corpus | Reads span every KB by default; narrow with `--kb` only to exclude the rest. |
 
-The important split is: **KBs are source corpora/domains** (`ageing-biology`, `swiftui-ios`, `acme-support`), while **diaries are agent/user namespaces** (`default`, `code-reviewer`, `support-tier2`). Keep those separate and the system stays understandable.
+The important split is: **KBs are domains** — personal, business, a project, or a source corpus like `ageing-biology` — while **diaries are agent/user namespaces** (`default`, `code-reviewer`, `support-tier2`). Keep those separate and the system stays understandable. Writing with `--kb <name>` registers the KB; no `kb create` needed first.
 
 ## Why not MCP / vector databases / RAG-as-a-service?
 
@@ -235,17 +242,27 @@ Format notes from current docs:
 The installed skill teaches your agent to do this every task:
 
 ```bash
-# 1. LOAD — recall anything relevant before answering
+# 1. LOAD — recall anything relevant before answering. No --kb: reads span every KB,
+#    because the write side chose the namespace, not the reader.
 engram recall "user's task in 4-6 words" --top-k 5 --json
 
 # 2. WORK — do the task, citing recalled chunks when they matter
 
 # 3. SAVE — whatever the user told you that will matter later
-engram remember "Rapamycin IC50 for mTORC1 is 0.1 nM (Sarbassov 2006)." --importance 9 --tag decision
-engram memory add "The team prefers Rust for CLI tools."                 --importance 7 --tag preference
+engram remember "Chose SQLite over Qdrant: single-binary deploy beat vector-index features." \
+  --kb business --importance 9 --tag decision
+engram memory add "The team prefers Rust for CLI tools." --importance 7 --tag preference
 ```
 
-Rule of thumb: save preferences, explicit decisions with rationale, stable facts with citations, and corrections. Don't save task-local state or conversation filler.
+Rule of thumb: save preferences, explicit decisions with rationale, stable facts, and corrections. Don't save task-local state or conversation filler.
+
+Response `metadata.kb_scope` reports how the scope was chosen (`flag` | `config` | `all_kbs`) and `metadata.kb` the effective KB (`*` = every KB) — so an empty recall is distinguishable from a narrowed one. Pin a default with `engram config set retrieval.default_kb <name>`; `--kb` and `--all-kbs` still override it.
+
+Verify retrieval quality after any change with the offline, deterministic personal suite (no keys, no network, never touches your store):
+
+```bash
+engram bench personal --json
+```
 
 ## Domain knowledge bases
 
@@ -429,10 +446,14 @@ ingest.require_scope true`, `ingest.include`, `ingest.exclude`, and
 
 | | |
 |---|---|
-| `engram kb create/list/show/delete` | Manage domain knowledge bases |
-| `engram remember <content>` | Store a memory. Flags: `--importance 0-10`, `--tag` (repeatable), `--diary`, `--kb`, `--extract-facts`, `--facts-json '<array>'` (store known triples with zero LLM cost), `--autonomy full\|assisted\|strict`, `--allow-duplicate`. Identical content in the same kb/diary is deduplicated (no second embedding) unless `--allow-duplicate`. |
+| `engram kb create/list/show/delete` | Manage domain knowledge bases. Writing with `--kb <name>` registers one automatically |
+| `engram kb repair [--dry-run]` | Register KBs that hold memories but are missing from `kb list` — residue of stores written before write-time registration. Additive and idempotent; will not resurrect a KB you deleted |
+| `engram remember <content>` | Store a memory. Flags: `--importance 0-10`, `--tag` (repeatable), `--diary`, `--kb`, `--event-time <RFC3339\|YYYY-MM-DD>`, `--no-extract-facts`, `--facts-json '<array>'` (store known triples with zero LLM cost), `--autonomy full\|assisted\|strict`, `--allow-duplicate`. Fact extraction runs by default when an OpenRouter key resolves; the envelope reports `fact_extraction` + `facts_added`. Identical content in the same kb/diary is deduplicated (no second embedding) unless `--allow-duplicate`. |
+| `engram memory add/search/update/delete/list` | CRUD aliases; `memory add` takes the same flags as `remember` |
 | `engram facts list \| show <subject> \| conflicts [--open] \| resolve <id> --action <a>` | Browse the fact store and contradiction record; `--open` lists contested (unresolved) conflicts; `resolve` records the calling agent's verdict |
-| `engram recall <query>` | Hybrid search. Flags: `--kb`, `--mode evidence\|raw\|wiki\|explore\|agent`, `--profile cloud_quality\|fast\|offline`, `--top-k`, `--allow-mixed-embeddings` |
+| `engram facts backfill --kb <name>` | Extract facts from memories stored before extraction was on. `--diary`, `--limit`, `--dry-run`. Idempotent, oldest-first, one LLM call per memory |
+| `engram people list \| show "<name>"` | The network view over person-typed entities: aliases, mention counts, and typed relations with provenance. `--kb '*'` for every KB |
+| `engram recall <query>` | Hybrid search across **every KB** by default. Flags: `--kb` (narrow; `'*'` = all), `--all-kbs`, `--diary`, `--mode evidence\|raw\|wiki\|explore\|agent`, `--profile cloud_quality\|fast\|offline`, `--top-k`, `--layer`, `--rerank-top-n`, `--graph-hops`, `--since`/`--until` (filter on `event_time`), `--allow-mixed-embeddings`. Metadata carries `kb_scope` and `diary_isolation` |
 | `engram research <query>` | Evidence-first research retrieval. Returns query plan, evidence leads, answer context, and citation-readiness checks |
 | `engram ingest <path>` | Mine one file, or a scoped directory. `--mode papers\|takeaways\|conversations\|repos\|general\|auto`, `--compile evidence`, `--dry-run`, `--include`, `--exclude`, `--max-files`, `--all` |
 | `engram documents list/show/delete` | Inspect or remove ingested source documents |
@@ -440,8 +461,8 @@ ingest.require_scope true`, `ingest.include`, `ingest.exclude`, and
 | `engram jobs list/show` | Inspect compile job history |
 | `engram reindex --kb <name> \| --all` | Re-embed chunks with current embedding metadata |
 | `engram wiki --kb <name> [path]` | Browse generated wiki pages |
-| `engram graph neighbors <entity> --kb <name>` | Browse SQLite graph expansion. Supports `--hops 1|2` and `--min-weight` |
-| `engram doctor --json` | Verify keys, schema, embedding consistency, and daemon port |
+| `engram graph neighbors <entity> --kb <name>` | Browse SQLite graph expansion, closest first. `--hops 1\|2`, `--min-weight`, `--limit`, `--typed-only` (drop weak `co_occurs_with` edges) |
+| `engram doctor --json` | Verify keys, schema, embedding consistency, and daemon port. `--integrity` also reports lifecycle residue and unregistered KBs |
 | `engram serve` / `engramd` | Start local HTTP API |
 | `engram usage [--kb <name>] [--since <rfc3339>]` | Summarize recorded Gemini/Cohere usage |
 | `engram budget show/set/clear` | Configure local daily/monthly API usage guardrails |
@@ -449,9 +470,9 @@ ingest.require_scope true`, `ingest.include`, `ingest.exclude`, and
 | `engram forget <id> --confirm` | Soft-delete (destructive, requires `--confirm`) |
 | `engram entities list \| show <name>` | Browse extracted entities |
 | `engram export` / `engram import <file>` | JSON backup / restore |
-| `engram bench <suite>` | Run benchmarks. Suites: `mini`, `mini-fts`, `scientific-mini`, `longmemeval`, `longmemeval-qa`, `locomo-plus`, `mab`, `litqa2`, `beir`, `biogen` |
-| `engram config show \| set \| check` | Configuration |
-| `engram skill install \| package \| uninstall` | Deploy/package the agent skill |
+| `engram bench <suite>` | Run benchmarks. Suites: `mini`, `mini-fts`, `personal`, `scientific-mini`, `longmemeval`, `longmemeval-qa`, `locomo-plus`, `mab`, `litqa2`, `beir`, `biogen`. `personal` is the offline personal-memory quality gate |
+| `engram config show \| set \| check` | Configuration. `retrieval.default_kb` pins reads to one KB (unset = every KB) |
+| `engram skill install \| package \| uninstall` | Deploy/package the agent skill. `install` refuses to overwrite a hand-edited `SKILL.md` unless `--force` |
 | `engram agent-info` | Self-describing manifest (start here) |
 
 ### Local daemon/API
@@ -488,8 +509,13 @@ Research direction for contributors: [`program.md`](program.md). Design rational
 - PDF ingestion with section-aware chunking
 - Evidence compiler for cited claims, source spans, entities, relations, and takeaways
 - Memory layers (L0–L3) with token budgeting
-- Diary namespaces for specialist agents
+- Diary namespaces for specialist agents, with recall-time isolation (a diary-scoped read cannot leak via compiled claims/wiki/entities, and reports what it withheld)
+- All-KB recall by default: a plain `recall` spans every KB, `retrieval.default_kb` pins it, `--kb`/`--all-kbs` override, and `metadata.kb_scope` reports which applied
+- Fact extraction on by default on `remember`/`memory add`, `--event-time` for real event times honored by `recall --since/--until`, and `facts backfill` for pre-existing memories
+- Person-typed entities with hygiene filters, typed person↔person relationships with accumulating provenance, `people list`/`people show`, and person-centric `graph neighbors --typed-only`
 - Entity extraction, graph browsing, and graph expansion during recall
+- `engram bench personal`: an offline, deterministic personal-memory suite (no keys, no network, no writes to the live store)
+- `engram kb repair` to register KBs orphaned by builds that predated write-time registration
 - Document/job/budget UX plus local daemon endpoints for KBs, recall, research, compile, reindex, documents, entities, jobs, usage, and budgets
 - Optional LLM compiler pass: Gemini 3.1 Flash-Lite Preview extraction + Gemini 3.1 Pro Preview synthesis via OpenRouter
 - Hallucination-resistance harness (loaders + scorers + unit tests): LitQA2 precision-with-abstention, BEIR-sci nDCG@10, BioGen CSR, ALCE citation P/R, repaired RAGAS faithfulness
@@ -498,10 +524,19 @@ Research direction for contributors: [`program.md`](program.md). Design rational
 - Unit + integration test suite (run with `cargo test`)
 
 **Next up**
+
+*Personal memory*
+- Recurring events: a birthday stored with `--event-time` is a single dated point, so "whose birthday is next month?" still relies on content matching rather than an annual recurrence rule
+- Relationship inference beyond what a single memory states — engram records `introduced_by` when a memory says so, but does not yet infer second-order connections across memories
+- `people merge` for the same person written under genuinely different names (aliases fold automatically only when one is a possessive or substring of the other)
+
+*Retrieval and evidence*
 - Close the answerer gap: LitQA2 full-text accuracy is answerer-limited — 90.7% given a retrieval hit, while retrieval surfaces the right passage 97% of the time — so the lever is answer interpretation (chain-of-thought / quote-the-span / self-verify prompts, and head-to-head answerer models)
 - Harder retrieval eval: a full open-access-paper corpus, instead of the curated key-passage corpus, to measure the retriever's ceiling under realistic haystack
 - A runnable `engram bench citation` suite (the ALCE scorer is implemented in `citation.rs`; it needs a CLI subcommand)
-- Chunk-level contradiction detection ("which paper overturned which") — fact-level supersession is shipped (`recall` `conflicts`, `facts conflicts`, KB-scoped over `remember --extract-facts` and `compile --llm`); extending it to disagreements *between retrieved chunks* is next
+- Chunk-level contradiction detection ("which paper overturned which") — fact-level supersession is shipped (`recall` `conflicts`, `facts conflicts`); extending it to disagreements *between retrieved chunks* is next
+
+*Distribution*
 - GitHub Actions CI releasing prebuilt macOS + Linux binaries; a real crates.io release + Homebrew tap (install today is source-only via `cargo install --path`)
 - Local embedding fallback via `candle` + `bge-small-en-v1.5` (zero API, p95 < 10 ms)
 
