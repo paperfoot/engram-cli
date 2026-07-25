@@ -15,6 +15,7 @@ pub mod ingest;
 pub mod jobs;
 pub mod kb;
 pub mod memory;
+pub mod people;
 pub mod recall;
 pub mod reindex;
 pub mod remember;

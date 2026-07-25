@@ -2280,3 +2280,286 @@ fn facts_backfill_scopes_to_kb_and_diary() {
     assert_eq!(v["data"]["memories_total"], 1);
     assert_eq!(v["data"]["would_process"], 1);
 }
+
+// ---------------------------------------------------------------------------
+// People graph — the networking surface. All of it must work offline with no
+// API key: the deterministic extractor is the floor, not a fallback.
+// ---------------------------------------------------------------------------
+
+/// Ingest one networking note and compile it, returning the isolated home.
+fn networking_kb() -> tempfile::TempDir {
+    let (tmp, mut ingest) = with_isolated_home();
+    let fixture = tmp.path().join("network.md");
+    std::fs::write(
+        &fixture,
+        "Avi Roy introduced me to Noemi Kostova at the Longevity Summit. \
+         Noemi Kostova is married to Sam Lee. \
+         I'm seeing Noemi on Monday. She's bringing Avi Roy. \
+         Noemi's deck was excellent. \
+         Sam Lee works with Avi Roy on the fund.",
+    )
+    .unwrap();
+    ingest
+        .args([
+            "ingest",
+            fixture.to_str().unwrap(),
+            "--kb",
+            "network",
+            "--mode",
+            "general",
+            "--compile",
+            "evidence",
+            "--json",
+        ])
+        .assert()
+        .success();
+    tmp
+}
+
+fn json_cmd(tmp: &tempfile::TempDir, args: &[&str]) -> Value {
+    let out = cmd_in(tmp)
+        .args(args)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    parse_stdout(&out)
+}
+
+#[test]
+fn compile_types_people_and_rejects_contraction_junk() {
+    let tmp = networking_kb();
+    let v = json_cmd(
+        &tmp,
+        &["entities", "list", "--kb", "network", "--limit", "100"],
+    );
+    let entities = v["data"]["entities"].as_array().unwrap();
+    let names: Vec<&str> = entities
+        .iter()
+        .filter_map(|e| e["canonical_name"].as_str())
+        .collect();
+
+    for junk in ["I'm", "She's", "It's", "Monday", "The"] {
+        assert!(!names.contains(&junk), "junk entity {junk} in {names:?}");
+    }
+    // "Noemi's" folds into its owner; no rival possessive node.
+    assert!(
+        !names.iter().any(|n| n.ends_with("'s")),
+        "possessive entity survived: {names:?}"
+    );
+
+    let people: Vec<&str> = entities
+        .iter()
+        .filter(|e| e["kind"] == "person")
+        .filter_map(|e| e["canonical_name"].as_str())
+        .collect();
+    for expected in ["Avi Roy", "Noemi Kostova", "Sam Lee"] {
+        assert!(
+            people.contains(&expected),
+            "{expected} not typed person: {people:?}"
+        );
+    }
+}
+
+#[test]
+fn people_list_returns_person_entities_with_relations() {
+    let tmp = networking_kb();
+    let v = json_cmd(&tmp, &["people", "list", "--kb", "network"]);
+    assert_eq!(v["status"], "success");
+    let people = v["data"]["people"].as_array().unwrap();
+    assert!(!people.is_empty(), "expected people in {v}");
+    assert!(people
+        .iter()
+        .all(|p| p["mentions"].as_u64().unwrap_or(0) >= 1));
+
+    let noemi = people
+        .iter()
+        .find(|p| p["name"] == "Noemi Kostova")
+        .expect("Noemi Kostova listed");
+    let predicates: Vec<&str> = noemi["top_relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["predicate"].as_str())
+        .collect();
+    assert!(
+        predicates.contains(&"introduced_by") || predicates.contains(&"married_to"),
+        "expected typed relations, got {predicates:?}"
+    );
+    // Alias spellings fold onto the person instead of splitting the node.
+    let aliases: Vec<&str> = noemi["aliases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a.as_str())
+        .collect();
+    assert!(
+        aliases.iter().any(|a| a.starts_with("Noemi")),
+        "{aliases:?}"
+    );
+}
+
+#[test]
+fn people_show_reports_predicate_provenance_and_snippets() {
+    let tmp = networking_kb();
+    let v = json_cmd(
+        &tmp,
+        &["people", "show", "Noemi Kostova", "--kb", "network"],
+    );
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["data"]["person"]["kind"], "person");
+
+    let relations = v["data"]["relations"].as_array().unwrap();
+    let introduced = relations
+        .iter()
+        .find(|r| r["predicate"] == "introduced_by")
+        .expect("introduced_by edge");
+    assert_eq!(introduced["subject"], "Noemi Kostova");
+    assert_eq!(introduced["object"], "Avi Roy");
+
+    // Every typed edge must be checkable: a memory id and the source sentence.
+    let source = introduced["sources"]
+        .as_array()
+        .and_then(|s| s.first())
+        .expect("edge provenance");
+    assert!(source["memory_id"].as_str().is_some_and(|m| !m.is_empty()));
+    assert!(source["chunk_id"].as_str().is_some_and(|c| !c.is_empty()));
+    assert!(source["sentence"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("introduced"));
+
+    let memories = v["data"]["memories"].as_array().unwrap();
+    assert!(!memories.is_empty(), "expected memory snippets");
+    assert!(memories
+        .iter()
+        .all(|m| m["memory_id"].as_str().is_some_and(|s| !s.is_empty())));
+}
+
+#[test]
+fn people_show_resolves_an_alias() {
+    let tmp = networking_kb();
+    // "Noemi" was written bare in one sentence; it must resolve to the person.
+    let v = json_cmd(&tmp, &["people", "show", "noemi", "--kb", "network"]);
+    assert_eq!(v["data"]["person"]["name"], "Noemi Kostova");
+}
+
+#[test]
+fn people_show_unknown_name_is_bad_input() {
+    let tmp = networking_kb();
+    cmd_in(&tmp)
+        .args([
+            "people",
+            "show",
+            "Nobody At All",
+            "--kb",
+            "network",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(3);
+}
+
+#[test]
+fn graph_neighbors_is_person_centric() {
+    let tmp = networking_kb();
+    let v = json_cmd(
+        &tmp,
+        &["graph", "neighbors", "Noemi Kostova", "--kb", "network"],
+    );
+    assert_eq!(v["data"]["resolved"]["kind"], "person");
+    let neighbors = v["data"]["neighbors"].as_array().unwrap();
+    let avi = neighbors
+        .iter()
+        .find(|n| n["name"] == "Avi Roy")
+        .expect("Avi Roy is a neighbor");
+    assert_eq!(avi["kind"], "person");
+    assert!(avi["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["predicate"] == "introduced_by"));
+
+    // --typed-only drops the weak co-occurrence edges.
+    let typed = json_cmd(
+        &tmp,
+        &[
+            "graph",
+            "neighbors",
+            "Noemi Kostova",
+            "--kb",
+            "network",
+            "--typed-only",
+        ],
+    );
+    assert!(typed["data"]["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["predicate"] != "co_occurs_with"));
+}
+
+#[test]
+fn recompiling_converges_instead_of_accumulating() {
+    let tmp = networking_kb();
+    let before = json_cmd(
+        &tmp,
+        &["entities", "list", "--kb", "network", "--limit", "500"],
+    );
+    let people_before = json_cmd(&tmp, &["people", "list", "--kb", "network"]);
+
+    json_cmd(&tmp, &["compile", "--kb", "network", "--all"]);
+    json_cmd(&tmp, &["compile", "--kb", "network", "--all"]);
+
+    let after = json_cmd(
+        &tmp,
+        &["entities", "list", "--kb", "network", "--limit", "500"],
+    );
+    let people_after = json_cmd(&tmp, &["people", "list", "--kb", "network"]);
+
+    let fingerprint = |v: &Value, key: &str, field: &str| -> Vec<String> {
+        let mut out: Vec<String> = v["data"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}",
+                    e[field].as_str().unwrap_or(""),
+                    e["mention_count"]
+                        .as_u64()
+                        .or_else(|| e["mentions"].as_u64())
+                        .unwrap_or(0)
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        fingerprint(&before, "entities", "canonical_name"),
+        fingerprint(&after, "entities", "canonical_name"),
+        "recompile must replace derived entities, not accumulate them"
+    );
+    assert_eq!(
+        fingerprint(&people_before, "people", "name"),
+        fingerprint(&people_after, "people", "name")
+    );
+
+    // Edge weight and provenance must not creep up across recompiles either.
+    let edges = json_cmd(
+        &tmp,
+        &["people", "show", "Noemi Kostova", "--kb", "network"],
+    );
+    let introduced = edges["data"]["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["predicate"] == "introduced_by")
+        .expect("introduced_by edge");
+    assert_eq!(introduced["sources"].as_array().unwrap().len(), 1);
+    assert!(introduced["weight"].as_f64().unwrap() <= 1.0);
+}

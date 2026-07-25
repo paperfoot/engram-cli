@@ -362,6 +362,10 @@ Examples:
     #[command(subcommand)]
     Entities(EntitiesCommand),
 
+    /// Explore your network: who you know, and how they are connected.
+    #[command(subcommand, visible_aliases = ["person"])]
+    People(PeopleCommand),
+
     /// Browse atomic (subject, predicate, object) facts and contradictions.
     #[command(subcommand)]
     Facts(FactsCommand),
@@ -659,6 +663,42 @@ pub enum GraphCommand {
         /// Minimum relation weight to include.
         #[arg(long, default_value_t = 1.0)]
         min_weight: f32,
+        /// Max neighbor nodes to return (closest first).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Drop weak `co_occurs_with` edges and keep only typed relations.
+        #[arg(long)]
+        typed_only: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PeopleCommand {
+    /// List people with their aliases, mention counts, and top relations.
+    #[command(visible_aliases = ["ls"])]
+    List {
+        /// Knowledge base/domain namespace. Pass "*" for all.
+        #[arg(long, default_value = "default")]
+        kb: String,
+        /// Max people to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Minimum mention count filter.
+        #[arg(long, default_value_t = 1)]
+        min_mentions: u32,
+    },
+    /// Show one person: aliases, relations with provenance, and the memories
+    /// that mention them.
+    #[command(visible_aliases = ["get"])]
+    Show {
+        /// Person name or any known alias (case-insensitive).
+        name: String,
+        /// Knowledge base/domain namespace. Pass "*" for all.
+        #[arg(long, default_value = "default")]
+        kb: String,
+        /// How many memory snippets to include.
+        #[arg(long, default_value_t = 5)]
+        snippets: usize,
     },
 }
 
