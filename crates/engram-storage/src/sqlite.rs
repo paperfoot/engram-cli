@@ -2993,11 +2993,26 @@ impl SqliteStore {
     /// Upsert an entity together with the alternate spellings that resolve to
     /// it ("Elias's", "Dr Jane Doe", a bare first name).
     ///
-    /// Resolution is by canonical name OR by any registered alias, both
-    /// case-folded, so a recompile converges on ONE row per real-world entity
-    /// instead of accumulating near-duplicates. The stored `kind` only ever
-    /// gets more specific (`concept` → `person`), never less: whichever chunk
-    /// carried the evidence wins regardless of chunk order.
+    /// Resolution is by canonical name OR by ANY spelling this call carries —
+    /// canonical name and aliases alike, all case-folded — so a recompile
+    /// converges on ONE row per real-world entity instead of accumulating
+    /// near-duplicates. The stored `kind` only ever gets more specific
+    /// (`concept` → `person`), never less: whichever chunk carried the
+    /// evidence wins regardless of chunk order.
+    ///
+    /// RESOLVING ON THE CANONICAL NAME ALONE was the bug that left the real
+    /// store with "Noemi" (119 mentions) beside "Noemi Varkoni" (54), and
+    /// "Maria" (432) beside "Maria Marenova" (21). The chunk that only knew
+    /// the bare first name compiled first and created its row; the chunk that
+    /// knew the full name arrived later carrying "Noemi" as an ALIAS, but the
+    /// alias insert is `OR IGNORE` under `UNIQUE(kb, alias_norm)` — the bare
+    /// row already owned that spelling, so the alias was silently dropped and
+    /// a second row appeared. Two entities for one woman, with the bare form
+    /// usually winning `people list` because it had more mentions.
+    ///
+    /// So every incoming spelling now resolves, every row it reaches is merged
+    /// into one, and a bare first name gives up its canonical slot to the full
+    /// name that contains it (see [`promotes_canonical`]).
     pub fn upsert_entity_with_aliases(
         &self,
         kb: &str,
@@ -3006,24 +3021,45 @@ impl SqliteStore {
         increment: u32,
         aliases: &[String],
     ) -> Result<Uuid, StorageError> {
-        let canonical_norm = canonical_name.to_ascii_lowercase();
-        let existing = self
-            .conn
-            .query_row(
-                "SELECT e.id FROM entities e
+        let canonical_norm = canonical_name.trim().to_ascii_lowercase();
+        // The canonical name is looked up FIRST, so when it already names a
+        // row that row survives and keeps its id (and therefore its edges).
+        let mut keys: Vec<String> = vec![canonical_norm.clone()];
+        for alias in aliases {
+            let norm = alias.trim().to_ascii_lowercase();
+            if !norm.is_empty() && !keys.contains(&norm) {
+                keys.push(norm);
+            }
+        }
+        let mut matched: Vec<String> = Vec::new();
+        for key in &keys {
+            // Cached: a compile upserts an entity per mention, and re-parsing
+            // this join for each spelling would show up on a large KB.
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT DISTINCT e.id FROM entities e
                  LEFT JOIN entity_aliases a ON a.entity_id = e.id AND a.kb = e.kb
-                 WHERE e.kb = ?1 AND (lower(e.canonical_name) = ?2 OR a.alias_norm = ?2)
-                 LIMIT 1",
-                params![kb, canonical_norm],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        let id = match existing {
-            Some(id_str) => {
-                let current_kind: String = self.conn.query_row(
-                    "SELECT kind FROM entities WHERE id = ?1",
-                    params![id_str],
-                    |r| r.get(0),
+                 WHERE e.kb = ?1 AND (lower(e.canonical_name) = ?2 OR a.alias_norm = ?2)",
+            )?;
+            let rows = stmt.query_map(params![kb, key], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let found = row?;
+                if !matched.contains(&found) {
+                    matched.push(found);
+                }
+            }
+        }
+        let id = match matched.split_first() {
+            Some((survivor, duplicates)) => {
+                let survivor = survivor.clone();
+                // One human, one row: everything the rival rows accumulated —
+                // mentions, edges, spellings — moves onto the survivor.
+                for dead in duplicates {
+                    self.merge_entity_rows(&survivor, dead)?;
+                }
+                let (current_name, current_kind): (String, String) = self.conn.query_row(
+                    "SELECT canonical_name, kind FROM entities WHERE id = ?1",
+                    params![survivor],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 let merged_kind = if kind_rank(kind) > kind_rank(&current_kind) {
                     kind
@@ -3033,9 +3069,15 @@ impl SqliteStore {
                 self.conn.execute(
                     "UPDATE entities SET mention_count = mention_count + ?1, kind = ?2
                      WHERE id = ?3",
-                    params![increment as i64, merged_kind, id_str],
+                    params![increment as i64, merged_kind, survivor],
                 )?;
-                Uuid::parse_str(&id_str).unwrap_or(Uuid::nil())
+                if promotes_canonical(&current_name, canonical_name) {
+                    self.conn.execute(
+                        "UPDATE entities SET canonical_name = ?1 WHERE id = ?2",
+                        params![canonical_name.trim(), survivor],
+                    )?;
+                }
+                Uuid::parse_str(&survivor).unwrap_or(Uuid::nil())
             }
             None => {
                 let id = Uuid::new_v4();
@@ -3092,6 +3134,73 @@ impl SqliteStore {
             params![serde_json::to_string(&stored)?, id.to_string()],
         )?;
         Ok(id)
+    }
+
+    /// Fold one entity row into another: mentions summed, kind sharpened,
+    /// edges and spellings carried over, then the rival row deleted.
+    ///
+    /// Edges keep their `provenance_json`, so every receipt `people show`
+    /// prints survives the merge. `UPDATE OR IGNORE` drops only an edge the
+    /// survivor already has under the same predicate — `UNIQUE(kb, from, to,
+    /// predicate)` — and those leftovers are deleted with the row.
+    fn merge_entity_rows(&self, survivor: &str, dead: &str) -> Result<(), StorageError> {
+        if survivor == dead {
+            return Ok(());
+        }
+        let dead_kind: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM entities WHERE id = ?1",
+                params![dead],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(dead_kind) = dead_kind else {
+            return Ok(());
+        };
+        self.conn.execute(
+            "UPDATE entities SET mention_count = mention_count
+                 + COALESCE((SELECT mention_count FROM entities WHERE id = ?2), 0)
+             WHERE id = ?1",
+            params![survivor, dead],
+        )?;
+        let survivor_kind: String = self.conn.query_row(
+            "SELECT kind FROM entities WHERE id = ?1",
+            params![survivor],
+            |r| r.get(0),
+        )?;
+        if kind_rank(&dead_kind) > kind_rank(&survivor_kind) {
+            self.conn.execute(
+                "UPDATE entities SET kind = ?1 WHERE id = ?2",
+                params![dead_kind, survivor],
+            )?;
+        }
+        self.conn.execute(
+            "UPDATE OR IGNORE relations SET from_entity_id = ?1 WHERE from_entity_id = ?2",
+            params![survivor, dead],
+        )?;
+        self.conn.execute(
+            "UPDATE OR IGNORE relations SET to_entity_id = ?1 WHERE to_entity_id = ?2",
+            params![survivor, dead],
+        )?;
+        // An edge between the two merged rows has become a self-loop.
+        self.conn.execute(
+            "DELETE FROM relations WHERE from_entity_id = ?1 AND to_entity_id = ?1",
+            params![survivor],
+        )?;
+        self.conn.execute(
+            "DELETE FROM relations WHERE from_entity_id = ?1 OR to_entity_id = ?1",
+            params![dead],
+        )?;
+        // Its spellings — including its own canonical name, which every upsert
+        // registers — become spellings of the survivor.
+        self.conn.execute(
+            "UPDATE OR IGNORE entity_aliases SET entity_id = ?1 WHERE entity_id = ?2",
+            params![survivor, dead],
+        )?;
+        self.conn
+            .execute("DELETE FROM entities WHERE id = ?1", params![dead])?;
+        Ok(())
     }
 
     /// Insert or reinforce a relation, ACCUMULATING provenance instead of
@@ -5039,6 +5148,28 @@ fn kind_rank(kind: &str) -> u8 {
     }
 }
 
+/// Should `incoming` take over as the canonical name of a row currently called
+/// `existing`?
+///
+/// Only in the one direction that identifies a human better than before: the
+/// stored name is a strict SUBSET of the incoming one, so "Noemi" yields to
+/// "Noemi Varkoni" and "Maria" to "Maria Marenova". The containment test is
+/// what keeps it honest — a messaging-app label ("Maria Microsoft London
+/// Tech") is longer but does not contain "Marenova", so it can never displace
+/// the real name, and two unrelated names never swap places.
+fn promotes_canonical(existing: &str, incoming: &str) -> bool {
+    let parts = |s: &str| -> Vec<String> {
+        s.split_whitespace()
+            .map(|w| w.to_ascii_lowercase())
+            .collect()
+    };
+    let existing = parts(existing);
+    let incoming = parts(incoming);
+    !existing.is_empty()
+        && incoming.len() > existing.len()
+        && existing.iter().all(|p| incoming.contains(p))
+}
+
 fn parse_entity_row(r: &rusqlite::Row) -> rusqlite::Result<EntityRecord> {
     let id_str: String = r.get(0)?;
     let aliases_json: String = r.get(3)?;
@@ -5747,6 +5878,151 @@ mod tests {
             .unwrap();
         assert_eq!(people.len(), 1);
         assert_eq!(people[0].canonical_name, "Elias");
+    }
+
+    /// The real store's twin rows: the chunk that only said "Noemi" compiled
+    /// before the chunk that knew "Noemi Varkoni", so the bare name owned the
+    /// row — and the alias the full name brought was silently dropped.
+    #[test]
+    fn a_full_name_absorbs_the_bare_row_that_was_created_first() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("kb", None).unwrap();
+        let bare = store
+            .upsert_entity_with_aliases("kb", "Noemi", "person", 119, &[])
+            .unwrap();
+        let avi = store.upsert_entity("kb", "Avi Roy", "person", 3).unwrap();
+        store
+            .insert_relation(
+                "kb",
+                bare,
+                avi,
+                "knows",
+                1.0,
+                serde_json::json!({ "sentence": "Noemi knows Avi Roy." }),
+                None,
+            )
+            .unwrap();
+
+        let full = store
+            .upsert_entity_with_aliases("kb", "Noemi Varkoni", "person", 54, &["Noemi".to_string()])
+            .unwrap();
+        assert_eq!(full, bare, "one woman, one row");
+
+        let entity = store.find_entity(Some("kb"), "Noemi").unwrap().unwrap();
+        assert_eq!(
+            entity.canonical_name, "Noemi Varkoni",
+            "the full name identifies her, not the bare first name"
+        );
+        assert_eq!(entity.mention_count, 173, "both mention counts survive");
+        assert!(entity.aliases.contains(&"Noemi".to_string()));
+        // Looking her up either way lands on the same row.
+        assert_eq!(
+            store
+                .find_entity(Some("kb"), "noemi varkoni")
+                .unwrap()
+                .unwrap()
+                .id,
+            entity.id
+        );
+        let people = store
+            .list_entities_by_kind(Some("kb"), "person", 10, 1)
+            .unwrap();
+        assert_eq!(
+            people
+                .iter()
+                .filter(|p| p.canonical_name.to_lowercase().contains("noemi"))
+                .count(),
+            1,
+            "no rival node: {people:?}"
+        );
+        // The edge follows her, provenance intact.
+        let rels = store.graph_neighbors("kb", "Noemi Varkoni", 2).unwrap();
+        let edge = rels
+            .iter()
+            .find(|r| r.predicate == "knows")
+            .expect("the merged row keeps its edge");
+        assert_eq!(edge.from_entity, "Noemi Varkoni");
+        assert_eq!(edge.to_entity, "Avi Roy");
+        assert!(edge.provenance.to_string().contains("Noemi knows Avi Roy."));
+    }
+
+    /// The merge is driven by an ALIAS, never by a shared first name — so two
+    /// different humans who happen to share one stay two rows.
+    #[test]
+    fn same_first_name_without_an_alias_never_merges() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("kb", None).unwrap();
+        let bare = store.upsert_entity("kb", "Laura", "person", 5).unwrap();
+        let corvo = store
+            .upsert_entity_with_aliases("kb", "Laura Corvo", "person", 2, &[])
+            .unwrap();
+        let moreno = store
+            .upsert_entity_with_aliases("kb", "Laura Quiroz", "person", 1, &[])
+            .unwrap();
+        assert_ne!(bare, corvo);
+        assert_ne!(bare, moreno);
+        assert_ne!(corvo, moreno);
+        assert_eq!(
+            store
+                .list_entities_by_kind(Some("kb"), "person", 10, 1)
+                .unwrap()
+                .len(),
+            3
+        );
+        // The bare row keeps its own name: nothing proved which Laura it is.
+        assert_eq!(
+            store
+                .find_entity(Some("kb"), "Laura")
+                .unwrap()
+                .unwrap()
+                .canonical_name,
+            "Laura"
+        );
+    }
+
+    #[test]
+    fn a_contact_label_never_displaces_the_real_name() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("kb", None).unwrap();
+        let id = store
+            .upsert_entity_with_aliases("kb", "Maria", "person", 400, &[])
+            .unwrap();
+        store
+            .upsert_entity_with_aliases("kb", "Maria Marenova", "person", 21, &["Maria".into()])
+            .unwrap();
+        // A phone-contact label is longer, but it is not her name.
+        store
+            .upsert_entity_with_aliases(
+                "kb",
+                "Maria Marenova",
+                "person",
+                4,
+                &["Maria Microsoft London Tech".into()],
+            )
+            .unwrap();
+        let entity = store
+            .find_entity(Some("kb"), "Maria Microsoft London Tech")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.id, id);
+        assert_eq!(entity.canonical_name, "Maria Marenova");
+        assert_eq!(entity.mention_count, 425);
+    }
+
+    #[test]
+    fn canonical_promotion_only_goes_bare_to_full() {
+        assert!(promotes_canonical("Noemi", "Noemi Varkoni"));
+        assert!(promotes_canonical("maria", "Maria Marenova"));
+        assert!(promotes_canonical("Avi Roy", "Avi Roy Sharma"));
+        // Never the other way, never sideways, never onto a label.
+        assert!(!promotes_canonical("Noemi Varkoni", "Noemi"));
+        assert!(!promotes_canonical(
+            "Maria Marenova",
+            "Maria Microsoft London Tech"
+        ));
+        assert!(!promotes_canonical("Laura Corvo", "Laura Quiroz"));
+        assert!(!promotes_canonical("Elias", "Elias"));
+        assert!(!promotes_canonical("", "Anything At All"));
     }
 
     #[test]
