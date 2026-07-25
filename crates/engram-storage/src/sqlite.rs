@@ -763,7 +763,7 @@ const MEMORY_CONSTRAINS_DERIVED: &str = "(
     )
 )";
 
-const CURRENT_VERSION: i32 = 8;
+const CURRENT_VERSION: i32 = 9;
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -896,6 +896,9 @@ impl SqliteStore {
             if current < 8 {
                 s.migrate_v8()?;
             }
+            if current < 9 {
+                s.migrate_v9()?;
+            }
             if current != CURRENT_VERSION {
                 s.conn.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -1002,6 +1005,26 @@ impl SqliteStore {
     /// when this migration runs are stamped with the migration time: they are
     /// deleted as of now, so any compile that starts later legitimately clears
     /// them, and any compile before now cannot be credited with having done so.
+    /// Indexes the entity graph's hot paths. Every statement here services a
+    /// predicate that could previously only scan: the canonical lookup needs a
+    /// NOCASE index because the query compares NOCASE and the default index is
+    /// BINARY; the merge path filters relations and aliases by a bare entity id,
+    /// which the existing `(kb, ...)` indexes cannot serve, and which foreign-key
+    /// enforcement also probes on delete.
+    fn migrate_v9(&self) -> Result<(), StorageError> {
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_entities_kb_name_nocase
+                 ON entities(kb, canonical_name COLLATE NOCASE);
+             CREATE INDEX IF NOT EXISTS idx_entity_aliases_entity_alias
+                 ON entity_aliases(entity_id, alias);
+             CREATE INDEX IF NOT EXISTS idx_relations_from_entity
+                 ON relations(from_entity_id);
+             CREATE INDEX IF NOT EXISTS idx_relations_to_entity
+                 ON relations(to_entity_id);",
+        )?;
+        Ok(())
+    }
+
     fn migrate_v8(&self) -> Result<(), StorageError> {
         self.add_column_if_missing("memories", "deleted_at", "TEXT")?;
         let now = chrono::Utc::now().to_rfc3339();
