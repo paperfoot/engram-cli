@@ -28,7 +28,7 @@ const FACT_EXTRACTION_PROMPT: &str = r#"You extract atomic factual claims from t
 RULES:
 - subject: the entity the claim is ABOUT (a person, place, organization, project, gene, drug, etc). Use the proper name when available.
 - predicate: a normalized verb phrase in snake_case. PREFER these canonical predicates when they fit: works_at, lives_in, has_age, has_role, married_to, partner_of, prefers, prefers_language, allergic_to, takes_medication, diagnosed_with, born_on, graduated_from, founded, owns, is_member_of, located_in, treats, inhibits, uses. Otherwise invent a sensible snake_case predicate.
-- object: the value of the claim. Keep it concise (a name, place, number, date, or short noun phrase).
+- object: the value of the claim. Keep it concise (a name, place, number, date, or short noun phrase). For date-valued predicates (born_on, died_on, married_on, founded_on, graduated_on, joined_on, started_on, ended_on, hired_on) the object MUST be an ISO date (YYYY-MM-DD) whenever the text gives a full date — it is stored as the event time.
 - confidence: 0.0..=1.0. 1.0 = explicit declarative statement; 0.7 = paraphrase or implicit; 0.4 = inferred from indirect mention.
 - fact_type: one of profile_slot (single-valued attribute: employer, city, age), preference, relationship, event (something that happened at a time), procedural (how to do something), assertion (anything else).
 - valid_from: if the text explicitly states WHEN the fact became true ("since March 2026", "starting next year"), an ISO date (YYYY-MM-DD). Otherwise null.
@@ -166,6 +166,26 @@ pub fn slot_policy(canonical: &str) -> Option<SlotPolicy> {
         }
         _ => None,
     }
+}
+
+/// Predicates whose OBJECT *is* the date the claim refers to. For these the
+/// object date is the fact's event time: `Ana born_on 1990-04-12` became true
+/// on 1990-04-12, not on the day someone typed it into the store. Callers feed
+/// this into the bi-temporal `valid_from` column so birthdays, anniversaries,
+/// and start dates answer "when" questions instead of reporting write time.
+pub fn date_valued_predicate(canonical: &str) -> bool {
+    matches!(
+        canonical,
+        "born_on"
+            | "died_on"
+            | "married_on"
+            | "founded_on"
+            | "graduated_on"
+            | "joined_on"
+            | "started_on"
+            | "ended_on"
+            | "hired_on"
+    )
 }
 
 // ----- Conflict adjudication (full-autonomy mode) -----
@@ -326,6 +346,14 @@ mod tests {
         );
         assert_eq!(slot_policy("prefers"), None);
         assert_eq!(slot_policy("inhibits"), None);
+    }
+
+    #[test]
+    fn date_valued_predicates_are_recognized() {
+        assert!(date_valued_predicate("born_on"));
+        assert!(date_valued_predicate(&canonical_predicate("Born On")));
+        assert!(!date_valued_predicate("lives_in"));
+        assert!(!date_valued_predicate("works_at"));
     }
 
     #[test]
