@@ -2784,6 +2784,137 @@ impl SqliteStore {
         }
     }
 
+    /// Every entity matching `name` (canonical name or alias, case-insensitive).
+    ///
+    /// `find_entity` returns at most one row, which is wrong for an unscoped
+    /// (all-KBs) lookup: the same person or concept usually exists once per KB,
+    /// and picking an arbitrary one silently drops the others from retrieval.
+    /// With `kb = None` this returns one entity per KB, best-mentioned first.
+    pub fn find_entities(
+        &self,
+        kb: Option<&str>,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<EntityRecord>, StorageError> {
+        let norm = name.to_ascii_lowercase();
+        let sql = if kb.is_some() {
+            "SELECT e.id, e.kb, e.canonical_name, e.aliases_json, e.kind, e.mention_count
+             FROM entities e
+             LEFT JOIN entity_aliases a ON a.entity_id = e.id
+             WHERE e.kb = ?1 AND (lower(e.canonical_name) = ?2 OR a.alias_norm = ?2)
+             GROUP BY e.id
+             ORDER BY e.mention_count DESC, e.canonical_name ASC
+             LIMIT ?3"
+        } else {
+            "SELECT e.id, e.kb, e.canonical_name, e.aliases_json, e.kind, e.mention_count
+             FROM entities e
+             LEFT JOIN entity_aliases a ON a.entity_id = e.id
+             WHERE lower(e.canonical_name) = ?1 OR a.alias_norm = ?1
+             GROUP BY e.id
+             ORDER BY e.mention_count DESC, e.canonical_name ASC
+             LIMIT ?2"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = if let Some(k) = kb {
+            stmt.query_map(params![k, norm, limit as i64], parse_entity_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![norm, limit as i64], parse_entity_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(rows)
+    }
+
+    /// KBs that hold at least one live memory OUTSIDE `diary`.
+    ///
+    /// DIARY ISOLATION INVARIANT: a diary-scoped recall never returns content
+    /// derived solely from another diary's memories. Compiler artifacts (wiki
+    /// pages, entities, relations) record only a `kb`, never a diary, so the
+    /// only sound test is at KB granularity: if a KB contains nothing but
+    /// `diary`'s memories, anything derived from it is necessarily derived from
+    /// `diary`. Any KB in this set is mixed, so its diary-less derived rows must
+    /// be withheld from a recall scoped to `diary`.
+    pub fn kbs_with_memories_outside_diary(
+        &self,
+        diary: &str,
+    ) -> Result<std::collections::HashSet<String>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT kb FROM memories WHERE deleted = 0 AND diary <> ?1")?;
+        let rows = stmt.query_map(params![diary], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// Filter `ids` down to the claims a recall scoped to `diary` may return.
+    ///
+    /// DIARY ISOLATION INVARIANT: a diary-scoped recall never returns content
+    /// derived solely from another diary's memories. A claim is a compiler/LLM
+    /// paraphrase of chunk text, so returning one whose evidence lives in
+    /// another diary leaks that diary's content in rewritten form. Claims carry
+    /// no diary column, but they do carry provenance
+    /// (claim_evidence -> chunks -> memories.diary), so the check is exact:
+    ///   - visible when any evidence resolves to a live memory in `diary`;
+    ///   - a claim with no resolvable evidence is visible only when its whole KB
+    ///     is confined to `diary` (nothing else could have produced it).
+    pub fn claims_visible_in_diary(
+        &self,
+        ids: &[Uuid],
+        diary: &str,
+    ) -> Result<std::collections::HashSet<Uuid>, StorageError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let placeholders = (2..2 + ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT c.id FROM claims c
+             WHERE c.id IN ({placeholders})
+               AND (
+                 EXISTS (
+                   SELECT 1 FROM claim_evidence ce
+                   JOIN chunks ch ON ch.id = ce.chunk_id
+                   JOIN memories m ON m.id = ch.memory_id
+                   WHERE ce.claim_id = c.id AND m.deleted = 0 AND m.diary = ?1
+                 )
+                 OR (
+                   NOT EXISTS (
+                     SELECT 1 FROM claim_evidence ce
+                     JOIN chunks ch ON ch.id = ce.chunk_id
+                     JOIN memories m ON m.id = ch.memory_id
+                     WHERE ce.claim_id = c.id AND m.deleted = 0
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM memories m2
+                     WHERE m2.deleted = 0 AND m2.kb = c.kb AND m2.diary <> ?1
+                   )
+                 )
+               )"
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
+        binds.push(Box::new(diary.to_string()));
+        for id in ids {
+            binds.push(Box::new(id.to_string()));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            if let Ok(id) = Uuid::parse_str(&row?) {
+                out.insert(id);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn graph_neighbors(
         &self,
         kb: &str,
@@ -4382,5 +4513,141 @@ mod tests {
         assert!(rels
             .iter()
             .any(|rel| rel.from_entity == "Gamma" && rel.to_entity == "Alpha"));
+    }
+
+    #[test]
+    fn find_entities_unscoped_returns_every_kbs_match() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("work", None).unwrap();
+        store.ensure_kb("home", None).unwrap();
+        store.upsert_entity("work", "Noemi", "Person", 3).unwrap();
+        store.upsert_entity("home", "Noemi", "Person", 7).unwrap();
+
+        // Scoped lookup stays scoped.
+        let scoped = store.find_entities(Some("work"), "noemi", 8).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].kb, "work");
+
+        // Unscoped lookup must not collapse to one arbitrary KB (the old
+        // `find_entity` LIMIT 1 behaviour silently dropped the other KBs).
+        let all = store.find_entities(None, "noemi", 8).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].kb, "home", "highest mention count first");
+        let kbs: std::collections::HashSet<&str> = all.iter().map(|e| e.kb.as_str()).collect();
+        assert!(kbs.contains("work") && kbs.contains("home"));
+    }
+
+    /// Memory in `kb`/`diary` with one chunk; returns (memory_id, chunk_id).
+    fn seeded_memory(store: &SqliteStore, kb: &str, diary: &str, content: &str) -> (Uuid, Uuid) {
+        let mut m = fact(content);
+        m.diary = diary.to_string();
+        store.insert_memory_with_kb(&m, kb).unwrap();
+        let chunk_id = Uuid::new_v4();
+        store
+            .insert_chunk(chunk_id, m.id, content, 0, None)
+            .unwrap();
+        (m.id, chunk_id)
+    }
+
+    #[test]
+    fn kbs_with_memories_outside_diary_flags_only_mixed_kbs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seeded_memory(&store, "shared", "work", "Quarterly numbers.");
+        seeded_memory(&store, "shared", "private", "Therapy appointment.");
+        seeded_memory(&store, "solo", "work", "Standup notes.");
+
+        let mixed = store.kbs_with_memories_outside_diary("work").unwrap();
+        assert!(mixed.contains("shared"));
+        assert!(!mixed.contains("solo"), "single-diary KB cannot leak");
+    }
+
+    #[test]
+    fn claims_visible_in_diary_follows_evidence_provenance() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let (_, private_chunk) = seeded_memory(
+            &store,
+            "shared",
+            "private",
+            "Therapy appointment on Tuesday.",
+        );
+        seeded_memory(&store, "shared", "work", "Quarterly numbers are up.");
+
+        let private_claim = store
+            .insert_claim(
+                "shared",
+                "Therapy appointment on Tuesday.",
+                "unknown",
+                0.7,
+                None,
+                Some(private_chunk),
+                None,
+            )
+            .unwrap();
+        // A claim with no resolvable evidence: admissible only when its whole
+        // KB is confined to the requesting diary.
+        let orphan_shared = store
+            .insert_claim(
+                "shared",
+                "Something summarised.",
+                "unknown",
+                0.7,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        seeded_memory(&store, "solo", "work", "Standup notes.");
+        let orphan_solo = store
+            .insert_claim("solo", "Standup summary.", "unknown", 0.7, None, None, None)
+            .unwrap();
+
+        let ids = [private_claim, orphan_shared, orphan_solo];
+
+        // The private diary's own recall still sees its claim.
+        let seen = store.claims_visible_in_diary(&ids, "private").unwrap();
+        assert!(seen.contains(&private_claim));
+
+        // A recall scoped to "work" must NOT see a paraphrase of the private
+        // diary's memory, nor an unprovenanced claim from the mixed KB.
+        let seen = store.claims_visible_in_diary(&ids, "work").unwrap();
+        assert!(!seen.contains(&private_claim));
+        assert!(!seen.contains(&orphan_shared));
+        // ...but a KB that only ever held "work" memories is safe.
+        assert!(seen.contains(&orphan_solo));
+    }
+
+    #[test]
+    fn claims_visible_in_diary_ignores_deleted_memory_evidence() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let (memory_id, chunk_id) = seeded_memory(
+            &store,
+            "shared",
+            "private",
+            "Therapy appointment on Tuesday.",
+        );
+        seeded_memory(&store, "shared", "work", "Quarterly numbers are up.");
+        let claim = store
+            .insert_claim(
+                "shared",
+                "Therapy appointment on Tuesday.",
+                "unknown",
+                0.7,
+                None,
+                Some(chunk_id),
+                None,
+            )
+            .unwrap();
+        store.soft_delete_memory(memory_id).unwrap();
+
+        // The evidence is gone, so provenance can no longer be proven and the
+        // KB is mixed — the claim stays out of every diary-scoped recall.
+        assert!(store
+            .claims_visible_in_diary(&[claim], "work")
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .claims_visible_in_diary(&[claim], "private")
+            .unwrap()
+            .is_empty());
     }
 }
