@@ -3188,3 +3188,631 @@ fn bench_personal_rejects_an_unknown_profile() {
         .failure()
         .code(3);
 }
+
+// ---------------------------------------------------------------------------
+// Verification-pass regressions. Each test below reproduces a defect an
+// adversarial review found in a live sandbox; each one fails without its fix.
+// ---------------------------------------------------------------------------
+
+/// Store a memory and return its id.
+fn remember_returning_id(tmp: &tempfile::TempDir, args: &[&str]) -> String {
+    let out = cmd_in(tmp)
+        .arg("remember")
+        .args(args)
+        .args(["--no-facts", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    parse_stdout(&out)["data"]["id"]
+        .as_str()
+        .expect("memory id")
+        .to_string()
+}
+
+/// FINDING 1 (critical): `forget` must not widen what another diary can see.
+///
+/// `forget` is a soft delete that leaves the KB's wiki pages and entity
+/// aggregates standing until the next compile. The isolation gate counted only
+/// live memories, so deleting the last memory of the private diary made the
+/// shared KB look like it belonged wholly to `work` — and a `--diary work`
+/// recall started returning wiki text paraphrasing the just-deleted private
+/// memory. Deleting content must never publish it.
+#[test]
+fn forget_does_not_unseal_another_diarys_derived_content() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let private_id = remember_returning_id(
+        &tmp,
+        &[
+            "Nadia consulted a psychiatrist about 3 ketamine infusions last winter.",
+            "--kb",
+            "shared",
+            "--diary",
+            "personal",
+        ],
+    );
+    remember_returning_id(
+        &tmp,
+        &[
+            "Standup moved to Tuesday mornings at 9 am for the whole team.",
+            "--kb",
+            "shared",
+            "--diary",
+            "work",
+        ],
+    );
+
+    // Compile builds the derived layer: wiki pages that quote chunk text
+    // verbatim, plus entity/relation aggregates.
+    cmd_in(&tmp)
+        .args(["compile", "--kb", "shared", "--all", "--json"])
+        .assert()
+        .success();
+
+    let leaked = |v: &Value| -> Vec<String> {
+        contents(v)
+            .into_iter()
+            .filter(|c| {
+                let c = c.to_lowercase();
+                c.contains("ketamine") || c.contains("psychiatrist") || c.contains("nadia")
+            })
+            .collect()
+    };
+
+    // BEFORE forget: the mixed KB is gated, and the gate says so.
+    let before = recall_json(
+        &tmp,
+        &[
+            "ketamine psychiatrist Nadia",
+            "--diary",
+            "work",
+            "--mode",
+            "agent",
+        ],
+    );
+    assert!(
+        leaked(&before).is_empty(),
+        "pre-forget leak into diary work: {:?}",
+        leaked(&before)
+    );
+    assert!(
+        before["metadata"]["diary_isolation"]["excluded_candidates"].is_object(),
+        "the gate must report what it withheld: {}",
+        before["metadata"]
+    );
+
+    // The owning diary can still read its own memory.
+    let owner = recall_json(
+        &tmp,
+        &[
+            "ketamine psychiatrist Nadia",
+            "--diary",
+            "personal",
+            "--mode",
+            "agent",
+        ],
+    );
+    assert!(
+        !leaked(&owner).is_empty(),
+        "the personal diary must still recall its own content"
+    );
+
+    cmd_in(&tmp)
+        .args(["forget", &private_id, "--confirm", "--json"])
+        .assert()
+        .success();
+
+    // AFTER forget: still gated. The wiki page and entity rows that paraphrase
+    // the deleted memory have not been purged, so the KB is not pure `work`.
+    let after = recall_json(
+        &tmp,
+        &[
+            "ketamine psychiatrist Nadia",
+            "--diary",
+            "work",
+            "--mode",
+            "agent",
+        ],
+    );
+    assert!(
+        leaked(&after).is_empty(),
+        "deleting the private memory PUBLISHED it to diary work: {:?}",
+        leaked(&after)
+    );
+    assert!(
+        after["metadata"]["diary_isolation"]["excluded_candidates"].is_object(),
+        "the withheld sources must still be reported after forget: {}",
+        after["metadata"]
+    );
+    assert_eq!(after["metadata"]["diary_isolation"]["diary"], "work");
+
+    // The gate over-blocks on purpose, so it needs a real exit: a full compile
+    // rebuilds the derived layer from live chunks only, genuinely purging the
+    // deleted memory — after which the KB is honestly pure `work` and stops
+    // being gated. Without this the KB would be blocked forever.
+    cmd_in(&tmp)
+        .args(["compile", "--kb", "shared", "--all", "--json"])
+        .assert()
+        .success();
+    let recompiled = recall_json(
+        &tmp,
+        &[
+            "ketamine psychiatrist Nadia",
+            "--diary",
+            "work",
+            "--mode",
+            "agent",
+        ],
+    );
+    assert!(
+        leaked(&recompiled).is_empty(),
+        "the recompile must PURGE the deleted memory, not expose it: {:?}",
+        leaked(&recompiled)
+    );
+    assert!(
+        recompiled["metadata"]["diary_isolation"].is_null(),
+        "once the KB really is single-diary, nothing should be withheld: {}",
+        recompiled["metadata"]
+    );
+}
+
+/// FINDING 2 (major): the "already extracted" marker is a promise that the
+/// facts are in the store, so it may only be written after they are.
+///
+/// Recording it straight off the LLM response meant a persistence failure was
+/// merely warned about while the memory was still marked done — and
+/// `facts backfill` treats any marker row as processed, so those facts were
+/// lost permanently and invisibly.
+#[test]
+fn a_failed_fact_write_leaves_the_memory_pending_for_backfill() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+
+    let out = cmd_with_extractor(&tmp, LISBON_SCRIPT)
+        .env("ENGRAM_FACT_WRITE_FAIL", "Ana")
+        .args([
+            "remember",
+            "Ana moved to Lisbon last March.",
+            "--kb",
+            "personal",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    // The memory is stored, the failure is loud, and nothing was persisted.
+    assert_eq!(v["data"]["stored"], true);
+    assert_eq!(v["data"]["fact_extraction"], "failed_partial_persist");
+    assert_eq!(v["data"]["facts_added"], 0);
+    assert!(v["data"]["fact_extraction_note"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("facts backfill"));
+
+    // The memory must still be in the backfill queue.
+    let pending = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "backfill", "--kb", "personal", "--dry-run"],
+    );
+    assert_eq!(
+        pending["data"]["pending"], 1,
+        "a memory whose facts never persisted must stay pending: {}",
+        pending["data"]
+    );
+
+    // And a later backfill actually recovers the facts.
+    let done = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["facts", "backfill", "--kb", "personal"],
+    );
+    assert_eq!(done["data"]["processed"], 1);
+    assert_eq!(done["data"]["facts_added"], 1);
+
+    let facts = run_json(&mut cmd_in(&tmp), &["facts", "list", "--kb", "personal"]);
+    assert_eq!(facts["data"]["count"], 1);
+    assert_eq!(facts["data"]["facts"][0]["predicate"], "lives_in");
+}
+
+/// FINDING 3 (major): `--since/--until` bound a memory's event time, and only
+/// raw chunks have one. Wiki pages, claims and entity aggregates were never
+/// filtered, so a window could return a wiki page compiled from a 2010 memory.
+#[test]
+fn a_temporal_window_excludes_derived_sources_and_says_so() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    cmd_in(&tmp)
+        .args([
+            "remember",
+            "Marguerite presented the vermilion protocol at the Kyoto workshop.",
+            "--kb",
+            "archive",
+            "--event-time",
+            "2010-05-04",
+            "--no-facts",
+            "--json",
+        ])
+        .assert()
+        .success();
+    cmd_in(&tmp)
+        .args(["compile", "--kb", "archive", "--all", "--json"])
+        .assert()
+        .success();
+
+    let kinds = |v: &Value| -> Vec<String> {
+        v["data"]["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    // Control: the wiki page exists and matches the query.
+    let control = recall_json(&tmp, &["Marguerite vermilion protocol", "--mode", "wiki"]);
+    assert!(
+        kinds(&control).iter().any(|k| k == "wiki_page"),
+        "expected a wiki page without a window: {:?}",
+        kinds(&control)
+    );
+    assert!(
+        control["metadata"]["temporal_scope"].is_null(),
+        "no window means no temporal note"
+    );
+
+    // Windowed: the 2010 page is not admissible under a 2025+ window.
+    let windowed = recall_json(
+        &tmp,
+        &[
+            "Marguerite vermilion protocol",
+            "--mode",
+            "wiki",
+            "--since",
+            "2025-01-01",
+        ],
+    );
+    assert!(
+        !kinds(&windowed).iter().any(|k| k == "wiki_page"),
+        "a wiki page compiled from a 2010 memory leaked through --since: {:?}",
+        kinds(&windowed)
+    );
+    let excluded = windowed["metadata"]["temporal_scope"]["excluded_sources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        excluded.iter().any(|s| s == "wiki"),
+        "the exclusion must be reported, not silent: {}",
+        windowed["metadata"]["temporal_scope"]
+    );
+
+    // Agent mode withholds every derived source, all reported.
+    let agent = recall_json(
+        &tmp,
+        &[
+            "Marguerite vermilion protocol",
+            "--mode",
+            "agent",
+            "--since",
+            "2025-01-01",
+        ],
+    );
+    let excluded = agent["metadata"]["temporal_scope"]["excluded_sources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for source in ["claim", "entity", "wiki"] {
+        assert!(
+            excluded.iter().any(|s| s == source),
+            "{source} exclusion missing from {}",
+            agent["metadata"]["temporal_scope"]
+        );
+    }
+}
+
+/// FINDING 4 (major): `people show --kb '*'` used a LIMIT-1 lookup with no
+/// ORDER BY, so SQLite returned one arbitrary KB's row and every other KB's
+/// relations, aliases and mentions vanished from an explicitly all-KB query.
+#[test]
+fn people_show_across_every_kb_merges_instead_of_dropping_kbs() {
+    let (tmp, _cmd) = with_isolated_home();
+    for (kb, text) in [
+        (
+            "network-a",
+            "Avi Roy introduced me to Noemi Kostova at the Longevity Summit.",
+        ),
+        (
+            "network-b",
+            "Priya Nair introduced me to Noemi Kostova at the Basel workshop.",
+        ),
+    ] {
+        let fixture = tmp.path().join(format!("{kb}.md"));
+        std::fs::write(&fixture, text).unwrap();
+        cmd_in(&tmp)
+            .args([
+                "ingest",
+                fixture.to_str().unwrap(),
+                "--kb",
+                kb,
+                "--mode",
+                "general",
+                "--compile",
+                "evidence",
+                "--json",
+            ])
+            .assert()
+            .success();
+    }
+
+    let v = json_cmd(&tmp, &["people", "show", "Noemi Kostova", "--kb", "*"]);
+    let kbs: Vec<&str> = v["data"]["kbs"]
+        .as_array()
+        .expect("kbs array")
+        .iter()
+        .filter_map(|k| k.as_str())
+        .collect();
+    assert!(
+        kbs.contains(&"network-a") && kbs.contains(&"network-b"),
+        "an all-KB lookup dropped a KB: {kbs:?}"
+    );
+
+    // Relations from BOTH KBs, each still carrying its own provenance.
+    let relations = v["data"]["relations"].as_array().expect("relations");
+    let relation_kbs: Vec<&str> = relations.iter().filter_map(|r| r["kb"].as_str()).collect();
+    assert!(
+        relation_kbs.contains(&"network-a") && relation_kbs.contains(&"network-b"),
+        "relations came from only one KB: {relation_kbs:?}"
+    );
+    let others: Vec<&str> = relations
+        .iter()
+        .filter_map(|r| r["other"].as_str())
+        .collect();
+    assert!(
+        others.contains(&"Avi Roy") && others.contains(&"Priya Nair"),
+        "both KBs' counterparties must survive the merge: {others:?}"
+    );
+
+    // Per-KB grouping keeps the namespaces separable.
+    let groups = v["data"]["relations_by_kb"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2, "one group per KB: {groups:?}");
+
+    // Mentions are summed, not taken from one arbitrary row.
+    let merged = v["data"]["person"]["mentions"].as_u64().unwrap_or(0);
+    let single = json_cmd(
+        &tmp,
+        &["people", "show", "Noemi Kostova", "--kb", "network-a"],
+    )["data"]["person"]["mentions"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        merged > single,
+        "merged mentions ({merged}) must exceed a single KB's ({single})"
+    );
+}
+
+/// FINDING 5 (major): `remember --event-time` accepts `YYYY-MM-DD` and its help
+/// says it drives `recall --since/--until`, but the reader was RFC3339-only, so
+/// the documented round-trip exited 3. A date-only bound now brackets the whole
+/// UTC day: `--since` at its start, `--until` at its end.
+#[test]
+fn recall_since_and_until_accept_a_bare_date() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    cmd_in(&tmp)
+        .args([
+            "remember",
+            "Turmeric harvest logged at the Sintra allotment.",
+            "--kb",
+            "garden",
+            "--event-time",
+            "2026-06-15T18:00:00Z",
+            "--no-facts",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let found = |args: &[&str]| -> bool {
+        contents(&recall_json(&tmp, args))
+            .iter()
+            .any(|c| c.contains("Turmeric harvest"))
+    };
+
+    // Date-only --since is the start of the day, so the same day matches.
+    assert!(found(&["Turmeric harvest Sintra", "--since", "2026-06-15"]));
+    // Date-only --until is the END of the day: an 18:00 event is inside it.
+    assert!(found(&["Turmeric harvest Sintra", "--until", "2026-06-15"]));
+    // Both bounds on the same date select exactly that day.
+    assert!(found(&[
+        "Turmeric harvest Sintra",
+        "--since",
+        "2026-06-15",
+        "--until",
+        "2026-06-15"
+    ]));
+    // And the window really is a filter, not a no-op.
+    assert!(!found(&[
+        "Turmeric harvest Sintra",
+        "--since",
+        "2026-06-16"
+    ]));
+    assert!(!found(&[
+        "Turmeric harvest Sintra",
+        "--until",
+        "2026-06-14"
+    ]));
+    // RFC3339 keeps working.
+    assert!(found(&[
+        "Turmeric harvest Sintra",
+        "--since",
+        "2026-06-15T00:00:00Z"
+    ]));
+
+    // `memory search` is the same engine and takes the same window.
+    let out = cmd_in(&tmp)
+        .args([
+            "memory",
+            "search",
+            "Turmeric harvest Sintra",
+            "--since",
+            "2026-06-15",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(contents(&parse_stdout(&out))
+        .iter()
+        .any(|c| c.contains("Turmeric harvest")));
+
+    // Garbage is still a hard error, never a silent "now".
+    for bad in ["last tuesday", "2026-13-45"] {
+        cmd_in(&tmp)
+            .args(["recall", "anything", "--since", bad, "--json"])
+            .assert()
+            .failure()
+            .code(3);
+        cmd_in(&tmp)
+            .args(["recall", "anything", "--until", bad, "--json"])
+            .assert()
+            .failure()
+            .code(3);
+    }
+}
+
+/// FINDING 6a (major): `facts list` defaulted to the KB literally named
+/// "default", so facts written to any other KB came back as `count: 0` with
+/// exit 0 — which an agent reads as "extraction produced nothing".
+#[test]
+fn facts_list_spans_every_kb_by_default_and_labels_each_fact() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    cmd_in(&tmp)
+        .args([
+            "remember",
+            "Ana moved to Lisbon last March.",
+            "--kb",
+            "personal",
+            "--facts-json",
+            r#"[{"subject":"Ana","predicate":"lives_in","object":"Lisbon","confidence":1.0}]"#,
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    // No --kb: every KB, and each fact says where it came from.
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "list"]);
+    assert_eq!(
+        v["data"]["count"], 1,
+        "an unscoped facts list must find facts in named KBs: {}",
+        v["data"]
+    );
+    assert_eq!(v["data"]["kb"], "*");
+    assert_eq!(v["data"]["kb_scope"], "all_kbs");
+    assert_eq!(v["data"]["facts"][0]["kb"], "personal");
+
+    // --kb still narrows.
+    let scoped = run_json(&mut cmd_in(&tmp), &["facts", "list", "--kb", "personal"]);
+    assert_eq!(scoped["data"]["count"], 1);
+    assert_eq!(scoped["data"]["kb_scope"], "flag");
+    let elsewhere = run_json(&mut cmd_in(&tmp), &["facts", "list", "--kb", "default"]);
+    assert_eq!(elsewhere["data"]["count"], 0);
+}
+
+/// FINDING 6b (major): `facts backfill` hard-required `--kb`, so catching up
+/// the fact layer meant already knowing every namespace ever written to.
+/// Omitting it now sweeps every KB, oldest first, writing each memory's facts
+/// back into that memory's own KB.
+#[test]
+fn facts_backfill_without_a_kb_sweeps_every_kb() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    for (kb, content) in [
+        ("personal", "Ana moved to Lisbon last March."),
+        ("elsewhere", "Ana works at Acme Corp."),
+    ] {
+        cmd_in(&tmp)
+            .args(["remember", content, "--kb", kb, "--json"])
+            .assert()
+            .success();
+    }
+
+    // Dry run with no --kb covers both namespaces and labels each memory.
+    let dry = run_json(&mut cmd_in(&tmp), &["facts", "backfill", "--dry-run"]);
+    assert_eq!(dry["data"]["kb"], "*");
+    assert_eq!(dry["data"]["memories_total"], 2);
+    assert_eq!(dry["data"]["would_process"], 2);
+    let kbs: Vec<&str> = dry["data"]["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["kb"].as_str())
+        .collect();
+    assert!(
+        kbs.contains(&"personal") && kbs.contains(&"elsewhere"),
+        "the sweep must span both KBs: {kbs:?}"
+    );
+
+    // The real sweep routes each memory's facts back into its own KB.
+    let done = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["facts", "backfill"],
+    );
+    assert_eq!(done["data"]["processed"], 2);
+    assert_eq!(done["data"]["facts_added"], 2);
+
+    let personal = run_json(&mut cmd_in(&tmp), &["facts", "list", "--kb", "personal"]);
+    assert_eq!(personal["data"]["count"], 1);
+    assert_eq!(personal["data"]["facts"][0]["predicate"], "lives_in");
+    let elsewhere = run_json(&mut cmd_in(&tmp), &["facts", "list", "--kb", "elsewhere"]);
+    assert_eq!(elsewhere["data"]["count"], 1);
+    assert_eq!(elsewhere["data"]["facts"][0]["predicate"], "works_at");
+}
+
+/// FINDING 7 (small): `--diary '*'` is a read-side wildcard. Writing to it
+/// stored a diary literally named `*` — unreachable by its own scoped recall,
+/// and enough to mark the KB permanently mixed for diary isolation.
+#[test]
+fn writing_to_the_diary_wildcard_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    for bad in ["*", "   ", ""] {
+        cmd_in(&tmp)
+            .args(["remember", "Something durable.", "--diary", bad, "--json"])
+            .assert()
+            .failure()
+            .code(3);
+        cmd_in(&tmp)
+            .args([
+                "memory",
+                "add",
+                "Something durable.",
+                "--diary",
+                bad,
+                "--json",
+            ])
+            .assert()
+            .failure()
+            .code(3);
+    }
+
+    let fixture = tmp.path().join("note.md");
+    std::fs::write(&fixture, "A note worth ingesting.").unwrap();
+    cmd_in(&tmp)
+        .args([
+            "ingest",
+            fixture.to_str().unwrap(),
+            "--diary",
+            "*",
+            "--mode",
+            "general",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(3);
+
+    // Nothing was written under the wildcard name.
+    let v = run_json(&mut cmd_in(&tmp), &["memory", "list", "--diary", "*"]);
+    assert_eq!(v["data"]["memories"].as_array().map(|a| a.len()), Some(0));
+}
