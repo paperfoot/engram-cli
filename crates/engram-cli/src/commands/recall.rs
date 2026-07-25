@@ -9,6 +9,7 @@ use crate::retrieval::{
 };
 use chrono::{DateTime, Utc};
 use engram_core::layers::approx_tokens;
+use engram_core::temporal::{parse_bound, DayBound};
 use engram_core::types::Layer;
 use engram_embed::gemini::{GeminiEmbedder, DEFAULT_DIMS, DEFAULT_MODEL, PROMPT_FORMAT};
 use engram_embed::stub::StubEmbedder;
@@ -43,8 +44,8 @@ pub async fn run(
     let layer_enum = parse_layer(&layer)?;
     let recall_mode = RecallMode::parse(&mode)?;
     let profile_enum = RetrievalProfile::parse(&profile)?;
-    let since_dt = parse_optional_time(&since)?;
-    let until_dt = parse_optional_time(&until)?;
+    let since_dt = parse_optional_time(&since, DayBound::Start)?;
+    let until_dt = parse_optional_time(&until, DayBound::End)?;
     let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -251,6 +252,11 @@ pub async fn run(
     if let Some(isolation) = notes.diary_isolation_json() {
         meta.add("diary_isolation", isolation);
     }
+    // Same contract for the temporal window: name the sources it withheld, so
+    // "no wiki page came back" reads as a scope decision, not an empty store.
+    if let Some(temporal) = notes.temporal_scope_json() {
+        meta.add("temporal_scope", temporal);
+    }
     meta.add(
         "retriever",
         if use_cloud_embedder {
@@ -307,7 +313,8 @@ pub async fn run(
                 "candidates_considered": rerank_candidates,
                 "kb": scope.label(),
                 "kb_scope": scope.origin.as_str(),
-                "diary_isolation": notes.diary_isolation_json()
+                "diary_isolation": notes.diary_isolation_json(),
+                "temporal_scope": notes.temporal_scope_json()
             }
         }),
         meta,
@@ -447,11 +454,66 @@ fn parse_layer(s: &str) -> Result<Layer, CliError> {
     }
 }
 
-fn parse_optional_time(s: &Option<String>) -> Result<Option<DateTime<Utc>>, CliError> {
+/// Parse `--since` / `--until`.
+///
+/// The write side (`remember --event-time`) accepts RFC3339 *or* `YYYY-MM-DD`
+/// and its own help text says it drives `recall --since/--until`, so the read
+/// side has to accept the same spellings — an RFC3339-only reader turned the
+/// documented round-trip (`--event-time 2026-06-01` then `--since 2026-06-01`)
+/// into exit 3.
+///
+/// A bare date is a whole day, so the bound it denotes depends on its side of
+/// the range: `--since 2026-06-01` starts at 00:00:00Z and
+/// `--until 2026-06-01` ends at 23:59:59.999999999Z, which makes
+/// `--since D --until D` select exactly day D. RFC3339 input is an exact
+/// instant and is unchanged. Anything else is still a hard error, never a
+/// silent "now".
+fn parse_optional_time(
+    s: &Option<String>,
+    bound: DayBound,
+) -> Result<Option<DateTime<Utc>>, CliError> {
     match s {
         None => Ok(None),
-        Some(v) => DateTime::parse_from_rfc3339(v)
-            .map(|d| Some(d.with_timezone(&Utc)))
-            .map_err(|e| CliError::BadInput(format!("invalid timestamp {v}: {e}"))),
+        Some(v) => parse_bound(v, bound).map(Some).ok_or_else(|| {
+            CliError::BadInput(format!(
+                "invalid timestamp {v}: expected RFC3339 (2026-06-01T09:30:00Z) or YYYY-MM-DD"
+            ))
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn since_and_until_accept_a_bare_date_and_bracket_the_day() {
+        let since = parse_optional_time(&Some("2026-06-01".into()), DayBound::Start)
+            .unwrap()
+            .unwrap();
+        let until = parse_optional_time(&Some("2026-06-01".into()), DayBound::End)
+            .unwrap()
+            .unwrap();
+        assert_eq!(since.to_rfc3339(), "2026-06-01T00:00:00+00:00");
+        assert_eq!(until.to_rfc3339(), "2026-06-01T23:59:59.999999999+00:00");
+    }
+
+    #[test]
+    fn rfc3339_bounds_are_unchanged() {
+        let t = parse_optional_time(&Some("2026-06-01T09:30:00Z".into()), DayBound::End)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.to_rfc3339(), "2026-06-01T09:30:00+00:00");
+    }
+
+    #[test]
+    fn garbage_bounds_are_bad_input_exit_3() {
+        for raw in ["not a date", "2026-13-45", ""] {
+            let err = parse_optional_time(&Some(raw.into()), DayBound::Start).unwrap_err();
+            assert_eq!(err.exit_code(), 3, "{raw}");
+        }
+        assert!(parse_optional_time(&None, DayBound::Start)
+            .unwrap()
+            .is_none());
     }
 }
