@@ -227,6 +227,23 @@ async fn compile_within_tx(
     let mut doc_takeaway_done: HashSet<Option<uuid::Uuid>> = HashSet::new();
     let mut span_by_chunk: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
 
+    // KB-WIDE PERSON PASS. One chunk cannot tell "Noemi" from "Noemi
+    // Varkoni" — which is how the real store ended up with the same human
+    // twice (Noemi 106 / Noemi Varkoni 66, Avi 52 / Avi Roy 25, Patrick 57 /
+    // Patrick Ashcomb Pruett). So scan every chunk once to learn the KB's full
+    // names, then analyze each chunk again with that index: a bare first name
+    // folds into the one full name it can belong to, and stays its own node
+    // when two full names compete for it (see `PersonIndex`).
+    let person_index = {
+        let mut builder = engram_graph::people::PersonIndexBuilder::default();
+        for chunk in chunks {
+            // Each extraction is folded in and dropped: only the name/kind
+            // aggregate is kept, never every chunk's edges and sentences.
+            builder.add(&engram_graph::people::analyze(&chunk.content));
+        }
+        builder.finish()
+    };
+
     for chunk in chunks {
         // Chunk-level span (no char offset — used by the LLM path, which
         // attributes claims to the whole chunk).
@@ -246,9 +263,10 @@ async fn compile_within_tx(
         span_by_chunk.insert(chunk.chunk_id, chunk_span_id);
 
         // Person-aware extraction: hygienic entity surfaces (no contractions,
-        // possessives folded onto their owner), person typing, and typed
-        // person↔person edges — all deterministic and offline.
-        let extraction = engram_graph::people::analyze(&chunk.content);
+        // possessives folded onto their owner, no greetings or contact labels
+        // standing up rival nodes), person typing, and typed person↔person
+        // edges — all deterministic and offline, now resolved KB-wide.
+        let extraction = engram_graph::people::analyze_with_index(&chunk.content, &person_index);
         let mut local_entities = Vec::new();
         let mut kept_other = 0usize;
         let mut kept_people = 0usize;
@@ -620,7 +638,7 @@ fn insert_llm_evidence(
                 }
             }
         }
-        let kind = normalize_llm_kind(entity.kind.as_deref(), &canonical.name);
+        let kind = normalize_llm_kind(entity.kind.as_deref(), &canonical);
         let id = ctx
             .store
             .upsert_entity_with_aliases(kb, &canonical.name, kind, 1, &aliases)?;
@@ -687,7 +705,7 @@ fn insert_llm_evidence(
             if let Some(id) = ids.get(&canonical.name.to_lowercase()).copied() {
                 return Ok(id);
             }
-            let kind = normalize_llm_kind(None, &canonical.name);
+            let kind = normalize_llm_kind(None, canonical);
             let id = ctx.store.upsert_entity_with_aliases(
                 kb,
                 &canonical.name,
@@ -873,8 +891,10 @@ const ALLOWED_KINDS: &[&str] = &[
     "concept",
 ];
 
-fn normalize_llm_kind(kind: Option<&str>, name: &str) -> &'static str {
-    let heuristic = infer_entity_kind(name);
+fn normalize_llm_kind(kind: Option<&str>, canonical: &engram_graph::Canonical) -> &'static str {
+    // A model that answers with a greeting or a contact label gets the same
+    // repair as the offline path, including its person evidence.
+    let heuristic = infer_entity_kind(&canonical.name, canonical.person_hint);
     let Some(kind) = kind.map(|k| k.trim().to_ascii_lowercase()) else {
         return heuristic;
     };
@@ -1150,9 +1170,13 @@ fn infer_evidence_level(text: &str) -> &'static str {
 }
 
 /// Kind inference without surrounding text (LLM path, entity backfill).
-/// The context-aware version lives in `engram_graph::people`.
-fn infer_entity_kind(name: &str) -> &'static str {
-    engram_graph::people::infer_kind(name, false)
+///
+/// `person_hint` carries the only evidence a bare surface can give: it was a
+/// greeting ("Heyy Elias") or a messaging-app contact label ("Maria Microsoft
+/// London Tech"), both of which address a human. The context-aware version
+/// lives in `engram_graph::people`.
+fn infer_entity_kind(name: &str, person_hint: bool) -> &'static str {
+    engram_graph::people::infer_kind(name, person_hint)
 }
 
 fn slugify(name: &str) -> String {
@@ -1252,12 +1276,15 @@ mod tests {
 
     #[test]
     fn entity_kind_not_every_caps_token_is_gene() {
-        assert_eq!(infer_entity_kind("DNA"), "concept");
-        assert_eq!(infer_entity_kind("FDA"), "concept");
-        assert_eq!(infer_entity_kind("ELISA"), "concept");
-        assert_eq!(infer_entity_kind("BRCA1"), "gene_or_protein");
-        assert_eq!(infer_entity_kind("IL-6"), "gene_or_protein");
-        assert_eq!(infer_entity_kind("Acme Labs"), "organization");
+        assert_eq!(infer_entity_kind("DNA", false), "concept");
+        assert_eq!(infer_entity_kind("FDA", false), "concept");
+        assert_eq!(infer_entity_kind("ELISA", false), "concept");
+        assert_eq!(infer_entity_kind("BRCA1", false), "gene_or_protein");
+        assert_eq!(infer_entity_kind("IL-6", false), "gene_or_protein");
+        assert_eq!(infer_entity_kind("Acme Labs", false), "organization");
+        // A place is never a person, however strong the surrounding cue.
+        assert_eq!(infer_entity_kind("London", true), "concept");
+        assert_eq!(infer_entity_kind("Islam", true), "concept");
     }
 
     #[test]

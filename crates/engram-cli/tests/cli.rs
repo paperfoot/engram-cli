@@ -3851,3 +3851,326 @@ fn facts_list_spans_every_diary_by_default_and_says_so() {
     let v = run_json(&mut cmd_in(&tmp), &["facts", "list", "--diary", "personal"]);
     assert_eq!(v["data"]["count"], 0);
 }
+
+// ---------------------------------------------------------------------------
+// Entity hygiene v2 — the person graph after a real WhatsApp/notes import.
+//
+// Compiling the owner's real store produced a `people list` whose top entries
+// included [Maria Microsoft London Tech 340], [Heyy Elias 183], [London 84],
+// [Ibiza 49], [Singapore 48], [Islam 32], [Oh 31] and [Good 20], while the
+// humans it did find were split in half (Noemi 106 / Noemi Varkoni 66, Avi 52
+// / Avi Roy 25, Patrick 57 / Patrick Ashcomb Pruett 57). This fixture
+// reproduces every one of those failure classes end to end.
+// ---------------------------------------------------------------------------
+
+/// Ingest a small WhatsApp-shaped corpus — one file per conversation, so the
+/// name unification has to work ACROSS chunks — and compile it.
+fn whatsapp_kb() -> tempfile::TempDir {
+    let (tmp, _) = with_isolated_home();
+    let files: [(&str, &str); 6] = [
+        (
+            "chat-maria.md",
+            "# WhatsApp export — Maria\n\n\
+             Maria Microsoft London Tech: Heyy Elias, the deck is ready for the review.\n\
+             Elias: Thanks Maria. Ok great, I will send notes tonight.\n\
+             Maria Microsoft London Tech: Good morning Elias. Oh and happy birthday!\n\
+             Elias: Morning Maria, dinner on Friday works for me.\n",
+        ),
+        (
+            "chat-noemi.md",
+            "# Notes — Noemi and Avi\n\n\
+             Noemi Varkoni introduced me to Avi Roy at the Longevity Summit.\n\
+             Noemi is speaking in Singapore next month and asked me to join her.\n\
+             Avi emailed me about the fund. I told Avi we should meet in London.\n\
+             I met Lira in London last week and we flew to Ibiza with my friend Avi Roy.\n",
+        ),
+        // The two Lauras live in DIFFERENT conversations on purpose: chunk by
+        // chunk each looks unambiguous, so a per-chunk fold would give both of
+        // them the alias "Laura" and the alias table (unique per KB) would
+        // quietly award one woman's mentions to the other.
+        (
+            "chat-laura-corvo.md",
+            "# Notes — Laura Corvo\n\n\
+             Laura Corvo is a friend from the Barcelona trip; we had dinner in London.\n\
+             Laura texted me about the trip photos.\n",
+        ),
+        (
+            "chat-laura-dating.md",
+            "# Notes — dating\n\n\
+             Laura Quiroz is someone I met on a dating app while in Ibiza.\n\
+             Laura asked if I am free on Friday.\n",
+        ),
+        (
+            "chat-branislava.md",
+            "# WhatsApp export — family\n\n\
+             BRANISLAVA MARENOVIC: call me when you land in Belgrade.\n\
+             Branislava Marenovic is my cousin and she called on Sunday.\n\
+             Branislava sent photos from the wedding.\n\
+             Islam came up over dinner with Lira. My friend Lira is Serbian.\n",
+        ),
+        (
+            "chat-elias.md",
+            "# Notes — Elias\n\n\
+             Elias Danilovski runs the biotech fund from London.\n\
+             Elias met Patrick Ashcomb Pruett at the summit in Ibiza.\n\
+             Patrick asked about the raise and Pruett wants an intro to Avi Roy.\n\
+             Elias's calendar is full. Heyy Elias, are we still on for Friday?\n",
+        ),
+    ];
+    for (name, body) in files {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        cmd_in(&tmp)
+            .args([
+                "ingest",
+                path.to_str().unwrap(),
+                "--kb",
+                "whatsapp",
+                "--mode",
+                "general",
+                "--json",
+            ])
+            .assert()
+            .success();
+    }
+    json_cmd(&tmp, &["compile", "--kb", "whatsapp", "--all"]);
+    tmp
+}
+
+fn people_named(v: &Value) -> Vec<String> {
+    v["data"]["people"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn person<'a>(v: &'a Value, name: &str) -> &'a Value {
+    v["data"]["people"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("{name} missing from {:?}", people_named(v)))
+}
+
+fn aliases_of(person: &Value) -> Vec<String> {
+    person["aliases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a.as_str())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+#[test]
+fn places_creeds_and_chat_filler_are_never_people() {
+    let tmp = whatsapp_kb();
+    let v = json_cmd(
+        &tmp,
+        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
+    );
+    let names = people_named(&v);
+    for junk in [
+        // Places and a creed, every one of them in an interpersonal context.
+        "London",
+        "Ibiza",
+        "Singapore",
+        "Barcelona",
+        "Belgrade",
+        "Islam",
+        "Serbian",
+        // Sentence-initial interjections and acknowledgements.
+        "Oh",
+        "Good",
+        "Ok",
+        "Thanks",
+        "Morning",
+        // Greeting-prefixed and contact-label forms.
+        "Heyy Elias",
+        "Morning Maria",
+        "Thanks Maria",
+        "Good Morning",
+        "Maria Microsoft London Tech",
+    ] {
+        assert!(
+            !names.contains(&junk.to_string()),
+            "{junk} must not be a person: {names:?}"
+        );
+    }
+    // Places survive as ordinary entities — only the TYPE was ever wrong.
+    let entities = json_cmd(
+        &tmp,
+        &["entities", "list", "--kb", "whatsapp", "--limit", "200"],
+    );
+    let london = entities["data"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["canonical_name"] == "London")
+        .expect("London is still an entity");
+    assert_eq!(london["kind"], "concept");
+}
+
+#[test]
+fn a_contact_label_resolves_to_the_person_with_the_label_as_an_alias() {
+    let tmp = whatsapp_kb();
+    let v = json_cmd(
+        &tmp,
+        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
+    );
+    let maria = person(&v, "Maria");
+    assert!(
+        aliases_of(maria).contains(&"Maria Microsoft London Tech".to_string()),
+        "the WhatsApp label must stay resolvable: {:?}",
+        aliases_of(maria)
+    );
+    // …and the label itself still resolves back to her.
+    let show = json_cmd(
+        &tmp,
+        &[
+            "people",
+            "show",
+            "Maria Microsoft London Tech",
+            "--kb",
+            "whatsapp",
+        ],
+    );
+    assert_eq!(show["data"]["person"]["name"], "Maria");
+    assert_eq!(show["data"]["person"]["kind"], "person");
+}
+
+#[test]
+fn greetings_and_case_variants_fold_onto_the_person() {
+    let tmp = whatsapp_kb();
+    let v = json_cmd(
+        &tmp,
+        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
+    );
+
+    // "Heyy Elias" was the real store's second-biggest person, and it had
+    // swallowed the actual Elias's mentions along with the greeting.
+    let elias = person(&v, "Elias Danilovski");
+    let aliases = aliases_of(elias);
+    assert!(aliases.contains(&"Elias".to_string()), "{aliases:?}");
+    assert!(aliases.contains(&"Elias's".to_string()), "{aliases:?}");
+    assert!(
+        elias["mentions"].as_u64().unwrap() >= 6,
+        "every greeting must count for the human: {elias}"
+    );
+
+    // A shouted WhatsApp contact line and the prose spelling are one person,
+    // displayed the way a human writes a name.
+    let branislava = person(&v, "Branislava Marenovic");
+    assert!(aliases_of(branislava).contains(&"Branislava".to_string()));
+    assert!(!people_named(&v).contains(&"BRANISLAVA MARENOVIC".to_string()));
+}
+
+#[test]
+fn bare_first_names_unify_kb_wide_when_unambiguous() {
+    let tmp = whatsapp_kb();
+    let v = json_cmd(
+        &tmp,
+        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
+    );
+    let names = people_named(&v);
+
+    for (short, full) in [
+        ("Noemi", "Noemi Varkoni"),
+        ("Avi", "Avi Roy"),
+        ("Patrick", "Patrick Ashcomb Pruett"),
+        ("Branislava", "Branislava Marenovic"),
+    ] {
+        assert!(
+            !names.contains(&short.to_string()),
+            "{short} must fold into {full}, not stand alone: {names:?}"
+        );
+        let merged = person(&v, full);
+        assert!(
+            aliases_of(merged).contains(&short.to_string()),
+            "{full} must carry {short} as an alias: {:?}",
+            aliases_of(merged)
+        );
+    }
+    // The mention counts merged rather than splitting across two nodes.
+    assert!(person(&v, "Avi Roy")["mentions"].as_u64().unwrap() >= 4);
+    // The bare form still resolves in `people show`.
+    let show = json_cmd(&tmp, &["people", "show", "Noemi", "--kb", "whatsapp"]);
+    assert_eq!(show["data"]["person"]["name"], "Noemi Varkoni");
+}
+
+/// SAFETY: the owner knows two different Lauras (a friend, Laura Corvo, and
+/// someone from a dating thread), and they appear in different conversations.
+/// Same-first-name merging must never fuse two humans — which is why the
+/// unifier folds only on an EXACTLY-ONE match, decided KB-wide rather than
+/// chunk by chunk.
+#[test]
+fn two_people_sharing_a_first_name_are_never_fused() {
+    let tmp = whatsapp_kb();
+    let v = json_cmd(
+        &tmp,
+        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
+    );
+    let names = people_named(&v);
+    for expected in ["Laura Corvo", "Laura Quiroz", "Laura"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected} must stay its own node: {names:?}"
+        );
+    }
+    for full in ["Laura Corvo", "Laura Quiroz"] {
+        assert!(
+            !aliases_of(person(&v, full)).contains(&"Laura".to_string()),
+            "{full} absorbed the ambiguous bare name: {:?}",
+            aliases_of(person(&v, full))
+        );
+    }
+    // Neither full name may collect the other's bare mentions, so the two
+    // ambiguous ones stay on the ambiguous node.
+    assert_eq!(person(&v, "Laura Corvo")["mentions"], 1);
+    assert_eq!(person(&v, "Laura Quiroz")["mentions"], 1);
+    assert_eq!(person(&v, "Laura")["mentions"], 2);
+    // An ambiguous lookup resolves to the ambiguous node, not to a guess.
+    let show = json_cmd(&tmp, &["people", "show", "Laura", "--kb", "whatsapp"]);
+    assert_eq!(show["data"]["person"]["name"], "Laura");
+}
+
+#[test]
+fn the_hygienic_person_graph_is_stable_across_recompiles() {
+    let tmp = whatsapp_kb();
+    let fingerprint = |v: &Value| -> Vec<String> {
+        let mut out: Vec<String> = v["data"]["people"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}:{}:{}",
+                    p["name"].as_str().unwrap_or(""),
+                    p["mentions"].as_u64().unwrap_or(0),
+                    aliases_of(p).join("|")
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let before = json_cmd(
+        &tmp,
+        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
+    );
+    json_cmd(&tmp, &["compile", "--kb", "whatsapp", "--all"]);
+    json_cmd(&tmp, &["compile", "--kb", "whatsapp", "--all"]);
+    let after = json_cmd(
+        &tmp,
+        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
+    );
+    assert_eq!(
+        fingerprint(&before),
+        fingerprint(&after),
+        "recompiling must converge, not drift"
+    );
+}

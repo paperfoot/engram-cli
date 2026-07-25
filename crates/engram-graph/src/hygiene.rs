@@ -16,7 +16,20 @@
 //! 3. **Bare function words and standalone dates are dropped.** Stop-words
 //!    are matched case-insensitively; month/weekday names are dropped only
 //!    when they stand alone (so `Monday Standup` survives as a phrase).
+//! 4. **Sentence-opening chat filler is dropped.** `Oh`, `Good`, `Morning`,
+//!    `Congrats` are capitalized only by position. Like dates they are
+//!    rejected only when they stand ALONE, so `Good Health Clinic` survives.
+//! 5. **Greetings fold into the person they address.** `Heyy Elias`,
+//!    `Good morning Noemi`, `Happy Birthday Avi` are one capitalized run to a
+//!    capitalization-driven extractor; the greeting prefix is stripped so the
+//!    mention lands on the human, not on a new node per salutation.
+//! 6. **Messaging-app contact labels keep only their name.**
+//!    `Maria Microsoft London Tech` is a phone contact nickname, not a human
+//!    called Maria Microsoft: the leading personal-name run becomes the
+//!    canonical form and the whole label is kept as an ALIAS, so the label
+//!    still resolves to her without standing up a rival node.
 
+use crate::gazetteer;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -377,6 +390,170 @@ const TEMPORAL_WORDS: &[&str] = &[
     "sun",
 ];
 
+/// Interjections, greetings, and the acknowledgement noise that opens a chat
+/// message. Rejected only when a candidate is EXACTLY one of them, exactly
+/// like [`TEMPORAL_WORDS`]: "Good" alone is junk, "Good Health Clinic" is not.
+///
+/// This is the fix for the third junk class the real store exposed — the
+/// extractor is capitalization-driven, so every "Oh", "Good", "Thanks", "Ok"
+/// and "Morning" that opened a WhatsApp line became a `person` node.
+const FILLER_WORDS: &[&str] = &[
+    // Interjections
+    "oh",
+    "ah",
+    "aha",
+    "oops",
+    "wow",
+    "woah",
+    "whoa",
+    "haha",
+    "hahaha",
+    "hehe",
+    "lol",
+    "lmao",
+    "omg",
+    "hmm",
+    "hm",
+    "huh",
+    "eh",
+    "erm",
+    "um",
+    "uh",
+    "yay",
+    "woohoo",
+    "aww",
+    "aw",
+    "ugh",
+    "meh",
+    "nah",
+    "yup",
+    "yeah",
+    "yep",
+    "nope",
+    "yes",
+    "no",
+    // Acknowledgements and sign-offs
+    "ok",
+    "okay",
+    "kk",
+    "sure",
+    "fine",
+    "good",
+    "great",
+    "cool",
+    "awesome",
+    "amazing",
+    "perfect",
+    "excellent",
+    "wonderful",
+    "lovely",
+    "brilliant",
+    "congrats",
+    "congratulations",
+    "welcome",
+    "cheers",
+    "thanks",
+    "thank",
+    "thx",
+    "ty",
+    "please",
+    "sorry",
+    "bye",
+    "goodbye",
+    "goodnight",
+    "hi",
+    "hii",
+    "hiii",
+    "hey",
+    "hello",
+    "hallo",
+    "heya",
+    "hiya",
+    "yo",
+    "hola",
+    "ciao",
+    "salut",
+    "dear",
+    // Time-of-day greetings (capitalized only by position in "Morning Elias")
+    "morning",
+    "afternoon",
+    "evening",
+    "night",
+    // Discourse filler
+    "alright",
+    "right",
+    "true",
+    "exactly",
+    "absolutely",
+    "definitely",
+    "totally",
+    "obviously",
+    "honestly",
+    "basically",
+    "literally",
+    "seriously",
+    "anyway",
+    "anyways",
+    "btw",
+    "fyi",
+    "asap",
+    "noted",
+    "agreed",
+    "understood",
+    "done",
+    "happy",
+    "birthday",
+    "sup",
+];
+
+/// Tokens that may LEAD a greeting run and are stripped from the front of a
+/// candidate so the mention lands on the person addressed ("Heyy Elias" →
+/// "Elias"). Deliberately narrower than [`FILLER_WORDS`]: "Good", "Great" and
+/// "Nice" open real names and are only stripped as part of "Good morning …"
+/// (see [`GOOD_TIMES`]).
+const GREETING_PREFIXES: &[&str] = &[
+    "hi",
+    "hii",
+    "hiii",
+    "hey",
+    "heya",
+    "hiya",
+    "hello",
+    "hallo",
+    "yo",
+    "hola",
+    "ciao",
+    "salut",
+    "dear",
+    "oh",
+    "ah",
+    "yes",
+    "no",
+    "ok",
+    "okay",
+    "thanks",
+    "thank",
+    "thx",
+    "congrats",
+    "congratulations",
+    "welcome",
+    "bye",
+    "goodbye",
+    "goodnight",
+    "morning",
+    "afternoon",
+    "evening",
+    "happy",
+    "birthday",
+    "sorry",
+    "please",
+    "sup",
+];
+
+/// Second word of a "Good <time>" greeting. "Good" only leads a greeting in
+/// this company, so "Good Health Clinic" is left intact.
+const GOOD_TIMES: &[&str] = &["morning", "afternoon", "evening", "night", "day", "luck"];
+
 /// Suffixes that follow an apostrophe in an English contraction or possessive.
 const CONTRACTION_SUFFIXES: &[&str] = &["s", "m", "re", "ve", "ll", "d", "t"];
 
@@ -437,6 +614,124 @@ pub fn is_temporal(text: &str) -> bool {
     temporal_set().contains(text.to_ascii_lowercase().as_str())
 }
 
+fn filler_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| FILLER_WORDS.iter().copied().collect())
+}
+
+fn greeting_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| GREETING_PREFIXES.iter().copied().collect())
+}
+
+/// Chat spellings stretch a word's last letter ("Heyy", "Hiii", "Byeee").
+/// Collapse a trailing run back to one character, but only for words of four
+/// characters or more so a real short name ("Yoo", "Ann") is never rewritten.
+fn collapse_trailing_repeat(word: &str) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    if chars.len() < 4 {
+        return word.to_string();
+    }
+    let mut end = chars.len();
+    while end >= 2 && chars[end - 1] == chars[end - 2] {
+        end -= 1;
+    }
+    chars[..end].iter().collect()
+}
+
+/// Is `text` chat filler — an interjection, greeting, or acknowledgement that
+/// is capitalized only because it opened a message ("Oh", "Good", "Heyy")?
+pub fn is_filler(text: &str) -> bool {
+    let lower = text.trim_end_matches(['!', '?', ',']).to_ascii_lowercase();
+    filler_set().contains(lower.as_str())
+        || filler_set().contains(collapse_trailing_repeat(&lower).as_str())
+}
+
+/// Can `word` lead a greeting run that should be stripped from a mention?
+fn is_greeting_prefix(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    greeting_set().contains(lower.as_str())
+        || greeting_set().contains(collapse_trailing_repeat(&lower).as_str())
+}
+
+/// Strip a leading greeting run in place ("Heyy Elias" → "Elias", "Good
+/// morning Noemi" → "Noemi"), leaving at least one token behind.
+///
+/// The greeting form is NOT kept as an alias: "Thanks Elias" is not a spelling
+/// of anyone's name, and hoarding one alias per salutation would bury the real
+/// ones ("Elias's", "Elias D.") that `people show` prints.
+fn strip_greeting_prefix(parts: &mut Vec<String>) -> bool {
+    let mut stripped = false;
+    loop {
+        if parts.len() < 2 {
+            return stripped;
+        }
+        // "Good morning Elias" — "Good" only leads a greeting in this company.
+        if parts.len() >= 3
+            && parts[0].eq_ignore_ascii_case("good")
+            && GOOD_TIMES.contains(&parts[1].to_ascii_lowercase().as_str())
+        {
+            parts.drain(..2);
+            stripped = true;
+            continue;
+        }
+        if is_greeting_prefix(&parts[0]) {
+            parts.remove(0);
+            stripped = true;
+            continue;
+        }
+        return stripped;
+    }
+}
+
+/// Does this token look like one component of a personal name — Title-Case (or
+/// a single initial), and not a word that only ever appears in a contact label?
+fn plausible_name_token(token: &str) -> bool {
+    if gazetteer::is_label_marker(token) || is_stopword(token) || is_temporal(token) {
+        return false;
+    }
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_uppercase() {
+        return false;
+    }
+    chars.all(|c| !c.is_ascii_digit())
+}
+
+/// Where the personal-name prefix of a messaging-app contact label ends.
+///
+/// "Maria Microsoft London Tech" is a phone contact nickname: a real given
+/// name followed by the tag its owner used to tell two Marias apart. Returns
+/// the number of leading tokens that are the actual name, or `None` when the
+/// candidate is not a label (an ordinary name, a place like "New York", or a
+/// label with no name in front of it like "Microsoft London").
+fn contact_label_name_len(parts: &[String]) -> Option<usize> {
+    if parts.len() < 2 || parts.len() > 6 {
+        return None;
+    }
+    let whole = parts.join(" ");
+    // A compound place is not a contact label — "New York Tech" must never be
+    // shortened to a person called "New".
+    if gazetteer::is_never_person(&whole) || gazetteer::is_place_modifier(&parts[0]) {
+        return None;
+    }
+    if !plausible_name_token(&parts[0]) {
+        return None;
+    }
+    // The name prefix runs until the first obvious non-name token, and a
+    // personal name is at most three tokens long.
+    let marker = parts
+        .iter()
+        .position(|p| gazetteer::is_label_marker(p))
+        .filter(|idx| (1..=3).contains(idx))?;
+    if !parts[..marker].iter().all(|p| plausible_name_token(p)) {
+        return None;
+    }
+    Some(marker)
+}
+
 /// Split a token at its last apostrophe (ASCII `'` or typographic `’`).
 fn split_apostrophe(token: &str) -> Option<(&str, &str)> {
     let idx = token.rfind(['\'', '\u{2019}'])?;
@@ -469,13 +764,18 @@ pub fn is_contraction(token: &str) -> bool {
 
 /// A cleaned-up entity surface form plus the spellings that should resolve to
 /// it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Canonical {
     /// The canonical surface form stored as `entities.canonical_name`.
     pub name: String,
     /// Alternate spellings seen in the source text (possessives, contracted
-    /// forms). Never contains `name` itself.
+    /// forms, the full contact label). Never contains `name` itself.
     pub aliases: Vec<String>,
+    /// The surface form itself proved this is a human: it was a greeting
+    /// ("Heyy Elias") or a messaging-app contact label ("Maria Microsoft
+    /// London Tech"). Both address a person by construction, so the caller can
+    /// type one bare token as a person without any other cue in the sentence.
+    pub person_hint: bool,
 }
 
 /// Normalize one candidate entity surface form, or reject it as junk.
@@ -531,19 +831,46 @@ pub fn canonicalize_surface(surface: &str) -> Option<Canonical> {
         }
     }
 
+    // "Heyy Elias", "Good morning Noemi", "Happy Birthday Avi" — one
+    // capitalized run to the extractor, one greeting plus one human to a
+    // reader. Strip the salutation so the mention counts for the human.
+    let greeted = strip_greeting_prefix(&mut parts);
+
+    // "Maria Microsoft London Tech" is a contact label: keep "Maria" as the
+    // node and the whole label as an alias so the label still resolves to her.
+    let mut labelled = false;
+    if let Some(name_len) = contact_label_name_len(&parts) {
+        let label = parts.join(" ");
+        parts.truncate(name_len);
+        if !aliases.contains(&label) {
+            aliases.push(label);
+        }
+        labelled = true;
+    }
+
     let name = parts.join(" ");
     if name.chars().count() < 2 {
         return None;
     }
+    // Nothing but filler ("Good Morning", "Thanks Again") names no one, at any
+    // length — otherwise a two-word salutation walks straight past the
+    // single-token guard below and is typed as a person.
+    if parts.iter().all(|p| is_filler(p)) {
+        return None;
+    }
     if parts.len() == 1 {
         let single = &parts[0];
-        if is_stopword(single) || is_temporal(single) || is_honorific(single) {
+        if is_stopword(single) || is_temporal(single) || is_honorific(single) || is_filler(single) {
             return None;
         }
     }
     aliases.retain(|a| a != &name);
     aliases.dedup();
-    Some(Canonical { name, aliases })
+    Some(Canonical {
+        name,
+        aliases,
+        person_hint: greeted || labelled,
+    })
 }
 
 /// Case-folded key used to deduplicate entity surface forms.
@@ -615,5 +942,96 @@ mod tests {
     #[test]
     fn dedup_key_is_case_and_space_folded() {
         assert_eq!(dedup_key("Avi  Roy"), dedup_key("avi roy"));
+    }
+
+    #[test]
+    fn sentence_opening_filler_is_never_an_entity() {
+        for junk in [
+            "Oh", "Good", "Thanks", "Ok", "Sure", "Morning", "Congrats", "Heyy", "Wow", "Lol",
+            "Perfect", "Amazing", "Happy",
+        ] {
+            assert!(
+                canonicalize_surface(junk).is_none(),
+                "{junk} must be rejected as chat filler"
+            );
+        }
+        // A two-word salutation is filler too — it must not slip past the
+        // single-token guard and become a person.
+        assert!(canonicalize_surface("Good Morning").is_none());
+        assert!(canonicalize_surface("Happy Birthday").is_none());
+    }
+
+    #[test]
+    fn filler_rejection_leaves_real_phrases_alone() {
+        // Only STANDALONE filler is dropped, exactly like month names.
+        assert_eq!(
+            canonicalize_surface("Good Health Clinic").unwrap().name,
+            "Good Health Clinic"
+        );
+        assert_eq!(
+            canonicalize_surface("Great Ormond Street").unwrap().name,
+            "Great Ormond Street"
+        );
+    }
+
+    #[test]
+    fn greetings_fold_into_the_person_addressed() {
+        for (surface, expected) in [
+            ("Heyy Elias", "Elias"),
+            ("Heyyy Elias", "Elias"),
+            ("Hi Elias", "Elias"),
+            ("Hey Noemi", "Noemi"),
+            ("Good morning Noemi", "Noemi"),
+            ("Good Morning Noemi", "Noemi"),
+            ("Happy Birthday Avi Roy", "Avi Roy"),
+            ("Thanks Elias", "Elias"),
+        ] {
+            let c = canonicalize_surface(surface).expect("kept");
+            assert_eq!(c.name, expected, "{surface} must fold onto {expected}");
+            assert!(c.person_hint, "{surface} addresses a human");
+            // The salutation is noise, not a spelling of anyone's name.
+            assert!(
+                c.aliases.is_empty(),
+                "{surface} must not hoard a greeting alias: {:?}",
+                c.aliases
+            );
+        }
+        // A short name is never rewritten by the repeated-letter rule.
+        assert_eq!(canonicalize_surface("Yoo Jin").unwrap().name, "Yoo Jin");
+    }
+
+    #[test]
+    fn contact_labels_keep_the_name_and_alias_the_label() {
+        let c = canonicalize_surface("Maria Microsoft London Tech").expect("kept");
+        assert_eq!(c.name, "Maria");
+        assert_eq!(
+            c.aliases,
+            vec!["Maria Microsoft London Tech".to_string()],
+            "the label must stay resolvable as an alias"
+        );
+        assert!(c.person_hint, "a contact label names a human");
+
+        let c = canonicalize_surface("Ana Lopez Gym").expect("kept");
+        assert_eq!(c.name, "Ana Lopez");
+        assert_eq!(c.aliases, vec!["Ana Lopez Gym".to_string()]);
+    }
+
+    #[test]
+    fn label_repair_never_truncates_a_place_or_a_bare_company() {
+        // "New York Tech" must not become a person called "New".
+        assert_eq!(
+            canonicalize_surface("New York Tech").unwrap().name,
+            "New York Tech"
+        );
+        assert_eq!(canonicalize_surface("New York").unwrap().name, "New York");
+        // A label with no personal name in front of it keeps its full form.
+        assert_eq!(
+            canonicalize_surface("Microsoft London").unwrap().name,
+            "Microsoft London"
+        );
+        // An ordinary two-token human name is untouched.
+        let c = canonicalize_surface("Maria Marenova").unwrap();
+        assert_eq!(c.name, "Maria Marenova");
+        assert!(!c.person_hint);
     }
 }
