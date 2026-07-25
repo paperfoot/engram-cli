@@ -287,7 +287,8 @@ pub fn resolve(
             )))
         }
     };
-    ctx.store.resolve_fact_conflict(qid, "caller", note.as_deref())?;
+    ctx.store
+        .resolve_fact_conflict(qid, "caller", note.as_deref())?;
 
     let payload = json!({
         "conflict_id": id,

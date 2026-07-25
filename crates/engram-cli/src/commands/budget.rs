@@ -130,7 +130,12 @@ fn scope_for(kb: Option<&str>) -> String {
 pub fn enforce_budget(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError> {
     // Disable with ENGRAM_BUDGET_ENFORCE=off for a one-off override.
     if std::env::var("ENGRAM_BUDGET_ENFORCE")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+        .map(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        })
         .unwrap_or(false)
     {
         return Ok(());

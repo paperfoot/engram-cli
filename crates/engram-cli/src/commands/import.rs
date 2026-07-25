@@ -16,7 +16,9 @@ use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use engram_core::types::Memory;
 use engram_ingest::chunker::naive_split;
-use engram_storage::{ChunkExportRow, DocumentExportRow, FactExportRow, KbExportRow, MemoryExportRow};
+use engram_storage::{
+    ChunkExportRow, DocumentExportRow, FactExportRow, KbExportRow, MemoryExportRow,
+};
 use serde_json::json;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -38,10 +40,7 @@ pub fn run(ctx: &AppContext, path: PathBuf) -> Result<(), CliError> {
         payload.clone()
     };
 
-    let version = body
-        .get("version")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(1);
+    let version = body.get("version").and_then(|v| v.as_i64()).unwrap_or(1);
 
     let (data, meta) = match version {
         2 => import_v2(ctx, &body)?,

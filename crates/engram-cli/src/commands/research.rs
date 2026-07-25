@@ -65,8 +65,9 @@ pub async fn run(
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let use_cloud =
         profile_enum != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-    let use_cohere =
-        profile_enum != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
+    let use_cohere = profile_enum != RetrievalProfile::Offline
+        && cohere_key.is_some()
+        && !force_stub
         && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
 

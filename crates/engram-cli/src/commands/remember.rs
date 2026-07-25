@@ -165,7 +165,11 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     "reason": "identical content already stored in this kb/diary; nothing re-embedded",
                 }),
                 meta,
-                |_| println!("Duplicate of {existing} — nothing stored (use --allow-duplicate to force)"),
+                |_| {
+                    println!(
+                        "Duplicate of {existing} — nothing stored (use --allow-duplicate to force)"
+                    )
+                },
             );
             return Ok(());
         }
@@ -422,7 +426,9 @@ mod tests {
 
     #[test]
     fn event_time_accepts_rfc3339_and_iso_date() {
-        let d = parse_event_time(&Some("2026-03-01".into())).unwrap().unwrap();
+        let d = parse_event_time(&Some("2026-03-01".into()))
+            .unwrap()
+            .unwrap();
         assert_eq!(d.to_rfc3339(), "2026-03-01T00:00:00+00:00");
         assert!(parse_event_time(&Some("2026-03-01T09:30:00Z".into()))
             .unwrap()

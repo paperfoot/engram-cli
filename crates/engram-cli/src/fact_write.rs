@@ -122,7 +122,10 @@ pub fn canonicalize_subject(
         return (raw_subject.to_string(), raw_norm);
     }
     // Exact: this subject_norm already exists — nothing to resolve.
-    if let Ok(existing) = ctx.store.list_facts_by_subject_scoped(&raw_norm, Some(diary), Some(kb), true) {
+    if let Ok(existing) =
+        ctx.store
+            .list_facts_by_subject_scoped(&raw_norm, Some(diary), Some(kb), true)
+    {
         if !existing.is_empty() {
             return (raw_subject.to_string(), raw_norm);
         }
@@ -266,7 +269,9 @@ pub async fn write_fact(
                         "slot_lww",
                         new_fact.valid_from,
                     )?;
-                    outcome.conflicts.push(conflict_payload(old, &new_fact, "slot_lww"));
+                    outcome
+                        .conflicts
+                        .push(conflict_payload(old, &new_fact, "slot_lww"));
                 }
                 outcome.added += 1;
             }
@@ -281,7 +286,9 @@ pub async fn write_fact(
                         "exact_match",
                         new_fact.valid_from,
                     )?;
-                    outcome.conflicts.push(conflict_payload(old, &new_fact, "exact_match"));
+                    outcome
+                        .conflicts
+                        .push(conflict_payload(old, &new_fact, "exact_match"));
                 }
                 outcome.added += 1;
             }
@@ -354,9 +361,11 @@ pub async fn write_fact(
                                         "semantic_llm",
                                         new_fact.valid_from,
                                     )?;
-                                    outcome
-                                        .conflicts
-                                        .push(conflict_payload(f, &new_fact, "semantic_llm"));
+                                    outcome.conflicts.push(conflict_payload(
+                                        f,
+                                        &new_fact,
+                                        "semantic_llm",
+                                    ));
                                 }
                             }
                             outcome.added += 1;
@@ -379,7 +388,16 @@ pub async fn write_fact(
                     ctx.store
                         .set_fact_embedding(new_fact.id, &embedding, &embedder.model())?;
                     for (f, score) in &cand_facts {
-                        queue_conflict(ctx, &new_fact, f, diary, kb, "semantic_cosine", Some(*score), outcome)?;
+                        queue_conflict(
+                            ctx,
+                            &new_fact,
+                            f,
+                            diary,
+                            kb,
+                            "semantic_cosine",
+                            Some(*score),
+                            outcome,
+                        )?;
                     }
                     outcome.added += 1;
                 }
@@ -399,7 +417,10 @@ async fn insert_with_embedding(
     ctx.store.insert_fact(fact)?;
     if let Some(e) = embedder {
         let text = fact_text(&fact.subject, &fact.predicate, &fact.object);
-        if let Ok(mut v) = e.embed_batch(&[text.as_str()], TaskMode::RetrievalDocument).await {
+        if let Ok(mut v) = e
+            .embed_batch(&[text.as_str()], TaskMode::RetrievalDocument)
+            .await
+        {
             if let Some(emb) = v.pop() {
                 ctx.store.set_fact_embedding(fact.id, &emb, &e.model())?;
             }

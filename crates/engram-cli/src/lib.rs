@@ -296,9 +296,12 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             FactsCommand::Show { subject, diary, kb } => {
                 commands::facts::show(&ctx, subject, diary, kb)
             }
-            FactsCommand::Conflicts { limit, open, diary, kb } => {
-                commands::facts::conflicts(&ctx, limit, open, diary, kb)
-            }
+            FactsCommand::Conflicts {
+                limit,
+                open,
+                diary,
+                kb,
+            } => commands::facts::conflicts(&ctx, limit, open, diary, kb),
             FactsCommand::Resolve { id, action, note } => {
                 commands::facts::resolve(&ctx, id, action, note)
             }

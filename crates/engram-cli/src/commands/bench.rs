@@ -183,16 +183,13 @@ fn build_corpus_from_kb(
     // document_id -> stable corpus key (DOI when available, else title/id).
     let mut doc_key: HashMap<uuid::Uuid, String> = HashMap::new();
     for doc in ctx.store.list_documents(Some(kb), 1_000_000)? {
-        let key = doc
-            .doi
-            .filter(|d| !d.trim().is_empty())
-            .unwrap_or_else(|| {
-                if doc.title.trim().is_empty() {
-                    doc.id.to_string()
-                } else {
-                    doc.title.clone()
-                }
-            });
+        let key = doc.doi.filter(|d| !d.trim().is_empty()).unwrap_or_else(|| {
+            if doc.title.trim().is_empty() {
+                doc.id.to_string()
+            } else {
+                doc.title.clone()
+            }
+        });
         doc_key.insert(doc.id, key);
     }
 
@@ -1310,16 +1307,21 @@ async fn run_litqa2(
     let openrouter_key =
         crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
             .ok_or_else(|| {
-                CliError::Config("OPENROUTER_API_KEY not set — required for the LLM answerer".into())
+                CliError::Config(
+                    "OPENROUTER_API_KEY not set — required for the LLM answerer".into(),
+                )
             })?;
-    let answerer =
-        OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
+    let answerer = OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
 
     let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60.0);
-    let top_k = if top_k == 0 { LITQA2_DEFAULT_TOP_K } else { top_k };
+    let top_k = if top_k == 0 {
+        LITQA2_DEFAULT_TOP_K
+    } else {
+        top_k
+    };
 
     // closed-book runs with NO embeddings / corpus; full-text builds the corpus
     // and a Gemini embedder.
@@ -1360,7 +1362,8 @@ async fn run_litqa2(
                 crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
                     .ok_or_else(|| {
                         CliError::Config(
-                            "GEMINI_API_KEY not set — required for LitQA2 full-text retrieval".into(),
+                            "GEMINI_API_KEY not set — required for LitQA2 full-text retrieval"
+                                .into(),
                         )
                     })?;
             let mut embedder = GeminiEmbedder::new(gemini_key);
@@ -1471,7 +1474,11 @@ async fn run_beir(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60.0);
-    let top_k = if top_k == 0 { BEIR_DEFAULT_TOP_K } else { top_k };
+    let top_k = if top_k == 0 {
+        BEIR_DEFAULT_TOP_K
+    } else {
+        top_k
+    };
 
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
         .ok_or_else(|| {
@@ -1510,9 +1517,14 @@ async fn run_beir(
         } else {
             format!("{title}\n{text}")
         };
-        let mem_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, format!("beir-mem:{doc_id}").as_bytes());
-        let chunk_id =
-            Uuid::new_v5(&Uuid::NAMESPACE_DNS, format!("beir-chunk:{doc_id}").as_bytes());
+        let mem_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_DNS,
+            format!("beir-mem:{doc_id}").as_bytes(),
+        );
+        let chunk_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_DNS,
+            format!("beir-chunk:{doc_id}").as_bytes(),
+        );
         let m = Memory {
             id: mem_id,
             content: blob.clone(),
@@ -1650,8 +1662,7 @@ async fn run_beir(
     let benchmarks_dir = std::path::PathBuf::from("benchmarks");
     let _ = std::fs::create_dir_all(&benchmarks_dir);
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-    let default_name =
-        benchmarks_dir.join(format!("beir-{}-{}.json", dataset_name, timestamp));
+    let default_name = benchmarks_dir.join(format!("beir-{}-{}.json", dataset_name, timestamp));
     let save_path = save.unwrap_or(default_name);
 
     let payload = json!({
@@ -1740,8 +1751,7 @@ async fn run_biogen(
     if let Ok(model) = std::env::var("GEMINI_EMBED_MODEL") {
         embedder = embedder.with_model(model);
     }
-    let answerer =
-        OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
+    let answerer = OpenRouterClient::new(openrouter_key.clone()).with_model(answerer_model.clone());
     let judge = OpenRouterClient::new(openrouter_key).with_model(judge_model.clone());
 
     let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")

@@ -102,8 +102,9 @@ pub async fn run(
     if use_cloud_embedder {
         crate::commands::budget::enforce_budget(ctx, scope.as_deref())?;
     }
-    let use_cohere =
-        profile_enum != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
+    let use_cohere = profile_enum != RetrievalProfile::Offline
+        && cohere_key.is_some()
+        && !force_stub
         && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
 

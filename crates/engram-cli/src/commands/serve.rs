@@ -324,7 +324,9 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let use_cloud = profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-    let use_cohere = profile != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
+    let use_cohere = profile != RetrievalProfile::Offline
+        && cohere_key.is_some()
+        && !force_stub
         && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
     let rerank_candidates = req
@@ -405,7 +407,9 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let use_cloud = profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-    let use_cohere = profile != RetrievalProfile::Offline && cohere_key.is_some() && !force_stub
+    let use_cohere = profile != RetrievalProfile::Offline
+        && cohere_key.is_some()
+        && !force_stub
         && !crate::commands::config::rerank_disabled();
     let cohere_model = engram_rerank::cohere::resolve_model();
     let rerank_candidates = req

@@ -69,9 +69,21 @@ fn cmd_in(tmp: &tempfile::TempDir) -> Command {
 
 /// Store a memory with caller-supplied facts (no LLM), returning the
 /// envelope. `autonomy` is the conflict-resolution mode under test.
-fn remember_with_facts(tmp: &tempfile::TempDir, content: &str, facts: &str, autonomy: &str) -> Value {
+fn remember_with_facts(
+    tmp: &tempfile::TempDir,
+    content: &str,
+    facts: &str,
+    autonomy: &str,
+) -> Value {
     let out = cmd_in(tmp)
-        .args(["remember", content, "--facts-json", facts, "--autonomy", autonomy])
+        .args([
+            "remember",
+            content,
+            "--facts-json",
+            facts,
+            "--autonomy",
+            autonomy,
+        ])
         .arg("--json")
         .assert()
         .success()
@@ -136,6 +148,135 @@ fn skill_install_writes_cli_and_cross_agent_locations() {
     ] {
         assert!(tmp.path().join(path).exists(), "missing {path}");
     }
+
+    // A fresh install reports every target as newly installed.
+    let dirs = v["data"]["directories"].as_array().expect("directories[]");
+    assert_eq!(dirs.len(), 4);
+    assert!(dirs.iter().all(|d| d["status"] == "installed"), "{dirs:?}");
+}
+
+#[test]
+fn skill_install_is_idempotent_and_reports_unchanged_targets() {
+    let (tmp, mut first) = with_isolated_home();
+    first
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success();
+
+    let out = cmd_in(&tmp)
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    let dirs = v["data"]["directories"].as_array().expect("directories[]");
+    assert!(dirs.iter().all(|d| d["status"] == "unchanged"), "{dirs:?}");
+    assert_eq!(v["metadata"]["unchanged"], 4);
+    assert_eq!(v["metadata"]["installed"], 0);
+}
+
+/// The footgun this guards: `skill install` used to fs::write over all four
+/// targets unconditionally, silently destroying a hand-tuned SKILL.md.
+#[test]
+fn skill_install_refuses_to_clobber_a_locally_modified_skill() {
+    let (tmp, mut first) = with_isolated_home();
+    first
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success();
+
+    let edited = tmp.path().join(".claude/skills/engram/SKILL.md");
+    std::fs::write(&edited, "# my hand-written skill\n").unwrap();
+
+    let assert = cmd_in(&tmp)
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .failure()
+        .code(2);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let err: Value = serde_json::from_str(stderr.trim()).expect("JSON error on stderr");
+    assert_eq!(err["error"]["exit_code"], 2);
+    // The message must name the exact path so the user can go rescue it.
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(edited.to_str().unwrap()),
+        "error did not name the path: {message}"
+    );
+    assert!(message.contains("--force"), "no recovery hint: {message}");
+
+    // Nothing was written — not even to the untouched targets.
+    assert_eq!(
+        std::fs::read_to_string(&edited).unwrap(),
+        "# my hand-written skill\n"
+    );
+}
+
+#[test]
+fn skill_install_force_overwrites_a_modified_skill() {
+    let (tmp, mut first) = with_isolated_home();
+    first
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success();
+
+    let edited = tmp.path().join(".claude/skills/engram/SKILL.md");
+    let pristine = std::fs::read_to_string(&edited).unwrap();
+    std::fs::write(&edited, "# my hand-written skill\n").unwrap();
+
+    let out = cmd_in(&tmp)
+        .arg("--json")
+        .args(["skill", "install", "--force"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["data"]["forced"], true);
+    let dirs = v["data"]["directories"].as_array().unwrap();
+    let claude = dirs
+        .iter()
+        .find(|d| d["skill_path"] == edited.to_str().unwrap())
+        .expect("claude target present");
+    assert_eq!(claude["status"], "installed");
+    // The other three were already correct and stay reported as unchanged.
+    assert_eq!(
+        dirs.iter().filter(|d| d["status"] == "unchanged").count(),
+        3
+    );
+    assert_eq!(std::fs::read_to_string(&edited).unwrap(), pristine);
+}
+
+/// A target that never had the skill installs normally even while a sibling
+/// is modified — but only once the modified one is resolved.
+#[test]
+fn skill_install_reports_absent_targets_as_installed() {
+    let (tmp, mut first) = with_isolated_home();
+    first
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success();
+    std::fs::remove_file(tmp.path().join(".gemini/skills/engram/SKILL.md")).unwrap();
+
+    let out = cmd_in(&tmp)
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["metadata"]["installed"], 1);
+    assert_eq!(v["metadata"]["unchanged"], 3);
 }
 
 #[test]
@@ -1167,8 +1308,13 @@ fn recall_since_until_actually_filter_by_time() {
     let past = recall_in(
         tmp.path(),
         &[
-            "recall", "rapamycin mTORC1", "--diary", "*", "--until",
-            "2020-01-01T00:00:00Z", "--json",
+            "recall",
+            "rapamycin mTORC1",
+            "--diary",
+            "*",
+            "--until",
+            "2020-01-01T00:00:00Z",
+            "--json",
         ],
     );
     assert_eq!(
@@ -1181,8 +1327,13 @@ fn recall_since_until_actually_filter_by_time() {
     let now_window = recall_in(
         tmp.path(),
         &[
-            "recall", "rapamycin mTORC1", "--diary", "*", "--since",
-            "2020-01-01T00:00:00Z", "--json",
+            "recall",
+            "rapamycin mTORC1",
+            "--diary",
+            "*",
+            "--since",
+            "2020-01-01T00:00:00Z",
+            "--json",
         ],
     );
     assert!(
@@ -1283,7 +1434,12 @@ fn remember_dedups_identical_content() {
     c3.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
     c3.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
     let out3 = c3
-        .args(["remember", "Rapamycin extends mouse lifespan.", "--allow-duplicate", "--json"])
+        .args([
+            "remember",
+            "Rapamycin extends mouse lifespan.",
+            "--allow-duplicate",
+            "--json",
+        ])
         .assert()
         .success()
         .get_output()
@@ -1303,7 +1459,10 @@ fn budget_gate_blocks_over_cap_spend() {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let env = |c: &mut Command| {
         c.env_remove("ENGRAM_BENCH_FORCE_STUB");
-        c.env("GEMINI_API_KEY", "fake-key-not-used-because-budget-blocks-first");
+        c.env(
+            "GEMINI_API_KEY",
+            "fake-key-not-used-because-budget-blocks-first",
+        );
         c.env("HOME", tmp.path());
         c.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
         c.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1312,9 +1471,17 @@ fn budget_gate_blocks_over_cap_spend() {
     // First, record some usage so spent >= 0 and set a $0 cap → immediately over.
     let mut setb = Command::cargo_bin("engram").unwrap();
     env(&mut setb);
-    setb.args(["budget", "set", "--kb", "capped", "--daily-usd", "0", "--json"])
-        .assert()
-        .success();
+    setb.args([
+        "budget",
+        "set",
+        "--kb",
+        "capped",
+        "--daily-usd",
+        "0",
+        "--json",
+    ])
+    .assert()
+    .success();
 
     let fixture = tmp.path().join("note.md");
     std::fs::write(&fixture, "Some content to embed.").unwrap();
@@ -1360,7 +1527,10 @@ fn facts_json_stores_typed_fact_without_llm() {
     assert_eq!(facts.len(), 1);
     // lives_in is a known profile slot; valid_from came from the caller.
     assert_eq!(facts[0]["fact_type"], "profile_slot");
-    assert!(facts[0]["valid_from"].as_str().unwrap().starts_with("2026-03-01"));
+    assert!(facts[0]["valid_from"]
+        .as_str()
+        .unwrap()
+        .starts_with("2026-03-01"));
 }
 
 #[test]
@@ -1381,7 +1551,11 @@ fn slot_last_writer_wins_supersedes_and_recall_reports_update() {
         "assisted",
     );
     let conflicts = v["data"]["conflicts"].as_array().unwrap();
-    assert_eq!(conflicts.len(), 1, "LWW slot update must report the supersession");
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "LWW slot update must report the supersession"
+    );
     assert_eq!(conflicts[0]["old_object"], "Porto");
     assert_eq!(conflicts[0]["new_object"], "Lisbon");
     assert_eq!(conflicts[0]["resolution"], "slot_lww");
@@ -1503,7 +1677,10 @@ fn safety_slot_queues_conflict_and_recall_reports_contested() {
         .get_output()
         .stdout
         .clone();
-    let facts = parse_stdout(&out)["data"]["facts"].as_array().unwrap().clone();
+    let facts = parse_stdout(&out)["data"]["facts"]
+        .as_array()
+        .unwrap()
+        .clone();
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0]["object"], "amoxicillin");
 }
@@ -1533,7 +1710,10 @@ fn reasserted_fact_dedupes_into_confirmation() {
         .get_output()
         .stdout
         .clone();
-    let facts = parse_stdout(&out)["data"]["facts"].as_array().unwrap().clone();
+    let facts = parse_stdout(&out)["data"]["facts"]
+        .as_array()
+        .unwrap()
+        .clone();
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0]["confirmations"], 1);
 }
@@ -1554,7 +1734,10 @@ fn strict_autonomy_queues_even_plain_slot_updates() {
         "strict",
     );
     assert_eq!(v["data"]["conflicts"].as_array().unwrap().len(), 0);
-    assert_eq!(v["data"]["adjudication_needed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        v["data"]["adjudication_needed"].as_array().unwrap().len(),
+        1
+    );
 }
 
 #[test]
@@ -1926,7 +2109,11 @@ fn remember_no_extract_facts_opts_out() {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let v = run_json(
         &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
-        &["remember", "Ana moved to Lisbon last March.", "--no-extract-facts"],
+        &[
+            "remember",
+            "Ana moved to Lisbon last March.",
+            "--no-extract-facts",
+        ],
     );
     assert_eq!(v["data"]["facts_added"], 0);
     assert_eq!(v["data"]["fact_extraction"], "disabled");
@@ -1966,7 +2153,11 @@ fn remember_still_accepts_the_deprecated_extract_facts_flag() {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let v = run_json(
         &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
-        &["remember", "Ana moved to Lisbon last March.", "--extract-facts"],
+        &[
+            "remember",
+            "Ana moved to Lisbon last March.",
+            "--extract-facts",
+        ],
     );
     assert_eq!(v["data"]["facts_added"], 1);
 
@@ -2117,7 +2308,10 @@ fn event_time_is_persisted_and_scopes_recall_since_until() {
         ],
     );
     let found = contents(&v);
-    assert!(found.iter().any(|c| c.contains("whole family")), "{found:?}");
+    assert!(
+        found.iter().any(|c| c.contains("whole family")),
+        "{found:?}"
+    );
     assert!(!found.iter().any(|c| c.contains("new crew")), "{found:?}");
 }
 
@@ -2164,7 +2358,15 @@ fn facts_backfill_dry_run_reports_work_without_calling_an_llm() {
     // --limit bounds the preview.
     let v = run_json(
         &mut cmd_in(&tmp),
-        &["facts", "backfill", "--kb", "personal", "--dry-run", "--limit", "1"],
+        &[
+            "facts",
+            "backfill",
+            "--kb",
+            "personal",
+            "--dry-run",
+            "--limit",
+            "1",
+        ],
     );
     assert_eq!(v["data"]["would_process"], 1);
     assert_eq!(v["data"]["pending"], 3);
@@ -2247,7 +2449,12 @@ fn facts_backfill_skips_memories_whose_facts_arrived_at_write_time() {
     let tmp = tempfile::tempdir().expect("tmp dir");
     run_json(
         &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
-        &["remember", "Ana moved to Lisbon last March.", "--kb", "personal"],
+        &[
+            "remember",
+            "Ana moved to Lisbon last March.",
+            "--kb",
+            "personal",
+        ],
     );
     let v = run_json(
         &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
@@ -2261,11 +2468,25 @@ fn facts_backfill_skips_memories_whose_facts_arrived_at_write_time() {
 fn facts_backfill_scopes_to_kb_and_diary() {
     let tmp = tempfile::tempdir().expect("tmp dir");
     cmd_in(&tmp)
-        .args(["remember", "Work note about Acme.", "--kb", "personal", "--diary", "work", "--json"])
+        .args([
+            "remember",
+            "Work note about Acme.",
+            "--kb",
+            "personal",
+            "--diary",
+            "work",
+            "--json",
+        ])
         .assert()
         .success();
     cmd_in(&tmp)
-        .args(["remember", "Home note about Lisbon.", "--kb", "personal", "--json"])
+        .args([
+            "remember",
+            "Home note about Lisbon.",
+            "--kb",
+            "personal",
+            "--json",
+        ])
         .assert()
         .success();
     cmd_in(&tmp)
@@ -2275,7 +2496,15 @@ fn facts_backfill_scopes_to_kb_and_diary() {
 
     let v = run_json(
         &mut cmd_in(&tmp),
-        &["facts", "backfill", "--kb", "personal", "--diary", "work", "--dry-run"],
+        &[
+            "facts",
+            "backfill",
+            "--kb",
+            "personal",
+            "--diary",
+            "work",
+            "--dry-run",
+        ],
     );
     assert_eq!(v["data"]["memories_total"], 1);
     assert_eq!(v["data"]["would_process"], 1);

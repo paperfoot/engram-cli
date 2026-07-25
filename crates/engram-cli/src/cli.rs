@@ -831,7 +831,13 @@ Examples:
 #[derive(Subcommand, Debug)]
 pub enum SkillCommand {
     /// Install the engram skill into agent skill directories.
-    Install,
+    Install {
+        /// Overwrite a SKILL.md that was edited locally. Without this, a
+        /// modified target is left untouched and the install exits 2 —
+        /// hand-tuned skill files are not disposable.
+        #[arg(long)]
+        force: bool,
+    },
     /// Package the engram skill folder as a ZIP for app upload.
     Package {
         /// Output ZIP path.
