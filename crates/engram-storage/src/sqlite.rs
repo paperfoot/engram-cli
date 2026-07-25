@@ -692,7 +692,30 @@ CREATE TABLE IF NOT EXISTS usage_budgets (
 CREATE INDEX IF NOT EXISTS idx_usage_budgets_kb ON usage_budgets(kb);
 "#;
 
-const CURRENT_VERSION: i32 = 6;
+/// A memory the fact extractor has never processed: no facts derived from it
+/// and no extraction marker. Written once and shared by the backfill work
+/// queue and its coverage counter so the two can never disagree about what
+/// "pending" means. Requires the memories table to be aliased `m`.
+const PENDING_EXTRACTION_PREDICATE: &str =
+    "NOT EXISTS (SELECT 1 FROM facts f WHERE f.source_memory_id = m.id)
+     AND NOT EXISTS (SELECT 1 FROM fact_extraction_log l WHERE l.memory_id = m.id)";
+
+const SCHEMA_V7: &str = r#"
+-- Which memories the fact extractor has already looked at. Facts alone are
+-- not a sufficient record: a memory that legitimately yields zero facts would
+-- otherwise be re-sent to the LLM by every `facts backfill` run, and an
+-- oldest-first backfill with --limit would stall on it forever.
+CREATE TABLE IF NOT EXISTS fact_extraction_log (
+    memory_id    TEXT PRIMARY KEY,
+    extracted_at TEXT NOT NULL,
+    model        TEXT,
+    fact_count   INTEGER NOT NULL DEFAULT 0,
+    source       TEXT NOT NULL DEFAULT 'remember',
+    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+);
+"#;
+
+const CURRENT_VERSION: i32 = 7;
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -818,6 +841,9 @@ impl SqliteStore {
             }
             if current < 6 {
                 s.migrate_v6()?;
+            }
+            if current < 7 {
+                s.conn.execute_batch(SCHEMA_V7)?;
             }
             if current != CURRENT_VERSION {
                 s.conn.execute(
@@ -1680,12 +1706,110 @@ impl SqliteStore {
         Ok(changed > 0)
     }
 
+    /// Drop everything the fact layer derived from one memory's content —
+    /// the facts themselves and the "already extracted" marker. `edit` calls
+    /// this when content changes, so rewritten content is eligible for
+    /// extraction again instead of being permanently marked as processed.
     pub fn delete_facts_for_memory(&self, memory_id: Uuid) -> Result<usize, StorageError> {
-        let n = self.conn.execute(
-            "DELETE FROM facts WHERE source_memory_id = ?1",
-            params![memory_id.to_string()],
+        let id = memory_id.to_string();
+        let n = self
+            .conn
+            .execute("DELETE FROM facts WHERE source_memory_id = ?1", params![id])?;
+        self.conn.execute(
+            "DELETE FROM fact_extraction_log WHERE memory_id = ?1",
+            params![id],
         )?;
         Ok(n)
+    }
+
+    /// Record that the fact extractor has processed this memory's content.
+    /// Idempotent: a later run overwrites the previous marker.
+    pub fn record_fact_extraction(
+        &self,
+        memory_id: Uuid,
+        model: Option<&str>,
+        fact_count: i64,
+        source: &str,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO fact_extraction_log(memory_id, extracted_at, model, fact_count, source)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                 extracted_at = excluded.extracted_at,
+                 model        = excluded.model,
+                 fact_count   = excluded.fact_count,
+                 source       = excluded.source",
+            params![
+                memory_id.to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                model,
+                fact_count,
+                source,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Memories in scope the fact extractor has never seen: no facts and no
+    /// extraction marker. Oldest first, so a `--limit`ed backfill always
+    /// advances chronologically and a re-run resumes where it stopped.
+    pub fn list_memories_pending_fact_extraction(
+        &self,
+        kb: &str,
+        diary: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Memory>, StorageError> {
+        let mut sql = format!(
+            "SELECT {} FROM memories m
+             WHERE m.deleted = 0 AND m.kb = ?1 AND {}",
+            memory_columns("m."),
+            PENDING_EXTRACTION_PREDICATE
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(kb.to_string())];
+        if let Some(d) = diary {
+            binds.push(Box::new(d.to_string()));
+            sql.push_str(&format!(" AND m.diary = ?{}", binds.len()));
+        }
+        sql.push_str(" ORDER BY m.created_at ASC, m.id ASC");
+        if let Some(n) = limit {
+            binds.push(Box::new(n as i64));
+            sql.push_str(&format!(" LIMIT ?{}", binds.len()));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+                parse_memory_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `(total, pending)` memory counts for a backfill scope, so a dry run can
+    /// report coverage without loading every row.
+    pub fn fact_extraction_coverage(
+        &self,
+        kb: &str,
+        diary: Option<&str>,
+    ) -> Result<(i64, i64), StorageError> {
+        let mut sql = format!(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN {} THEN 1 ELSE 0 END), 0)
+             FROM memories m
+             WHERE m.deleted = 0 AND m.kb = ?1",
+            PENDING_EXTRACTION_PREDICATE
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(kb.to_string())];
+        if let Some(d) = diary {
+            binds.push(Box::new(d.to_string()));
+            sql.push_str(&format!(" AND m.diary = ?{}", binds.len()));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let row = stmt.query_row(
+            rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        Ok(row)
     }
 
     /// Delete all chunks belonging to a memory. Used by `edit` before
@@ -4100,6 +4224,61 @@ fn parse_id_score_row(r: &rusqlite::Row) -> rusqlite::Result<(String, f32)> {
     Ok((id, score as f32))
 }
 
+/// Column list every `Memory` query selects, in the order
+/// [`parse_memory_row`] expects. `{p}` is the table alias prefix.
+fn memory_columns(prefix: &str) -> String {
+    [
+        "id",
+        "content",
+        "created_at",
+        "event_time",
+        "importance",
+        "emotional_weight",
+        "access_count",
+        "last_accessed",
+        "stability",
+        "source_json",
+        "diary",
+        "valid_from",
+        "valid_until",
+        "tags_json",
+    ]
+    .iter()
+    .map(|c| format!("{prefix}{c}"))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+fn parse_memory_row(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
+    use chrono::{DateTime, Utc};
+    let parse_ts = |s: Option<String>| {
+        s.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    };
+    let id_str: String = r.get(0)?;
+    let created: String = r.get(2)?;
+    let src_json: String = r.get(9)?;
+    let tags_json: String = r.get(13)?;
+    Ok(Memory {
+        id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+        content: r.get(1)?,
+        created_at: DateTime::parse_from_rfc3339(&created)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        event_time: parse_ts(r.get(3)?),
+        importance: r.get(4)?,
+        emotional_weight: r.get(5)?,
+        access_count: r.get(6)?,
+        last_accessed: parse_ts(r.get(7)?),
+        stability: r.get(8)?,
+        source: serde_json::from_str(&src_json).unwrap_or(engram_core::types::MemorySource::Manual),
+        diary: r.get(10)?,
+        valid_from: parse_ts(r.get(11)?),
+        valid_until: parse_ts(r.get(12)?),
+        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+    })
+}
+
 fn parse_chunk_embedding_row(r: &rusqlite::Row) -> rusqlite::Result<StoredChunkEmbedding> {
     let chunk_id: String = r.get(0)?;
     let memory_id: String = r.get(1)?;
@@ -4490,6 +4669,111 @@ mod tests {
         let hits = store.fts_search("rapamycin", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, chunk_id);
+    }
+
+    #[test]
+    fn pending_fact_extraction_queue_is_oldest_first_and_skips_processed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut oldest = fact("Ana moved to Lisbon.");
+        oldest.created_at = Utc::now() - chrono::Duration::days(3);
+        let mut middle = fact("Ana works at Acme.");
+        middle.created_at = Utc::now() - chrono::Duration::days(2);
+        let mut newest = fact("Ana prefers Rust.");
+        newest.created_at = Utc::now() - chrono::Duration::days(1);
+        for m in [&oldest, &middle, &newest] {
+            store.insert_memory_with_kb(m, "personal").unwrap();
+        }
+        // A memory in another KB must never enter this queue.
+        store
+            .insert_memory_with_kb(&fact("Unrelated kb memory."), "other")
+            .unwrap();
+
+        let pending = store
+            .list_memories_pending_fact_extraction("personal", None, None)
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![oldest.id, middle.id, newest.id]
+        );
+        assert_eq!(
+            store.fact_extraction_coverage("personal", None).unwrap(),
+            (3, 3)
+        );
+
+        // A memory that produced a fact is processed.
+        let f = engram_core::types::Fact {
+            source_memory_id: oldest.id,
+            ..test_fact(&store, "Ana", "lives_in", "Lisbon")
+        };
+        store.insert_fact(&f).unwrap();
+        // A memory that produced NO facts is processed too, once logged.
+        store
+            .record_fact_extraction(middle.id, Some("test-model"), 0, "backfill")
+            .unwrap();
+
+        let pending = store
+            .list_memories_pending_fact_extraction("personal", None, None)
+            .unwrap();
+        assert_eq!(pending.iter().map(|m| m.id).collect::<Vec<_>>(), vec![newest.id]);
+        assert_eq!(
+            store.fact_extraction_coverage("personal", None).unwrap(),
+            (3, 1)
+        );
+
+        // --limit takes the oldest slice.
+        let limited = store
+            .list_memories_pending_fact_extraction("personal", None, Some(1))
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, newest.id);
+
+        // Re-editing content clears the marker so new content is re-examined.
+        store.delete_facts_for_memory(middle.id).unwrap();
+        assert_eq!(
+            store
+                .list_memories_pending_fact_extraction("personal", None, None)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn pending_fact_extraction_queue_filters_by_diary() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut work = fact("Work note.");
+        work.diary = "work".into();
+        store.insert_memory_with_kb(&work, "personal").unwrap();
+        store
+            .insert_memory_with_kb(&fact("Default note."), "personal")
+            .unwrap();
+
+        let pending = store
+            .list_memories_pending_fact_extraction("personal", Some("work"), None)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, work.id);
+        assert_eq!(
+            store
+                .fact_extraction_coverage("personal", Some("work"))
+                .unwrap(),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn event_time_roundtrips_through_the_memory_row() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let when = chrono::DateTime::parse_from_rfc3339("1990-04-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut m = fact("Ana was born in April 1990.");
+        m.event_time = Some(when);
+        store.insert_memory_with_kb(&m, "personal").unwrap();
+        let got = store
+            .list_memories_pending_fact_extraction("personal", None, None)
+            .unwrap();
+        assert_eq!(got[0].event_time, Some(when));
     }
 
     #[test]

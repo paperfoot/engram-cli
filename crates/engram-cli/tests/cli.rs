@@ -899,8 +899,10 @@ fn document_delete_clears_derived_entities() {
 }
 
 #[test]
-fn memory_aliases_roundtrip_and_default_no_fact_extraction() {
+fn memory_aliases_roundtrip_and_skip_extraction_loudly_without_a_key() {
     let (tmp, mut add) = with_isolated_home();
+    // ENGRAM_BENCH_FORCE_STUB (set by engram()) stands in for "no key": the
+    // fact layer must refuse to reach the network, and say so.
     add.env("OPENROUTER_API_KEY", "fake-key-that-should-not-be-used");
     let out = add
         .args([
@@ -918,6 +920,18 @@ fn memory_aliases_roundtrip_and_default_no_fact_extraction() {
         .clone();
     let added = parse_stdout(&out);
     assert_eq!(added["data"]["facts_added"], 0);
+    assert_eq!(
+        added["data"]["fact_extraction"],
+        "skipped_no_openrouter_key"
+    );
+    assert_eq!(
+        added["metadata"]["fact_extraction"],
+        "skipped_no_openrouter_key"
+    );
+    let note = added["metadata"]["fact_extraction_note"]
+        .as_str()
+        .expect("a loud skip carries a note");
+    assert!(note.contains("facts backfill"), "actionable note: {note}");
 
     let mut search = engram();
     search.env("HOME", tmp.path());
@@ -1605,6 +1619,36 @@ fn recall_json(tmp: &tempfile::TempDir, args: &[&str]) -> Value {
     parse_stdout(&out)
 }
 
+// ----- Fact layer activation: default-on extraction, event time, backfill ---
+
+/// A deterministic offline "extractor". Keys are matched against the memory
+/// text, so several memories can yield different facts in one process without
+/// a network call.
+const LISBON_SCRIPT: &str = r#"{
+  "Lisbon": [{"subject":"Ana","predicate":"lives_in","object":"Lisbon","confidence":1.0,"fact_type":"profile_slot"}],
+  "Acme":   [{"subject":"Ana","predicate":"works_at","object":"Acme","confidence":1.0,"fact_type":"profile_slot"}],
+  "*": []
+}"#;
+
+/// A command against `tmp` whose fact extraction is driven by `script`.
+fn cmd_with_extractor(tmp: &tempfile::TempDir, script: &str) -> Command {
+    let mut cmd = cmd_in(tmp);
+    cmd.env("ENGRAM_FACT_LLM_STUB", script);
+    cmd
+}
+
+fn run_json(cmd: &mut Command, args: &[&str]) -> Value {
+    let out = cmd
+        .args(args)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    parse_stdout(&out)
+}
+
 fn contents(v: &Value) -> Vec<String> {
     v["data"]["results"]
         .as_array()
@@ -1858,4 +1902,381 @@ fn entity_retrieval_fires_when_recall_spans_every_kb() {
         entity_kbs.contains(&"one") && entity_kbs.contains(&"two"),
         "entity retrieval must fire in both KBs, got {entity_kbs:?}"
     );
+}
+
+#[test]
+fn remember_extracts_facts_by_default() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["remember", "Ana moved to Lisbon last March."],
+    );
+    // No --extract-facts flag anywhere: extraction is the default now.
+    assert_eq!(v["data"]["facts_added"], 1);
+    assert_eq!(v["data"]["fact_extraction"], "ran_stub");
+    assert!(v["data"]["fact_extraction_note"].is_null());
+
+    let facts = run_json(&mut cmd_in(&tmp), &["facts", "list", "--subject", "Ana"]);
+    assert_eq!(facts["data"]["facts"][0]["predicate"], "lives_in");
+    assert_eq!(facts["data"]["facts"][0]["object"], "Lisbon");
+}
+
+#[test]
+fn remember_no_extract_facts_opts_out() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["remember", "Ana moved to Lisbon last March.", "--no-extract-facts"],
+    );
+    assert_eq!(v["data"]["facts_added"], 0);
+    assert_eq!(v["data"]["fact_extraction"], "disabled");
+
+    // The legacy spelling still works.
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["remember", "Ana works at Acme.", "--no-facts"],
+    );
+    assert_eq!(v["data"]["fact_extraction"], "disabled");
+}
+
+#[test]
+fn facts_json_still_skips_the_extraction_call() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    // An extractor IS available, but the caller supplied the triple — the
+    // documented contract is "no LLM call", so the Lisbon rule must not fire.
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &[
+            "remember",
+            "Ana moved to Lisbon last March.",
+            "--facts-json",
+            r#"[{"subject":"Ana","predicate":"prefers_language","object":"Rust"}]"#,
+        ],
+    );
+    assert_eq!(v["data"]["fact_extraction"], "skipped_facts_json");
+    assert_eq!(v["data"]["facts_added"], 1);
+
+    let facts = run_json(&mut cmd_in(&tmp), &["facts", "list", "--subject", "Ana"]);
+    assert_eq!(facts["data"]["count"], 1);
+    assert_eq!(facts["data"]["facts"][0]["predicate"], "prefers_language");
+}
+
+#[test]
+fn remember_still_accepts_the_deprecated_extract_facts_flag() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["remember", "Ana moved to Lisbon last March.", "--extract-facts"],
+    );
+    assert_eq!(v["data"]["facts_added"], 1);
+
+    // Old behavior preserved: --extract-facts alongside --facts-json still
+    // does both, instead of only storing the caller's triple.
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &[
+            "remember",
+            "Ana works at Acme Corp.",
+            "--extract-facts",
+            "--facts-json",
+            r#"[{"subject":"Ana","predicate":"prefers_language","object":"Rust"}]"#,
+        ],
+    );
+    assert_eq!(v["data"]["fact_extraction"], "ran_stub");
+    assert_eq!(v["data"]["facts_added"], 2);
+}
+
+#[test]
+fn remember_without_a_key_skips_extraction_loudly_on_stderr() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    let assert = cmd
+        .args(["remember", "Ana moved to Lisbon last March.", "--json"])
+        .assert()
+        .success();
+    let v = parse_stdout(&assert.get_output().stdout);
+    assert_eq!(v["data"]["fact_extraction"], "skipped_no_openrouter_key");
+    let err = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        err.contains("fact extraction skipped"),
+        "the skip must be audible, got stderr: {err}"
+    );
+}
+
+#[test]
+fn memory_add_has_full_flag_parity_with_remember() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    // --facts-json, --autonomy and --event-time now exist on `memory add`.
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &[
+            "memory",
+            "add",
+            "Ana and Bo married in Porto.",
+            "--facts-json",
+            r#"[{"subject":"Ana","predicate":"married_to","object":"Bo"}]"#,
+            "--autonomy",
+            "strict",
+            "--event-time",
+            "2019-08-17",
+            "--no-extract-facts",
+        ],
+    );
+    assert_eq!(v["data"]["facts_added"], 1);
+    assert_eq!(v["data"]["event_time"], "2019-08-17T00:00:00+00:00");
+
+    // The fact inherits the memory's event time as its bi-temporal start.
+    let facts = run_json(&mut cmd_in(&tmp), &["facts", "list", "--subject", "Ana"]);
+    assert!(facts["data"]["facts"][0]["valid_from"]
+        .as_str()
+        .unwrap()
+        .starts_with("2019-08-17"));
+}
+
+#[test]
+fn date_valued_predicate_object_becomes_the_fact_event_time() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    run_json(
+        &mut cmd_in(&tmp),
+        &[
+            "remember",
+            "Ana's birthday.",
+            "--facts-json",
+            r#"[{"subject":"Ana","predicate":"born_on","object":"1990-04-12"}]"#,
+        ],
+    );
+    let facts = run_json(&mut cmd_in(&tmp), &["facts", "list", "--subject", "Ana"]);
+    assert!(facts["data"]["facts"][0]["valid_from"]
+        .as_str()
+        .unwrap()
+        .starts_with("1990-04-12"));
+}
+
+#[test]
+fn event_time_is_persisted_and_scopes_recall_since_until() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let old = run_json(
+        &mut cmd_in(&tmp),
+        &[
+            "remember",
+            "Sailing regatta in Cascais with the whole family.",
+            "--event-time",
+            "2019-06-01T10:00:00Z",
+        ],
+    );
+    assert_eq!(old["data"]["event_time"], "2019-06-01T10:00:00+00:00");
+    let recent = run_json(
+        &mut cmd_in(&tmp),
+        &[
+            "remember",
+            "Sailing regatta in Cascais with the new crew.",
+            "--event-time",
+            "2026-06-01",
+        ],
+    );
+
+    assert_eq!(recent["data"]["event_time"], "2026-06-01T00:00:00+00:00");
+
+    let contents = |v: &Value| -> Vec<String> {
+        v["data"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["content"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    // --since after the old event: only the recent memory survives, even
+    // though both rows were created seconds ago.
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &[
+            "recall",
+            "sailing regatta Cascais",
+            "--since",
+            "2025-01-01T00:00:00Z",
+        ],
+    );
+    let found = contents(&v);
+    assert!(
+        found.iter().any(|c| c.contains("new crew")),
+        "the 2026 event must answer a --since 2025 recall, got {found:?}"
+    );
+    assert!(
+        !found.iter().any(|c| c.contains("whole family")),
+        "a 2019 event must not answer a --since 2025 recall, got {found:?}"
+    );
+
+    // --until before the recent event flips the result.
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &[
+            "recall",
+            "sailing regatta Cascais",
+            "--until",
+            "2020-01-01T00:00:00Z",
+        ],
+    );
+    let found = contents(&v);
+    assert!(found.iter().any(|c| c.contains("whole family")), "{found:?}");
+    assert!(!found.iter().any(|c| c.contains("new crew")), "{found:?}");
+}
+
+#[test]
+fn event_time_rejects_unparseable_dates() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    cmd.args(["remember", "x", "--event-time", "last tuesday", "--json"])
+        .assert()
+        .failure()
+        .code(3);
+}
+
+/// Store three memories with no extractor available — the pre-activation
+/// state of a real store — then backfill them.
+fn seed_unextracted(tmp: &tempfile::TempDir) {
+    for content in [
+        "Ana moved to Lisbon last March.",
+        "Ana works at Acme Corp.",
+        "Weather was pleasant, nothing worth filing.",
+    ] {
+        cmd_in(tmp)
+            .args(["remember", content, "--kb", "personal", "--json"])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn facts_backfill_dry_run_reports_work_without_calling_an_llm() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    seed_unextracted(&tmp);
+
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "backfill", "--kb", "personal", "--dry-run"],
+    );
+    assert_eq!(v["data"]["dry_run"], true);
+    assert_eq!(v["data"]["memories_total"], 3);
+    assert_eq!(v["data"]["pending"], 3);
+    assert_eq!(v["data"]["would_process"], 3);
+    assert_eq!(v["data"]["llm_available"], false);
+    assert_eq!(v["data"]["memories"].as_array().unwrap().len(), 3);
+
+    // --limit bounds the preview.
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "backfill", "--kb", "personal", "--dry-run", "--limit", "1"],
+    );
+    assert_eq!(v["data"]["would_process"], 1);
+    assert_eq!(v["data"]["pending"], 3);
+
+    // Nothing was written: a dry run is still a dry run.
+    let facts = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "list", "--kb", "personal", "--diary", "*"],
+    );
+    assert_eq!(facts["data"]["count"], 0);
+}
+
+#[test]
+fn facts_backfill_without_a_key_refuses_with_exit_2() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    seed_unextracted(&tmp);
+    let assert = cmd_in(&tmp)
+        .args(["facts", "backfill", "--kb", "personal", "--json"])
+        .assert()
+        .failure()
+        .code(2);
+    let err = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        err.contains("OPENROUTER_API_KEY"),
+        "the refusal must name the missing key, got: {err}"
+    );
+}
+
+#[test]
+fn facts_backfill_is_idempotent_oldest_first_and_resumable() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    seed_unextracted(&tmp);
+
+    // First pass, bounded: the two oldest memories only.
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["facts", "backfill", "--kb", "personal", "--limit", "2"],
+    );
+    assert_eq!(v["data"]["processed"], 2);
+    assert_eq!(v["data"]["facts_added"], 2);
+    assert_eq!(v["data"]["failed"], 0);
+    assert_eq!(v["data"]["remaining_pending"], 1);
+
+    // Second pass picks up exactly where the first stopped, including the
+    // memory that legitimately yields no facts.
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["facts", "backfill", "--kb", "personal"],
+    );
+    assert_eq!(v["data"]["processed"], 1);
+    assert_eq!(v["data"]["facts_added"], 0);
+    assert_eq!(v["data"]["no_facts_found"], 1);
+    assert_eq!(v["data"]["remaining_pending"], 0);
+
+    // Third pass is a no-op — no re-extraction, no duplicate facts.
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["facts", "backfill", "--kb", "personal"],
+    );
+    assert_eq!(v["data"]["processed"], 0);
+    assert_eq!(v["data"]["facts_added"], 0);
+
+    let facts = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "list", "--kb", "personal", "--diary", "*"],
+    );
+    assert_eq!(facts["data"]["count"], 2);
+    let predicates: Vec<&str> = facts["data"]["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["predicate"].as_str().unwrap())
+        .collect();
+    assert!(predicates.contains(&"lives_in"));
+    assert!(predicates.contains(&"works_at"));
+}
+
+#[test]
+fn facts_backfill_skips_memories_whose_facts_arrived_at_write_time() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["remember", "Ana moved to Lisbon last March.", "--kb", "personal"],
+    );
+    let v = run_json(
+        &mut cmd_with_extractor(&tmp, LISBON_SCRIPT),
+        &["facts", "backfill", "--kb", "personal", "--dry-run"],
+    );
+    assert_eq!(v["data"]["pending"], 0);
+    assert_eq!(v["data"]["already_processed"], 1);
+}
+
+#[test]
+fn facts_backfill_scopes_to_kb_and_diary() {
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    cmd_in(&tmp)
+        .args(["remember", "Work note about Acme.", "--kb", "personal", "--diary", "work", "--json"])
+        .assert()
+        .success();
+    cmd_in(&tmp)
+        .args(["remember", "Home note about Lisbon.", "--kb", "personal", "--json"])
+        .assert()
+        .success();
+    cmd_in(&tmp)
+        .args(["remember", "Other kb note.", "--kb", "elsewhere", "--json"])
+        .assert()
+        .success();
+
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "backfill", "--kb", "personal", "--diary", "work", "--dry-run"],
+    );
+    assert_eq!(v["data"]["memories_total"], 1);
+    assert_eq!(v["data"]["would_process"], 1);
 }

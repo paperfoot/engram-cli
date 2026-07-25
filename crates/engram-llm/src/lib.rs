@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod openrouter;
+pub mod stub;
 
 use async_trait::async_trait;
 pub use error::LlmError;
