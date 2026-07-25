@@ -3033,15 +3033,24 @@ impl SqliteStore {
         }
         let mut matched: Vec<String> = Vec::new();
         for key in &keys {
-            // Cached: a compile upserts an entity per mention, and re-parsing
-            // this join for each spelling would show up on a large KB.
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT DISTINCT e.id FROM entities e
-                 LEFT JOIN entity_aliases a ON a.entity_id = e.id AND a.kb = e.kb
-                 WHERE e.kb = ?1 AND (lower(e.canonical_name) = ?2 OR a.alias_norm = ?2)",
+            // Two indexed seeks, deliberately NOT one OR-joined query. An `OR`
+            // spanning `entities` and `entity_aliases` across a LEFT JOIN forces
+            // SQLite to scan every entity in the KB and cross-join the KB's
+            // aliases (it can only seek the `kb` prefix), and `lower()` on the
+            // column defeats idx_entities_kb_name outright. On a 2,300-entity KB
+            // that measured 904ms per lookup against 0.09ms for these two seeks,
+            // once per spelling per mention — minutes of compile became hours.
+            let mut by_name = self.conn.prepare_cached(
+                "SELECT id FROM entities
+                 WHERE kb = ?1 AND canonical_name = ?2 COLLATE NOCASE",
             )?;
-            let rows = stmt.query_map(params![kb, key], |r| r.get::<_, String>(0))?;
-            for row in rows {
+            let mut by_alias = self.conn.prepare_cached(
+                "SELECT entity_id FROM entity_aliases WHERE kb = ?1 AND alias_norm = ?2",
+            )?;
+            let found = by_name
+                .query_map(params![kb, key], |r| r.get::<_, String>(0))?
+                .chain(by_alias.query_map(params![kb, key], |r| r.get::<_, String>(0))?);
+            for row in found {
                 let found = row?;
                 if !matched.contains(&found) {
                     matched.push(found);
