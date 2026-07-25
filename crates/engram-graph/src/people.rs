@@ -563,8 +563,12 @@ impl Extraction {
 pub struct PersonIndex {
     /// Case-folded key → the spelling the KB should display.
     display: HashMap<String, String>,
-    /// Case-folded keys of every multi-token person in the KB, sorted.
-    full_names: Vec<String>,
+    /// First name → the full-name keys starting with it, sorted. Two entries
+    /// under one first name is the ambiguity that blocks every fold.
+    by_first_name: HashMap<String, Vec<String>>,
+    /// Any name part → the full-name keys containing it, sorted. Used only for
+    /// the bare-surname fallback.
+    by_part: HashMap<String, Vec<String>>,
 }
 
 impl PersonIndex {
@@ -597,15 +601,72 @@ impl PersonIndex {
             .map(|(key, _)| key.clone())
             .collect();
         full_names.sort();
+
+        // Inverted indexes, so a chunk pays a hash lookup per bare name rather
+        // than a scan of every person in the KB.
+        let mut by_first_name: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_part: HashMap<String, Vec<String>> = HashMap::new();
+        for full in &full_names {
+            let mut parts = full.split(' ');
+            if let Some(first) = parts.next() {
+                by_first_name
+                    .entry(first.to_string())
+                    .or_default()
+                    .push(full.clone());
+            }
+            for part in full.split(' ') {
+                let bucket = by_part.entry(part.to_string()).or_default();
+                if !bucket.contains(full) {
+                    bucket.push(full.clone());
+                }
+            }
+        }
         Self {
             display,
-            full_names,
+            by_first_name,
+            by_part,
         }
     }
 
     /// True when nothing is known yet (a plain single-chunk `analyze`).
     pub fn is_empty(&self) -> bool {
         self.display.is_empty()
+    }
+
+    /// The full-name person a bare `short_key` may fold into, given the full
+    /// names of the chunk being analyzed as well as the KB's.
+    ///
+    /// Returns `None` when nothing matches OR when more than one person could
+    /// claim the name — the conservative half of the rule, and the reason two
+    /// Lauras never become one.
+    fn fold_target(&self, short_key: &str, local_full: &[String]) -> Option<String> {
+        let gather = |kb: Option<&Vec<String>>, first_only: bool| -> Vec<String> {
+            let mut out: Vec<String> = kb.cloned().unwrap_or_default();
+            for local in local_full {
+                let hit = if first_only {
+                    local.split(' ').next() == Some(short_key)
+                } else {
+                    local.split(' ').any(|part| part == short_key)
+                };
+                if hit && !out.contains(local) {
+                    out.push(local.clone());
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        };
+        // Preferred rule: the short form is the person's FIRST name.
+        let first = gather(self.by_first_name.get(short_key), true);
+        match first.len() {
+            1 => return first.into_iter().next(),
+            0 => {}
+            _ => return None,
+        }
+        // Fallback: a bare surname ("Pruett" → "Patrick Ashcomb Pruett"),
+        // under the same exactly-one rule.
+        let any = gather(self.by_part.get(short_key), false);
+        (any.len() == 1).then(|| any.into_iter().next().unwrap_or_default())
     }
 
     /// The spelling this KB should display for `name`.
@@ -938,16 +999,13 @@ pub fn analyze_with_index(text: &str, index: &PersonIndex) -> Extraction {
     // knows, which is what makes the fold work across chunks — and what makes
     // the ambiguity test honest: two Lauras anywhere in the KB block the fold
     // in every chunk, including the ones that mention only one of them.
-    let mut people_keys: Vec<String> = acc
+    let local_full: Vec<String> = acc
         .values()
         .filter(|a| a.kind == KIND_PERSON && a.name.split_whitespace().count() >= 2)
         .map(|a| hygiene::dedup_key(&a.name))
         .collect();
-    people_keys.extend(index.full_names.iter().cloned());
-    people_keys.sort();
-    people_keys.dedup();
 
-    let mut redirect: Vec<(String, String)> = Vec::new();
+    let mut merge_order: Vec<(String, String)> = Vec::new();
     for (key, entry) in acc.iter() {
         if entry.name.split_whitespace().count() != 1 {
             continue;
@@ -959,39 +1017,14 @@ pub fn analyze_with_index(text: &str, index: &PersonIndex) -> Extraction {
         if !looks_like_person_name(&entry.name) {
             continue;
         }
-        // Preferred rule: the short form is the person's FIRST name.
-        let first: Vec<&String> = people_keys
-            .iter()
-            .filter(|full| full.split(' ').next() == Some(key.as_str()))
-            .collect();
-        let target = match first.len() {
-            // Ambiguous ("Laura" inside both "Laura Corvo" and "Laura
-            // Moreno") → leave the bare node alone rather than fuse two
-            // humans. This is the whole point of the "exactly one" rule.
-            1 => Some(first[0]),
-            0 => {
-                // Fall back to a bare surname ("Pruett" → "Patrick Ashcomb
-                // Pruett"), under the same exactly-one rule.
-                let mut any = people_keys
-                    .iter()
-                    .filter(|full| full.split(' ').any(|part| part == key));
-                any.next().filter(|_| any.next().is_none())
-            }
-            _ => None,
-        };
-        if let Some(full) = target {
-            redirect.push((key.clone(), full.clone()));
+        if let Some(full) = index.fold_target(key, &local_full) {
+            merge_order.push((key.clone(), full));
         }
     }
     // Sorted, so a chunk compiles to the same graph on every run.
-    redirect.sort();
-    let redirect: HashMap<String, String> = redirect.into_iter().collect();
-
-    let mut merge_order: Vec<(String, String)> = redirect
-        .iter()
-        .map(|(short, full)| (short.clone(), full.clone()))
-        .collect();
     merge_order.sort();
+    let redirect: HashMap<String, String> = merge_order.iter().cloned().collect();
+
     for (short_key, full_key) in merge_order {
         let Some(short) = acc.remove(&short_key) else {
             continue;
