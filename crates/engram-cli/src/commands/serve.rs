@@ -388,7 +388,8 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
                 "profile": profile.as_str(),
                 "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
                 "candidates_considered": rerank_candidates,
-                "diary_isolation": notes.diary_isolation_json()
+                "diary_isolation": notes.diary_isolation_json(),
+                "temporal_scope": notes.temporal_scope_json()
             }
         }
     }))
@@ -518,7 +519,8 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
                 "candidates_considered": rerank_candidates,
                 "kb": scope.label(),
                 "kb_scope": scope.origin.as_str(),
-                "diary_isolation": notes.diary_isolation_json()
+                "diary_isolation": notes.diary_isolation_json(),
+                "temporal_scope": notes.temporal_scope_json()
             }
         }
     }))

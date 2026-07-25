@@ -93,33 +93,112 @@ pub fn list(ctx: &AppContext, kb: String, limit: usize, min_mentions: u32) -> Re
     Ok(())
 }
 
+/// `engram people show <name> [--kb '*']`
+///
+/// One person usually exists once PER KB — the compiler builds entity rows per
+/// namespace — so an unscoped lookup has to merge them. It used to call
+/// `find_entity(None, …)`, whose SQL is `LIMIT 1` with no ORDER BY: SQLite
+/// handed back an arbitrary KB's row and every other KB's aliases, mentions,
+/// relations and memories were silently dropped, which is the opposite of what
+/// `--kb '*'` asks for. `find_entities` returns one row per KB, so this now
+/// unions the aliases, sums the mention counts, and keeps relations and
+/// snippets grouped by their own KB (provenance survives the merge).
 pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Result<(), CliError> {
     let kb_filter = if kb == "*" { None } else { Some(kb.as_str()) };
-    let Some(person) = ctx.store.find_entity(kb_filter, &name)? else {
+    // One row per KB. The cap is generous: a name is expected in a handful of
+    // KBs, never hundreds.
+    let matches = ctx.store.find_entities(kb_filter, &name, 64)?;
+    let Some(primary) = matches.first().cloned() else {
         return Err(CliError::BadInput(format!(
             "no entity named {name:?} in kb {kb:?} — run `engram people list --kb {kb}`"
         )));
     };
-    let relations = ctx
-        .store
-        .relations_for_entity(&person.kb, person.id, SHOW_RELATIONS)?;
-    let ranked = rank_relations(&person.canonical_name, relations);
-    let memories = memory_snippets(ctx, &person, &ranked, snippets)?;
 
-    let mut meta = Metadata::default();
-    meta.add("kb", person.kb.clone());
-    meta.add("relations", ranked.len());
-    meta.add("kind", person.kind.clone());
-    let payload = json!({
-        "kb": person.kb,
-        "person": {
-            "name": person.canonical_name,
-            "kind": person.kind,
-            "aliases": person.aliases,
-            "mentions": person.mention_count,
+    // Per-KB views, in the order find_entities ranked them (best-mentioned
+    // first), so the merged output leads with the KB that knows this person best.
+    let mut per_kb: Vec<(EntityRecord, Vec<Edge>)> = Vec::with_capacity(matches.len());
+    for person in matches {
+        let relations = ctx
+            .store
+            .relations_for_entity(&person.kb, person.id, SHOW_RELATIONS)?;
+        let ranked = rank_relations(&person.canonical_name, relations);
+        per_kb.push((person, ranked));
+    }
+
+    // Union of aliases (and of the other KBs' canonical spellings, which are
+    // aliases from the merged person's point of view), case-insensitively
+    // deduped against the primary name.
+    let mut aliases: Vec<String> = Vec::new();
+    let mut seen_alias: Vec<String> = vec![primary.canonical_name.to_ascii_lowercase()];
+    let push_alias = |candidate: &str, out: &mut Vec<String>, seen: &mut Vec<String>| {
+        let key = candidate.to_ascii_lowercase();
+        if candidate.trim().is_empty() || seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+        out.push(candidate.to_string());
+    };
+    for (person, _) in &per_kb {
+        push_alias(&person.canonical_name, &mut aliases, &mut seen_alias);
+        for alias in &person.aliases {
+            push_alias(alias, &mut aliases, &mut seen_alias);
+        }
+    }
+
+    let mentions: u32 = per_kb.iter().map(|(p, _)| p.mention_count).sum();
+    let relation_total: usize = per_kb.iter().map(|(_, r)| r.len()).sum();
+    let kbs: Vec<String> = per_kb.iter().map(|(p, _)| p.kb.clone()).collect();
+
+    // Flat relation list (each edge labelled with its KB) plus the per-KB
+    // grouping, so a caller can either scan everything or stay inside one
+    // namespace.
+    let mut flat_relations: Vec<Value> = Vec::with_capacity(relation_total);
+    let mut relations_by_kb: Vec<Value> = Vec::with_capacity(per_kb.len());
+    let mut memories: Vec<Value> = Vec::new();
+    for (person, ranked) in &per_kb {
+        let mut group: Vec<Value> = Vec::with_capacity(ranked.len());
+        for edge in ranked {
+            let mut v = edge_json(edge);
+            v["kb"] = json!(person.kb);
+            group.push(v.clone());
+            flat_relations.push(v);
+        }
+        relations_by_kb.push(json!({
+            "kb": person.kb,
             "entity_id": person.id.to_string(),
+            "mentions": person.mention_count,
+            "relations": group,
+        }));
+        // Snippets come from every KB, each tagged, instead of only whichever
+        // row SQLite happened to return first.
+        for mut snippet in memory_snippets(ctx, person, ranked, snippets)? {
+            snippet["kb"] = json!(person.kb);
+            memories.push(snippet);
+        }
+    }
+
+    let kb_label = if kb_filter.is_some() {
+        primary.kb.clone()
+    } else {
+        "*".to_string()
+    };
+    let mut meta = Metadata::default();
+    meta.add("kb", kb_label.clone());
+    meta.add("kbs", kbs.clone());
+    meta.add("relations", flat_relations.len());
+    meta.add("kind", primary.kind.clone());
+    let payload = json!({
+        "kb": kb_label,
+        "kbs": kbs,
+        "person": {
+            "name": primary.canonical_name,
+            "kind": primary.kind,
+            "aliases": aliases,
+            "mentions": mentions,
+            "entity_id": primary.id.to_string(),
         },
-        "relations": ranked.iter().map(edge_json).collect::<Vec<_>>(),
+        "relations": flat_relations,
+        "relations_by_kb": relations_by_kb,
         "memories": memories,
     });
 
@@ -143,26 +222,50 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
                 );
             }
         }
+        if let Some(kbs) = data["kbs"].as_array() {
+            if kbs.len() > 1 {
+                println!(
+                    "Known in: {}",
+                    kbs.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         println!();
-        let relations = data["relations"].as_array().cloned().unwrap_or_default();
-        if relations.is_empty() {
+        let groups = data["relations_by_kb"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let total: usize = groups
+            .iter()
+            .map(|g| g["relations"].as_array().map(|a| a.len()).unwrap_or(0))
+            .sum();
+        if total == 0 {
             println!("Relations: (none yet)");
         } else {
-            println!("Relations:");
-            for edge in &relations {
-                let source = edge["sources"]
-                    .as_array()
-                    .and_then(|s| s.first())
-                    .and_then(|s| s.get("memory_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unsourced");
-                println!(
-                    "  {} — {} -> {}, source: {}",
-                    edge["subject"].as_str().unwrap_or(""),
-                    edge["predicate"].as_str().unwrap_or(""),
-                    edge["object"].as_str().unwrap_or(""),
-                    source
-                );
+            for group in &groups {
+                let relations = group["relations"].as_array().cloned().unwrap_or_default();
+                if relations.is_empty() {
+                    continue;
+                }
+                println!("Relations (kb={}):", group["kb"].as_str().unwrap_or(""));
+                for edge in &relations {
+                    let source = edge["sources"]
+                        .as_array()
+                        .and_then(|s| s.first())
+                        .and_then(|s| s.get("memory_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unsourced");
+                    println!(
+                        "  {} — {} -> {}, source: {}",
+                        edge["subject"].as_str().unwrap_or(""),
+                        edge["predicate"].as_str().unwrap_or(""),
+                        edge["object"].as_str().unwrap_or(""),
+                        source
+                    );
+                }
             }
         }
         let memories = data["memories"].as_array().cloned().unwrap_or_default();

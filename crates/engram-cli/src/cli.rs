@@ -139,11 +139,18 @@ pub enum Command {
         #[arg(long)]
         allow_mixed_embeddings: bool,
 
-        /// Earliest event_time to include (RFC3339).
+        /// Earliest event_time to include: RFC3339 (2026-06-01T09:30:00Z) or
+        /// YYYY-MM-DD, which means the START of that UTC day. Same spellings
+        /// `remember --event-time` accepts. NOTE: a temporal window restricts
+        /// results to raw memory chunks — derived sources (claims, wiki pages,
+        /// entities, relations) carry no event time of their own and are
+        /// withheld, which `metadata.temporal_scope` reports.
         #[arg(long)]
         since: Option<String>,
 
-        /// Latest event_time to include (RFC3339).
+        /// Latest event_time to include: RFC3339 or YYYY-MM-DD, which means
+        /// the END of that UTC day, so `--since D --until D` selects all of
+        /// day D.
         #[arg(long)]
         until: Option<String>,
     },
@@ -596,6 +603,14 @@ pub enum MemoryCommand {
         all_kbs: bool,
         #[arg(long, default_value = "default")]
         diary: String,
+        /// Earliest event_time to include: RFC3339 or YYYY-MM-DD (start of
+        /// that UTC day). Same window semantics as `recall --since`.
+        #[arg(long)]
+        since: Option<String>,
+        /// Latest event_time to include: RFC3339 or YYYY-MM-DD (end of that
+        /// UTC day). Same window semantics as `recall --until`.
+        #[arg(long)]
+        until: Option<String>,
     },
     /// Update a memory by UUID.
     Update {
@@ -755,9 +770,12 @@ pub enum FactsCommand {
         /// Diary scope. Default is "default".
         #[arg(long, default_value = "default")]
         diary: String,
-        /// Knowledge base/domain namespace. Pass "*" for all.
-        #[arg(long, default_value = "default")]
-        kb: String,
+        /// Knowledge base/domain namespace. Omit (or pass "*") to list facts
+        /// from EVERY KB — the same default as `recall`, because facts written
+        /// to a named KB are otherwise invisible here and read as "extraction
+        /// produced nothing". Every fact is labelled with its own KB.
+        #[arg(long)]
+        kb: Option<String>,
         /// Include superseded (historic) facts in addition to active ones.
         #[arg(long)]
         all: bool,
@@ -802,15 +820,18 @@ pub enum FactsCommand {
     /// and respects `engram budget` guardrails.
     #[command(after_long_help = "\
 Examples:
+  engram facts backfill --dry-run                     # every KB, no API call
   engram facts backfill --kb personal --dry-run       # what would be processed
   engram facts backfill --kb personal --limit 25      # bounded first pass
   engram facts backfill --kb personal --diary work    # one diary only
 ")]
     Backfill {
-        /// Knowledge base/domain namespace to backfill. Required: this spends
-        /// one LLM call per memory, so the scope is never implicit.
+        /// Knowledge base/domain namespace to backfill. Omit (or pass "*") to
+        /// sweep EVERY KB, oldest memory first across the union. Pair an
+        /// unscoped sweep with --dry-run or --limit: this spends one LLM call
+        /// per memory.
         #[arg(long)]
-        kb: String,
+        kb: Option<String>,
         /// Restrict to one diary. Omit (or pass "*") for every diary in the KB.
         #[arg(long)]
         diary: Option<String>,

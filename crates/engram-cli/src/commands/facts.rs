@@ -19,15 +19,33 @@ use engram_graph::facts::{extract_facts, normalize};
 use serde_json::json;
 use std::time::Instant;
 
+/// `engram facts list` — active facts, across EVERY KB by default.
+///
+/// Defaulting to the KB literally named "default" made this command lie: an
+/// agent that wrote to `--kb personal` and then ran `facts list` got
+/// `count: 0` and exit 0, which reads as "extraction produced nothing" rather
+/// than "you are looking in the wrong namespace". `recall` already defaults to
+/// every KB for the same reason; `--kb <name>` narrows, and each fact is
+/// labelled with the KB it came from so a cross-KB listing stays legible.
 pub fn list(
     ctx: &AppContext,
     subject: Option<String>,
     diary: String,
-    kb: String,
+    kb: Option<String>,
     all: bool,
     limit: usize,
 ) -> Result<(), CliError> {
-    let kb_filter = if kb == "*" { None } else { Some(kb.as_str()) };
+    let kb_label = kb
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .unwrap_or("*")
+        .to_string();
+    let kb_filter = if kb_label == "*" {
+        None
+    } else {
+        Some(kb_label.as_str())
+    };
     let facts = match subject {
         Some(s) => {
             let s_norm = normalize(&s);
@@ -50,30 +68,56 @@ pub fn list(
         }
     };
 
+    let fact_kbs = ctx
+        .store
+        .kbs_for_facts(&facts.iter().map(|f| f.id).collect::<Vec<_>>())?;
+    let labelled = |f: &Fact| {
+        let mut v = fact_to_json(f);
+        v["kb"] = json!(fact_kbs.get(&f.id).cloned().unwrap_or_default());
+        v
+    };
+
     let payload = json!({
-        "kb": kb,
+        "kb": kb_label,
+        "kb_scope": if kb_filter.is_some() { "flag" } else { "all_kbs" },
         "count": facts.len(),
-        "facts": facts.iter().map(fact_to_json).collect::<Vec<_>>(),
+        "facts": facts.iter().map(labelled).collect::<Vec<_>>(),
     });
 
-    print_success(ctx.format, payload, Metadata::default(), |_| {
-        if facts.is_empty() {
+    let mut meta = Metadata::default();
+    meta.add("kb", kb_label.clone());
+    meta.add(
+        "kb_scope",
+        if kb_filter.is_some() {
+            "flag"
+        } else {
+            "all_kbs"
+        },
+    );
+    print_success(ctx.format, payload, meta, |data| {
+        let rows = data["facts"].as_array().cloned().unwrap_or_default();
+        if rows.is_empty() {
             println!("(no facts)");
             return;
         }
-        for f in &facts {
-            let status = if f.superseded_by.is_some() {
-                " [superseded]"
-            } else {
+        for f in &rows {
+            let status = if f["superseded_by"].is_null() {
                 ""
+            } else {
+                " [superseded]"
             };
             println!(
-                "  {} -- {} -> {}  (conf={:.2}){}",
-                f.subject, f.predicate, f.object, f.confidence, status
+                "  [{}] {} -- {} -> {}  (conf={:.2}){}",
+                f["kb"].as_str().unwrap_or("?"),
+                f["subject"].as_str().unwrap_or(""),
+                f["predicate"].as_str().unwrap_or(""),
+                f["object"].as_str().unwrap_or(""),
+                f["confidence"].as_f64().unwrap_or(0.0),
+                status
             );
         }
         println!();
-        println!("{} facts", facts.len());
+        println!("{} facts", rows.len());
     });
     Ok(())
 }
@@ -302,34 +346,54 @@ pub fn resolve(
     Ok(())
 }
 
-/// `engram facts backfill --kb <kb>` — run fact extraction over memories that
-/// were stored before extraction was on (or while no key was configured).
+/// `engram facts backfill [--kb <kb>]` — run fact extraction over memories
+/// that were stored before extraction was on (or while no key was configured).
 ///
 /// Idempotent by provenance: a memory is skipped once it has facts or an
 /// extraction marker, so a re-run costs nothing and processes only what is
 /// genuinely new. Oldest first, so a `--limit`ed run always advances and a
 /// later run resumes where the previous one stopped.
+///
+/// `--kb` is OPTIONAL: omitted, the run sweeps every KB, oldest-first across
+/// the union. Hard-requiring it meant an agent had to already know every
+/// namespace it had ever written to before it could catch up the fact layer —
+/// and a KB it forgot stayed permanently un-extracted with no signal. Each
+/// memory's facts are written back into that memory's own KB.
 pub async fn backfill(
     ctx: &AppContext,
-    kb: String,
+    kb: Option<String>,
     diary: Option<String>,
     limit: Option<usize>,
     dry_run: bool,
 ) -> Result<(), CliError> {
     let start = Instant::now();
     let diary_filter = diary.as_deref().filter(|d| *d != "*");
+    let kb_label = kb
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .unwrap_or("*")
+        .to_string();
+    let kb_filter = if kb_label == "*" {
+        None
+    } else {
+        Some(kb_label.as_str())
+    };
     let llm = crate::fact_llm::resolve()?;
-    let (total, pending_total) = ctx.store.fact_extraction_coverage(&kb, diary_filter)?;
+    let (total, pending_total) = ctx
+        .store
+        .fact_extraction_coverage(kb_filter, diary_filter)?;
     let queue = ctx
         .store
-        .list_memories_pending_fact_extraction(&kb, diary_filter, limit)?;
+        .list_memories_pending_fact_extraction(kb_filter, diary_filter, limit)?;
 
     if dry_run {
         let preview: Vec<serde_json::Value> = queue
             .iter()
-            .map(|m| {
+            .map(|(mkb, m)| {
                 json!({
                     "memory_id": m.id.to_string(),
+                    "kb": mkb,
                     "created_at": m.created_at.to_rfc3339(),
                     "event_time": m.event_time.map(|t| t.to_rfc3339()),
                     "diary": m.diary,
@@ -341,14 +405,14 @@ pub async fn backfill(
             elapsed_ms: start.elapsed().as_millis() as u64,
             ..Default::default()
         };
-        meta.add("kb", kb.clone());
+        meta.add("kb", kb_label.clone());
         meta.add("dry_run", true);
         meta.add("openrouter_available", llm.is_some());
         let would_process = preview.len();
         print_success(
             ctx.format,
             json!({
-                "kb": kb,
+                "kb": kb_label,
                 "diary": diary_filter,
                 "dry_run": true,
                 "memories_total": total,
@@ -384,8 +448,9 @@ pub async fn backfill(
             crate::fact_llm::no_llm_hint()
         )));
     };
-    // One LLM call per memory, so the spend guardrail applies.
-    crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
+    // One LLM call per memory, so the spend guardrail applies. A cross-KB
+    // sweep is checked against the global budget.
+    crate::commands::budget::enforce_budget(ctx, kb_filter)?;
     let model = llm.model();
 
     // The novelty gate must use the same embedder family the fact
@@ -402,13 +467,13 @@ pub async fn backfill(
     let mut failed = 0usize;
     let mut without_facts = 0usize;
     let queued = queue.len();
-    for (i, memory) in queue.iter().enumerate() {
+    for (i, (memory_kb, memory)) in queue.iter().enumerate() {
         if llm.is_live() {
             ctx.store.record_usage_event(
                 "openrouter",
                 "facts_backfill_extract",
                 Some(&model),
-                Some(&kb),
+                Some(memory_kb),
                 Some(&memory.diary),
                 1,
                 1,
@@ -428,28 +493,51 @@ pub async fn backfill(
                 continue;
             }
         };
-        ctx.store.record_fact_extraction(
-            memory.id,
-            Some(&model),
-            extracted.len() as i64,
-            "backfill",
-        )?;
         let before = outcome.added;
         let write_ctx = FactWriteCtx {
             memory_id: memory.id,
             diary: &memory.diary,
-            kb: &kb,
+            // Each memory's facts belong to that memory's OWN KB — a sweep
+            // must not relabel them with the flag's (possibly absent) scope.
+            kb: memory_kb,
             event_time: memory.event_time,
             embedder: Some(gate_embedder.as_ref()),
             llm: Some(llm.as_chat()),
             autonomy: Autonomy::default(),
             source_kind: SourceKind::AgentExtracted,
         };
+        let mut write_failures = 0usize;
         for ef in &extracted {
             if let Err(e) = write_fact(ctx, &write_ctx, ef, &mut outcome).await {
                 tracing::warn!("fact write failed for {:?}: {e}", ef);
+                write_failures += 1;
             }
         }
+        // EXTRACTION MARKER ORDERING (same rule as `remember`): the marker is
+        // what makes a memory invisible to every future backfill, so it is
+        // only earned once the facts are actually in the store. Recording it
+        // before the write loop meant a persistence failure retired the memory
+        // from the queue with nothing to show for it.
+        if write_failures > 0 {
+            failed += 1;
+            progress(
+                ctx,
+                i + 1,
+                queued,
+                &format!(
+                    "{write_failures} of {} facts failed to persist — left pending",
+                    extracted.len()
+                ),
+                memory,
+            );
+            continue;
+        }
+        ctx.store.record_fact_extraction(
+            memory.id,
+            Some(&model),
+            extracted.len() as i64,
+            "backfill",
+        )?;
         processed += 1;
         if extracted.is_empty() {
             without_facts += 1;
@@ -469,7 +557,7 @@ pub async fn backfill(
         elapsed_ms: start.elapsed().as_millis() as u64,
         ..Default::default()
     };
-    meta.add("kb", kb.clone());
+    meta.add("kb", kb_label.clone());
     meta.add("processed", processed);
     meta.add("facts_added", outcome.added);
     meta.add("facts_deduped", outcome.deduped);
@@ -478,7 +566,7 @@ pub async fn backfill(
     print_success(
         ctx.format,
         json!({
-            "kb": kb,
+            "kb": kb_label,
             "diary": diary_filter,
             "memories_total": total,
             "processed": processed,
@@ -494,7 +582,7 @@ pub async fn backfill(
         meta,
         |_| {
             println!(
-                "Backfilled {processed} memories in kb {kb}: {} facts added, {} deduped, \
+                "Backfilled {processed} memories in kb {kb_label}: {} facts added, {} deduped, \
                  {} queued for resolution ({} still pending)",
                 outcome.added,
                 outcome.deduped,

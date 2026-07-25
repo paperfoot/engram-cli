@@ -723,7 +723,45 @@ CREATE TABLE IF NOT EXISTS fact_extraction_log (
 );
 "#;
 
-const CURRENT_VERSION: i32 = 7;
+/// Whether a memory row (which MUST be aliased `m`) still constrains what its
+/// KB's derived layer is allowed to expose. True for every live memory, and
+/// ALSO for a soft-deleted one whose content has not actually been purged yet.
+///
+/// `forget` is a soft delete: it hard-deletes the memory's claims and source
+/// spans, but the KB's wiki pages and entity/relation aggregates are rewrites
+/// and roll-ups that keep the deleted text's substance until the next full
+/// `compile` rebuilds them from the surviving chunks. Treating a soft-deleted
+/// memory as gone therefore *widened* what a diary-scoped recall could see:
+/// deleting the only memory of diary B made a mixed KB look pure to diary A,
+/// and A's recall started returning wiki/entity text paraphrasing B's private,
+/// deleted memory. Deleting content must never publish it.
+///
+/// A completed `compile` job for the KB that STARTED after the deletion is
+/// proof the derived layer was rebuilt without that memory (compile reads only
+/// live chunks and clears the KB's derived rows in the same transaction), so
+/// such a memory stops constraining anything and the KB un-gates. `created_at`
+/// — not `updated_at` — is the safe side of the comparison: the job row is
+/// created before the compiler reads its chunk snapshot, so "job started after
+/// the delete" implies the snapshot excluded the deleted memory.
+///
+/// The timestamps are compared as strings, which is exact here: every writer
+/// of `compile_jobs.created_at` and `memories.deleted_at` is
+/// `chrono::Utc::now().to_rfc3339()`, so both are fixed-width RFC3339 in UTC
+/// (`+00:00`) and lexicographic order is chronological order, to the
+/// nanosecond. A NULL `deleted_at` (deletion time unknown) compares against a
+/// far-future sentinel, so it can never be proven purged — the v8 migration
+/// backfills it precisely to avoid gating legacy stores forever.
+const MEMORY_CONSTRAINS_DERIVED: &str = "(
+    m.deleted = 0
+    OR NOT EXISTS (
+        SELECT 1 FROM compile_jobs j
+        WHERE j.kb = m.kb
+          AND j.status = 'completed'
+          AND j.created_at > COALESCE(m.deleted_at, '9999-12-31T23:59:59.999999999+00:00')
+    )
+)";
+
+const CURRENT_VERSION: i32 = 8;
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -853,6 +891,9 @@ impl SqliteStore {
             if current < 7 {
                 s.conn.execute_batch(SCHEMA_V7)?;
             }
+            if current < 8 {
+                s.migrate_v8()?;
+            }
             if current != CURRENT_VERSION {
                 s.conn.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -946,6 +987,29 @@ impl SqliteStore {
         self.conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_kb_source_unique
                  ON documents(kb, source_path) WHERE source_path IS NOT NULL;",
+        )?;
+        Ok(())
+    }
+
+    /// v8: record WHEN a memory was soft-deleted.
+    ///
+    /// Without it the diary-isolation gate cannot tell a memory deleted before
+    /// the last compile (genuinely purged from the derived layer) from one
+    /// deleted after it (still paraphrased by live wiki pages and entity
+    /// aggregates) — see `MEMORY_CONSTRAINS_DERIVED`. Rows already soft-deleted
+    /// when this migration runs are stamped with the migration time: they are
+    /// deleted as of now, so any compile that starts later legitimately clears
+    /// them, and any compile before now cannot be credited with having done so.
+    fn migrate_v8(&self) -> Result<(), StorageError> {
+        self.add_column_if_missing("memories", "deleted_at", "TEXT")?;
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE memories SET deleted_at = ?1 WHERE deleted = 1 AND deleted_at IS NULL",
+            params![now],
+        )?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_kb_diary_deleted
+                 ON memories(kb, diary, deleted);",
         )?;
         Ok(())
     }
@@ -1197,8 +1261,8 @@ impl SqliteStore {
         }
         self.with_tx(|s| {
             s.conn.execute(
-                "UPDATE memories SET deleted = 1 WHERE kb = ?1 AND deleted = 0",
-                params![name],
+                "UPDATE memories SET deleted = 1, deleted_at = ?2 WHERE kb = ?1 AND deleted = 0",
+                params![name, chrono::Utc::now().to_rfc3339()],
             )?;
             s.conn
                 .execute("DELETE FROM facts WHERE kb = ?1", params![name])?;
@@ -1688,11 +1752,15 @@ impl SqliteStore {
     }
 
     /// Mark a memory as deleted (soft delete).
+    ///
+    /// `deleted_at` is stamped so the diary-isolation gate can tell whether a
+    /// later compile has actually purged this memory from the KB's derived
+    /// layer — see `MEMORY_CONSTRAINS_DERIVED`.
     pub fn soft_delete_memory(&self, memory_id: Uuid) -> Result<bool, StorageError> {
         self.with_tx(|s| {
             let n = s.conn.execute(
-                "UPDATE memories SET deleted = 1 WHERE id = ?1 AND deleted = 0",
-                params![memory_id.to_string()],
+                "UPDATE memories SET deleted = 1, deleted_at = ?2 WHERE id = ?1 AND deleted = 0",
+                params![memory_id.to_string(), chrono::Utc::now().to_rfc3339()],
             )?;
             if n > 0 {
                 s.conn.execute(
@@ -1770,6 +1838,38 @@ impl SqliteStore {
         Ok(n)
     }
 
+    /// KB of each of `ids`, as a lookup map.
+    ///
+    /// `Fact` carries no `kb` field, but an unscoped `facts list` has to label
+    /// every row with the namespace it came from — without it a cross-KB
+    /// listing is a pile of facts with no way to tell which store answered.
+    pub fn kbs_for_facts(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, StorageError> {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id, kb FROM facts WHERE id IN ({placeholders})");
+        let binds: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, kb) = row?;
+            if let Ok(id) = Uuid::parse_str(&id) {
+                out.insert(id, kb);
+            }
+        }
+        Ok(out)
+    }
+
     /// Record that the fact extractor has processed this memory's content.
     /// Idempotent: a later run overwrites the previous marker.
     pub fn record_fact_extraction(
@@ -1801,19 +1901,29 @@ impl SqliteStore {
     /// Memories in scope the fact extractor has never seen: no facts and no
     /// extraction marker. Oldest first, so a `--limit`ed backfill always
     /// advances chronologically and a re-run resumes where it stopped.
+    ///
+    /// `kb = None` sweeps EVERY KB, and the ordering is global across the
+    /// union rather than per-KB, so a bounded sweep still processes the
+    /// oldest unprocessed memories in the store first. Each row carries its
+    /// own KB, because a cross-KB sweep must write each memory's facts back
+    /// into the KB the memory actually lives in.
     pub fn list_memories_pending_fact_extraction(
         &self,
-        kb: &str,
+        kb: Option<&str>,
         diary: Option<&str>,
         limit: Option<usize>,
-    ) -> Result<Vec<Memory>, StorageError> {
+    ) -> Result<Vec<(String, Memory)>, StorageError> {
         let mut sql = format!(
-            "SELECT {} FROM memories m
-             WHERE m.deleted = 0 AND m.kb = ?1 AND {}",
+            "SELECT m.kb, {} FROM memories m
+             WHERE m.deleted = 0 AND {}",
             memory_columns("m."),
             PENDING_EXTRACTION_PREDICATE
         );
-        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(kb.to_string())];
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(k) = kb {
+            binds.push(Box::new(k.to_string()));
+            sql.push_str(&format!(" AND m.kb = ?{}", binds.len()));
+        }
         if let Some(d) = diary {
             binds.push(Box::new(d.to_string()));
             sql.push_str(&format!(" AND m.diary = ?{}", binds.len()));
@@ -1827,27 +1937,31 @@ impl SqliteStore {
         let rows = stmt
             .query_map(
                 rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
-                parse_memory_row,
+                |r| Ok((r.get::<_, String>(0)?, parse_memory_from_offset(r, 1)?)),
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     /// `(total, pending)` memory counts for a backfill scope, so a dry run can
-    /// report coverage without loading every row.
+    /// report coverage without loading every row. `kb = None` counts every KB.
     pub fn fact_extraction_coverage(
         &self,
-        kb: &str,
+        kb: Option<&str>,
         diary: Option<&str>,
     ) -> Result<(i64, i64), StorageError> {
         let mut sql = format!(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN {} THEN 1 ELSE 0 END), 0)
              FROM memories m
-             WHERE m.deleted = 0 AND m.kb = ?1",
+             WHERE m.deleted = 0",
             PENDING_EXTRACTION_PREDICATE
         );
-        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(kb.to_string())];
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(k) = kb {
+            binds.push(Box::new(k.to_string()));
+            sql.push_str(&format!(" AND m.kb = ?{}", binds.len()));
+        }
         if let Some(d) = diary {
             binds.push(Box::new(d.to_string()));
             sql.push_str(&format!(" AND m.diary = ?{}", binds.len()));
@@ -2333,9 +2447,10 @@ impl SqliteStore {
                 s.delete_facts_for_memory(*memory_id)?;
             }
             s.conn.execute(
-                "UPDATE memories SET deleted = 1
-                 WHERE id IN (SELECT memory_id FROM chunks WHERE document_id = ?1)",
-                params![id_s],
+                "UPDATE memories SET deleted = 1, deleted_at = ?2
+                 WHERE id IN (SELECT memory_id FROM chunks WHERE document_id = ?1)
+                   AND deleted = 0",
+                params![id_s, chrono::Utc::now().to_rfc3339()],
             )?;
             s.conn.execute(
                 "DELETE FROM claims
@@ -3238,7 +3353,7 @@ impl SqliteStore {
         Ok(rows)
     }
 
-    /// KBs that hold at least one live memory OUTSIDE `diary`.
+    /// KBs whose derived layer could still carry content from OUTSIDE `diary`.
     ///
     /// DIARY ISOLATION INVARIANT: a diary-scoped recall never returns content
     /// derived solely from another diary's memories. Compiler artifacts (wiki
@@ -3247,13 +3362,23 @@ impl SqliteStore {
     /// `diary`'s memories, anything derived from it is necessarily derived from
     /// `diary`. Any KB in this set is mixed, so its diary-less derived rows must
     /// be withheld from a recall scoped to `diary`.
+    ///
+    /// "Contains" spans soft-deleted memories that no compile has purged yet
+    /// (`MEMORY_CONSTRAINS_DERIVED`). Counting only live rows meant `forget`
+    /// could UN-gate a KB: delete the last memory of diary B and a recall
+    /// scoped to diary A started seeing wiki pages and entity aggregates
+    /// paraphrasing B's just-deleted private memory. Over-blocking (a KB stays
+    /// gated until it is recompiled) is the acceptable failure here; leaking a
+    /// deleted memory into another diary is not.
     pub fn kbs_with_memories_outside_diary(
         &self,
         diary: &str,
     ) -> Result<std::collections::HashSet<String>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT kb FROM memories WHERE deleted = 0 AND diary <> ?1")?;
+        let sql = format!(
+            "SELECT DISTINCT m.kb FROM memories m
+             WHERE m.diary <> ?1 AND {MEMORY_CONSTRAINS_DERIVED}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![diary], |r| r.get::<_, String>(0))?;
         let mut out = std::collections::HashSet::new();
         for row in rows {
@@ -3273,6 +3398,25 @@ impl SqliteStore {
     ///   - visible when any evidence resolves to a live memory in `diary`;
     ///   - a claim with no resolvable evidence is visible only when its whole KB
     ///     is confined to `diary` (nothing else could have produced it).
+    ///
+    /// DELIBERATE PARTIAL EXPOSURE — read this before "tightening" the first
+    /// rule. `ANY evidence chunk in `diary`" is an OR, not an ALL: a claim
+    /// synthesised from evidence spanning several diaries is admitted as soon
+    /// as ONE of its evidence chunks belongs to the requested diary, even
+    /// though the claim's wording may also reflect the other diaries' chunks.
+    /// The alternative (require EVERY evidence chunk to be in `diary`) would
+    /// suppress the claims a multi-diary KB exists to produce — a cross-cutting
+    /// claim would become invisible from every diary, including the ones that
+    /// genuinely contributed to it — and would make the layer useless in the
+    /// exact case it is built for. So the trade is: a diary-scoped recall may
+    /// see a claim it part-owns, but never one it has no stake in at all.
+    /// Callers who need strict single-diary provenance must scope by KB (one
+    /// KB per diary), which the KB-confinement rule above enforces exactly.
+    ///
+    /// The "no resolvable evidence" fallback uses the same
+    /// `MEMORY_CONSTRAINS_DERIVED` rule as `kbs_with_memories_outside_diary`,
+    /// so a soft-deleted memory keeps gating the KB until a compile actually
+    /// purges it.
     pub fn claims_visible_in_diary(
         &self,
         ids: &[Uuid],
@@ -3303,8 +3447,9 @@ impl SqliteStore {
                      WHERE ce.claim_id = c.id AND m.deleted = 0
                    )
                    AND NOT EXISTS (
-                     SELECT 1 FROM memories m2
-                     WHERE m2.deleted = 0 AND m2.kb = c.kb AND m2.diary <> ?1
+                     SELECT 1 FROM memories m
+                     WHERE m.kb = c.kb AND m.diary <> ?1
+                       AND {MEMORY_CONSTRAINS_DERIVED}
                    )
                  )
                )"
@@ -4535,7 +4680,7 @@ fn parse_id_score_row(r: &rusqlite::Row) -> rusqlite::Result<(String, f32)> {
 }
 
 /// Column list every `Memory` query selects, in the order
-/// [`parse_memory_row`] expects. `{p}` is the table alias prefix.
+/// [`parse_memory_from_offset`] expects. `{p}` is the table alias prefix.
 fn memory_columns(prefix: &str) -> String {
     [
         "id",
@@ -4559,32 +4704,34 @@ fn memory_columns(prefix: &str) -> String {
     .join(", ")
 }
 
-fn parse_memory_row(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
+/// Build a `Memory` from a row whose memory columns start at index `o` — a
+/// cross-KB sweep selects `m.kb` ahead of them, everything else uses `o = 0`.
+fn parse_memory_from_offset(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Memory> {
     use chrono::{DateTime, Utc};
     let parse_ts = |s: Option<String>| {
         s.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&Utc))
     };
-    let id_str: String = r.get(0)?;
-    let created: String = r.get(2)?;
-    let src_json: String = r.get(9)?;
-    let tags_json: String = r.get(13)?;
+    let id_str: String = r.get(o)?;
+    let created: String = r.get(o + 2)?;
+    let src_json: String = r.get(o + 9)?;
+    let tags_json: String = r.get(o + 13)?;
     Ok(Memory {
         id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
-        content: r.get(1)?,
+        content: r.get(o + 1)?,
         created_at: DateTime::parse_from_rfc3339(&created)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
-        event_time: parse_ts(r.get(3)?),
-        importance: r.get(4)?,
-        emotional_weight: r.get(5)?,
-        access_count: r.get(6)?,
-        last_accessed: parse_ts(r.get(7)?),
-        stability: r.get(8)?,
+        event_time: parse_ts(r.get(o + 3)?),
+        importance: r.get(o + 4)?,
+        emotional_weight: r.get(o + 5)?,
+        access_count: r.get(o + 6)?,
+        last_accessed: parse_ts(r.get(o + 7)?),
+        stability: r.get(o + 8)?,
         source: serde_json::from_str(&src_json).unwrap_or(engram_core::types::MemorySource::Manual),
-        diary: r.get(10)?,
-        valid_from: parse_ts(r.get(11)?),
-        valid_until: parse_ts(r.get(12)?),
+        diary: r.get(o + 10)?,
+        valid_from: parse_ts(r.get(o + 11)?),
+        valid_until: parse_ts(r.get(o + 12)?),
         tags: serde_json::from_str(&tags_json).unwrap_or_default(),
     })
 }
@@ -5131,14 +5278,16 @@ mod tests {
             .unwrap();
 
         let pending = store
-            .list_memories_pending_fact_extraction("personal", None, None)
+            .list_memories_pending_fact_extraction(Some("personal"), None, None)
             .unwrap();
         assert_eq!(
-            pending.iter().map(|m| m.id).collect::<Vec<_>>(),
+            pending.iter().map(|(_, m)| m.id).collect::<Vec<_>>(),
             vec![oldest.id, middle.id, newest.id]
         );
         assert_eq!(
-            store.fact_extraction_coverage("personal", None).unwrap(),
+            store
+                .fact_extraction_coverage(Some("personal"), None)
+                .unwrap(),
             (3, 3)
         );
 
@@ -5154,29 +5303,31 @@ mod tests {
             .unwrap();
 
         let pending = store
-            .list_memories_pending_fact_extraction("personal", None, None)
+            .list_memories_pending_fact_extraction(Some("personal"), None, None)
             .unwrap();
         assert_eq!(
-            pending.iter().map(|m| m.id).collect::<Vec<_>>(),
+            pending.iter().map(|(_, m)| m.id).collect::<Vec<_>>(),
             vec![newest.id]
         );
         assert_eq!(
-            store.fact_extraction_coverage("personal", None).unwrap(),
+            store
+                .fact_extraction_coverage(Some("personal"), None)
+                .unwrap(),
             (3, 1)
         );
 
         // --limit takes the oldest slice.
         let limited = store
-            .list_memories_pending_fact_extraction("personal", None, Some(1))
+            .list_memories_pending_fact_extraction(Some("personal"), None, Some(1))
             .unwrap();
         assert_eq!(limited.len(), 1);
-        assert_eq!(limited[0].id, newest.id);
+        assert_eq!(limited[0].1.id, newest.id);
 
         // Re-editing content clears the marker so new content is re-examined.
         store.delete_facts_for_memory(middle.id).unwrap();
         assert_eq!(
             store
-                .list_memories_pending_fact_extraction("personal", None, None)
+                .list_memories_pending_fact_extraction(Some("personal"), None, None)
                 .unwrap()
                 .len(),
             2
@@ -5194,13 +5345,13 @@ mod tests {
             .unwrap();
 
         let pending = store
-            .list_memories_pending_fact_extraction("personal", Some("work"), None)
+            .list_memories_pending_fact_extraction(Some("personal"), Some("work"), None)
             .unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, work.id);
+        assert_eq!(pending[0].1.id, work.id);
         assert_eq!(
             store
-                .fact_extraction_coverage("personal", Some("work"))
+                .fact_extraction_coverage(Some("personal"), Some("work"))
                 .unwrap(),
             (1, 1)
         );
@@ -5216,9 +5367,9 @@ mod tests {
         m.event_time = Some(when);
         store.insert_memory_with_kb(&m, "personal").unwrap();
         let got = store
-            .list_memories_pending_fact_extraction("personal", None, None)
+            .list_memories_pending_fact_extraction(Some("personal"), None, None)
             .unwrap();
-        assert_eq!(got[0].event_time, Some(when));
+        assert_eq!(got[0].1.event_time, Some(when));
     }
 
     #[test]

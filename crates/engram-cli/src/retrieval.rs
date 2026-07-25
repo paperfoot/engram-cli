@@ -11,7 +11,7 @@ use engram_embed::{Embedder, TaskMode};
 use engram_graph::extract_entities;
 use engram_rerank::{passthrough::PassthroughReranker, RerankCandidate, Reranker};
 use engram_storage::{SourceCitation, SqliteStore, StoredChunkEmbedding};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -208,6 +208,12 @@ pub struct RecallNotes {
     pub diary_scope: Option<String>,
     /// Candidates withheld by the diary-isolation guard, keyed by source name.
     pub diary_excluded: BTreeMap<&'static str, usize>,
+    /// `--since` bound of this recall, as RFC3339.
+    pub since: Option<String>,
+    /// `--until` bound of this recall, as RFC3339.
+    pub until: Option<String>,
+    /// Retrieval sources skipped because a temporal window was active.
+    pub temporal_excluded: BTreeSet<&'static str>,
 }
 
 impl RecallNotes {
@@ -215,6 +221,28 @@ impl RecallNotes {
         if count > 0 {
             *self.diary_excluded.entry(source).or_insert(0) += count;
         }
+    }
+
+    fn exclude_temporal(&mut self, source: &'static str) {
+        self.temporal_excluded.insert(source);
+    }
+
+    /// JSON for response metadata, or `None` when no window was requested.
+    ///
+    /// Mirrors `diary_isolation_json`: a source the pipeline deliberately did
+    /// not consult is reported, never dropped in silence.
+    pub fn temporal_scope_json(&self) -> Option<serde_json::Value> {
+        if self.since.is_none() && self.until.is_none() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "since": self.since,
+            "until": self.until,
+            "excluded_sources": self.temporal_excluded.iter().collect::<Vec<_>>(),
+            "reason": "derived content (claims, wiki pages, entities, relations) has no \
+                       event time of its own, so it cannot be placed inside or outside the \
+                       requested window; only raw memory chunks are searched",
+        }))
     }
 
     /// JSON for response metadata, or `None` when nothing was withheld.
@@ -322,8 +350,13 @@ where
     let kb = params.filters.kb.as_deref();
     let diary = params.filters.diary.as_deref();
 
+    let since = params.filters.since.map(|t| t.to_rfc3339());
+    let until = params.filters.until.map(|t| t.to_rfc3339());
+
     let mut notes = RecallNotes {
         diary_scope: params.filters.diary.clone(),
+        since: since.clone(),
+        until: until.clone(),
         ..RecallNotes::default()
     };
 
@@ -350,8 +383,6 @@ where
     let mut source_map: HashMap<Uuid, HashSet<RetrievalSource>> = HashMap::new();
     let mut runs: Vec<Vec<RankedHit>> = Vec::new();
 
-    let since = params.filters.since.map(|t| t.to_rfc3339());
-    let until = params.filters.until.map(|t| t.to_rfc3339());
     let chunks = store.iter_chunks_with_embedding_records_since(
         diary,
         kb,
@@ -366,10 +397,25 @@ where
         params.allow_mixed_embeddings,
     )?;
 
-    // When a temporal window is active, the lexical (FTS) path — which queries
-    // the whole table independently — must be restricted to the same in-window
-    // chunk set as the dense path, or `--since/--until` would leak out-of-window
-    // hits through FTS.
+    // TEMPORAL WINDOW SEMANTICS: `--since/--until` are bounds on a memory's
+    // effective event time (`COALESCE(event_time, created_at)`). Only raw
+    // chunks have one.
+    //
+    // The lexical (FTS) path queries the whole table independently, so it is
+    // restricted to the same in-window chunk set as the dense path or the
+    // window would leak out-of-window hits through FTS.
+    //
+    // The DERIVED layers have no per-item event time at all: a wiki page is a
+    // synthesis over a whole KB, an entity row an aggregate mention count, a
+    // relation an edge accumulated across chunks. A claim carries evidence
+    // links but is itself a rewrite with no timestamp. Admitting them would
+    // let `recall --since 2025-01-01` return a wiki page compiled from a 2010
+    // memory (reproduced), and filtering them "by their evidence" is
+    // ill-defined the moment evidence straddles the boundary. So a windowed
+    // recall is chunks-only: claim/wiki/entity/graph are EXCLUDED, and each
+    // exclusion is reported in `RecallNotes` (metadata.temporal_scope) rather
+    // than dropped silently — same contract as diary isolation. Drop the
+    // window to search the derived layers.
     let temporal_active = since.is_some() || until.is_some();
     let allowed_chunks: Option<HashSet<Uuid>> =
         temporal_active.then(|| chunks.iter().map(|c| c.chunk_id).collect());
@@ -424,12 +470,15 @@ where
         runs.push(lexical_run);
     }
 
-    if !fts_q.is_empty()
+    let claims_wanted = !fts_q.is_empty()
         && matches!(
             params.mode,
             RecallMode::Evidence | RecallMode::Explore | RecallMode::Agent
-        )
-    {
+        );
+    if claims_wanted && temporal_active {
+        notes.exclude_temporal("claim");
+    }
+    if claims_wanted && !temporal_active {
         let mut claims = match store.claim_fts_search(&fts_q, kb, params.rerank_top_n) {
             Ok(hits) => hits,
             Err(e) => {
@@ -468,12 +517,15 @@ where
         runs.push(claim_run);
     }
 
-    if !fts_q.is_empty()
+    let wiki_wanted = !fts_q.is_empty()
         && matches!(
             params.mode,
             RecallMode::Wiki | RecallMode::Explore | RecallMode::Agent
-        )
-    {
+        );
+    if wiki_wanted && temporal_active {
+        notes.exclude_temporal("wiki");
+    }
+    if wiki_wanted && !temporal_active {
         let wiki_hits = match store.wiki_fts_search(&fts_q, kb, params.rerank_top_n) {
             Ok(hits) => hits,
             Err(e) => {
@@ -522,6 +574,7 @@ where
         kb,
         params.mode,
         params.graph_hops,
+        temporal_active,
         mixed_diary_kbs.as_ref(),
         &mut CandidateSink {
             records: &mut candidate_records,
@@ -768,12 +821,14 @@ struct CandidateSink<'a> {
 /// flooding the fused ranking.
 const ENTITY_MATCHES_PER_TERM: usize = 8;
 
+#[allow(clippy::too_many_arguments)]
 fn add_entity_and_graph_candidates(
     store: &SqliteStore,
     query: &str,
     kb: Option<&str>,
     mode: RecallMode,
     graph_hops: u8,
+    temporal_active: bool,
     mixed_diary_kbs: Option<&HashSet<String>>,
     sink: &mut CandidateSink<'_>,
 ) -> Result<(), crate::error::CliError> {
@@ -781,6 +836,17 @@ fn add_entity_and_graph_candidates(
     // graph retrieval — including the unscoped (all-KBs) case, which used to
     // bail out here and silently lose two of the pipeline's five sources.
     if mode == RecallMode::Raw {
+        return Ok(());
+    }
+    // A windowed recall is chunks-only: entity rows are mention-count
+    // aggregates and relations are accumulated edges, so neither can be
+    // placed inside or outside `--since/--until`. See the temporal window
+    // semantics note in `hybrid_recall`.
+    if temporal_active {
+        sink.notes.exclude_temporal("entity");
+        if mode == RecallMode::Explore {
+            sink.notes.exclude_temporal("graph");
+        }
         return Ok(());
     }
     // Match entity names from the query. `find_entities` already lowercases both
