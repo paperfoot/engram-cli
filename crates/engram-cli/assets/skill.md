@@ -36,7 +36,7 @@ That is the whole loop. Everything below is detail.
 ## KBs vs diaries — don't mix them
 
 - **KBs** are domains: `personal` (people, family, health, preferences), `business` (company, competitors, deals), one per project, plus source corpora like `ageing-biology`. Writing with `--kb <name>` registers it — no `kb create` first.
-- **Diaries** are agent/user namespaces (`default`, `code-reviewer`). When several agents share a store, give each its own `--diary`; `--diary '*'` searches all. Diary-scoped recall reports whatever the isolation guard withheld in `metadata.diary_isolation`.
+- **Diaries** are agent/user namespaces (`default`, `code-reviewer`). When several agents share a store, give each its own `--diary`; `--diary '*'` searches all. It is **read-only** — every write path (`remember`, `memory add`, `ingest`) rejects `--diary '*'` and blank names with exit 3. Diary-scoped recall reports whatever the isolation guard withheld in `metadata.diary_isolation`.
 
 ## Dates: use `--event-time`
 
@@ -46,7 +46,9 @@ Anything with a real date — birthdays, anniversaries, when a decision was made
 engram remember "Mum's birthday is 14 March." --kb personal --event-time 1958-03-14 --importance 9
 ```
 
-Then time works: `engram recall "what happened last March?" --since 2026-03-01 --until 2026-03-31`. Both filters read `event_time` and fall back to write time — so a dated memory saved without it looks like it happened the day you typed it.
+Then time works: `engram recall "what happened last March?" --since 2026-03-01 --until 2026-03-31` (same on `memory search`). Both take RFC3339 or a bare `YYYY-MM-DD` — `--since D` is the start of that UTC day, `--until D` the end, so `--since D --until D` is all of day D. They read `event_time` falling back to write time, so a dated memory saved without `--event-time` looks like it happened the day you typed it.
+
+**A window narrows retrieval to raw memory chunks.** Claims, wiki, entities and relations have no event time, so they cannot be placed in or out of the window and are withheld — reported in `metadata.temporal_scope` (absent when no window is set). A thin windowed result is not "the store knows nothing"; re-run without the window before concluding that.
 
 ## What to save (and not)
 
@@ -58,9 +60,19 @@ Importance: 0–3 trivia, 4–6 useful context, 7–8 decisions/preferences, 9�
 
 ## Facts and contradictions
 
-`remember` extracts `(subject, predicate, object)` facts automatically when an OpenRouter key resolves. **Check `fact_extraction` in the response** — `skipped_no_openrouter_key` means nothing was captured. Opt out with `--no-extract-facts`; skip the LLM call by supplying the triple yourself via `--facts-json '[{"subject":"...","predicate":"...","object":"..."}]'` (same contradiction detection, zero cost). For memories stored before extraction was on: `engram facts backfill --kb personal [--dry-run] [--limit 50]` — idempotent, resumes where it stopped.
+`remember` extracts `(subject, predicate, object)` facts automatically when an OpenRouter key resolves. Opt out with `--no-extract-facts`; skip the LLM call by supplying the triple yourself via `--facts-json '[{"subject":"...","predicate":"...","object":"..."}]'` (same contradiction detection, zero cost).
 
-When `remember` returns a non-empty `adjudication_needed`, **you** are the adjudicator — you have the conversation context engram lacks. Run each entry's `resolve_command` with `--action supersede-old` | `keep-both` | `reject-new`, plus `--note "why"`. If you genuinely can't tell, leave it queued and say so. Safety slots (`allergic_to`, `takes_medication`, `diagnosed_with`) are never auto-superseded.
+**Check `fact_extraction` in the response** — `skipped_no_openrouter_key` (nothing captured), `failed_partial_persist` (a fact didn't persist, so no done-marker: backfill will retry that memory), `failed_extraction_marker` (facts landed, marker didn't — a later backfill may re-extract; harmless).
+
+```bash
+engram facts list                                   # every KB; each fact labelled with its own kb
+engram facts backfill --dry-run                     # sweep every KB, oldest first, no API call
+engram facts backfill --kb personal --limit 50      # bounded, scoped pass
+```
+
+`facts list` spans every KB unless you pass `--kb`, and reports `kb_scope`. **An empty KB-scoped listing means the scope was wrong, not that extraction produced nothing.** `facts backfill --kb` is optional now, but an unscoped sweep costs one LLM call per memory — pair it with `--dry-run` or `--limit`. Idempotent; resumes where it stopped.
+
+When `remember` returns a non-empty `adjudication_needed`, **you** are the adjudicator — you have the conversation context engram lacks. Run each entry's `resolve_command` with `--action supersede-old` | `keep-both` | `reject-new`, plus `--note "why"`. Can't tell? Leave it queued and say so. Safety slots (`allergic_to`, `takes_medication`, `diagnosed_with`) are never auto-superseded.
 
 `recall` output carries a `conflicts` array: **superseded** (a fact was updated — cite the current value and note the change) and **contested** (unresolved; both values listed — never pick one silently).
 
@@ -76,6 +88,8 @@ engram graph neighbors "Sarah Chen" --kb personal --typed-only --limit 20
 
 `--typed-only` drops weak `co_occurs_with` edges, leaving the real relationship graph rather than co-mention noise. `people show` resolves any known alias, case-insensitively.
 
+**Pass `--kb '*'` unless you mean one KB** — unlike `recall`, these still default to `--kb default`, where a person written to `personal` is simply absent. Under `--kb '*'` the person is *merged* across KBs rather than picking whichever ranked first: `kbs` lists every KB they appear in, `relations_by_kb` keeps the per-KB breakdown, so work and personal relationships arrive as one view.
+
 ## Quality gate
 
 `engram bench personal --json` is offline and deterministic — hash embedder, no network, no keys, and it never touches your store. Run it before and after any retrieval change. Headline metrics are production behaviour; `legacy_default_comparison` is what the old single-KB default would have scored, kept as a regression tripwire.
@@ -84,15 +98,16 @@ engram graph neighbors "Sarah Chen" --kb personal --typed-only --limit 20
 
 For ingested source corpora — PDFs, product docs, support archives — the rules tighten. **For research literature (papers, neuromodulation/medical corpora) use the superlibrary skill instead.**
 
-Recall first, answer only from returned chunks, and cite each claim's `source`/`chunk_id` so the user can re-run the recall to verify. On `status: no_results` or only low-scoring chunks, say "insufficient evidence in the knowledge base" — never fill from training data or invent a citation. If sources conflict, cite both. For "how many / list all" questions pass `--top-k 30–50`, synthesize over the whole returned set rather than the first few, and union the hits from synonym and acronym variants.
+Recall first, answer only from returned chunks, and cite each claim's `source`/`chunk_id` so the user can re-run the recall to verify. On `status: no_results` or only low-scoring chunks, say "insufficient evidence in the knowledge base" — never fill from training data or invent a citation. If sources conflict, cite both. For "how many / list all" questions pass `--top-k 30–50`, synthesize over the whole returned set, and union the hits from synonym and acronym variants.
 
-With the default `ingest.require_scope=true` an unscoped directory ingest is refused: run `--dry-run --include '...' --json` first, inspect `data.matched_files`, then re-run the same scope with `--max-files` (`--all` only when the user explicitly wants the whole folder). Single-file ingest is exact and unaffected. `engram compile --kb K --all` derives claims, entities and wiki pages; `engram research "<q>" --kb K` is the evidence-first pass.
+An unscoped directory ingest is refused by default: `--dry-run --include '...' --json` first, inspect `data.matched_files`, then re-run the same scope with `--max-files` (`--all` only when the user wants the whole folder). Single-file ingest is exact and unaffected. `engram compile --kb K --all` derives claims, entities and wiki pages; `engram research "<q>" --kb K` is the evidence-first pass.
 
 ## Gotchas
 
 - **Errors are JSON on stderr**, never stdout. Exit codes: 1 transient (retry with backoff), 2 config (`engram config check`), 3 bad input (fix args, don't retry identically), 4 rate limited (wait).
 - Every command returns `{version, status, data, metadata}`; `--json` is automatic when stdout is piped.
 - **Memories missing from `engram kb list`?** Older builds wrote to KBs without registering them. Run `engram kb repair --dry-run`, then without the flag. Additive, idempotent, and it won't resurrect a KB you deleted.
+- **`forget` does not unseal another diary's derived content** — a KB's compiled wiki/entities stay withheld until a post-deletion `compile` purges them; `recall` reports it in `metadata.diary_isolation`. Schema is v8 (`doctor --json` → `data.db.schema_version`).
 - **After changing embedding model/dimensions/prompt format, run `engram reindex --kb <name>`** — legacy embeddings are refused by default.
 - `engram forget <id>` requires `--confirm`. `engram update` (without `--check`) mutates the install — only on user request.
 - `engram skill install` refuses to overwrite a SKILL.md you edited by hand; pass `--force` if you mean it.

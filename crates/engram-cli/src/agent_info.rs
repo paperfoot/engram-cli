@@ -20,7 +20,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "A plain `recall <query>` searches EVERY KB. Do not add --kb to 'find' something — you cannot know which namespace a fact was filed under. Narrow with --kb only to deliberately exclude the rest.",
             "Pipe stdout to jq — output is always JSON when piped or with --json.",
             "Errors include `code`, `message`, `suggestion`, and `exit_code` for programmatic handling.",
-            "Use `--diary <name>` to keep separate memory namespaces per specialist agent.",
+            "Use `--diary <name>` to keep separate memory namespaces per specialist agent. `--diary '*'` is read-only: writes reject it (exit 3).",
             "Use `--kb <name>` on WRITES to file a memory under a domain (personal, business, songs). Writing to a new KB registers it automatically.",
             "`remember` extracts (subject, predicate, object) facts by default when an OpenRouter key resolves; the envelope always says which via `fact_extraction`. Opt out with --no-extract-facts.",
             "Use `--event-time` whenever the content has a real date (birthday, anniversary, a decision made last March) — `recall --since/--until` filters on it.",
@@ -35,10 +35,10 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "documents list|show|delete": "Inspect or remove ingested source documents. Flags: --kb <name>, --all-kbs, --limit <n>, --confirm",
             "remember <content>": "Store a new memory. Flags: --importance 0-10, --tag <tag> (repeatable), --diary <name>, --kb <name>, --event-time <RFC3339|YYYY-MM-DD>, --no-extract-facts, --facts-json '<json array>', --autonomy full|assisted|strict, --allow-duplicate. Identical content in the same kb/diary is deduplicated (no second embedding) unless --allow-duplicate. Fact extraction runs BY DEFAULT whenever an OpenRouter key resolves — pass --no-extract-facts for bulk/low-value writes, or --facts-json when you already know the (subject, predicate, object) triple (same contradiction detection, zero LLM cost). Set --event-time for anything with a real date: `recall --since/--until` filters on it and the extracted facts inherit it. Under the default --autonomy assisted, uncertain contradictions come back in `adjudication_needed` for YOU to resolve (you have the conversation context): run the included resolve_command. Safety slots (allergic_to, takes_medication, diagnosed_with) are never auto-superseded.",
             "memory add|search|update|delete|list": "Simple aliases for agent memory workflows. Prefer these when an agent wants CRUD semantics. `memory add` takes the same flags as `remember` (including --event-time, --no-extract-facts, --facts-json, --autonomy).",
-            "recall <query>": "Retrieve via cloud-quality hybrid search. Searches EVERY KB unless narrowed. Flags: --kb <name> (narrow to one; '*' means all), --all-kbs (force all, ignoring --kb and retrieval.default_kb), --diary <name>|'*', --mode evidence|raw|wiki|explore|agent, --profile cloud_quality|fast|offline, --top-k <n>, --layer identity|critical|topic|deep, --rerank-top-n <n>, --graph-hops 1|2, --allow-mixed-embeddings, --since <rfc3339>, --until <rfc3339>. `metadata.kb_scope` reports how the scope was chosen (flag|config|all_kbs) and `metadata.kb` the effective KB ('*' for all) — check it before concluding a memory does not exist. A diary-scoped recall reports anything the isolation guard withheld in `metadata.diary_isolation`. Output includes a `conflicts` array with two statuses: `superseded` (a fact was updated — cite the current value or surface the change) and `contested` (an UNRESOLVED contradiction: both values are listed — do not pick one silently; resolve it via the included resolve_command or surface both to the user).",
-            "facts list|show <subject>|conflicts|resolve|backfill": "Browse the fact store and contradiction record. `facts conflicts` lists resolved supersessions; `facts conflicts --open` lists CONTESTED pairs awaiting your decision; `facts resolve <id> --action supersede-old|keep-both|reject-new [--note]` records your verdict and applies the supersession (never a deletion). Facts come from `remember` (on by default), `--facts-json`, and `compile --llm`, KB-scoped.",
-            "facts backfill --kb <name>": "Extract facts from memories stored before extraction was on. Flags: --diary <name>, --limit <n>, --dry-run. Idempotent — memories that already have facts or an extraction marker are skipped, oldest first, so a --limit'ed run resumes where the last one stopped. One LLM call per memory: --kb is required so the spend is never implicit, and it exits 2 without an OpenRouter key.",
-            "people list | people show <name>": "The networking view over person-typed entities. `people list` gives aliases, mention counts, and top relations (flags: --kb <name>|'*', --limit <n>, --min-mentions <n>); `people show <name>` resolves any known alias case-insensitively and returns relations WITH provenance plus the memories that mention them (flags: --kb, --snippets <n>).",
+            "recall <query>": "Retrieve via cloud-quality hybrid search. Searches EVERY KB unless narrowed. Flags: --kb <name> (narrow to one; '*' means all), --all-kbs (force all, ignoring --kb and retrieval.default_kb), --diary <name>|'*', --mode evidence|raw|wiki|explore|agent, --profile cloud_quality|fast|offline, --top-k <n>, --layer identity|critical|topic|deep, --rerank-top-n <n>, --graph-hops 1|2, --allow-mixed-embeddings, --since, --until (RFC3339 or bare YYYY-MM-DD — --since D is the START of that UTC day, --until D the END, so `--since D --until D` selects all of day D). `metadata.kb_scope` reports how the scope was chosen (flag|config|all_kbs) and `metadata.kb` the effective KB ('*' for all) — check it before concluding a memory does not exist. A diary-scoped recall reports anything the isolation guard withheld in `metadata.diary_isolation`. A temporal window restricts results to raw memory chunks: derived sources (claims, wiki pages, entities, relations) carry no event time of their own, so they are withheld and listed in `metadata.temporal_scope` (absent when no window is set). Output includes a `conflicts` array with two statuses: `superseded` (a fact was updated — cite the current value or surface the change) and `contested` (an UNRESOLVED contradiction: both values are listed — do not pick one silently; resolve it via the included resolve_command or surface both to the user).",
+            "facts list|show <subject>|conflicts|resolve|backfill": "Browse the fact store and contradiction record. `facts list` spans EVERY KB by default (omit --kb, or pass '*') and labels each fact with its own `kb`; the response carries `kb_scope` (flag|config|all_kbs) — a KB-scoped listing that comes back empty is a scope result, not proof extraction produced nothing. `facts conflicts` lists resolved supersessions; `facts conflicts --open` lists CONTESTED pairs awaiting your decision; `facts resolve <id> --action supersede-old|keep-both|reject-new [--note]` records your verdict and applies the supersession (never a deletion).",
+            "facts backfill [--kb <name>]": "Extract facts from memories stored before extraction was on. Flags: --kb <name>|'*' (omit to sweep EVERY KB, oldest memory first across the union), --diary <name>, --limit <n>, --dry-run. Idempotent — memories that already have facts or an extraction marker are skipped, so a --limit'ed run resumes where the last one stopped. One LLM call per memory, so pair an unscoped sweep with --dry-run or --limit; exits 2 without an OpenRouter key.",
+            "people list | people show <name>": "The networking view over person-typed entities. Both default to --kb default; pass --kb '*' for every KB. `people list` gives aliases, mention counts, and top relations (flags: --limit <n>, --min-mentions <n>); `people show <name>` resolves any known alias case-insensitively and returns relations WITH provenance plus the memories that mention them (flags: --snippets <n>). Under --kb '*' the same person is MERGED across KBs rather than picking one: `kbs` lists every KB they appear in and `relations_by_kb` keeps the per-KB breakdown.",
             "research <query>": "Evidence-first research retrieval pass. Returns query_plan, answer_context, evidence leads, and citation readiness.",
             "ingest <path>": "Mine a file or scoped directory. Flags: --mode papers|takeaways|conversations|repos|general|auto, --diary <name>, --kb <name>, --compile evidence, --dry-run, --include <pattern>, --exclude <pattern>, --max-files <n>, --all. Re-ingesting the same path is idempotent when content is unchanged, and REPLACES the prior version when the file changed (edited PDFs no longer go stale).",
             "compile --kb <name> --all": "Derive cited claims, entities, relations, takeaways, and wiki pages. Add --llm for Gemini 3.1 Flash-Lite extraction + Gemini 3.1 Pro synthesis via OpenRouter.",
@@ -75,7 +75,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                 "flags": {
                     "importance": "0..10",
                     "tag": "string[]",
-                    "diary": "string",
+                    "diary": "string — a real diary name. '*' is a READ-side wildcard and is rejected with exit 3 on any write (remember, memory add, ingest), as is a blank/whitespace name",
                     "kb": "string — writing to a new KB registers it",
                     "event_time": "RFC3339 or YYYY-MM-DD (midnight UTC); when the content actually happened",
                     "no_extract_facts": "boolean; opt out of the default LLM fact extraction",
@@ -90,7 +90,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                     "chunks": "integer",
                     "kb": "string",
                     "event_time": "rfc3339|null",
-                    "fact_extraction": "ran|ran_stub|disabled|skipped_facts_json|skipped_no_openrouter_key|failed — ALWAYS check this before assuming facts were captured",
+                    "fact_extraction": "ran|ran_stub|disabled|skipped_facts_json|skipped_no_openrouter_key|failed|failed_partial_persist|failed_extraction_marker — ALWAYS check this before assuming facts were captured. `failed_partial_persist`: the LLM returned facts but at least one did not persist, so NO extraction marker was recorded and `facts backfill` will retry the memory. `failed_extraction_marker`: every fact persisted but the done-marker did not, so a later backfill may re-extract it (harmless).",
                     "fact_extraction_note": "string|null — present whenever facts were NOT captured, with the fix",
                     "facts_added": "integer",
                     "facts_deduped": "integer",
@@ -112,26 +112,39 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                     "rerank_top_n": "integer; candidates sent to rerank (default from profile)",
                     "graph_hops": "1|2; graph expansion depth",
                     "allow_mixed_embeddings": "boolean",
-                    "since": "rfc3339; earliest event_time",
-                    "until": "rfc3339; latest event_time"
+                    "since": "rfc3339 OR bare YYYY-MM-DD (start of that UTC day); earliest event_time",
+                    "until": "rfc3339 OR bare YYYY-MM-DD (end of that UTC day); latest event_time"
                 },
                 "output_data": { "status": "success|no_results", "answer_context": "string", "results": "array", "kb": "string — effective scope, '*' when every KB was searched", "kb_scope": "flag|config|all_kbs", "diary_isolation": "object|null — sources withheld by diary isolation" },
-                "metadata": { "kb": "string", "kb_scope": "flag|config|all_kbs", "diary": "string", "diary_isolation": "object (only when something was withheld)", "candidates_considered": "integer" },
-                "agent_rule": "Never add --kb just to find something: reads default to every KB precisely because the write side chose the namespace. If a recall comes back empty, check metadata.kb_scope before concluding the memory is absent."
+                "metadata": { "kb": "string", "kb_scope": "flag|config|all_kbs", "diary": "string", "diary_isolation": "object (only when something was withheld)", "temporal_scope": "object (only when --since/--until is set): { since, until, excluded_sources, reason }", "candidates_considered": "integer" },
+                "agent_rule": "Never add --kb just to find something: reads default to every KB precisely because the write side chose the namespace. If a recall comes back empty, check metadata.kb_scope before concluding the memory is absent.",
+                "temporal_rule": "A window narrows retrieval to raw memory chunks only. Derived sources (claims, wiki, entities, relations) have no event time, so they are excluded and reported in metadata.temporal_scope.excluded_sources — do not read a thin windowed result as 'the KB knows nothing'; re-run without the window to consult derived content."
+            },
+            "memory search": {
+                "destructive": false,
+                "args": { "query": "string" },
+                "flags": { "top_k": "integer", "kb": "string|*", "all_kbs": "boolean", "diary": "string|*", "mode": "evidence|raw|wiki|explore|agent", "profile": "cloud_quality|fast|offline", "since": "rfc3339 or YYYY-MM-DD", "until": "rfc3339 or YYYY-MM-DD" },
+                "note": "Same engine and same window semantics as `recall`, including metadata.temporal_scope."
             },
             "people show": {
                 "destructive": false,
                 "args": { "name": "person name or any known alias (case-insensitive)" },
-                "flags": { "kb": "string|*", "snippets": "integer" },
-                "output_data": { "person": "object with canonical_name + aliases", "relations": "array — typed edges with provenance", "memories": "array of snippets that mention them" }
+                "flags": { "kb": "string; defaults to 'default'. Pass '*' to merge the person across EVERY KB", "snippets": "integer" },
+                "output_data": { "person": "object with canonical_name + aliases", "relations": "array — typed edges with provenance, merged across KBs under --kb '*'", "kbs": "string[] — every KB this person appears in", "relations_by_kb": "array — the per-KB breakdown behind the merged `relations`", "memories": "array of snippets that mention them" },
+                "agent_rule": "Use --kb '*' for 'who is X': under the default scope a person written to `personal` is simply absent, and the merge is what joins their work and personal relationships into one view."
+            },
+            "facts list": {
+                "destructive": false,
+                "flags": { "kb": "string; omit (or pass '*') to list facts from EVERY KB", "subject": "string", "diary": "string", "all": "boolean; include superseded/historic facts", "limit": "integer" },
+                "output_data": { "facts": "array; each fact carries its own `kb` label", "kb": "string — effective scope", "kb_scope": "flag|config|all_kbs", "count": "integer" },
+                "agent_rule": "An empty KB-scoped listing means the scope was wrong, not that extraction produced nothing. Check kb_scope, or drop --kb."
             },
             "facts backfill": {
                 "destructive": false,
-                "requires": ["--kb"],
-                "flags": { "kb": "string (required)", "diary": "string|*", "limit": "integer", "dry_run": "boolean" },
-                "cost": "one LLM call per unprocessed memory; exits 2 without an OpenRouter key and respects `engram budget`",
+                "flags": { "kb": "string|*; omit to sweep EVERY KB, oldest memory first across the union", "diary": "string|*", "limit": "integer", "dry_run": "boolean" },
+                "cost": "one LLM call per unprocessed memory; exits 2 without an OpenRouter key and respects `engram budget`. Pair an unscoped sweep with --dry-run or --limit.",
                 "idempotency": "memories with existing facts or an extraction marker are skipped; oldest first, so a --limit'ed run resumes where the last stopped",
-                "output_data": { "processed": "integer", "facts_added": "integer", "skipped": "integer" }
+                "output_data": { "kb": "string — '*' for an unscoped sweep", "pending": "integer", "already_processed": "integer", "would_process": "integer (dry run)", "memories": "array", "llm_available": "boolean" }
             },
             "kb repair": {
                 "destructive": false,
@@ -259,16 +272,19 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                 "Default to a bare `engram recall '<query>'`. It spans every KB, which is what you want when looking something up — the write side chose the namespace, not you.",
                 "Add --kb only to deliberately EXCLUDE other domains (e.g. business-only competitor intel), never as a guess at where a fact lives.",
                 "On an empty result, read metadata.kb_scope and metadata.kb before telling the user nothing is stored. `kb_scope: flag` or `config` means the search was narrowed.",
-                "For 'when did X happen' questions, pass --since/--until: they filter on event_time, which is only populated when the write used --event-time."
+                "For 'when did X happen' questions, pass --since/--until: they filter on event_time, which is only populated when the write used --event-time. Bare YYYY-MM-DD works — `--since D --until D` is all of day D.",
+                "A temporal window searches raw memory chunks ONLY; claims/wiki/entities/relations are withheld (they have no event time) and listed in metadata.temporal_scope.excluded_sources. If a windowed recall looks thin, re-run without the window before concluding anything."
             ],
             "remember": [
                 "File personal facts under --kb personal, work/company facts under --kb business, project context under the project's own KB. Writing to a KB registers it.",
                 "Set --event-time for anything dated — birthdays, anniversaries, when a decision was made. Without it the memory is only findable by content, never by time.",
-                "Check `fact_extraction` in the response. `skipped_no_openrouter_key` means no facts were captured: either configure the key or run `engram facts backfill --kb <kb>` later.",
+                "Check `fact_extraction` in the response. `skipped_no_openrouter_key` means no facts were captured: either configure the key or run `engram facts backfill` later. A `failed*` status also leaves work for backfill.",
+                "Never write with `--diary '*'` — it is a read-side wildcard and every write path rejects it with exit 3.",
                 "Handle `adjudication_needed` rather than ignoring it — you have the conversation context the resolver lacks."
             ],
             "people": [
                 "Use `people list` / `people show` for who-do-I-know questions; they read the person-typed entity graph, not raw text.",
+                "Pass --kb '*' unless you deliberately want one KB: these commands still default to `default`, and --kb '*' MERGES the person across KBs (`kbs`, `relations_by_kb`) instead of showing whichever KB happened to win.",
                 "`graph neighbors <name> --typed-only` gives the real relationship graph; without it you also get weak `co_occurs_with` co-mention edges."
             ],
             "ingest": [
@@ -342,12 +358,15 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "engram remember \"Mum's birthday is 14 March.\" --kb personal --event-time 1958-03-14 --importance 9",
             "engram remember 'Chose Postgres over DynamoDB: relational reporting mattered more than write throughput.' --kb business --importance 9 --tag decision",
             "engram recall 'what happened last March?' --since 2026-03-01 --until 2026-03-31 --json",
+            "engram memory search 'standup decisions' --since 2026-03-15 --until 2026-03-15 --json",
             "engram recall 'competitor pricing' --kb business --json",
             "engram people list --kb '*' --min-mentions 2 --json",
             "engram people show 'Sarah Chen' --kb '*' --json",
             "engram graph neighbors 'Sarah Chen' --kb personal --typed-only --limit 20 --json",
+            "engram facts list --json",
             "engram facts show 'Sarah Chen' --kb '*' --json",
-            "engram facts backfill --kb personal --dry-run --json",
+            "engram facts backfill --dry-run --json",
+            "engram facts backfill --kb personal --limit 25 --json",
             "engram facts conflicts --open --json",
             "engram kb list --json",
             "engram kb repair --dry-run --json",
