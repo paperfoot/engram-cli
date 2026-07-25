@@ -28,6 +28,13 @@
 //!    called Maria Microsoft: the leading personal-name run becomes the
 //!    canonical form and the whole label is kept as an ALIAS, so the label
 //!    still resolves to her without standing up a rival node.
+//! 7. **Relationship words and sentence-opening verbs are stripped the same
+//!    way greetings are.** `Partner Rosalie`, `Wants Elias` and `Told Noemi`
+//!    are one capitalized run to the extractor and were typed as people with
+//!    64, 28 and 11 mentions in the real store. The leading word is dropped so
+//!    the mention counts for the human, and — like a greeting — it is NOT kept
+//!    as an alias, because "Partner Rosalie" is nobody's name. Standing alone,
+//!    `Partner`, `Doctor`, `Said` and `Says` are rejected outright.
 
 use crate::gazetteer;
 use std::collections::HashSet;
@@ -506,6 +513,192 @@ const FILLER_WORDS: &[&str] = &[
     "sup",
 ];
 
+/// Verbs that open a clause and glue themselves to the next capitalized word
+/// ("Wants Elias", "Said hi", "Says Maria"). They belong to the same class as
+/// [`FILLER_WORDS`] — capitalized only by position — so they are rejected
+/// standing alone AND stripped from the front of a candidate.
+///
+/// These say nothing about whether what follows is human, so stripping one
+/// does not set [`Canonical::person_hint`]; see [`HUMAN_OBJECT_VERBS`] for the
+/// ones that do.
+const LEADING_VERBS: &[&str] = &[
+    "said",
+    "says",
+    "saying",
+    "wants",
+    "want",
+    "wanted",
+    "needs",
+    "needed",
+    "thinks",
+    "think",
+    "thought",
+    "feels",
+    "felt",
+    "likes",
+    "liked",
+    "loves",
+    "loved",
+    "hates",
+    "hated",
+    "mentioned",
+    "mentions",
+    "replied",
+    "replies",
+    "confirmed",
+    "confirms",
+    "promised",
+    "promises",
+    "suggested",
+    "suggests",
+    "offered",
+    "offers",
+    "decided",
+    "decides",
+    "forgot",
+    "forgets",
+    "sent",
+    "sends",
+    "wrote",
+    "writes",
+    "came",
+    "comes",
+    "saw",
+    "sees",
+    "brought",
+    "brings",
+];
+
+/// Verbs whose object is a human by construction ("Told Noemi", "Met Elias",
+/// "Thanked Avi"). Same treatment as [`LEADING_VERBS`], except that stripping
+/// one is itself the interpersonal evidence — the cue would otherwise be
+/// invisible, because it sits INSIDE the candidate's own token span and the
+/// evidence scan skips those.
+const HUMAN_OBJECT_VERBS: &[&str] = &[
+    "told",
+    "tells",
+    "asked",
+    "asks",
+    "met",
+    "meets",
+    "texted",
+    "texts",
+    "emailed",
+    "emails",
+    "messaged",
+    "messages",
+    "phoned",
+    "phones",
+    "pinged",
+    "pings",
+    "thanked",
+    "thanks",
+    "invited",
+    "invites",
+    "introduced",
+    "introduces",
+    "hired",
+    "hires",
+    "married",
+    "marries",
+    "visited",
+    "visits",
+    "knows",
+    "knew",
+];
+
+/// Words for a human role or family tie. "Partner Rosalie" is a relationship
+/// plus a name, not a name — the run is one capitalized phrase only because
+/// the sentence started there.
+///
+/// Given names that read like roles are deliberately absent: Angel, Faith,
+/// Grace, Hope, Prince, King, Earl, Duke, Major, Mason. Losing "Angel the
+/// friend" costs a person; keeping "angel the investor label" costs nothing.
+const RELATIONSHIP_WORDS: &[&str] = &[
+    "partner",
+    "friend",
+    "bestie",
+    "colleague",
+    "coworker",
+    "co-worker",
+    "boss",
+    "wife",
+    "husband",
+    "spouse",
+    "ex",
+    "girlfriend",
+    "boyfriend",
+    "fiance",
+    "fiancee",
+    "brother",
+    "sister",
+    "stepbrother",
+    "stepsister",
+    "mother",
+    "father",
+    "stepmother",
+    "stepfather",
+    "mom",
+    "mum",
+    "mommy",
+    "mummy",
+    "dad",
+    "daddy",
+    "son",
+    "daughter",
+    "cousin",
+    "uncle",
+    "aunt",
+    "auntie",
+    "nephew",
+    "niece",
+    "grandma",
+    "grandpa",
+    "granny",
+    "grandmother",
+    "grandfather",
+    "neighbour",
+    "neighbor",
+    "roommate",
+    "flatmate",
+    "housemate",
+    "classmate",
+    "teammate",
+    "landlord",
+    "landlady",
+    "tenant",
+    "doctor",
+    "dentist",
+    "therapist",
+    "physio",
+    "lawyer",
+    "solicitor",
+    "accountant",
+    "nanny",
+    "babysitter",
+    "cleaner",
+    "gardener",
+    "plumber",
+    "electrician",
+    "builder",
+    "handyman",
+    "barber",
+    "hairdresser",
+    "trainer",
+    "driver",
+    "mentor",
+    "mentee",
+    "assistant",
+    "secretary",
+    "recruiter",
+    "teacher",
+    "student",
+    "client",
+    "customer",
+    "investor",
+    "supplier",
+];
+
 /// Tokens that may LEAD a greeting run and are stripped from the front of a
 /// candidate so the mention lands on the person addressed ("Heyy Elias" →
 /// "Elias"). Deliberately narrower than [`FILLER_WORDS`]: "Good", "Great" and
@@ -616,12 +809,45 @@ pub fn is_temporal(text: &str) -> bool {
 
 fn filler_set() -> &'static HashSet<&'static str> {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    SET.get_or_init(|| FILLER_WORDS.iter().copied().collect())
+    SET.get_or_init(|| {
+        FILLER_WORDS
+            .iter()
+            .chain(LEADING_VERBS)
+            .chain(HUMAN_OBJECT_VERBS)
+            .copied()
+            .collect()
+    })
 }
 
 fn greeting_set() -> &'static HashSet<&'static str> {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| GREETING_PREFIXES.iter().copied().collect())
+}
+
+fn relationship_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| RELATIONSHIP_WORDS.iter().copied().collect())
+}
+
+fn verb_prefix_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| LEADING_VERBS.iter().copied().collect())
+}
+
+fn human_object_verb_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| HUMAN_OBJECT_VERBS.iter().copied().collect())
+}
+
+/// Is `text` a word for a human role or family tie ("partner", "doctor")?
+/// Such a word names a relationship, never a person, so it is never an entity
+/// on its own.
+pub fn is_role_word(text: &str) -> bool {
+    relationship_set().contains(
+        text.trim_end_matches([':', ','])
+            .to_ascii_lowercase()
+            .as_str(),
+    )
 }
 
 /// Chat spellings stretch a word's last letter ("Heyy", "Hiii", "Byeee").
@@ -654,17 +880,23 @@ fn is_greeting_prefix(word: &str) -> bool {
         || greeting_set().contains(collapse_trailing_repeat(&lower).as_str())
 }
 
-/// Strip a leading greeting run in place ("Heyy Elias" → "Elias", "Good
-/// morning Noemi" → "Noemi"), leaving at least one token behind.
+/// Strip the leading words that are not part of anybody's name — a greeting
+/// ("Heyy Elias" → "Elias", "Good morning Noemi" → "Noemi"), a relationship
+/// word ("Partner Rosalie" → "Rosalie") or a clause-opening verb ("Wants
+/// Elias" → "Elias") — leaving at least one token behind.
 ///
-/// The greeting form is NOT kept as an alias: "Thanks Elias" is not a spelling
-/// of anyone's name, and hoarding one alias per salutation would bury the real
-/// ones ("Elias's", "Elias D.") that `people show` prints.
-fn strip_greeting_prefix(parts: &mut Vec<String>) -> bool {
-    let mut stripped = false;
+/// None of them is kept as an alias: "Thanks Elias" and "Partner Rosalie" are
+/// not spellings of anyone's name, and hoarding one alias per salutation would
+/// bury the real ones ("Elias's", "Elias D.") that `people show` prints.
+///
+/// Returns `true` when what was stripped PROVES a human follows — a greeting
+/// addresses someone, "my partner X" describes someone, "told X" has a human
+/// object. A plain verb ("Wants X") proves nothing and returns `false`.
+fn strip_leading_noise(parts: &mut Vec<String>) -> bool {
+    let mut human = false;
     loop {
         if parts.len() < 2 {
-            return stripped;
+            return human;
         }
         // "Good morning Elias" — "Good" only leads a greeting in this company.
         if parts.len() >= 3
@@ -672,15 +904,23 @@ fn strip_greeting_prefix(parts: &mut Vec<String>) -> bool {
             && GOOD_TIMES.contains(&parts[1].to_ascii_lowercase().as_str())
         {
             parts.drain(..2);
-            stripped = true;
+            human = true;
             continue;
         }
-        if is_greeting_prefix(&parts[0]) {
+        let head = parts[0].to_ascii_lowercase();
+        if is_greeting_prefix(&parts[0])
+            || relationship_set().contains(head.as_str())
+            || human_object_verb_set().contains(head.as_str())
+        {
             parts.remove(0);
-            stripped = true;
+            human = true;
             continue;
         }
-        return stripped;
+        if verb_prefix_set().contains(head.as_str()) {
+            parts.remove(0);
+            continue;
+        }
+        return human;
     }
 }
 
@@ -821,6 +1061,13 @@ pub fn canonicalize_surface(surface: &str) -> Option<Canonical> {
         }
     }
 
+    // "Heyy Elias", "Good morning Noemi", "Partner Rosalie", "Wants Elias" —
+    // one capitalized run to the extractor, one piece of noise plus one human
+    // to a reader. Strip the prefix so the mention counts for the human. Runs
+    // BEFORE the honorific fold: a title ("Dr Patel") is a name spelling worth
+    // keeping as an alias, a relationship word ("Partner Rosalie") never is.
+    let greeted = strip_leading_noise(&mut parts);
+
     // "Dr Jane Doe" and "Dr. Jane Doe" must land on the same node as "Jane
     // Doe", so the title is folded into an alias.
     if parts.len() >= 2 && is_honorific(&parts[0]) {
@@ -830,11 +1077,6 @@ pub fn canonicalize_surface(surface: &str) -> Option<Canonical> {
             aliases.push(full);
         }
     }
-
-    // "Heyy Elias", "Good morning Noemi", "Happy Birthday Avi" — one
-    // capitalized run to the extractor, one greeting plus one human to a
-    // reader. Strip the salutation so the mention counts for the human.
-    let greeted = strip_greeting_prefix(&mut parts);
 
     // "Maria Microsoft London Tech" is a contact label: keep "Maria" as the
     // node and the whole label as an alias so the label still resolves to her.
@@ -860,7 +1102,14 @@ pub fn canonicalize_surface(surface: &str) -> Option<Canonical> {
     }
     if parts.len() == 1 {
         let single = &parts[0];
-        if is_stopword(single) || is_temporal(single) || is_honorific(single) || is_filler(single) {
+        // A relationship word standing alone ("Partner", "Doctor") names a
+        // role, never a human — the same verdict filler and titles get.
+        if is_stopword(single)
+            || is_temporal(single)
+            || is_honorific(single)
+            || is_filler(single)
+            || is_role_word(single)
+        {
             return None;
         }
     }
@@ -998,6 +1247,99 @@ mod tests {
         }
         // A short name is never rewritten by the repeated-letter rule.
         assert_eq!(canonicalize_surface("Yoo Jin").unwrap().name, "Yoo Jin");
+    }
+
+    #[test]
+    fn a_relationship_word_folds_into_the_person_it_describes() {
+        for (surface, expected) in [
+            ("Partner Rosalie", "Rosalie"),
+            ("Friend Rosalie", "Rosalie"),
+            ("Brother Milan", "Milan"),
+            ("Sister Maria Marenova", "Maria Marenova"),
+            ("Boss Elias", "Elias"),
+            ("Doctor Patel", "Patel"),
+            ("Neighbour Noemi", "Noemi"),
+            ("Colleague Wei Zhang", "Wei Zhang"),
+        ] {
+            let c = canonicalize_surface(surface).expect("kept");
+            assert_eq!(c.name, expected, "{surface} must fold onto {expected}");
+            assert!(c.person_hint, "{surface} describes a human");
+            // "Partner Rosalie" is nobody's name — it must not be hoarded.
+            assert!(
+                c.aliases.is_empty(),
+                "{surface} left a junk alias: {:?}",
+                c.aliases
+            );
+        }
+    }
+
+    #[test]
+    fn a_relationship_word_alone_is_never_an_entity() {
+        for junk in [
+            "Partner",
+            "Doctor",
+            "Friend",
+            "Boss",
+            "Colleague",
+            "Wife",
+            "Husband",
+            "Brother",
+            "Neighbour",
+            "Landlord",
+        ] {
+            assert!(
+                canonicalize_surface(junk).is_none(),
+                "{junk} names a role, not a person"
+            );
+        }
+    }
+
+    #[test]
+    fn given_names_that_read_like_roles_still_survive() {
+        // The relationship list deliberately omits these — see its docs.
+        for name in ["Angel", "Grace", "Faith", "Hope", "Prince", "Mason", "Duke"] {
+            assert_eq!(
+                canonicalize_surface(name).map(|c| c.name),
+                Some(name.to_string()),
+                "{name} is a given name, not a role"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clause_opening_verb_folds_into_the_name_behind_it() {
+        for (surface, expected) in [
+            ("Wants Elias", "Elias"),
+            ("Said Maria", "Maria"),
+            ("Says Noemi", "Noemi"),
+            ("Told Noemi", "Noemi"),
+            ("Asked Avi Roy", "Avi Roy"),
+            ("Sent Elias", "Elias"),
+        ] {
+            let c = canonicalize_surface(surface).expect("kept");
+            assert_eq!(c.name, expected, "{surface} must fold onto {expected}");
+            assert!(
+                c.aliases.is_empty(),
+                "{surface} left a junk alias: {:?}",
+                c.aliases
+            );
+        }
+        // A verb whose object is a human by construction is itself evidence;
+        // a plain verb proves nothing about what follows it.
+        assert!(canonicalize_surface("Told Noemi").unwrap().person_hint);
+        assert!(!canonicalize_surface("Wants Rapamycin").unwrap().person_hint);
+    }
+
+    #[test]
+    fn a_clause_opening_verb_alone_is_never_an_entity() {
+        for junk in [
+            "Said", "Says", "Told", "Asked", "Wants", "Needs", "Thinks", "Sent", "Met",
+        ] {
+            assert!(
+                canonicalize_surface(junk).is_none(),
+                "{junk} is a verb, not a person"
+            );
+        }
     }
 
     #[test]

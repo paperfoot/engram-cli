@@ -422,7 +422,9 @@ async fn compile_within_tx(
         .await?;
     }
 
-    stats.entities = entity_ids.len();
+    // Distinct ROWS, not distinct spellings: two spellings of one human that
+    // the storage layer merged are one entity, and the report must say so.
+    stats.entities = entity_ids.values().collect::<HashSet<_>>().len();
     stats.people = ctx
         .store
         .list_entities_by_kind(Some(kb), engram_graph::people::KIND_PERSON, usize::MAX, 1)?

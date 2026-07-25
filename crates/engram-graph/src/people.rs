@@ -417,6 +417,13 @@ pub fn looks_like_person_name(name: &str) -> bool {
     if gazetteer::is_never_person(name) {
         return false;
     }
+    // "Chelsea Flower" (the Chelsea Flower Show, cut short by the stop-word
+    // filter) has the exact shape of a two-part human name. A place word plus
+    // a venue noun gives it away — see `is_truncated_place_phrase` for why
+    // both halves are required.
+    if gazetteer::is_truncated_place_phrase(name) {
+        return false;
+    }
     let tokens: Vec<&str> = name.split_whitespace().collect();
     if tokens.is_empty() || tokens.len() > 4 {
         return false;
@@ -428,6 +435,38 @@ pub fn looks_like_person_name(name: &str) -> bool {
     tokens
         .iter()
         .any(|t| t.chars().count() >= 2 && !NAME_PARTICLES.contains(&t.to_lowercase().as_str()))
+}
+
+/// A SHOUTED spelling read back as a written name ("MARIA" → "Maria", "MARIA
+/// MARENOVA" → "Maria Marenova").
+///
+/// A WhatsApp export shouts the contact name on every line, and to a
+/// capitalization-driven reader an ALL-CAPS token is an acronym, not a given
+/// name — which is why [`looks_like_person_name`] refuses it and why the fold
+/// used to walk straight past "MARIA:" and leave it as its own node. Tokens
+/// that already carry a lowercase letter are untouched, so a mixed-case name
+/// keeps whatever spelling the writer chose.
+fn as_written_name(name: &str) -> String {
+    name.split_whitespace()
+        .map(|token| {
+            let shouted = token.chars().count() >= 2
+                && token.chars().any(|c| c.is_uppercase())
+                && !token.chars().any(|c| c.is_lowercase());
+            if !shouted {
+                return token.to_string();
+            }
+            let mut out = String::with_capacity(token.len());
+            for (idx, c) in token.chars().enumerate() {
+                if idx == 0 {
+                    out.extend(c.to_uppercase());
+                } else {
+                    out.extend(c.to_lowercase());
+                }
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Organization suffixes kept from the original compiler heuristic.
@@ -1024,6 +1063,25 @@ pub fn analyze_with_index(text: &str, index: &PersonIndex) -> Extraction {
         occurrences.push((phrase.clone(), key));
     }
 
+    // One spelling per person, KB-wide ("MARIA MARENOVA" → "Maria Marenova").
+    //
+    // This runs BEFORE the fold on purpose. A WhatsApp export shouts the
+    // contact name on every line ("MARIA:"), and an ALL-CAPS token is an
+    // acronym to `looks_like_person_name`, so the fold below used to skip it —
+    // then this very rewrite turned it into a perfectly ordinary bare "Maria"
+    // that stood up its own node. That is how the real store ended up with
+    // "Maria" (432 mentions) beside "Maria Marenova" (21): not a broken
+    // ambiguity rule, a fold that never got to run on the shouted spelling.
+    if !index.is_empty() {
+        for entry in acc.values_mut() {
+            let display = index.display_name(&entry.name);
+            if display != entry.name {
+                entry.aliases.retain(|a| a != &display);
+                entry.name = display;
+            }
+        }
+    }
+
     // Pass 2 — fold a bare first name into the full person it belongs to
     // ("Avi" → alias of "Avi Roy"), so the graph has one node per human.
     //
@@ -1046,7 +1104,9 @@ pub fn analyze_with_index(text: &str, index: &PersonIndex) -> Extraction {
             continue;
         }
         // A place or a creed never folds into a person, whatever it resembles.
-        if !looks_like_person_name(&entry.name) {
+        // The test reads a shouted spelling as the name it is, so "MARIA:" is
+        // eligible for the same fold as "Maria".
+        if !looks_like_person_name(&as_written_name(&entry.name)) {
             continue;
         }
         if let Some(full) = index.fold_target(key, &local_full) {
@@ -1093,17 +1153,6 @@ pub fn analyze_with_index(text: &str, index: &PersonIndex) -> Extraction {
                         order: short.order,
                     },
                 );
-            }
-        }
-    }
-
-    // One spelling per person, KB-wide ("MARIA MARENOVA" → "Maria Marenova").
-    if !index.is_empty() {
-        for entry in acc.values_mut() {
-            let display = index.display_name(&entry.name);
-            if display != entry.name {
-                entry.aliases.retain(|a| a != &display);
-                entry.name = display;
             }
         }
     }
@@ -1537,6 +1586,83 @@ mod tests {
         );
     }
 
+    /// Every junk string the real store still produced after the first hygiene
+    /// pass, with its measured mention count: "Partner Rosalie" 64, "Wants
+    /// Elias" 28, "Said" 11, "Says" 8, "Chelsea Flower" 24.
+    #[test]
+    fn leading_non_name_words_never_produce_a_person() {
+        let ex = analyze(
+            "Partner Rosalie called about the flat. Wants Elias to confirm the booking. \
+             Said the meeting is at noon. Says the deck is ready. \
+             Chelsea Flower tickets arrived for my friend Rosalie.",
+        );
+        for junk in [
+            "Partner Rosalie",
+            "Wants Elias",
+            "Said",
+            "Says",
+            "Chelsea Flower",
+            "Partner",
+        ] {
+            assert_ne!(
+                ex.kind_of(junk),
+                Some(KIND_PERSON),
+                "{junk} must not be person-typed: {:?}",
+                ex.entities
+            );
+        }
+        for gone in ["Said", "Says", "Partner"] {
+            assert!(
+                ex.kind_of(gone).is_none(),
+                "{gone} must not be an entity at all: {:?}",
+                ex.entities
+            );
+        }
+        // The humans behind the junk survive, and the junk is not their alias.
+        let rosalie = ex
+            .entities
+            .iter()
+            .find(|e| e.name == "Rosalie")
+            .expect("the role word folds onto the person");
+        assert_eq!(rosalie.kind, KIND_PERSON);
+        assert_eq!(
+            rosalie.mentions, 2,
+            "the prefixed mention counts: {rosalie:?}"
+        );
+        assert!(
+            rosalie.aliases.is_empty(),
+            "a relationship word is nobody's name: {:?}",
+            rosalie.aliases
+        );
+        let elias = ex
+            .entities
+            .iter()
+            .find(|e| e.name == "Elias")
+            .expect("the verb folds onto the person");
+        assert!(elias.aliases.is_empty(), "{:?}", elias.aliases);
+    }
+
+    /// The conservative half of the truncated-place rule.
+    #[test]
+    fn two_part_surnames_survive_the_truncated_place_rule() {
+        let k = kinds(
+            "Jordan Peterson wrote back. My friend Jisoo Park called. \
+             Laura Corvo and Milan Kundera joined.",
+        );
+        for person in [
+            "Jordan Peterson",
+            "Jisoo Park",
+            "Laura Corvo",
+            "Milan Kundera",
+        ] {
+            assert_eq!(
+                k.get(person).copied(),
+                Some(KIND_PERSON),
+                "{person} must stay a person: {k:?}"
+            );
+        }
+    }
+
     /// The KB-wide pass: the same person written two ways in two chunks.
     #[test]
     fn kb_wide_index_folds_a_bare_first_name_across_chunks() {
@@ -1597,6 +1723,38 @@ mod tests {
         assert!(corvo.entities.iter().any(|e| e.name == "Laura Corvo"));
         let moreno = analyze_with_index(chunks[1], &index);
         assert!(moreno.entities.iter().any(|e| e.name == "Laura Quiroz"));
+    }
+
+    /// A WhatsApp export shouts the contact name on every line. The shouted
+    /// spelling is an acronym to `looks_like_person_name`, so the fold used to
+    /// skip it — and the display rewrite that ran afterwards handed the KB a
+    /// perfectly ordinary bare "Maria" with its own node. 432 mentions of one
+    /// woman under a name that was not hers.
+    #[test]
+    fn a_shouted_bare_first_name_still_folds_into_the_full_person() {
+        let chunks = [
+            "Maria Marenova is my partner and she cooked dinner.",
+            "MARIA: call me back when you can.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+        let shouted = analyze_with_index(chunks[1], &index);
+
+        assert!(
+            !shouted
+                .entities
+                .iter()
+                .any(|e| e.name.eq_ignore_ascii_case("maria")),
+            "the shouted first name stood up its own node: {:?}",
+            shouted.entities
+        );
+        let maria = shouted
+            .entities
+            .iter()
+            .find(|e| e.name == "Maria Marenova")
+            .expect("folded onto the full person");
+        assert_eq!(maria.kind, KIND_PERSON);
+        assert_eq!(maria.mentions, 1);
     }
 
     #[test]

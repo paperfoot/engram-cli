@@ -822,6 +822,122 @@ pub const CONTACT_LABEL_WORDS: &[&str] = &[
     "hinge",
 ];
 
+/// Place names deliberately kept OUT of [`PLACES`] because they are ordinary
+/// given names too (see the module docs). A bare "Chelsea" or "Milan" must
+/// stay person-eligible — but "Chelsea Flower" (the Chelsea Flower Show, cut
+/// short because `Show` is a stop-word) is not a human, and neither is "Milan
+/// Fashion" or "Georgia Tech".
+///
+/// These are therefore only consulted in the MULTI-WORD test below, never on
+/// their own.
+pub const AMBIGUOUS_PLACE_NAMES: &[&str] = &[
+    "chelsea",
+    "milan",
+    "sofia",
+    "jordan",
+    "georgia",
+    "austin",
+    "sydney",
+    "victoria",
+    "charlotte",
+    "florence",
+    "alexandria",
+    "phoenix",
+    "brooklyn",
+    "savannah",
+    "dakota",
+    "asia",
+    "india",
+    "kenya",
+    "paris",
+    "vienna",
+    "siena",
+    "verona",
+    "adelaide",
+    "regina",
+    "aurora",
+    "vega",
+];
+
+/// Common nouns that head a place, venue, or recurring-event name. On their
+/// own they are ordinary words; directly after a place word they say the
+/// capitalized run names an EVENT or a LOCATION, not a human.
+///
+/// Deliberately excludes the ones that are also everyday surnames — Green,
+/// Hill, Wood, Field, Marsh, Park, Cross, Gate — because the whole point of
+/// the two-word test is to keep "Jisoo Park" and "Chelsea Green" alive.
+pub const PLACE_HEAD_NOUNS: &[&str] = &[
+    "flower",
+    "flowers",
+    "garden",
+    "gardens",
+    "market",
+    "markets",
+    "festival",
+    "fashion",
+    "fair",
+    "expo",
+    "exhibition",
+    "carnival",
+    "parade",
+    "marathon",
+    "regatta",
+    "derby",
+    "arena",
+    "stadium",
+    "palace",
+    "abbey",
+    "cathedral",
+    "basilica",
+    "mosque",
+    "synagogue",
+    "pier",
+    "embankment",
+    "promenade",
+    "esplanade",
+    "waterfront",
+    "seafront",
+    "marina",
+    "harbour",
+    "harbor",
+    "wharf",
+    "quay",
+    "docks",
+    "bridge",
+    "tunnel",
+    "underground",
+    "metro",
+    "tramway",
+    "zoo",
+    "aquarium",
+    "observatory",
+    "planetarium",
+    "arcade",
+    "mall",
+    "plaza",
+    "piazza",
+    "boulevard",
+    "circus",
+    "junction",
+    "terminal",
+    "quarter",
+    "district",
+    "borough",
+    "precinct",
+    "campus",
+    "skyline",
+    "peninsula",
+    "estuary",
+    "lagoon",
+    "canal",
+    "reservoir",
+    "waterfall",
+    "glacier",
+    "desert",
+    "savanna",
+    "rainforest",
+];
+
 /// Lowercase words that lead a compound place name ("New York", "San Diego",
 /// "Cape Town"). A candidate starting with one is never treated as a contact
 /// label, so "New York Tech" can't be shortened to the person "New".
@@ -853,6 +969,16 @@ fn label_set() -> &'static HashSet<&'static str> {
 fn modifier_set() -> &'static HashSet<&'static str> {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| set_of(PLACE_MODIFIERS))
+}
+
+fn head_noun_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| set_of(PLACE_HEAD_NOUNS))
+}
+
+fn ambiguous_place_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| set_of(AMBIGUOUS_PLACE_NAMES))
 }
 
 /// Lowercase, single-spaced lookup key for a candidate name.
@@ -898,6 +1024,50 @@ pub fn is_place_modifier(word: &str) -> bool {
 /// that ends the personal-name prefix of a messaging-app contact label?
 pub fn is_label_marker(word: &str) -> bool {
     is_contact_label_word(word) || is_place_token(word) || is_creed_or_people(word)
+}
+
+/// Is this a place or event name that the extractor only caught PART of?
+///
+/// "Chelsea Flower Show" loses its head noun to the stop-word filter and
+/// arrives as "Chelsea Flower" — two Title-Case tokens, which is exactly the
+/// shape of a human name, so it was typed as a person with 24 mentions in the
+/// real store. The give-away is the pair: a place word (including the ones
+/// [`AMBIGUOUS_PLACE_NAMES`] keeps out of [`PLACES`] because they double as
+/// given names) followed somewhere by a venue/event noun.
+///
+/// Both halves are required, which is what keeps it conservative: "Jordan
+/// Peterson" has no venue noun, "Jisoo Park" has no place word, and a bare
+/// "Chelsea" is untouched.
+pub fn is_truncated_place_phrase(name: &str) -> bool {
+    let words: Vec<String> = name.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.len() < 2 {
+        return false;
+    }
+    // Longest place match first, so a two-word place ("Notting Hill", "New
+    // York") is one span and its own second word can't be read as the noun.
+    let mut place: Option<(usize, usize)> = None;
+    for idx in 0..words.len() {
+        if idx + 1 < words.len() {
+            let pair = format!("{} {}", words[idx], words[idx + 1]);
+            if place_set().contains(pair.as_str()) {
+                place = Some((idx, idx + 2));
+                break;
+            }
+        }
+        if place_set().contains(words[idx].as_str())
+            || ambiguous_place_set().contains(words[idx].as_str())
+        {
+            place = Some((idx, idx + 1));
+            break;
+        }
+    }
+    let Some((start, end)) = place else {
+        return false;
+    };
+    words
+        .iter()
+        .enumerate()
+        .any(|(idx, w)| !(start..end).contains(&idx) && head_noun_set().contains(w.as_str()))
 }
 
 #[cfg(test)]
@@ -949,6 +1119,48 @@ mod tests {
     fn a_place_word_inside_a_longer_name_is_harmless() {
         assert!(!is_never_person("Jordan Peterson"));
         assert!(!is_never_person("Elias London"));
+    }
+
+    #[test]
+    fn a_place_word_plus_a_venue_noun_is_a_truncated_place() {
+        // "Chelsea Flower Show" arrives without its head noun (a stop-word).
+        for phrase in [
+            "Chelsea Flower",
+            "chelsea flower",
+            "Milan Fashion",
+            "London Bridge",
+            "Camden Market",
+            "Notting Hill Carnival",
+        ] {
+            assert!(
+                is_truncated_place_phrase(phrase),
+                "{phrase} must read as a place, not a person"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_place_test_leaves_real_two_part_names_alone() {
+        for name in [
+            // A place word with no venue noun after it.
+            "Jordan Peterson",
+            "Milan Kundera",
+            "Victoria Beckham",
+            "Elias London",
+            // A venue noun with no place word before it.
+            "Jisoo Park",
+            "Laura Corvo",
+            "Maria Marenova",
+            "Noemi Varkoni",
+            // One word alone is never enough.
+            "Chelsea",
+            "Flower",
+        ] {
+            assert!(
+                !is_truncated_place_phrase(name),
+                "{name} must stay person-eligible"
+            );
+        }
     }
 
     #[test]
