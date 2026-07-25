@@ -10,20 +10,49 @@ use predicates::prelude::*;
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// Point a spawned binary's data/config/cache at `home`.
+/// The `directories` crate honors XDG_* on Linux and HOME on macOS.
+fn point_at_home(cmd: &mut Command, home: &std::path::Path) {
+    cmd.env("HOME", home);
+    cmd.env("XDG_CONFIG_HOME", home.join(".config"));
+    cmd.env("XDG_DATA_HOME", home.join(".local/share"));
+    cmd.env("XDG_CACHE_HOME", home.join(".cache"));
+}
+
+/// Process-wide throwaway home for tests that need no store of their own.
+///
+/// `engram` opens (and migrates) its SQLite database on every startup, so a
+/// spawned binary with no HOME override would read and WRITE the developer's
+/// real memory store — which also made the suite fail whenever that store had
+/// been migrated by a newer build. Every command in this file is sandboxed.
+fn shared_sandbox_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        // Create and migrate the sandbox database exactly once, before any
+        // parallel test can spawn against it. `OnceLock` serializes this
+        // initializer, so the tests never race to create the same fresh
+        // SQLite file from several processes at the same time.
+        let mut warmup = Command::cargo_bin("engram").expect("binary built");
+        warmup.env("ENGRAM_BENCH_FORCE_STUB", "1");
+        point_at_home(&mut warmup, tmp.path());
+        warmup.arg("agent-info").assert().success();
+        tmp
+    })
+    .path()
+}
+
 fn engram() -> Command {
     let mut cmd = Command::cargo_bin("engram").expect("binary built");
     cmd.env("ENGRAM_BENCH_FORCE_STUB", "1");
+    point_at_home(&mut cmd, shared_sandbox_home());
     cmd
 }
 
 fn with_isolated_home() -> (tempfile::TempDir, Command) {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let mut cmd = engram();
-    // directories crate honors XDG_* on Linux and HOME on macOS.
-    cmd.env("HOME", tmp.path());
-    cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    cmd.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    point_at_home(&mut cmd, tmp.path());
     (tmp, cmd)
 }
 
@@ -34,10 +63,7 @@ fn parse_stdout(out: &[u8]) -> Value {
 /// A second/third command against the same isolated home.
 fn cmd_in(tmp: &tempfile::TempDir) -> Command {
     let mut cmd = engram();
-    cmd.env("HOME", tmp.path());
-    cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    cmd.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
+    point_at_home(&mut cmd, tmp.path());
     cmd
 }
 
@@ -1540,4 +1566,296 @@ fn resolve_unknown_conflict_is_bad_input() {
     .assert()
     .failure()
     .code(3);
+}
+
+// ===========================================================================
+// Retrieval scope: a plain `recall` must search every KB, `retrieval.default_kb`
+// pins it, and a diary-scoped recall must never leak derived content from
+// another diary.
+// ===========================================================================
+
+/// Store `content` in `kb` (and optionally `diary`) in the isolated home.
+fn remember_in(tmp: &tempfile::TempDir, content: &str, kb: &str, diary: &str) {
+    cmd_in(tmp)
+        .args([
+            "remember",
+            content,
+            "--kb",
+            kb,
+            "--diary",
+            diary,
+            "--no-facts",
+            "--json",
+        ])
+        .assert()
+        .success();
+}
+
+/// Run `recall` with the given extra args and return the envelope.
+fn recall_json(tmp: &tempfile::TempDir, args: &[&str]) -> Value {
+    let out = cmd_in(tmp)
+        .arg("recall")
+        .args(args)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    parse_stdout(&out)
+}
+
+fn contents(v: &Value) -> Vec<String> {
+    v["data"]["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|r| r["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn plain_recall_searches_every_kb_by_default() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_in(
+        &tmp,
+        "Noemi birthday is on the fourteenth of March.",
+        "relationships",
+        "default",
+    );
+
+    // No --kb at all: the fact lives in `relationships`, and the caller has no
+    // way to know that. Searching only the KB named "default" would miss it.
+    let v = recall_json(&tmp, &["Noemi birthday"]);
+    assert_eq!(v["status"], "success", "plain recall must find the memory");
+    assert!(contents(&v).iter().any(|c| c.contains("Noemi birthday")));
+    assert_eq!(v["metadata"]["kb"], "*");
+    assert_eq!(v["metadata"]["kb_scope"], "all_kbs");
+    assert_eq!(v["data"]["results"][0]["kb"], "relationships");
+}
+
+#[test]
+fn memory_search_alias_also_defaults_to_every_kb() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_in(
+        &tmp,
+        "Petus raised a seed round in June.",
+        "business",
+        "default",
+    );
+
+    let out = cmd_in(&tmp)
+        .args(["memory", "search", "Petus seed round"])
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["status"], "success");
+    assert!(contents(&v).iter().any(|c| c.contains("Petus raised")));
+}
+
+#[test]
+fn explicit_kb_flag_still_scopes_recall_to_that_kb() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_in(&tmp, "Alpha marker phrase quokka.", "alpha", "default");
+    remember_in(&tmp, "Beta marker phrase wombat.", "beta", "default");
+
+    let v = recall_json(&tmp, &["marker phrase quokka", "--kb", "beta"]);
+    assert_eq!(v["metadata"]["kb"], "beta");
+    assert_eq!(v["metadata"]["kb_scope"], "flag");
+    assert!(
+        !contents(&v).iter().any(|c| c.contains("quokka")),
+        "an explicit --kb must not return another KB's memory: {:?}",
+        contents(&v)
+    );
+
+    // ...and the same query unscoped does reach it.
+    let v = recall_json(&tmp, &["marker phrase quokka"]);
+    assert!(contents(&v).iter().any(|c| c.contains("quokka")));
+}
+
+#[test]
+fn retrieval_default_kb_config_pins_recall_scope() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_in(&tmp, "Alpha marker phrase quokka.", "alpha", "default");
+    remember_in(&tmp, "Beta marker phrase wombat.", "beta", "default");
+
+    cmd_in(&tmp)
+        .args(["config", "set", "retrieval.default_kb", "beta"])
+        .arg("--json")
+        .assert()
+        .success();
+
+    // The pinned KB is discoverable via `config show`.
+    let out = cmd_in(&tmp)
+        .args(["config", "show", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let cfg = parse_stdout(&out);
+    assert_eq!(cfg["data"]["retrieval"]["default_kb"], "beta");
+    assert_eq!(
+        cfg["data"]["retrieval"]["default_kb_effective_scope"],
+        "beta"
+    );
+
+    // Config pins the scope when no --kb is passed.
+    let v = recall_json(&tmp, &["marker phrase"]);
+    assert_eq!(v["metadata"]["kb"], "beta");
+    assert_eq!(v["metadata"]["kb_scope"], "config");
+    let found = contents(&v);
+    assert!(found.iter().any(|c| c.contains("wombat")));
+    assert!(!found.iter().any(|c| c.contains("quokka")));
+
+    // An explicit --kb outranks the config.
+    let v = recall_json(&tmp, &["marker phrase", "--kb", "alpha"]);
+    assert_eq!(v["metadata"]["kb_scope"], "flag");
+    assert!(contents(&v).iter().any(|c| c.contains("quokka")));
+
+    // --all-kbs is still the escape hatch back to everything.
+    let v = recall_json(&tmp, &["marker phrase", "--all-kbs"]);
+    assert_eq!(v["metadata"]["kb"], "*");
+    assert_eq!(v["metadata"]["kb_scope"], "all_kbs");
+    let found = contents(&v);
+    assert!(found.iter().any(|c| c.contains("quokka")));
+    assert!(found.iter().any(|c| c.contains("wombat")));
+}
+
+#[test]
+fn diary_scoped_recall_never_returns_another_diarys_compiled_claims() {
+    let (tmp, _cmd) = with_isolated_home();
+    // Two diaries share one KB, so the KB alone cannot prove provenance.
+    // The digit matters: the deterministic compiler only turns a sentence into
+    // a cited claim when it looks like evidence.
+    remember_in(
+        &tmp,
+        "Nadia consulted a psychiatrist about 3 ketamine infusions last winter.",
+        "shared",
+        "private",
+    );
+    remember_in(
+        &tmp,
+        "Standup moved to Tuesday mornings at 9 am for the whole team.",
+        "shared",
+        "work",
+    );
+
+    // Compile turns each chunk into cited claims — the LLM/compiler paraphrase
+    // layer that recall searches in agent/evidence mode.
+    cmd_in(&tmp)
+        .args(["compile", "--kb", "shared", "--all", "--json"])
+        .assert()
+        .success();
+
+    // The owning diary still sees its own content.
+    let v = recall_json(
+        &tmp,
+        &[
+            "ketamine psychiatrist",
+            "--diary",
+            "private",
+            "--mode",
+            "agent",
+        ],
+    );
+    assert!(
+        contents(&v).iter().any(|c| c.contains("ketamine")),
+        "the private diary must still recall its own memory"
+    );
+
+    // A recall scoped to another diary must return nothing derived from it —
+    // not the chunk, and not a claim restating the chunk.
+    let v = recall_json(
+        &tmp,
+        &[
+            "ketamine psychiatrist",
+            "--diary",
+            "work",
+            "--mode",
+            "agent",
+        ],
+    );
+    let leaked = contents(&v);
+    assert!(
+        !leaked
+            .iter()
+            .any(|c| c.to_lowercase().contains("ketamine")
+                || c.to_lowercase().contains("psychiatrist")),
+        "diary isolation leak: {leaked:?}"
+    );
+    // The exclusion is reported, not silent.
+    let excluded = &v["metadata"]["diary_isolation"]["excluded_candidates"];
+    assert!(
+        excluded["claim"].as_u64().unwrap_or(0) >= 1,
+        "withheld claims must be reported in metadata: {}",
+        v["metadata"]["diary_isolation"]
+    );
+    assert_eq!(v["metadata"]["diary_isolation"]["diary"], "work");
+}
+
+#[test]
+fn entity_retrieval_fires_when_recall_spans_every_kb() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_in(
+        &tmp,
+        "Rapamycin extends mouse lifespan through mTORC1 inhibition.",
+        "one",
+        "default",
+    );
+    remember_in(
+        &tmp,
+        "Metformin lowers fasting glucose in older adults.",
+        "two",
+        "default",
+    );
+    for kb in ["one", "two"] {
+        cmd_in(&tmp)
+            .args(["compile", "--kb", kb, "--all", "--json"])
+            .assert()
+            .success();
+    }
+
+    // Both KBs really do carry an entity.
+    for (kb, name) in [("one", "Rapamycin"), ("two", "Metformin")] {
+        let out = cmd_in(&tmp)
+            .args(["entities", "list", "--kb", kb, "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = parse_stdout(&out);
+        assert!(
+            v["data"]["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["canonical_name"] == name),
+            "expected entity {name} in kb {kb}"
+        );
+    }
+
+    // Unscoped recall used to return early before entity/graph retrieval,
+    // silently dropping two of the pipeline's sources.
+    let v = recall_json(&tmp, &["Rapamycin Metformin", "--top-k", "20"]);
+    let results = v["data"]["results"].as_array().unwrap();
+    let entity_kbs: Vec<&str> = results
+        .iter()
+        .filter(|r| {
+            r["sources"]
+                .as_array()
+                .map(|s| s.iter().any(|x| x == "entity"))
+                .unwrap_or(false)
+        })
+        .map(|r| r["kb"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        entity_kbs.contains(&"one") && entity_kbs.contains(&"two"),
+        "entity retrieval must fire in both KBs, got {entity_kbs:?}"
+    );
 }

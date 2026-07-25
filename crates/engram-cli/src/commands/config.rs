@@ -75,6 +75,12 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
             "retrieval": {
                 "profile": "cloud_quality",
                 "rerank_top_n": 50,
+                // Unset means reads span EVERY KB. Set it to pin recall and
+                // `memory search` to one KB when no --kb flag is given.
+                "default_kb": std::env::var(crate::retrieval::DEFAULT_KB_ENV).ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .or_else(|| resolve_config_string(crate::retrieval::DEFAULT_KB_CONFIG_KEY)),
+                "default_kb_effective_scope": crate::retrieval::resolve_kb_scope(None, false).label(),
             },
             "embedding": {
                 "provider": "gemini",

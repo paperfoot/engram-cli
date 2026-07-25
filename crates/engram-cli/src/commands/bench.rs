@@ -411,7 +411,8 @@ async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
                 allow_mixed_embeddings: false,
             },
         )
-        .await?;
+        .await?
+        .results;
         let hit = results
             .iter()
             .any(|r| r.content.to_ascii_lowercase().contains(expected));

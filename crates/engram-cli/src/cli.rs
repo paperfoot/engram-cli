@@ -103,11 +103,12 @@ pub enum Command {
         #[arg(long, default_value = "cloud_quality")]
         profile: String,
 
-        /// Knowledge base/domain namespace.
-        #[arg(long, default_value = "default")]
-        kb: String,
+        /// Knowledge base/domain namespace to search. Omit to search EVERY KB
+        /// (or the KB pinned by `retrieval.default_kb`). Pass "*" for all.
+        #[arg(long)]
+        kb: Option<String>,
 
-        /// Search all KBs instead of only --kb.
+        /// Search all KBs, ignoring --kb and retrieval.default_kb.
         #[arg(long)]
         all_kbs: bool,
 
@@ -537,8 +538,11 @@ pub enum MemoryCommand {
         mode: String,
         #[arg(long, default_value = "cloud_quality")]
         profile: String,
-        #[arg(long, default_value = "default")]
-        kb: String,
+        /// Knowledge base to search. Omit to search EVERY KB (or the KB pinned
+        /// by `retrieval.default_kb`). Pass "*" for all.
+        #[arg(long)]
+        kb: Option<String>,
+        /// Search all KBs, ignoring --kb and retrieval.default_kb.
         #[arg(long)]
         all_kbs: bool,
         #[arg(long, default_value = "default")]
