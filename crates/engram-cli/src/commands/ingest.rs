@@ -30,6 +30,7 @@ pub async fn run(
     max_files: Option<usize>,
     all: bool,
 ) -> Result<(), CliError> {
+    crate::commands::validate_diary_for_write(&diary)?;
     if !path.exists() {
         return Err(CliError::BadInput(format!(
             "path does not exist: {}",

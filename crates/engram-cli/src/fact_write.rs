@@ -197,12 +197,31 @@ pub struct FactWriteCtx<'a> {
 }
 
 /// Write one extracted fact through the write-path v2 pipeline.
+/// Test seam: make persistence of matching facts fail.
+///
+/// Set to a substring; any fact whose subject or predicate contains it fails
+/// to persist. Fact persistence has no other way to fail on demand, and the
+/// "extraction marker recorded even though the facts were never written" bug
+/// class is exactly what has to stay covered — a memory marked done with no
+/// facts in it is invisible to `facts backfill` forever. Same shape as
+/// `ENGRAM_FACT_LLM_STUB`.
+pub const WRITE_FAIL_ENV: &str = "ENGRAM_FACT_WRITE_FAIL";
+
 pub async fn write_fact(
     ctx: &AppContext,
     w: &FactWriteCtx<'_>,
     ef: &ExtractedFact,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), CliError> {
+    if let Ok(needle) = std::env::var(WRITE_FAIL_ENV) {
+        if !needle.trim().is_empty()
+            && (ef.subject.contains(needle.trim()) || ef.predicate.contains(needle.trim()))
+        {
+            return Err(CliError::Storage(engram_storage::StorageError::Migration(
+                format!("{WRITE_FAIL_ENV} injected a persistence failure for {ef:?}"),
+            )));
+        }
+    }
     let (memory_id, diary, kb) = (w.memory_id, w.diary, w.kb);
     let (embedder, llm, autonomy, source_kind) = (w.embedder, w.llm, w.autonomy, w.source_kind);
     let predicate = canonical_predicate(&ef.predicate);

@@ -69,6 +69,16 @@ enum ExtractionStatus {
     SkippedNoKey,
     /// The LLM call was attempted and failed. The memory is still stored.
     Failed(String),
+    /// The LLM returned facts but at least one could not be persisted. No
+    /// extraction marker was recorded, so the memory is still pending.
+    FailedPersist {
+        failed: usize,
+        total: usize,
+        detail: String,
+    },
+    /// Every fact persisted, but the "already extracted" marker itself could
+    /// not be written. Harmless apart from a re-extraction later.
+    MarkerNotRecorded(String),
 }
 
 impl ExtractionStatus {
@@ -80,7 +90,15 @@ impl ExtractionStatus {
             ExtractionStatus::CallerSupplied => "skipped_facts_json",
             ExtractionStatus::SkippedNoKey => "skipped_no_openrouter_key",
             ExtractionStatus::Failed(_) => "failed",
+            ExtractionStatus::FailedPersist { .. } => "failed_partial_persist",
+            ExtractionStatus::MarkerNotRecorded(_) => "failed_extraction_marker",
         }
+    }
+
+    /// Whether extraction actually ran (and therefore whether a "done" marker
+    /// would be meaningful).
+    fn extraction_ran(&self) -> bool {
+        matches!(self, ExtractionStatus::Ran | ExtractionStatus::RanStub)
     }
 
     /// The one sentence a caller needs when facts did NOT get captured.
@@ -93,6 +111,19 @@ impl ExtractionStatus {
             ExtractionStatus::Failed(e) => Some(format!(
                 "fact extraction failed ({e}); the memory is stored — retry with \
                  `engram facts backfill --kb {kb}`"
+            )),
+            ExtractionStatus::FailedPersist {
+                failed,
+                total,
+                detail,
+            } => Some(format!(
+                "{failed} of {total} extracted facts could not be stored ({detail}); the memory \
+                 is stored and left UNPROCESSED, so `engram facts backfill --kb {kb}` will \
+                 retry it"
+            )),
+            ExtractionStatus::MarkerNotRecorded(e) => Some(format!(
+                "facts were stored but the extraction marker was not ({e}); \
+                 `engram facts backfill --kb {kb}` may extract this memory again"
             )),
             _ => None,
         }
@@ -127,6 +158,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         event_time,
     } = args;
     let autonomy = Autonomy::parse(&autonomy)?;
+    crate::commands::validate_diary_for_write(&diary)?;
     let event_time = parse_event_time(&event_time)?;
     // Paid calls (embedding, extraction) respect the KB budget guardrail.
     crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
@@ -262,7 +294,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // Fact processing (extraction and/or caller-supplied triples) runs after
     // the memory is safely persisted so a fact failure never blocks `remember`.
     let llm = crate::fact_llm::resolve()?;
-    let status = if no_extract_facts {
+    // The model the marker will credit, recorded only if extraction ran.
+    let mut extraction_model: Option<String> = None;
+    let mut status = if no_extract_facts {
         ExtractionStatus::Disabled
     } else if facts_json.is_some() && !force_extract_facts {
         // --facts-json means the caller already did the extraction. Honoring
@@ -272,8 +306,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     } else {
         match &llm {
             Some(llm) => {
-                match extract_into(ctx, llm, &content, &kb, &diary, memory.id, &mut extracted).await
-                {
+                extraction_model = Some(llm.model());
+                match extract_into(ctx, llm, &content, &kb, &diary, &mut extracted).await {
                     Ok(()) if llm.is_live() => ExtractionStatus::Ran,
                     Ok(()) => ExtractionStatus::RanStub,
                     Err(e) => ExtractionStatus::Failed(e),
@@ -283,6 +317,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         }
     };
 
+    let mut write_failures: Vec<String> = Vec::new();
     let mut outcome = FactWriteOutcome::default();
     if !extracted.is_empty() {
         // The novelty gate uses the same embedder family as the chunks above.
@@ -305,9 +340,42 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         for ef in &extracted {
             if let Err(e) = write_fact(ctx, &write_ctx, ef, &mut outcome).await {
                 tracing::warn!("fact write failed for {:?}: {e}", ef);
+                write_failures.push(e.to_string());
             }
         }
     }
+
+    // EXTRACTION MARKER ORDERING. `facts backfill` treats any row in
+    // fact_extraction_log as "this memory is done" (PENDING_EXTRACTION_
+    // PREDICATE), so the marker is a promise that the facts are in the store.
+    // Writing it right after the LLM returned — before the write loop below —
+    // broke that promise: a persistence failure was only `tracing::warn!`ed,
+    // the memory was still marked processed, and no backfill would ever look
+    // at it again. The facts were lost silently and permanently.
+    //
+    // So: record the marker only once every extracted fact has been persisted.
+    // On any failure record NOTHING (the memory stays pending and a later
+    // `facts backfill` retries it) and say so loudly in the envelope.
+    if status.extraction_ran() {
+        if let Some(detail) = write_failures.first() {
+            status = ExtractionStatus::FailedPersist {
+                failed: write_failures.len(),
+                total: extracted.len(),
+                detail: detail.clone(),
+            };
+        } else if let Err(e) = ctx.store.record_fact_extraction(
+            memory.id,
+            extraction_model.as_deref(),
+            extracted.len() as i64,
+            "remember",
+        ) {
+            // Marker-only failure: the facts ARE stored, the memory just stays
+            // in the backfill queue. Failing safe means a possible re-extract,
+            // never a silent loss.
+            status = ExtractionStatus::MarkerNotRecorded(e.to_string());
+        }
+    }
+
     let facts_added = outcome.added;
     let conflicts = outcome.conflicts;
     let adjudication_needed = outcome.queued;
@@ -368,16 +436,19 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Run one extraction call, append the triples, and record the attempt.
+/// Run one extraction call and append the triples.
 /// An extraction failure is reported, never fatal — the memory is already
 /// stored and losing facts must not lose the memory.
+///
+/// Deliberately does NOT record the "already extracted" marker: that belongs
+/// after the facts are persisted, in the caller. See the marker-ordering note
+/// in `run`.
 async fn extract_into(
     ctx: &AppContext,
     llm: &FactLlm,
     content: &str,
     kb: &str,
     diary: &str,
-    memory_id: Uuid,
     out: &mut Vec<ExtractedFact>,
 ) -> Result<(), String> {
     let model = llm.model();
@@ -401,16 +472,7 @@ async fn extract_into(
     }
     match extract_facts(llm.as_chat(), content).await {
         Ok(more) => {
-            let n = more.len();
             out.extend(more);
-            // Mark the memory processed even when it yielded nothing, so
-            // `facts backfill` never re-pays for a memory with no facts in it.
-            if let Err(e) =
-                ctx.store
-                    .record_fact_extraction(memory_id, Some(&model), n as i64, "remember")
-            {
-                tracing::warn!("could not record fact extraction marker: {e}");
-            }
             Ok(())
         }
         Err(e) => {
