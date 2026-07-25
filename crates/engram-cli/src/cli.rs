@@ -51,14 +51,24 @@ pub enum Command {
         kb: String,
 
         /// Skip LLM-based fact extraction + contradiction detection.
-        /// Deprecated compatibility flag. Fact extraction is now opt-in.
-        #[arg(long)]
-        no_facts: bool,
+        /// Extraction is ON by default whenever an OpenRouter key resolves;
+        /// use this for bulk/low-value writes you don't want facts from.
+        /// `--no-facts` is accepted as the older spelling.
+        #[arg(long, alias = "no-facts")]
+        no_extract_facts: bool,
 
-        /// Extract atomic facts and run contradiction detection while writing.
-        /// This may make a network LLM call when OPENROUTER_API_KEY is configured.
+        /// Deprecated: fact extraction is now the default, so this flag is
+        /// redundant on its own. It still forces extraction alongside
+        /// --facts-json, exactly as it did before. Opt out with
+        /// --no-extract-facts.
         #[arg(long)]
         extract_facts: bool,
+
+        /// When the content actually happened: RFC3339 (2026-03-01T09:30:00Z)
+        /// or YYYY-MM-DD (midnight UTC). Drives `recall --since/--until` and
+        /// seeds the event time of facts extracted from it. Defaults to now.
+        #[arg(long)]
+        event_time: Option<String>,
 
         /// Store even if identical content already exists in this kb/diary.
         /// By default an exact duplicate is a no-op (no second embedding).
@@ -75,8 +85,9 @@ pub enum Command {
         /// Store facts directly from a JSON array (same shape as extraction
         /// output: [{"subject","predicate","object","confidence","fact_type",
         /// "valid_from"}]). Skips the extraction LLM call entirely — use this
-        /// when you already know the triple. Runs the same contradiction
-        /// detection as --extract-facts.
+        /// when you already know the triple. The supplied facts still run the
+        /// full write path: canonicalization, dedup, slot policies, and
+        /// contradiction detection.
         #[arg(long)]
         facts_json: Option<String>,
     },
@@ -510,7 +521,7 @@ pub enum DocumentsCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommand {
-    /// Add a durable memory.
+    /// Add a durable memory. Same engine as `remember`, same flags.
     Add {
         content: String,
         #[arg(long, default_value_t = 5)]
@@ -521,8 +532,26 @@ pub enum MemoryCommand {
         diary: String,
         #[arg(long, default_value = "default")]
         kb: String,
+        /// Skip LLM-based fact extraction + contradiction detection.
+        /// Extraction is ON by default whenever an OpenRouter key resolves.
+        #[arg(long, alias = "no-facts")]
+        no_extract_facts: bool,
+        /// Deprecated: extraction is the default; still forces extraction
+        /// alongside --facts-json.
         #[arg(long)]
         extract_facts: bool,
+        /// When the content actually happened: RFC3339 or YYYY-MM-DD
+        /// (midnight UTC). Drives `recall --since/--until`.
+        #[arg(long)]
+        event_time: Option<String>,
+        /// Conflict-resolution authority: assisted (default) | full | strict.
+        /// See `remember --help`.
+        #[arg(long, default_value = "assisted")]
+        autonomy: String,
+        /// Store facts directly from a JSON array, skipping the extraction
+        /// LLM call. Same shape as `remember --facts-json`.
+        #[arg(long)]
+        facts_json: Option<String>,
         /// Store even if identical content already exists in this kb/diary.
         #[arg(long)]
         allow_duplicate: bool,
@@ -704,6 +733,35 @@ pub enum FactsCommand {
         #[arg(long)]
         kb: Option<String>,
     },
+    /// Extract facts from memories that were stored before extraction was on.
+    ///
+    /// Idempotent: memories that already have facts (or an extraction marker)
+    /// are skipped, so re-running costs nothing. Oldest first, so a `--limit`ed
+    /// run advances chronologically and the next run resumes after it.
+    /// One LLM call per memory — needs an OpenRouter key (exit 2 without one)
+    /// and respects `engram budget` guardrails.
+    #[command(after_long_help = "\
+Examples:
+  engram facts backfill --kb personal --dry-run       # what would be processed
+  engram facts backfill --kb personal --limit 25      # bounded first pass
+  engram facts backfill --kb personal --diary work    # one diary only
+")]
+    Backfill {
+        /// Knowledge base/domain namespace to backfill. Required: this spends
+        /// one LLM call per memory, so the scope is never implicit.
+        #[arg(long)]
+        kb: String,
+        /// Restrict to one diary. Omit (or pass "*") for every diary in the KB.
+        #[arg(long)]
+        diary: Option<String>,
+        /// Process at most this many memories in one run.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Report what would be processed without making any LLM call.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Resolve a queued fact conflict. You (the calling agent) have the
     /// conversation context — decide and engram records it.
     Resolve {

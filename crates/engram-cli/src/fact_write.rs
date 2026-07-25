@@ -20,12 +20,13 @@
 
 use crate::context::AppContext;
 use crate::error::CliError;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
+use engram_core::temporal::parse_moment;
 use engram_core::types::{Fact, FactType, SourceKind};
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::facts::{
-    adjudicate, canonical_predicate, normalize, AdjudicationAction, ExtractedFact, SlotPolicy,
-    slot_policy,
+    adjudicate, canonical_predicate, date_valued_predicate, normalize, slot_policy,
+    AdjudicationAction, ExtractedFact, SlotPolicy,
 };
 use engram_graph::gate::{novelty_gate, GateDecision};
 use engram_llm::ChatLlm;
@@ -82,18 +83,29 @@ fn gate_thresholds() -> (f32, f32) {
     (dup, novel)
 }
 
-fn parse_valid_from(raw: &Option<String>) -> Option<DateTime<Utc>> {
-    let s = raw.as_deref()?.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|ndt| DateTime::from_naive_utc_and_offset(ndt, Utc))
+/// When this fact became true, in the bi-temporal sense the v6 schema models.
+/// Precedence, most specific first:
+/// 1. an explicit `valid_from` from the extractor ("since March 2026");
+/// 2. the object of a date-valued predicate — `born_on 1990-04-12` was true
+///    in 1990, whatever today's date is;
+/// 3. the parent memory's `--event-time` — facts learned about an event
+///    inherit that event's time;
+/// 4. now, so the temporal model is never left NULL.
+fn resolve_valid_from(
+    ef: &ExtractedFact,
+    predicate: &str,
+    memory_event_time: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    ef.valid_from
+        .as_deref()
+        .and_then(parse_moment)
+        .or_else(|| {
+            date_valued_predicate(predicate)
+                .then(|| parse_moment(&ef.object))
+                .flatten()
+        })
+        .or(memory_event_time)
+        .or_else(|| Some(Utc::now()))
 }
 
 /// Resolve a raw subject against known fact subjects in (diary, kb):
@@ -164,21 +176,32 @@ fn fact_summary(f: &Fact) -> serde_json::Value {
     })
 }
 
-/// Write one extracted fact. `embedder` powers the novelty gate (None = gate
-/// off, exact path only); `llm` powers full-autonomy adjudication.
-#[allow(clippy::too_many_arguments)]
+/// Everything a batch of facts from one memory shares. Bundled so the write
+/// path keeps one honest signature as the fact layer grows.
+pub struct FactWriteCtx<'a> {
+    /// Memory the facts were derived from (provenance + backfill idempotency).
+    pub memory_id: Uuid,
+    pub diary: &'a str,
+    pub kb: &'a str,
+    /// The memory's event time, inherited by facts with no date of their own.
+    pub event_time: Option<DateTime<Utc>>,
+    /// Powers the novelty gate. `None` = gate off, exact path only.
+    pub embedder: Option<&'a dyn Embedder>,
+    /// Powers full-autonomy adjudication.
+    pub llm: Option<&'a dyn ChatLlm>,
+    pub autonomy: Autonomy,
+    pub source_kind: SourceKind,
+}
+
+/// Write one extracted fact through the write-path v2 pipeline.
 pub async fn write_fact(
     ctx: &AppContext,
-    memory_id: Uuid,
-    diary: &str,
-    kb: &str,
+    w: &FactWriteCtx<'_>,
     ef: &ExtractedFact,
-    embedder: Option<&dyn Embedder>,
-    llm: Option<&dyn ChatLlm>,
-    autonomy: Autonomy,
-    source_kind: SourceKind,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), CliError> {
+    let (memory_id, diary, kb) = (w.memory_id, w.diary, w.kb);
+    let (embedder, llm, autonomy, source_kind) = (w.embedder, w.llm, w.autonomy, w.source_kind);
     let predicate = canonical_predicate(&ef.predicate);
     let (subject, subject_norm) = canonicalize_subject(ctx, diary, kb, &ef.subject);
     let object_norm = normalize(&ef.object);
@@ -192,7 +215,7 @@ pub async fn write_fact(
         (false, Some(t)) => FactType::parse(t),
         (false, None) => FactType::Assertion,
     };
-    let valid_from = parse_valid_from(&ef.valid_from).or_else(|| Some(Utc::now()));
+    let valid_from = resolve_valid_from(ef, &predicate, w.event_time);
 
     let new_fact = Fact {
         id: Uuid::new_v4(),
@@ -454,13 +477,60 @@ mod tests {
         assert!(Autonomy::parse("yolo").is_err());
     }
 
+    fn extracted(predicate: &str, object: &str, valid_from: Option<&str>) -> ExtractedFact {
+        ExtractedFact {
+            subject: "Ana".into(),
+            predicate: predicate.into(),
+            object: object.into(),
+            confidence: 1.0,
+            fact_type: None,
+            valid_from: valid_from.map(|s| s.to_string()),
+        }
+    }
+
+    fn moment(s: &str) -> DateTime<Utc> {
+        parse_moment(s).unwrap()
+    }
+
     #[test]
-    fn valid_from_parses_iso_date_and_rfc3339() {
-        let d = parse_valid_from(&Some("2026-03-01".into())).unwrap();
-        assert_eq!(d.to_rfc3339(), "2026-03-01T00:00:00+00:00");
-        assert!(parse_valid_from(&Some("2026-03-01T12:00:00Z".into())).is_some());
-        assert!(parse_valid_from(&Some("next spring".into())).is_none());
-        assert!(parse_valid_from(&None).is_none());
+    fn explicit_valid_from_wins() {
+        let ef = extracted("lives_in", "Lisbon", Some("2026-03-01"));
+        let got = resolve_valid_from(&ef, "lives_in", Some(moment("2020-01-01"))).unwrap();
+        assert_eq!(got, moment("2026-03-01"));
+    }
+
+    #[test]
+    fn date_valued_object_becomes_the_event_time() {
+        let ef = extracted("born_on", "1990-04-12", None);
+        let got = resolve_valid_from(&ef, "born_on", None).unwrap();
+        assert_eq!(got, moment("1990-04-12"));
+    }
+
+    #[test]
+    fn non_date_predicates_ignore_a_date_shaped_object() {
+        let ef = extracted("lives_in", "1990-04-12", None);
+        let event = moment("2024-06-01");
+        assert_eq!(
+            resolve_valid_from(&ef, "lives_in", Some(event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn facts_inherit_the_memory_event_time() {
+        let ef = extracted("married_to", "Bo", None);
+        let event = moment("2019-08-17T14:00:00Z");
+        assert_eq!(
+            resolve_valid_from(&ef, "married_to", Some(event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn undated_facts_fall_back_to_now() {
+        let ef = extracted("prefers", "tea", Some("next spring"));
+        let got = resolve_valid_from(&ef, "prefers", None).unwrap();
+        assert!((Utc::now() - got).num_seconds().abs() < 5);
     }
 
     #[test]

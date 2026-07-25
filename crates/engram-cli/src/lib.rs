@@ -5,6 +5,7 @@ pub mod cli;
 pub mod commands;
 pub mod context;
 pub mod error;
+pub mod fact_llm;
 pub mod fact_write;
 pub mod output;
 pub mod retrieval;
@@ -27,23 +28,28 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             tag,
             diary,
             kb,
-            no_facts,
+            no_extract_facts,
             extract_facts,
+            event_time,
             allow_duplicate,
             autonomy,
             facts_json,
         } => {
             commands::remember::run(
                 &ctx,
-                content,
-                importance,
-                tag,
-                diary,
-                kb,
-                extract_facts && !no_facts,
-                allow_duplicate,
-                autonomy,
-                facts_json,
+                commands::remember::RememberArgs {
+                    content,
+                    importance,
+                    tags: tag,
+                    diary,
+                    kb,
+                    no_extract_facts,
+                    force_extract_facts: extract_facts,
+                    allow_duplicate,
+                    autonomy,
+                    facts_json,
+                    event_time,
+                },
             )
             .await
         }
@@ -182,20 +188,28 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 tag,
                 diary,
                 kb,
+                no_extract_facts,
                 extract_facts,
+                event_time,
+                autonomy,
+                facts_json,
                 allow_duplicate,
             } => {
                 commands::remember::run(
                     &ctx,
-                    content,
-                    importance,
-                    tag,
-                    diary,
-                    kb,
-                    extract_facts,
-                    allow_duplicate,
-                    "assisted".to_string(),
-                    None,
+                    commands::remember::RememberArgs {
+                        content,
+                        importance,
+                        tags: tag,
+                        diary,
+                        kb,
+                        no_extract_facts,
+                        force_extract_facts: extract_facts,
+                        allow_duplicate,
+                        autonomy,
+                        facts_json,
+                        event_time,
+                    },
                 )
                 .await
             }
@@ -276,6 +290,12 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             FactsCommand::Resolve { id, action, note } => {
                 commands::facts::resolve(&ctx, id, action, note)
             }
+            FactsCommand::Backfill {
+                kb,
+                diary,
+                limit,
+                dry_run,
+            } => commands::facts::backfill(&ctx, kb, diary, limit, dry_run).await,
         },
         Command::Export { format, kb } => commands::export::run(&ctx, format, kb),
         Command::Import { file } => commands::import::run(&ctx, file),
