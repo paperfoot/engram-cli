@@ -389,9 +389,15 @@ Examples:
 
     /// Run a benchmark suite.
     Bench {
-        /// Benchmark name: mini | mini-fts | scientific-mini | longmemeval | longmemeval-qa | locomo-plus | mab | litqa2 | beir | biogen
+        /// Benchmark name: mini | mini-fts | personal | scientific-mini | longmemeval | longmemeval-qa | locomo-plus | mab | litqa2 | beir | biogen
         #[arg(default_value = "mini")]
         suite: String,
+
+        /// Retrieval profile for the `personal` suite: offline (deterministic
+        /// hash embedder + passthrough reranker, no network) | cloud_quality |
+        /// fast. Ignored by the other suites.
+        #[arg(long, default_value = "offline")]
+        profile: String,
 
         /// MemoryAgentBench split: accurate_retrieval | test_time_learning | long_range_understanding | conflict_resolution.
         #[arg(long, default_value = "accurate_retrieval")]

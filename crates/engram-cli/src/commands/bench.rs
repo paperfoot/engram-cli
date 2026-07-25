@@ -33,11 +33,21 @@ pub struct BenchArgs {
     pub dataset: String,
     pub rerank: String,
     pub year: String,
+    pub profile: String,
 }
 
 pub async fn run(ctx: &AppContext, args: BenchArgs) -> Result<(), CliError> {
     match args.suite.as_str() {
         "mini" => run_mini(ctx).await,
+        "personal" => {
+            run_personal(
+                ctx,
+                args.profile,
+                top_k_or(args.top_k, PERSONAL_DEFAULT_TOP_K),
+                args.save,
+            )
+            .await
+        }
         "mini-fts" => run_mini_fts(ctx),
         "scientific-mini" | "science-mini" => run_scientific_mini(ctx).await,
         "longmemeval" => run_longmemeval(ctx, args.download, args.limit).await,
@@ -124,6 +134,9 @@ const QA_DEFAULT_TOP_K: usize = 5;
 const LITQA2_DEFAULT_TOP_K: usize = 30;
 /// Default top-k for BEIR retrieval rows.
 const BEIR_DEFAULT_TOP_K: usize = 30;
+/// Default top-k for the personal suite — matches the `recall` default, so the
+/// bench measures what an agent actually gets back.
+const PERSONAL_DEFAULT_TOP_K: usize = 10;
 
 /// Resolve the effective top-k: a `--top-k 0` (the "auto" sentinel) selects the
 /// suite default; any explicit positive value is used verbatim.
@@ -441,6 +454,275 @@ async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
+}
+
+/// `engram bench personal` — the personal-memory quality gate.
+///
+/// Seeds the committed synthetic dataset into a throwaway in-memory store
+/// through the production write path (chunker + embedder + embedding metadata),
+/// then runs every query through the *real* `hybrid_recall` pipeline, so the
+/// numbers move when retrieval changes. Offline by default: deterministic hash
+/// embedder, passthrough reranker, zero network.
+///
+/// Several categories are expected to score badly today (hint-less cross-KB
+/// lookups return nothing at all under the default `kb=default` filter;
+/// event-time temporal queries with no `--since/--until` have no signal to go
+/// on). Measuring that is the job — the suite asserts nothing about score
+/// levels, it reports them.
+async fn run_personal(
+    ctx: &AppContext,
+    profile: String,
+    top_k: usize,
+    save: Option<std::path::PathBuf>,
+) -> Result<(), CliError> {
+    use crate::retrieval::{hybrid_recall, Filters, HybridParams, RecallMode, RetrievalProfile};
+    use engram_bench::personal::{self, QueryRun};
+    use engram_embed::Embedder;
+    use engram_rerank::cohere::CohereReranker;
+    use engram_rerank::Reranker;
+    use engram_storage::SqliteStore;
+    use std::time::Instant;
+
+    let profile_enum = RetrievalProfile::parse(&profile)?;
+    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
+
+    // A cloud profile with no key must fail loudly rather than silently
+    // benchmarking the 64-dim stub and reporting it as cloud quality.
+    if profile_enum != RetrievalProfile::Offline && (gemini_key.is_none() || force_stub) {
+        return Err(CliError::Config(format!(
+            "profile `{}` needs a Gemini API key for real retrieval, but none is available. \
+             Set it with `engram config set keys.gemini <KEY>` (or GEMINI_API_KEY), \
+             or run `engram bench personal --profile offline` for the deterministic offline suite.",
+            profile_enum.as_str()
+        )));
+    }
+
+    let use_cloud = profile_enum != RetrievalProfile::Offline;
+    let embedder: Box<dyn Embedder> = if use_cloud {
+        Box::new(GeminiEmbedder::new(
+            gemini_key.clone().expect("checked above"),
+        ))
+    } else {
+        Box::new(StubEmbedder::default())
+    };
+    let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
+    let reranker: Option<Box<dyn Reranker>> = match (use_cloud, cohere_key) {
+        (true, Some(key)) if !crate::commands::config::rerank_disabled() => {
+            Some(Box::new(CohereReranker::new(key)))
+        }
+        _ => None,
+    };
+    let reranker_name = reranker
+        .as_ref()
+        .map(|r| r.name().to_string())
+        .unwrap_or_else(|| "passthrough".to_string());
+
+    let store = SqliteStore::open_in_memory()?;
+    let seeded = personal::seed_store(&store, embedder.as_ref()).await?;
+
+    let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0);
+    let rerank_top_n = profile_enum.default_rerank_top_n();
+
+    let mut runs: Vec<QueryRun> = Vec::with_capacity(personal::QUERIES.len());
+    for q in personal::QUERIES {
+        // No hint means the agent searches the `recall --kb` default, which is
+        // exactly the path a cross-KB fact falls through today.
+        let kb_filter = Some(q.kb_hint.unwrap_or(personal::DEFAULT_KB).to_string());
+        let (since, until) = match q.window {
+            Some(w) => {
+                let (from, to) = personal::window_bounds(w)?;
+                (Some(from), Some(to))
+            }
+            None => (None, None),
+        };
+
+        let start = Instant::now();
+        let results = hybrid_recall(
+            &store,
+            embedder.as_ref(),
+            reranker.as_deref(),
+            HybridParams {
+                query: q.text,
+                top_k,
+                rrf_k,
+                rerank_top_n,
+                filters: Filters {
+                    diary: Some(personal::DIARY.to_string()),
+                    kb: kb_filter.clone(),
+                    since,
+                    until,
+                },
+                mode: RecallMode::Evidence,
+                graph_hops: 1,
+                allow_mixed_embeddings: false,
+            },
+        )
+        .await?;
+        let latency_ms = start.elapsed().as_millis() as u64;
+        let retrieved = to_items(&results.results, &seeded);
+
+        // Hint-less queries are also run unfiltered to record the ceiling the
+        // default-KB behaviour is currently leaving on the table.
+        let retrieved_all_kbs = if q.kb_hint.is_none() {
+            let results = hybrid_recall(
+                &store,
+                embedder.as_ref(),
+                reranker.as_deref(),
+                HybridParams {
+                    query: q.text,
+                    top_k,
+                    rrf_k,
+                    rerank_top_n,
+                    filters: Filters {
+                        diary: Some(personal::DIARY.to_string()),
+                        kb: None,
+                        since,
+                        until,
+                    },
+                    mode: RecallMode::Evidence,
+                    graph_hops: 1,
+                    allow_mixed_embeddings: false,
+                },
+            )
+            .await?;
+            Some(to_items(&results.results, &seeded))
+        } else {
+            None
+        };
+
+        runs.push(QueryRun {
+            query_id: q.id,
+            category: q.category,
+            text: q.text,
+            kb_filter,
+            gold: q.gold,
+            retrieved,
+            retrieved_all_kbs,
+            latency_ms,
+        });
+    }
+
+    let report = personal::aggregate(
+        &runs,
+        "personal",
+        profile_enum.as_str(),
+        &embedder.model(),
+        &reranker_name,
+        top_k,
+        &seeded,
+    );
+
+    let mut meta = Metadata::default();
+    meta.add("profile", profile_enum.as_str());
+    meta.add("embedder", embedder.model());
+    meta.add("reranker", reranker_name);
+    meta.add("memories_seeded", report.memories_seeded);
+    meta.add("queries_evaluated", report.queries_evaluated);
+    if let Some(path) = &save {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+        meta.add("saved_to", path.to_string_lossy());
+    }
+
+    print_success(ctx.format, report, meta, print_personal_table);
+    Ok(())
+}
+
+/// Map hybrid results back onto dataset memories. Anything that is not a
+/// seeded chunk (an entity or claim candidate) keeps its rank but scores as a
+/// miss — it really did displace an answer.
+fn to_items(
+    results: &[crate::retrieval::HybridResult],
+    seeded: &engram_bench::personal::SeededDataset,
+) -> Vec<engram_bench::personal::RetrievedItem> {
+    results
+        .iter()
+        .map(|r| engram_bench::personal::RetrievedItem {
+            dataset_id: seeded.dataset_id_for(&r.id).map(|s| s.to_string()),
+            kind: r.kind.clone(),
+            score: r.score,
+        })
+        .collect()
+}
+
+/// Human-readable per-category table for `engram bench personal`.
+fn print_personal_table(report: &engram_bench::personal::PersonalReport) {
+    use comfy_table::{presets::UTF8_FULL, Table};
+
+    println!(
+        "personal memory bench — profile={} embedder={} reranker={} top_k={}",
+        report.profile, report.embedder, report.reranker, report.top_k
+    );
+    println!(
+        "{} memories / {} chunks across {} KBs; {} queries",
+        report.memories_seeded,
+        report.chunks_seeded,
+        report.kbs.len(),
+        report.queries_evaluated
+    );
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "category", "queries", "R@1", "R@3", "R@5", "R@10", "MRR@10", "cov@10", "abstain",
+    ]);
+    for c in &report.per_category {
+        table.add_row(vec![
+            c.category.clone(),
+            c.queries.to_string(),
+            fmt3(c.recall_at_1),
+            fmt3(c.recall_at_3),
+            fmt3(c.recall_at_5),
+            fmt3(c.recall_at_10),
+            fmt3(c.mrr_at_10),
+            fmt3(c.gold_coverage_at_10),
+            c.abstention_rate.map(fmt3).unwrap_or_else(|| "-".into()),
+        ]);
+    }
+    let m = &report.metrics;
+    table.add_row(vec![
+        "ALL (scored)".to_string(),
+        m.queries_scored.to_string(),
+        fmt3(m.recall_at_1),
+        fmt3(m.recall_at_3),
+        fmt3(m.recall_at_5),
+        fmt3(m.recall_at_10),
+        fmt3(m.mrr_at_10),
+        fmt3(m.gold_coverage_at_10),
+        fmt3(m.abstention_rate),
+    ]);
+    println!("{table}");
+
+    if let Some(cmp) = &report.all_kbs_comparison {
+        println!(
+            "hint-less queries reran with no KB filter ({} queries): R@1 {} R@5 {} R@10 {} MRR {}",
+            cmp.queries,
+            fmt3(cmp.recall_at_1),
+            fmt3(cmp.recall_at_5),
+            fmt3(cmp.recall_at_10),
+            fmt3(cmp.mrr_at_10),
+        );
+    }
+    println!(
+        "negative controls: {} queries, abstained on {}, mean top score {}",
+        m.negative_controls,
+        fmt3(m.abstention_rate),
+        fmt3(m.negative_mean_top_score)
+    );
+    println!(
+        "latency: mean {:.0}ms  p50 {:.0}ms  p95 {:.0}ms",
+        m.mean_latency_ms, m.p50_latency_ms, m.p95_latency_ms
+    );
+}
+
+fn fmt3(v: f32) -> String {
+    format!("{v:.3}")
 }
 
 async fn run_mini(ctx: &AppContext) -> Result<(), CliError> {
@@ -1591,4 +1873,61 @@ async fn run_longmemeval(
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_bench::personal::{
+        aggregate, QueryCategory, QueryRun, RetrievedItem, SeededDataset,
+    };
+
+    fn run(category: QueryCategory, gold: &'static [&'static str], hits: &[&str]) -> QueryRun {
+        QueryRun {
+            query_id: "q",
+            category,
+            text: "who is who",
+            kb_filter: Some("relationships".into()),
+            gold,
+            retrieved: hits
+                .iter()
+                .map(|h| RetrievedItem {
+                    dataset_id: Some((*h).to_string()),
+                    kind: "chunk".into(),
+                    score: 0.5,
+                })
+                .collect(),
+            retrieved_all_kbs: None,
+            latency_ms: 1,
+        }
+    }
+
+    /// The human branch is unreachable from the integration tests (piped
+    /// stdout always selects JSON), so exercise the table renderer directly.
+    #[test]
+    fn personal_table_renders_every_category_row() {
+        let runs = vec![
+            run(QueryCategory::PersonFact, &["g1"], &["g1"]),
+            run(QueryCategory::NegativeControl, &[], &[]),
+        ];
+        let report = aggregate(
+            &runs,
+            "personal",
+            "offline",
+            "stub-64",
+            "passthrough",
+            10,
+            &SeededDataset::default(),
+        );
+        // Rendering must not panic on an empty result set or a `None`
+        // abstention rate.
+        print_personal_table(&report);
+        assert_eq!(report.per_category.len(), 2);
+    }
+
+    #[test]
+    fn top_k_sentinel_selects_the_personal_default() {
+        assert_eq!(top_k_or(0, PERSONAL_DEFAULT_TOP_K), PERSONAL_DEFAULT_TOP_K);
+        assert_eq!(top_k_or(3, PERSONAL_DEFAULT_TOP_K), 3);
+    }
 }

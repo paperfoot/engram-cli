@@ -15,6 +15,7 @@ pub mod longmemeval;
 pub mod memoryagentbench;
 pub mod metrics;
 pub mod mini;
+pub mod personal;
 pub mod qa;
 pub mod ragas;
 

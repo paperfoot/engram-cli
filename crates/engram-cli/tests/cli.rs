@@ -2563,3 +2563,183 @@ fn recompiling_converges_instead_of_accumulating() {
     assert_eq!(introduced["sources"].as_array().unwrap().len(), 1);
     assert!(introduced["weight"].as_f64().unwrap() <= 1.0);
 }
+
+/// The personal-memory suite must run end to end with no API keys and produce
+/// a well-formed report. Deliberately asserts NOTHING about score levels: the
+/// retrieval paths it measures (cross-KB, event-time temporal) are being fixed
+/// in parallel, and the point of the suite is to record where they stand.
+#[test]
+fn bench_personal_runs_offline_and_reports_sane_structure() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    let out = cmd
+        .args(["bench", "personal", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    assert_eq!(v["status"], "success");
+    let d = &v["data"];
+    assert_eq!(d["suite"], "personal");
+    assert_eq!(d["profile"], "offline");
+    assert_eq!(d["reranker"], "passthrough");
+
+    // The dataset actually reached the store through the write path.
+    let seeded = d["memories_seeded"].as_u64().unwrap();
+    assert!((40..=60).contains(&seeded), "seeded {seeded} memories");
+    assert!(d["chunks_seeded"].as_u64().unwrap() >= seeded);
+    assert_eq!(d["kbs"].as_array().unwrap().len(), 4);
+
+    let queries = d["queries_evaluated"].as_u64().unwrap() as usize;
+    assert!((30..=50).contains(&queries), "evaluated {queries} queries");
+    let per_query = d["per_query"].as_array().unwrap();
+    assert_eq!(per_query.len(), queries);
+
+    // Every category appears exactly once in the breakdown.
+    let categories: Vec<&str> = d["per_category"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["category"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "person_fact",
+        "temporal",
+        "cross_kb",
+        "paraphrase_dedup",
+        "multi_fact",
+        "negative_control",
+    ] {
+        assert_eq!(
+            categories.iter().filter(|c| **c == expected).count(),
+            1,
+            "category {expected} missing from breakdown"
+        );
+    }
+
+    // Metrics are well-formed rates, not NaN or out-of-range garbage.
+    let m = &d["metrics"];
+    for key in [
+        "recall_at_1",
+        "recall_at_3",
+        "recall_at_5",
+        "recall_at_10",
+        "mrr_at_10",
+        "gold_coverage_at_10",
+        "abstention_rate",
+    ] {
+        let value = m[key].as_f64().unwrap_or_else(|| panic!("{key} missing"));
+        assert!((0.0..=1.0).contains(&value), "{key} out of range: {value}");
+    }
+    assert_eq!(
+        m["queries_scored"].as_u64().unwrap() + m["negative_controls"].as_u64().unwrap(),
+        queries as u64
+    );
+    assert!(m["negative_controls"].as_u64().unwrap() >= 1);
+
+    // Negative controls carry no gold; every other query does.
+    for q in per_query {
+        let gold = q["gold"].as_array().unwrap();
+        if q["category"] == "negative_control" {
+            assert!(
+                gold.is_empty(),
+                "negative control {} has gold",
+                q["query_id"]
+            );
+        } else {
+            assert!(!gold.is_empty(), "query {} has no gold", q["query_id"]);
+        }
+        assert!(q["latency_ms"].is_number());
+    }
+
+    // Hint-less queries were rerun without a KB filter for the ceiling row.
+    let cmp = &d["all_kbs_comparison"];
+    assert!(cmp["queries"].as_u64().unwrap() >= 1);
+    let hintless = per_query
+        .iter()
+        .filter(|q| q["all_kbs"].is_object())
+        .count();
+    assert_eq!(cmp["queries"].as_u64().unwrap() as usize, hintless);
+}
+
+#[test]
+fn bench_personal_is_deterministic_and_saves_a_report() {
+    let (tmp, mut cmd) = with_isolated_home();
+    let report_path = tmp.path().join("reports/personal.json");
+    let out = cmd
+        .args([
+            "bench",
+            "personal",
+            "--save",
+            report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first = parse_stdout(&out);
+    assert!(report_path.exists(), "--save wrote no report");
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap()).expect("valid report JSON");
+    assert_eq!(saved["suite"], "personal");
+    // The saved file holds the same report as stdout. Compared field by field
+    // rather than as raw JSON: the envelope round-trips f32 scores through
+    // f64, so 0.14285715 on disk prints as 0.1428571492433548 on stdout.
+    let saved_rows = saved["per_query"].as_array().unwrap();
+    let stdout_rows = first["data"]["per_query"].as_array().unwrap();
+    assert_eq!(saved_rows.len(), stdout_rows.len());
+    for (a, b) in saved_rows.iter().zip(stdout_rows) {
+        assert_eq!(a["query_id"], b["query_id"]);
+        assert_eq!(a["gold"], b["gold"]);
+        assert_eq!(a["first_gold_rank"], b["first_gold_rank"]);
+        assert_eq!(a["top_retrieved"], b["top_retrieved"]);
+    }
+
+    let out2 = cmd_in(&tmp)
+        .args(["bench", "personal", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second = parse_stdout(&out2);
+    // The offline profile is the deterministic hash embedder: identical scores
+    // and identical rankings on every rerun.
+    assert_eq!(
+        first["data"]["metrics"]["mrr_at_10"],
+        second["data"]["metrics"]["mrr_at_10"]
+    );
+    assert_eq!(
+        first["data"]["per_category"],
+        second["data"]["per_category"]
+    );
+    for (a, b) in stdout_rows
+        .iter()
+        .zip(second["data"]["per_query"].as_array().unwrap())
+    {
+        assert_eq!(a["query_id"], b["query_id"]);
+        assert_eq!(a["top_retrieved"], b["top_retrieved"]);
+        assert_eq!(a["mrr_at_10"], b["mrr_at_10"]);
+    }
+}
+
+#[test]
+fn bench_personal_cloud_profile_without_keys_is_config_error() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    cmd.args(["bench", "personal", "--profile", "cloud_quality", "--json"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn bench_personal_rejects_an_unknown_profile() {
+    let (_tmp, mut cmd) = with_isolated_home();
+    cmd.args(["bench", "personal", "--profile", "nonsense", "--json"])
+        .assert()
+        .failure()
+        .code(3);
+}
