@@ -224,6 +224,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 all_kbs,
                 diary,
+                since,
+                until,
             } => {
                 commands::recall::run(
                     &ctx,
@@ -238,8 +240,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                     None,
                     1,
                     false,
-                    None,
-                    None,
+                    since,
+                    until,
                 )
                 .await
             }
