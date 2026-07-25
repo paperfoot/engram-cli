@@ -529,9 +529,9 @@ async fn run_personal(
 
     let mut runs: Vec<QueryRun> = Vec::with_capacity(personal::QUERIES.len());
     for q in personal::QUERIES {
-        // No hint means the agent searches the `recall --kb` default, which is
-        // exactly the path a cross-KB fact falls through today.
-        let kb_filter = Some(q.kb_hint.unwrap_or(personal::DEFAULT_KB).to_string());
+        // No hint means the agent takes the `recall` default, which now spans
+        // every KB; the legacy single-KB run below keeps the old floor visible.
+        let kb_filter = q.kb_hint.map(str::to_string);
         let (since, until) = match q.window {
             Some(w) => {
                 let (from, to) = personal::window_bounds(w)?;
