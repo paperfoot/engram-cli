@@ -115,6 +115,73 @@ fn agent_info_alias_info_works() {
     engram().arg("info").assert().success();
 }
 
+/// The manifest is the only thing most agents ever read, so a stale example is
+/// a bug that ships straight into someone's tool call. Every example must at
+/// least parse against the real clap definition.
+#[test]
+fn agent_info_examples_are_all_real_commands() {
+    let mut cmd = engram();
+    let out = cmd
+        .arg("agent-info")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    let examples = v["examples"].as_array().expect("examples[]");
+    assert!(examples.len() >= 10, "manifest lost its examples");
+
+    for example in examples {
+        let line = example.as_str().unwrap();
+        let args = shell_split(line);
+        assert_eq!(
+            args[0], "engram",
+            "example is not an engram command: {line}"
+        );
+        // `--help` makes clap validate the subcommand path and flag names
+        // without executing anything or touching the network.
+        let mut probe = engram();
+        probe.args(&args[1..]).arg("--help");
+        let status = probe.assert();
+        assert!(
+            status.get_output().status.success(),
+            "manifest example does not parse: {line}\n{}",
+            String::from_utf8_lossy(&status.get_output().stderr)
+        );
+    }
+}
+
+/// Minimal POSIX-ish splitter: handles the single and double quotes the
+/// manifest examples use. Not a general shell parser.
+fn shell_split(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for c in line.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '\'') | (None, '"') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if started || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 #[test]
 fn version_flag_exits_zero() {
     engram().arg("--version").assert().success();

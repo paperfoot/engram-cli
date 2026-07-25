@@ -74,7 +74,11 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
             },
             "retrieval": {
                 "profile": "cloud_quality",
-                "rerank_top_n": 50,
+                // Derived, not hardcoded: this line said 50 long after the
+                // cloud_quality default became 200, so `config show` was
+                // reporting a number the retriever never used.
+                "rerank_top_n": crate::retrieval::RetrievalProfile::CloudQuality
+                    .default_rerank_top_n(),
                 // Unset means reads span EVERY KB. Set it to pin recall and
                 // `memory search` to one KB when no --kb flag is given.
                 "default_kb": std::env::var(crate::retrieval::DEFAULT_KB_ENV).ok()

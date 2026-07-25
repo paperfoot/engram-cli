@@ -13,33 +13,39 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
     let manifest = json!({
         "name": "engram",
         "version": env!("CARGO_PKG_VERSION"),
-        "description": "Agent-native memory engine for scientific knowledge and personal memory.",
+        "description": "Agent-native memory engine for personal, business, and domain memory.",
         "homepage": "https://github.com/paperfoot/engram-cli",
         "summary_for_agents": [
-            "engram is a local-first knowledge engine. Use `remember` to store, `recall` to retrieve.",
+            "engram is a local-first memory engine. Use `remember` to store, `recall` to retrieve.",
+            "A plain `recall <query>` searches EVERY KB. Do not add --kb to 'find' something — you cannot know which namespace a fact was filed under. Narrow with --kb only to deliberately exclude the rest.",
             "Pipe stdout to jq — output is always JSON when piped or with --json.",
             "Errors include `code`, `message`, `suggestion`, and `exit_code` for programmatic handling.",
             "Use `--diary <name>` to keep separate memory namespaces per specialist agent.",
-            "Use `--kb <name>` to select the domain knowledge base.",
+            "Use `--kb <name>` on WRITES to file a memory under a domain (personal, business, songs). Writing to a new KB registers it automatically.",
+            "`remember` extracts (subject, predicate, object) facts by default when an OpenRouter key resolves; the envelope always says which via `fact_extraction`. Opt out with --no-extract-facts.",
+            "Use `--event-time` whenever the content has a real date (birthday, anniversary, a decision made last March) — `recall --since/--until` filters on it.",
             "For directory ingest, run `engram ingest <dir> --dry-run` first, then ingest with the same --include/--exclude/--max-files scope. Use --all only for an intentional full recursive ingest.",
             "Default recall profile is cloud_quality: Gemini Embedding 2 + FTS5 BM25 + claims/entities/graph + Cohere rerank when configured."
         ],
         "commands": {
             "agent-info | info": "Print this manifest (raw JSON, not enveloped)",
-            "kb create <name>": "Create/update a knowledge base. Flags: --description <text>",
+            "kb create <name>": "Create/update a knowledge base. Flags: --description <text>. Rarely needed: writing with --kb <name> registers the KB.",
             "kb list | kb show <name> | kb delete <name> --confirm": "Manage domain KBs.",
+            "kb repair [--dry-run]": "Register KBs that hold memories but are missing from `kb list` — the residue of stores written by builds that predated write-time registration. Idempotent and additive; never touches memories. `doctor --integrity` reports the same fault as `unregistered_kbs`.",
             "documents list|show|delete": "Inspect or remove ingested source documents. Flags: --kb <name>, --all-kbs, --limit <n>, --confirm",
-            "remember <content>": "Store a new memory. Flags: --importance 0-10, --tag <tag> (repeatable), --diary <name>, --kb <name>, --extract-facts, --facts-json '<json array>', --autonomy full|assisted|strict, --allow-duplicate. Identical content in the same kb/diary is deduplicated (no second embedding) unless --allow-duplicate. Fact extraction is opt-in because it may call an LLM; prefer --facts-json when you already know the (subject, predicate, object) triple — it runs the same contradiction detection with zero LLM cost. Under the default --autonomy assisted, uncertain contradictions come back in `adjudication_needed` for YOU to resolve (you have the conversation context): run the included resolve_command. Safety slots (allergic_to, takes_medication, diagnosed_with) are never auto-superseded.",
-            "memory add|search|update|delete|list": "Simple aliases for agent memory workflows. Prefer these when an agent wants CRUD semantics.",
-            "recall <query>": "Retrieve via cloud-quality hybrid search. Flags: --kb <name>, --mode evidence|raw|wiki|explore|agent, --profile cloud_quality|fast|offline, --top-k <n>, --allow-mixed-embeddings, --since <rfc3339>, --until <rfc3339>. Output includes a `conflicts` array with two statuses: `superseded` (a fact was updated — cite the current value or surface the change) and `contested` (an UNRESOLVED contradiction: both values are listed — do not pick one silently; resolve it via the included resolve_command or surface both to the user).",
-            "facts list|show <subject>|conflicts|resolve": "Browse the fact store and contradiction record. `facts conflicts` lists resolved supersessions; `facts conflicts --open` lists CONTESTED pairs awaiting your decision; `facts resolve <id> --action supersede-old|keep-both|reject-new [--note]` records your verdict and applies the supersession (never a deletion). Facts are populated by `remember --extract-facts` / `--facts-json` and by `compile --llm`, KB-scoped.",
+            "remember <content>": "Store a new memory. Flags: --importance 0-10, --tag <tag> (repeatable), --diary <name>, --kb <name>, --event-time <RFC3339|YYYY-MM-DD>, --no-extract-facts, --facts-json '<json array>', --autonomy full|assisted|strict, --allow-duplicate. Identical content in the same kb/diary is deduplicated (no second embedding) unless --allow-duplicate. Fact extraction runs BY DEFAULT whenever an OpenRouter key resolves — pass --no-extract-facts for bulk/low-value writes, or --facts-json when you already know the (subject, predicate, object) triple (same contradiction detection, zero LLM cost). Set --event-time for anything with a real date: `recall --since/--until` filters on it and the extracted facts inherit it. Under the default --autonomy assisted, uncertain contradictions come back in `adjudication_needed` for YOU to resolve (you have the conversation context): run the included resolve_command. Safety slots (allergic_to, takes_medication, diagnosed_with) are never auto-superseded.",
+            "memory add|search|update|delete|list": "Simple aliases for agent memory workflows. Prefer these when an agent wants CRUD semantics. `memory add` takes the same flags as `remember` (including --event-time, --no-extract-facts, --facts-json, --autonomy).",
+            "recall <query>": "Retrieve via cloud-quality hybrid search. Searches EVERY KB unless narrowed. Flags: --kb <name> (narrow to one; '*' means all), --all-kbs (force all, ignoring --kb and retrieval.default_kb), --diary <name>|'*', --mode evidence|raw|wiki|explore|agent, --profile cloud_quality|fast|offline, --top-k <n>, --layer identity|critical|topic|deep, --rerank-top-n <n>, --graph-hops 1|2, --allow-mixed-embeddings, --since <rfc3339>, --until <rfc3339>. `metadata.kb_scope` reports how the scope was chosen (flag|config|all_kbs) and `metadata.kb` the effective KB ('*' for all) — check it before concluding a memory does not exist. A diary-scoped recall reports anything the isolation guard withheld in `metadata.diary_isolation`. Output includes a `conflicts` array with two statuses: `superseded` (a fact was updated — cite the current value or surface the change) and `contested` (an UNRESOLVED contradiction: both values are listed — do not pick one silently; resolve it via the included resolve_command or surface both to the user).",
+            "facts list|show <subject>|conflicts|resolve|backfill": "Browse the fact store and contradiction record. `facts conflicts` lists resolved supersessions; `facts conflicts --open` lists CONTESTED pairs awaiting your decision; `facts resolve <id> --action supersede-old|keep-both|reject-new [--note]` records your verdict and applies the supersession (never a deletion). Facts come from `remember` (on by default), `--facts-json`, and `compile --llm`, KB-scoped.",
+            "facts backfill --kb <name>": "Extract facts from memories stored before extraction was on. Flags: --diary <name>, --limit <n>, --dry-run. Idempotent — memories that already have facts or an extraction marker are skipped, oldest first, so a --limit'ed run resumes where the last one stopped. One LLM call per memory: --kb is required so the spend is never implicit, and it exits 2 without an OpenRouter key.",
+            "people list | people show <name>": "The networking view over person-typed entities. `people list` gives aliases, mention counts, and top relations (flags: --kb <name>|'*', --limit <n>, --min-mentions <n>); `people show <name>` resolves any known alias case-insensitively and returns relations WITH provenance plus the memories that mention them (flags: --kb, --snippets <n>).",
             "research <query>": "Evidence-first research retrieval pass. Returns query_plan, answer_context, evidence leads, and citation readiness.",
             "ingest <path>": "Mine a file or scoped directory. Flags: --mode papers|takeaways|conversations|repos|general|auto, --diary <name>, --kb <name>, --compile evidence, --dry-run, --include <pattern>, --exclude <pattern>, --max-files <n>, --all. Re-ingesting the same path is idempotent when content is unchanged, and REPLACES the prior version when the file changed (edited PDFs no longer go stale).",
             "compile --kb <name> --all": "Derive cited claims, entities, relations, takeaways, and wiki pages. Add --llm for Gemini 3.1 Flash-Lite extraction + Gemini 3.1 Pro synthesis via OpenRouter.",
             "jobs list|show": "Inspect compile job history.",
             "reindex --kb <name> | --all": "Re-embed chunks with Gemini Embedding 2 metadata guards.",
             "wiki --kb <name> [path]": "Inspect generated domain wiki pages.",
-            "graph neighbors <entity> --kb <name>": "Inspect SQLite graph neighbors. Flags: --hops 1|2, --min-weight <n>.",
+            "graph neighbors <entity> --kb <name>": "Inspect SQLite graph neighbors, closest first. Flags: --hops 1|2, --min-weight <n>, --limit <n>, --typed-only (drop weak `co_occurs_with` edges and keep only typed relations — use it when you want the real relationship graph, not co-mention noise).",
             "doctor": "Verify keys, schema, embedding metadata, and daemon port. Use --compiler to require OpenRouter and --integrity to check lifecycle residue.",
             "repair --dry-run | --confirm": "Inspect or clean stale facts and derived graph residue left by old delete/edit flows.",
             "serve": "Start local HTTP API. Default: 127.0.0.1:8768. Alias binary: engramd.",
@@ -50,7 +56,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "export [--format json] [--kb <name>]": "Export memories as JSON",
             "import <file>": "Import memories from a JSON export",
             "entities [list|show <name>]": "Browse the entity graph. Alias: list|ls",
-            "bench <suite>": "Run a benchmark. Suites: mini | mini-fts | scientific-mini | longmemeval | longmemeval-qa | locomo-plus | mab | litqa2 | beir | biogen. Flags: --limit <n>, --download, --mode closed-book|fulltext, --dataset <scifact|nfcorpus|trec-covid|scidocs>, --rerank on|off, --year 2024|2025, --top-k <n>, --kb <name>, --corpus <path>, --answerer <slug>, --judge <slug>, --save <path>",
+            "bench <suite>": "Run a benchmark. Suites: mini | mini-fts | personal | scientific-mini | longmemeval | longmemeval-qa | locomo-plus | mab | litqa2 | beir | biogen. Flags: --limit <n>, --download, --profile offline|cloud_quality|fast (personal only), --mode closed-book|fulltext, --dataset <scifact|nfcorpus|trec-covid|scidocs>, --rerank on|off, --year 2024|2025, --top-k <n>, --kb <name>, --corpus <path>, --answerer <slug>, --judge <slug>, --save <path>",
+            "bench personal": "The personal-memory quality gate. Offline and deterministic by default (hash embedder, no network, no keys, no writes to your store) — run it before and after any retrieval change. Headline metrics are production behaviour; `legacy_default_comparison` is what the old kb=default floor would have scored, kept as a regression tripwire.",
             "config show": "Display effective configuration",
             "config set <key> <value>": "Persist a configuration value to the on-disk config file (exact path in `config_path` below).",
             "config check": "Validate configured API keys",
@@ -65,14 +72,73 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "remember": {
                 "destructive": false,
                 "args": { "content": "string" },
-                "flags": { "importance": "0..10", "tag": "string[]", "diary": "string", "kb": "string", "extract_facts": "boolean", "facts_json": "json string", "autonomy": "full|assisted|strict" },
-                "output_data": { "id": "uuid", "stored": "boolean", "chunks": "integer", "kb": "string", "facts_added": "integer", "facts_deduped": "integer", "conflicts": "array", "adjudication_needed": "array — unresolved conflicts with a ready-to-run resolve_command; handle them" }
+                "flags": {
+                    "importance": "0..10",
+                    "tag": "string[]",
+                    "diary": "string",
+                    "kb": "string — writing to a new KB registers it",
+                    "event_time": "RFC3339 or YYYY-MM-DD (midnight UTC); when the content actually happened",
+                    "no_extract_facts": "boolean; opt out of the default LLM fact extraction",
+                    "extract_facts": "boolean; deprecated — extraction is the default. Still forces extraction alongside --facts-json",
+                    "facts_json": "json string; supply the triples yourself and skip the extraction LLM call",
+                    "autonomy": "full|assisted|strict",
+                    "allow_duplicate": "boolean"
+                },
+                "output_data": {
+                    "id": "uuid",
+                    "stored": "boolean",
+                    "chunks": "integer",
+                    "kb": "string",
+                    "event_time": "rfc3339|null",
+                    "fact_extraction": "ran|ran_stub|disabled|skipped_facts_json|skipped_no_openrouter_key|failed — ALWAYS check this before assuming facts were captured",
+                    "fact_extraction_note": "string|null — present whenever facts were NOT captured, with the fix",
+                    "facts_added": "integer",
+                    "facts_deduped": "integer",
+                    "conflicts": "array",
+                    "adjudication_needed": "array — unresolved conflicts with a ready-to-run resolve_command; handle them"
+                }
             },
             "recall": {
                 "destructive": false,
                 "args": { "query": "string" },
-                "flags": { "top_k": "integer", "kb": "string", "all_kbs": "boolean", "diary": "string|*", "mode": "evidence|raw|wiki|explore|agent", "profile": "cloud_quality|fast|offline" },
-                "output_data": { "status": "success|no_results", "answer_context": "string", "results": "array" }
+                "flags": {
+                    "top_k": "integer",
+                    "kb": "string; omit to search EVERY KB. '*' is an explicit all-KB search",
+                    "all_kbs": "boolean; force all KBs, overriding --kb and retrieval.default_kb",
+                    "diary": "string|*",
+                    "mode": "evidence|raw|wiki|explore|agent",
+                    "profile": "cloud_quality|fast|offline",
+                    "layer": "identity|critical|topic|deep (default topic)",
+                    "rerank_top_n": "integer; candidates sent to rerank (default from profile)",
+                    "graph_hops": "1|2; graph expansion depth",
+                    "allow_mixed_embeddings": "boolean",
+                    "since": "rfc3339; earliest event_time",
+                    "until": "rfc3339; latest event_time"
+                },
+                "output_data": { "status": "success|no_results", "answer_context": "string", "results": "array", "kb": "string — effective scope, '*' when every KB was searched", "kb_scope": "flag|config|all_kbs", "diary_isolation": "object|null — sources withheld by diary isolation" },
+                "metadata": { "kb": "string", "kb_scope": "flag|config|all_kbs", "diary": "string", "diary_isolation": "object (only when something was withheld)", "candidates_considered": "integer" },
+                "agent_rule": "Never add --kb just to find something: reads default to every KB precisely because the write side chose the namespace. If a recall comes back empty, check metadata.kb_scope before concluding the memory is absent."
+            },
+            "people show": {
+                "destructive": false,
+                "args": { "name": "person name or any known alias (case-insensitive)" },
+                "flags": { "kb": "string|*", "snippets": "integer" },
+                "output_data": { "person": "object with canonical_name + aliases", "relations": "array — typed edges with provenance", "memories": "array of snippets that mention them" }
+            },
+            "facts backfill": {
+                "destructive": false,
+                "requires": ["--kb"],
+                "flags": { "kb": "string (required)", "diary": "string|*", "limit": "integer", "dry_run": "boolean" },
+                "cost": "one LLM call per unprocessed memory; exits 2 without an OpenRouter key and respects `engram budget`",
+                "idempotency": "memories with existing facts or an extraction marker are skipped; oldest first, so a --limit'ed run resumes where the last stopped",
+                "output_data": { "processed": "integer", "facts_added": "integer", "skipped": "integer" }
+            },
+            "kb repair": {
+                "destructive": false,
+                "safe_mode": "--dry-run",
+                "repairs": ["KBs that hold live memories but have no `knowledge_bases` row, so `kb list` cannot see them"],
+                "idempotency": "additive only; a healed store reports an empty list. Will not resurrect a KB removed by `kb delete`.",
+                "output_data": { "unregistered_kbs": "string[]", "registered": "integer", "dry_run": "boolean" }
             },
             "ingest": {
                 "destructive": false,
@@ -169,12 +235,14 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "ENGRAM_UPDATE_GITHUB_REPO": "GitHub repo used by update checks. Default paperfoot/engram-cli.",
             "ENGRAM_UPDATE_CRATE": "crates.io package used by cargo updates. Default paperfoot-engram.",
             "ENGRAM_UPDATE_HOMEBREW_FORMULA": "Homebrew formula used by brew updates. Default paperfoot/tap/engram.",
+            "ENGRAM_DEFAULT_KB": "Pin reads to one KB when no --kb is given. Unset (the default) means recall spans every KB. Same as config `retrieval.default_kb`.",
             "ENGRAM_EMBEDDER": "Force embedder: gemini|stub (default: gemini if key set)",
             "ENGRAM_COHERE_RERANK_MODEL": "Override the Cohere rerank model slug (default rerank-v4.0-pro; e.g. rerank-v4.0-fast).",
             "ENGRAM_RERANK_PROVIDER": "Reranker selector: cohere|zerank2|none. recall/research/serve use Cohere when COHERE_API_KEY is set; set `none` to disable reranking explicitly (e.g. Cohere billing failure) — retrieval then returns hybrid-fused order.",
             "ENGRAM_LME_SPLIT": "LongMemEval split: s|oracle (default: s)"
         },
         "config_keys": {
+            "retrieval.default_kb": "Unset by default, which means reads span EVERY KB. Set it to pin `recall` / `memory search` to one KB when no --kb is given; `--kb <name>` and `--all-kbs` still override it. Env: ENGRAM_DEFAULT_KB.",
             "ingest.require_scope": "true by default. Keep true for agent safety; set false only in tightly controlled batch environments.",
             "ingest.include": "Comma-separated default include patterns, for example `*.pdf,notes/*.md`.",
             "ingest.exclude": "Comma-separated default exclude patterns, for example `private/*,drafts/*`.",
@@ -187,6 +255,22 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "update.homebrew_formula": "Homebrew formula for brew upgrades."
         },
         "agent_decision_rules": {
+            "recall": [
+                "Default to a bare `engram recall '<query>'`. It spans every KB, which is what you want when looking something up — the write side chose the namespace, not you.",
+                "Add --kb only to deliberately EXCLUDE other domains (e.g. business-only competitor intel), never as a guess at where a fact lives.",
+                "On an empty result, read metadata.kb_scope and metadata.kb before telling the user nothing is stored. `kb_scope: flag` or `config` means the search was narrowed.",
+                "For 'when did X happen' questions, pass --since/--until: they filter on event_time, which is only populated when the write used --event-time."
+            ],
+            "remember": [
+                "File personal facts under --kb personal, work/company facts under --kb business, project context under the project's own KB. Writing to a KB registers it.",
+                "Set --event-time for anything dated — birthdays, anniversaries, when a decision was made. Without it the memory is only findable by content, never by time.",
+                "Check `fact_extraction` in the response. `skipped_no_openrouter_key` means no facts were captured: either configure the key or run `engram facts backfill --kb <kb>` later.",
+                "Handle `adjudication_needed` rather than ignoring it — you have the conversation context the resolver lacks."
+            ],
+            "people": [
+                "Use `people list` / `people show` for who-do-I-know questions; they read the person-typed entity graph, not raw text.",
+                "`graph neighbors <name> --typed-only` gives the real relationship graph; without it you also get weak `co_occurs_with` co-mention edges."
+            ],
             "ingest": [
                 "If the user gives one exact file path, ingest that file directly.",
                 "If the user gives a directory, first run `engram ingest <dir> --dry-run --json` plus any obvious --include/--exclude scope and inspect data.matched_files.",
@@ -247,26 +331,35 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             }
         },
         "retrieval_profiles": {
-            "cloud_quality": { "embedder": "gemini-embedding-2", "dims": 1536, "lexical": "FTS5 BM25", "entity_claim_search": true, "graph_expansion": true, "reranker": "cohere/rerank-v4.0-pro", "rerank_top_n": 50 },
+            "cloud_quality": { "embedder": "gemini-embedding-2", "dims": 1536, "lexical": "FTS5 BM25", "entity_claim_search": true, "graph_expansion": true, "reranker": "cohere/rerank-v4.0-pro", "rerank_top_n": 200 },
             "fast": { "embedder": "gemini-embedding-2", "dims": 1536, "rerank_top_n": 20 },
-            "offline": { "embedder": "stub", "lexical": "FTS5 BM25", "reranker": "none" }
+            "offline": { "embedder": "stub", "lexical": "FTS5 BM25", "reranker": "none", "rerank_top_n": 50 }
         },
         "examples": [
-            "engram kb create ageing-biology --description 'Ageing biology and longevity science'",
-            "engram ingest ./paper.pdf --kb ageing-biology --mode papers --compile evidence",
-            "engram ingest ./papers --kb ageing-biology --mode papers --dry-run --include '*.pdf' --json",
-            "engram ingest ./papers --kb ageing-biology --mode papers --include '*.pdf' --max-files 20 --compile evidence",
-            "engram documents list --kb ageing-biology --json",
-            "engram compile --kb ageing-biology --all --llm --max-llm-chunks 25",
-            "engram research 'what human evidence exists for rapamycin dosing?' --kb ageing-biology --json",
-            "engram reindex --kb ageing-biology",
-            "engram recall 'rapamycin dosing evidence in humans' --kb ageing-biology --mode evidence --profile cloud_quality --json",
-            "engram usage --kb ageing-biology --json",
-            "engram budget set --kb ageing-biology --daily-usd 5 --monthly-usd 100",
+            "engram recall 'what did I decide about the pricing model?' --json",
+            "engram recall \"Sarah's kids\" --json",
+            "engram remember 'Sarah prefers async standups; sync only for incidents.' --kb personal --importance 8",
+            "engram remember \"Mum's birthday is 14 March.\" --kb personal --event-time 1958-03-14 --importance 9",
+            "engram remember 'Chose Postgres over DynamoDB: relational reporting mattered more than write throughput.' --kb business --importance 9 --tag decision",
+            "engram recall 'what happened last March?' --since 2026-03-01 --until 2026-03-31 --json",
+            "engram recall 'competitor pricing' --kb business --json",
+            "engram people list --kb '*' --min-mentions 2 --json",
+            "engram people show 'Sarah Chen' --kb '*' --json",
+            "engram graph neighbors 'Sarah Chen' --kb personal --typed-only --limit 20 --json",
+            "engram facts show 'Sarah Chen' --kb '*' --json",
+            "engram facts backfill --kb personal --dry-run --json",
+            "engram facts conflicts --open --json",
+            "engram kb list --json",
+            "engram kb repair --dry-run --json",
+            "engram bench personal --json",
+            "engram doctor --integrity --json",
             "engram skill install",
             "engram skill package --out engram-skill.zip",
             "engram serve --host 127.0.0.1 --port 8768",
-            "engram bench scientific-mini --json"
+            "engram ingest ./paper.pdf --kb ageing-biology --mode papers --compile evidence",
+            "engram ingest ./papers --kb ageing-biology --mode papers --dry-run --include '*.pdf' --json",
+            "engram compile --kb ageing-biology --all --llm --max-llm-chunks 25",
+            "engram research 'what human evidence exists for rapamycin dosing?' --kb ageing-biology --json"
         ],
         "benchmarks": {
             "longmemeval_s": {
