@@ -417,6 +417,13 @@ pub fn looks_like_person_name(name: &str) -> bool {
     if gazetteer::is_never_person(name) {
         return false;
     }
+    // "Chelsea Flower" (the Chelsea Flower Show, cut short by the stop-word
+    // filter) has the exact shape of a two-part human name. A place word plus
+    // a venue noun gives it away — see `is_truncated_place_phrase` for why
+    // both halves are required.
+    if gazetteer::is_truncated_place_phrase(name) {
+        return false;
+    }
     let tokens: Vec<&str> = name.split_whitespace().collect();
     if tokens.is_empty() || tokens.len() > 4 {
         return false;
@@ -1535,6 +1542,83 @@ mod tests {
             "the label must not stand up a rival node: {:?}",
             ex.entities
         );
+    }
+
+    /// Every junk string the real store still produced after the first hygiene
+    /// pass, with its measured mention count: "Partner Rosalie" 64, "Wants
+    /// Elias" 28, "Said" 11, "Says" 8, "Chelsea Flower" 24.
+    #[test]
+    fn leading_non_name_words_never_produce_a_person() {
+        let ex = analyze(
+            "Partner Rosalie called about the flat. Wants Elias to confirm the booking. \
+             Said the meeting is at noon. Says the deck is ready. \
+             Chelsea Flower tickets arrived for my friend Rosalie.",
+        );
+        for junk in [
+            "Partner Rosalie",
+            "Wants Elias",
+            "Said",
+            "Says",
+            "Chelsea Flower",
+            "Partner",
+        ] {
+            assert_ne!(
+                ex.kind_of(junk),
+                Some(KIND_PERSON),
+                "{junk} must not be person-typed: {:?}",
+                ex.entities
+            );
+        }
+        for gone in ["Said", "Says", "Partner"] {
+            assert!(
+                ex.kind_of(gone).is_none(),
+                "{gone} must not be an entity at all: {:?}",
+                ex.entities
+            );
+        }
+        // The humans behind the junk survive, and the junk is not their alias.
+        let rosalie = ex
+            .entities
+            .iter()
+            .find(|e| e.name == "Rosalie")
+            .expect("the role word folds onto the person");
+        assert_eq!(rosalie.kind, KIND_PERSON);
+        assert_eq!(
+            rosalie.mentions, 2,
+            "the prefixed mention counts: {rosalie:?}"
+        );
+        assert!(
+            rosalie.aliases.is_empty(),
+            "a relationship word is nobody's name: {:?}",
+            rosalie.aliases
+        );
+        let elias = ex
+            .entities
+            .iter()
+            .find(|e| e.name == "Elias")
+            .expect("the verb folds onto the person");
+        assert!(elias.aliases.is_empty(), "{:?}", elias.aliases);
+    }
+
+    /// The conservative half of the truncated-place rule.
+    #[test]
+    fn two_part_surnames_survive_the_truncated_place_rule() {
+        let k = kinds(
+            "Jordan Peterson wrote back. My friend Jisoo Park called. \
+             Laura Corvo and Milan Kundera joined.",
+        );
+        for person in [
+            "Jordan Peterson",
+            "Jisoo Park",
+            "Laura Corvo",
+            "Milan Kundera",
+        ] {
+            assert_eq!(
+                k.get(person).copied(),
+                Some(KIND_PERSON),
+                "{person} must stay a person: {k:?}"
+            );
+        }
     }
 
     /// The KB-wide pass: the same person written two ways in two chunks.
