@@ -796,7 +796,15 @@ pub enum FactsCommand {
         kb: String,
     },
     /// Show recent contradictions: facts that were superseded by newer claims.
-    /// With --open: unresolved (contested) conflicts awaiting your decision.
+    /// With --open (or --subject): the unresolved queue, grouped by subject
+    /// and predicate, newest first, with both values and their sources.
+    #[command(after_long_help = "\
+Examples:
+  engram facts conflicts                          # supersession history + backlog size
+  engram facts conflicts --open --limit 50        # the queue, grouped by subject/predicate
+  engram facts conflicts --subject \"Ana\"          # one person's contested slots
+  engram facts triage --dry-run                   # what triage would auto-resolve
+")]
     Conflicts {
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -810,6 +818,42 @@ pub enum FactsCommand {
         /// Filter open conflicts by KB.
         #[arg(long)]
         kb: Option<String>,
+        /// Only conflicts about this subject (substring, case-insensitive).
+        /// Implies --open: the supersession history is not subject-indexed.
+        #[arg(long)]
+        subject: Option<String>,
+    },
+    /// Re-classify ALREADY-QUEUED conflicts and auto-resolve the ones today's
+    /// write path would never have queued (second values of multi-valued
+    /// predicates, candidates about another subject or another attribute,
+    /// duplicates, and slots with a clear event-time ordering).
+    ///
+    /// Never auto-resolves a safety slot (allergies, medication, diagnoses,
+    /// blood type). Non-destructive: coexisting values are un-queued and stay
+    /// active, resolved slots supersede rather than delete. Idempotent — a
+    /// second run resolves nothing.
+    #[command(after_long_help = "\
+Examples:
+  engram facts triage --dry-run                   # report only, writes nothing
+  engram facts triage --kb personal               # apply to one KB
+  engram facts triage --subject \"Ana\" --dry-run   # inspect one person's backlog
+")]
+    Triage {
+        /// Knowledge base to triage. Omit (or "*") for every KB.
+        #[arg(long)]
+        kb: Option<String>,
+        /// Restrict to one diary. Omit (or "*") for every diary.
+        #[arg(long)]
+        diary: Option<String>,
+        /// Only conflicts about this subject (substring, case-insensitive).
+        #[arg(long)]
+        subject: Option<String>,
+        /// Examine at most this many queued conflicts (newest first).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Report what would be resolved without writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Extract facts from memories that were stored before extraction was on.
     ///

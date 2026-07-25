@@ -5,18 +5,29 @@
 //! 1. canonicalize the predicate (synonym map) and the subject (alias/fuzzy
 //!    cascade against known subjects), then normalize;
 //! 2. exact path — an active fact with the same (subject_norm, predicate):
-//!    same object → dedup (confirmation++); different object → slot policy:
-//!    last-writer-wins supersedes, await-confirmation queues (both active);
-//!    non-slot exact conflicts supersede (same question, new answer);
+//!    same object → dedup (confirmation++); different object → the conflict
+//!    classifier decides (see below);
 //! 3. semantic path — the embedding novelty gate classifies against all
 //!    active facts: duplicate → confirmation++; novel → insert; uncertain →
-//!    resolve by autonomy mode: `full` asks this system's LLM, `assisted`
-//!    (default) inserts the new fact as *contested* and queues the conflict
-//!    for the calling agent, `strict` always queues.
+//!    the classifier again, and only what it cannot settle is escalated by
+//!    autonomy mode: `full` asks this system's LLM, `assisted` (default)
+//!    inserts the new fact as *contested* and queues the conflict for the
+//!    calling agent, `strict` always queues.
 //!
 //! The caller is a frontier agent with conversation context this store
 //! cannot see — `assisted` mode hands it the adjudication instead of paying
 //! for a worse-informed LLM call here.
+//!
+//! CONFLICT CLASSIFICATION (`classify_pair`) is the gate in front of the
+//! queue. Importing 1,332 real memories produced 2,953 facts and 9,510
+//! queued "conflicts" — a backlog no human will ever adjudicate, which
+//! buries the handful of contradictions that matter. Almost none of them
+//! were contradictions: candidates about a different person, candidates on a
+//! different predicate, and second values of multi-valued predicates
+//! (`knows`, `friend_of`, `met_at`) which are additions, not disagreements.
+//! The classifier resolves those without queueing and reserves the queue for
+//! same-slot contradictions with no recency ordering — plus every safety
+//! slot, which is never auto-superseded.
 
 use crate::context::AppContext;
 use crate::error::CliError;
@@ -55,6 +66,253 @@ impl Autonomy {
                 "unknown autonomy mode '{other}' (expected full|assisted|strict)"
             ))),
         }
+    }
+}
+
+// ===========================================================================
+// Conflict classification
+// ===========================================================================
+
+/// How many values one `(subject, predicate)` slot may hold at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arity {
+    /// One value at a time — a new value replaces the old one.
+    Single,
+    /// Many values coexist — a second value is an addition, not a conflict.
+    Multi,
+}
+
+/// Canonical predicates that are single-valued but carry no slot policy of
+/// their own. `slot_policy` covers the profile/safety slots; these are the
+/// remaining "a person has exactly one" attributes.
+const SINGLE_VALUED_EXTRA: &[&str] = &[
+    "died_on",
+    "birthday",
+    "has_birthday",
+    "date_of_birth",
+    "nationality",
+    "has_nationality",
+];
+
+/// Canonical predicates that are explicitly multi-valued. The DEFAULT for an
+/// unknown predicate is also multi-valued — this list documents the ones that
+/// dominate a personal store (networking, family, events) and pins them in a
+/// test, because treating them as slots is what turned a person's whole
+/// address book into a conflict queue.
+pub const MULTI_VALUED_PREDICATES: &[&str] = &[
+    "knows",
+    "friend_of",
+    "friends_with",
+    "met_at",
+    "met",
+    "family_of",
+    "related_to",
+    "sibling_of",
+    "parent_of",
+    "child_of",
+    "colleague_of",
+    "worked_with",
+    "mentor_of",
+    "introduced_by",
+    "introduced_to",
+    "invested_in",
+    "founded",
+    "owns",
+    "is_member_of",
+    "attended",
+    "visited",
+    "speaks",
+    "prefers",
+    "likes",
+    "dislikes",
+    "interested_in",
+    "works_on",
+];
+
+/// Single- vs multi-valued. Unknown predicates default to MULTI: the cost of
+/// a wrong `Multi` is two coexisting facts, the cost of a wrong `Single` is a
+/// true fact silently superseded or a human asked to adjudicate a non-event.
+pub fn predicate_arity(canonical: &str) -> Arity {
+    if slot_policy(canonical).is_some() || SINGLE_VALUED_EXTRA.contains(&canonical) {
+        Arity::Single
+    } else {
+        Arity::Multi
+    }
+}
+
+/// Safety-critical slots (allergies, medication, diagnoses, blood type). A
+/// fact on one of these is never auto-superseded, at write time or in a bulk
+/// triage — a wrong answer here is a medical incident, not a stale profile
+/// field. The only thing either path may do unattended is drop a queued pair
+/// that is about two DIFFERENT people, which supersedes nothing.
+pub fn is_safety_slot(canonical: &str) -> bool {
+    matches!(slot_policy(canonical), Some(SlotPolicy::AwaitConfirmation))
+}
+
+/// What to do with one `(new fact, old fact)` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictClass {
+    /// Not a conflict: both facts are true at the same time.
+    Coexist,
+    /// Same claim: keep the existing fact, count a confirmation.
+    Duplicate,
+    /// Single-valued slot, the new value is the current one.
+    SupersedeOld,
+    /// Single-valued slot, the INCOMING value is the stale one.
+    SupersedeNew,
+    /// One of the pair is already superseded — nothing left to decide.
+    Settled,
+    /// A human (or the calling agent) must decide.
+    Queue,
+}
+
+/// A classification plus the rule that produced it. The rule name is reported
+/// in `facts triage` output so a bulk auto-resolution is auditable rather
+/// than a number the user has to trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verdict {
+    pub class: ConflictClass,
+    pub rule: &'static str,
+}
+
+impl Verdict {
+    const fn new(class: ConflictClass, rule: &'static str) -> Self {
+        Verdict { class, rule }
+    }
+    pub fn is_auto_resolvable(&self) -> bool {
+        !matches!(self.class, ConflictClass::Queue)
+    }
+}
+
+/// Which side of the fact layer is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassifyMode {
+    /// The write path: an agent is asserting this value right now, so
+    /// ingestion order is itself evidence (last writer wins the slot).
+    Write,
+    /// `facts triage`: re-reading a backlog where ingestion order proves
+    /// nothing, so only an explicit event-time ordering (or a wide confidence
+    /// gap) resolves a slot. Everything else about the rules is identical to
+    /// `Write` — same function, same safety guarantees.
+    Triage,
+}
+
+/// Event times closer together than this are "the same moment" — clock noise
+/// and same-batch writes must not read as a correction.
+const RECENCY_MARGIN_SECS: i64 = 1;
+
+/// Confidence gap above which the more-confident value wins a single-valued
+/// slot outright instead of asking a human (see `classify_pair`).
+const CONFIDENCE_GAP: f32 = 0.3;
+
+/// Cosine above which two DIFFERENT predicates on the same subject are
+/// treated as the same slot phrased two ways ("lives_in" vs "home_base_is").
+/// Below it they are simply two different attributes.
+const PARAPHRASE_SIMILARITY: f32 = 0.88;
+
+/// Event time of a fact: when it became true, falling back to when the store
+/// learned it.
+fn effective_time(f: &Fact) -> DateTime<Utc> {
+    f.valid_from.unwrap_or(f.created_at)
+}
+
+/// Classify a candidate conflict between an incoming/newer fact and an
+/// existing one. Pure and side-effect free so the write path and `facts
+/// triage` apply exactly the same rules — that identity is what makes triage
+/// "resolve everything the new rules would never have queued" true by
+/// construction rather than by a second, drifting implementation.
+///
+/// `score` is the novelty gate's cosine when the pair came from the semantic
+/// path, `None` for exact (same subject + predicate) pairs.
+pub fn classify_pair(new: &Fact, old: &Fact, score: Option<f32>, mode: ClassifyMode) -> Verdict {
+    let new_pred = canonical_predicate(&new.predicate);
+    let old_pred = canonical_predicate(&old.predicate);
+    let safety = is_safety_slot(&new_pred) || is_safety_slot(&old_pred);
+    let same_subject = new.subject_norm == old.subject_norm;
+
+    if !same_subject {
+        // Two people can hold opposite values without contradicting anyone.
+        // This verdict never touches a fact — both stay active, the pair is
+        // simply not a question — so it is safe even for a safety predicate:
+        // one person's allergy is not evidence about another's.
+        return Verdict::new(ConflictClass::Coexist, "different_subject");
+    }
+    // One subject, a safety slot involved: the only class that may ever come
+    // out of here is Queue. A wrong answer about an allergy, a medication or
+    // a diagnosis is a medical incident, so neither the write path nor a bulk
+    // triage is allowed to pick a winner — a human confirms it.
+    if safety {
+        return Verdict::new(ConflictClass::Queue, "safety_slot");
+    }
+    if new.superseded_by.is_some() || old.superseded_by.is_some() {
+        return Verdict::new(ConflictClass::Settled, "already_settled");
+    }
+    if new_pred != old_pred {
+        // Same subject, different predicates: only a near-identical phrasing
+        // can be the same slot in disguise, and even then a human decides —
+        // superseding across predicates would rewrite a claim nobody made.
+        let paraphrase = score.unwrap_or(0.0) >= PARAPHRASE_SIMILARITY
+            && predicate_arity(&new_pred) == Arity::Single
+            && predicate_arity(&old_pred) == Arity::Single;
+        return if paraphrase {
+            Verdict::new(ConflictClass::Queue, "paraphrase_slot")
+        } else {
+            Verdict::new(ConflictClass::Coexist, "different_predicate")
+        };
+    }
+    if new.object_norm == old.object_norm {
+        return Verdict::new(ConflictClass::Duplicate, "duplicate_object");
+    }
+    if predicate_arity(&new_pred) == Arity::Multi {
+        // `Ana knows Bob` does not stop being true when `Ana knows Carol`
+        // arrives. This single rule is most of the 9,510.
+        return Verdict::new(ConflictClass::Coexist, "multi_valued");
+    }
+
+    // Single-valued, non-safety, same slot, different values: a real
+    // disagreement. Resolve it when the evidence orders the two values.
+    let (nt, ot) = (effective_time(new), effective_time(old));
+    let gap = (nt - ot).num_seconds();
+    let same_source = new.source_memory_id == old.source_memory_id;
+    if !same_source && gap >= RECENCY_MARGIN_SECS {
+        let rule = match mode {
+            // Preserve the long-standing audit tags on the write path.
+            ClassifyMode::Write => write_supersede_rule(&new_pred),
+            ClassifyMode::Triage => "recency_supersede",
+        };
+        return Verdict::new(ConflictClass::SupersedeOld, rule);
+    }
+    if !same_source && gap <= -RECENCY_MARGIN_SECS {
+        // The incoming value is older than what is stored (a backfill of an
+        // old memory, or an out-of-order import): the stored value stands.
+        return Verdict::new(ConflictClass::SupersedeNew, "recency_stale");
+    }
+    if same_source {
+        // Both values came out of one text: ordering them by clock is
+        // meaningless, so this is exactly the contradiction a human wants.
+        return Verdict::new(ConflictClass::Queue, "same_source_contradiction");
+    }
+    // Comparable event times. The write path still has ingestion order to go
+    // on — an agent asserting a value now is asserting the current one.
+    if mode == ClassifyMode::Write {
+        return Verdict::new(ConflictClass::SupersedeOld, write_supersede_rule(&new_pred));
+    }
+    let conf_gap = new.confidence - old.confidence;
+    if conf_gap >= CONFIDENCE_GAP {
+        return Verdict::new(ConflictClass::SupersedeOld, "confidence_gap");
+    }
+    if conf_gap <= -CONFIDENCE_GAP {
+        return Verdict::new(ConflictClass::SupersedeNew, "confidence_gap");
+    }
+    Verdict::new(ConflictClass::Queue, "comparable_values")
+}
+
+/// Audit tag for a write-path supersession, unchanged from write-path v2:
+/// `slot_lww` for a declared profile slot, `exact_match` otherwise.
+fn write_supersede_rule(canonical: &str) -> &'static str {
+    match slot_policy(canonical) {
+        Some(SlotPolicy::LastWriterWins) => "slot_lww",
+        _ => "exact_match",
     }
 }
 
@@ -207,6 +465,21 @@ pub struct FactWriteCtx<'a> {
 /// `ENGRAM_FACT_LLM_STUB`.
 pub const WRITE_FAIL_ENV: &str = "ENGRAM_FACT_WRITE_FAIL";
 
+/// Test seam: queue EVERY conflict candidate, bypassing classification.
+///
+/// This is the pre-triage write path — the one that turned 2,953 imported
+/// facts into 9,510 queued conflicts. `facts triage` exists to clean up
+/// exactly the backlog this produces, so its tests need a way to build one
+/// through the normal CLI. Same shape as `ENGRAM_FACT_WRITE_FAIL`; never set
+/// in production use.
+pub const QUEUE_ALL_ENV: &str = "ENGRAM_FACT_QUEUE_ALL";
+
+fn queue_everything() -> bool {
+    std::env::var(QUEUE_ALL_ENV)
+        .map(|v| !v.trim().is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
 pub async fn write_fact(
     ctx: &AppContext,
     w: &FactWriteCtx<'_>,
@@ -270,47 +543,14 @@ pub async fn write_fact(
         return Ok(());
     }
     if !exact.is_empty() {
-        // Same question, different answer.
-        match (policy, autonomy) {
-            (Some(SlotPolicy::AwaitConfirmation), _) | (_, Autonomy::Strict) => {
-                insert_with_embedding(ctx, &new_fact, embedder, kb, diary).await?;
-                for old in &exact {
-                    queue_conflict(ctx, &new_fact, old, diary, kb, "slot", None, outcome)?;
-                }
-                outcome.added += 1;
-            }
-            (Some(SlotPolicy::LastWriterWins), _) => {
-                insert_with_embedding(ctx, &new_fact, embedder, kb, diary).await?;
-                for old in &exact {
-                    ctx.store.supersede_fact_with(
-                        old.id,
-                        new_fact.id,
-                        "slot_lww",
-                        new_fact.valid_from,
-                    )?;
-                    outcome
-                        .conflicts
-                        .push(conflict_payload(old, &new_fact, "slot_lww"));
-                }
-                outcome.added += 1;
-            }
-            (None, _) => {
-                // Non-slot exact conflict: preserve the long-standing
-                // supersede-on-exact-match behavior.
-                insert_with_embedding(ctx, &new_fact, embedder, kb, diary).await?;
-                for old in &exact {
-                    ctx.store.supersede_fact_with(
-                        old.id,
-                        new_fact.id,
-                        "exact_match",
-                        new_fact.valid_from,
-                    )?;
-                    outcome
-                        .conflicts
-                        .push(conflict_payload(old, &new_fact, "exact_match"));
-                }
-                outcome.added += 1;
-            }
+        // Same question, different answer — or, for a multi-valued predicate,
+        // simply a second answer. The classifier decides per pair.
+        insert_with_embedding(ctx, &new_fact, embedder, kb, diary).await?;
+        outcome.added += 1;
+        for old in &exact {
+            apply_write_verdict(
+                ctx, &new_fact, old, diary, kb, "slot", None, autonomy, outcome,
+            )?;
         }
         return Ok(());
     }
@@ -349,6 +589,44 @@ pub async fn write_fact(
                 .iter()
                 .filter_map(|(id, s)| ctx.store.get_fact(*id).ok().flatten().map(|f| (f, *s)))
                 .collect();
+            // Classify BEFORE escalating. The gate's uncertain band is a
+            // similarity band, not a contradiction: most candidates are about
+            // someone else or about a different attribute of the same person.
+            // Filtering here is what stops a personal store from queueing
+            // three "conflicts" per imported fact.
+            let mut cand_facts: Vec<(Fact, f32)> = cand_facts;
+            let mut settled: Vec<(Fact, f32)> = Vec::new();
+            if !queue_everything() {
+                cand_facts.retain(|(f, s)| {
+                    let keep = classify_pair(&new_fact, f, Some(*s), ClassifyMode::Write).class
+                        == ConflictClass::Queue;
+                    if !keep {
+                        settled.push((f.clone(), *s));
+                    }
+                    keep
+                });
+            }
+            if cand_facts.is_empty() {
+                // Nothing here a human or an LLM could improve on.
+                ctx.store.insert_fact(&new_fact)?;
+                ctx.store
+                    .set_fact_embedding(new_fact.id, &embedding, &embedder.model())?;
+                outcome.added += 1;
+                for (f, s) in &settled {
+                    apply_write_verdict(
+                        ctx,
+                        &new_fact,
+                        f,
+                        diary,
+                        kb,
+                        "semantic_cosine",
+                        Some(*s),
+                        autonomy,
+                        outcome,
+                    )?;
+                }
+                return Ok(());
+            }
             match (autonomy, llm) {
                 (Autonomy::Full, Some(llm)) => {
                     let rendered: Vec<String> = cand_facts
@@ -421,6 +699,74 @@ pub async fn write_fact(
                     outcome.added += 1;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Classify one candidate pair and carry out the verdict. `new_fact` is
+/// already in the store; the classifier decides whether the pair is a
+/// supersession, a non-event, or something only the caller can settle.
+#[allow(clippy::too_many_arguments)]
+fn apply_write_verdict(
+    ctx: &AppContext,
+    new_fact: &Fact,
+    old: &Fact,
+    diary: &str,
+    kb: &str,
+    detector: &str,
+    score: Option<f32>,
+    autonomy: Autonomy,
+    outcome: &mut FactWriteOutcome,
+) -> Result<(), CliError> {
+    let verdict = classify_pair(new_fact, old, score, ClassifyMode::Write);
+    // `strict` promised never to auto-supersede: it escalates every real
+    // disagreement. It does NOT invent conflicts out of coexisting values —
+    // a second `knows` is not a decision anyone has to make.
+    let class = match (verdict.class, autonomy) {
+        (ConflictClass::SupersedeOld | ConflictClass::SupersedeNew, Autonomy::Strict) => {
+            ConflictClass::Queue
+        }
+        (ConflictClass::Duplicate, _) => ConflictClass::Duplicate,
+        (c, _) if queue_everything() => {
+            let _ = c;
+            ConflictClass::Queue
+        }
+        (c, _) => c,
+    };
+    match class {
+        ConflictClass::Coexist | ConflictClass::Settled => {}
+        ConflictClass::Duplicate => {
+            // The exact path dedupes before inserting, so this only fires if
+            // a duplicate slipped through another route: keep the original
+            // row (its id is what other tables reference) and count a
+            // confirmation instead of leaving two identical active facts.
+            ctx.store
+                .supersede_fact_with(new_fact.id, old.id, "duplicate", None)?;
+            ctx.store.increment_fact_confirmations(old.id)?;
+            outcome.deduped += 1;
+            outcome.added = outcome.added.saturating_sub(1);
+        }
+        ConflictClass::SupersedeOld => {
+            ctx.store.supersede_fact_with(
+                old.id,
+                new_fact.id,
+                verdict.rule,
+                new_fact.valid_from,
+            )?;
+            outcome
+                .conflicts
+                .push(conflict_payload(old, new_fact, verdict.rule));
+        }
+        ConflictClass::SupersedeNew => {
+            ctx.store
+                .supersede_fact_with(new_fact.id, old.id, verdict.rule, old.valid_from)?;
+            outcome
+                .conflicts
+                .push(conflict_payload(new_fact, old, verdict.rule));
+        }
+        ConflictClass::Queue => {
+            queue_conflict(ctx, new_fact, old, diary, kb, detector, score, outcome)?;
         }
     }
     Ok(())
@@ -577,5 +923,219 @@ mod tests {
     fn token_sort_normalizes_name_order() {
         assert_eq!(token_sort("smith, robert"), token_sort("robert smith"));
         assert_ne!(token_sort("robert smith"), token_sort("robert smythe"));
+    }
+
+    // ----- Conflict classification -----
+
+    /// A stored fact. `at` is the event time; every fact gets its own source
+    /// memory unless the caller pins one, because "came out of the same text"
+    /// is itself a classification signal.
+    fn stored(subject: &str, predicate: &str, object: &str, at: &str) -> Fact {
+        let t = moment(at);
+        Fact {
+            id: Uuid::new_v4(),
+            source_memory_id: Uuid::new_v4(),
+            subject: subject.into(),
+            subject_norm: normalize(subject),
+            predicate: predicate.into(),
+            object: object.into(),
+            object_norm: normalize(object),
+            confidence: 1.0,
+            created_at: t,
+            superseded_by: None,
+            superseded_at: None,
+            diary: "default".into(),
+            fact_type: FactType::Assertion,
+            valid_from: Some(t),
+            valid_until: None,
+            resolution: None,
+            source_kind: SourceKind::AgentExtracted,
+            confirmations: 0,
+        }
+    }
+
+    fn triage(new: &Fact, old: &Fact) -> Verdict {
+        classify_pair(new, old, None, ClassifyMode::Triage)
+    }
+
+    #[test]
+    fn arity_defaults_to_multi_and_knows_the_slots() {
+        assert_eq!(predicate_arity("lives_in"), Arity::Single);
+        assert_eq!(predicate_arity("works_at"), Arity::Single);
+        assert_eq!(predicate_arity("has_role"), Arity::Single);
+        assert_eq!(predicate_arity("born_on"), Arity::Single);
+        assert_eq!(predicate_arity("allergic_to"), Arity::Single);
+        for p in MULTI_VALUED_PREDICATES {
+            assert_eq!(predicate_arity(p), Arity::Multi, "{p} must be multi-valued");
+        }
+        // Unknown predicates are multi-valued: a wrong Single silently hides
+        // a true fact, a wrong Multi only keeps both.
+        assert_eq!(predicate_arity("collaborated_with"), Arity::Multi);
+    }
+
+    #[test]
+    fn second_value_of_a_multi_valued_predicate_is_not_a_conflict() {
+        let old = stored("Elias", "knows", "Alice", "2026-01-01");
+        let new = stored("Elias", "knows", "Bob", "2026-02-01");
+        let v = triage(&new, &old);
+        assert_eq!(v.class, ConflictClass::Coexist);
+        assert_eq!(v.rule, "multi_valued");
+        // ...and the same holds on the write path, in every autonomy mode.
+        assert_eq!(
+            classify_pair(&new, &old, None, ClassifyMode::Write).class,
+            ConflictClass::Coexist
+        );
+    }
+
+    #[test]
+    fn different_subjects_never_conflict() {
+        let old = stored("Alice", "lives_in", "Berlin", "2026-01-01");
+        let new = stored("Bob", "lives_in", "Porto", "2026-02-01");
+        assert_eq!(triage(&new, &old).rule, "different_subject");
+        assert_eq!(triage(&new, &old).class, ConflictClass::Coexist);
+    }
+
+    #[test]
+    fn different_predicates_on_one_subject_coexist_unless_they_are_one_slot() {
+        let old = stored("Elias", "lives_in", "Lisbon", "2026-01-01");
+        let new = stored("Elias", "has_role", "CEO", "2026-02-01");
+        assert_eq!(triage(&new, &old).rule, "different_predicate");
+        // A near-identical embedding of two single-valued predicates is the
+        // paraphrase case the novelty gate exists for — a human decides,
+        // because superseding across predicates rewrites a claim nobody made.
+        let old = stored("Elias", "lives_in", "Lisbon", "2026-01-01");
+        let new = stored("Elias", "home_city_is", "Porto", "2026-02-01");
+        assert_eq!(
+            classify_pair(&new, &old, Some(0.93), ClassifyMode::Triage).class,
+            ConflictClass::Coexist,
+            "an unknown predicate is multi-valued, so it cannot claim a slot"
+        );
+        let old = stored("Elias", "lives_in", "Lisbon", "2026-01-01");
+        let new = stored("Elias", "born_on", "1980-01-01", "2026-02-01");
+        let v = classify_pair(&new, &old, Some(0.93), ClassifyMode::Triage);
+        assert_eq!(v.class, ConflictClass::Queue);
+        assert_eq!(v.rule, "paraphrase_slot");
+        // Below the paraphrase band the two are simply different attributes.
+        assert_eq!(
+            classify_pair(&new, &old, Some(0.70), ClassifyMode::Triage).rule,
+            "different_predicate"
+        );
+    }
+
+    #[test]
+    fn identical_objects_are_duplicates_not_contradictions() {
+        let old = stored("Elias", "works_at", "Acme", "2026-01-01");
+        let new = stored("Elias", "works_at", "acme", "2026-02-01");
+        let v = triage(&new, &old);
+        assert_eq!(v.class, ConflictClass::Duplicate);
+        assert_eq!(v.rule, "duplicate_object");
+    }
+
+    #[test]
+    fn safety_slots_are_never_auto_resolved_for_one_subject() {
+        let old = stored("Ana", "allergic_to", "penicillin", "2020-01-01");
+        let new = stored("Ana", "allergic_to", "amoxicillin", "2026-01-01");
+        // Six years of recency ordering is not enough: this stays queued.
+        assert_eq!(triage(&new, &old).class, ConflictClass::Queue);
+        assert_eq!(triage(&new, &old).rule, "safety_slot");
+        assert_eq!(
+            classify_pair(&new, &old, None, ClassifyMode::Write).class,
+            ConflictClass::Queue
+        );
+        // Any predicate paired with a safety slot on the same subject queues.
+        let other = stored("Ana", "takes_medication", "amoxicillin", "2026-01-01");
+        assert_eq!(triage(&other, &old).rule, "safety_slot");
+        // Different people never contradict each other, and un-queueing that
+        // pair supersedes nothing — no allergy can be hidden by it.
+        let bob = stored("Bob", "allergic_to", "peanuts", "2026-01-01");
+        assert_eq!(triage(&bob, &old).rule, "different_subject");
+        assert_eq!(triage(&bob, &old).class, ConflictClass::Coexist);
+    }
+
+    #[test]
+    fn a_clear_event_time_ordering_resolves_a_slot_in_both_directions() {
+        let old = stored("Elias", "lives_in", "London", "2015-06-01");
+        let new = stored("Elias", "lives_in", "Lisbon", "2024-02-01");
+        let v = triage(&new, &old);
+        assert_eq!(v.class, ConflictClass::SupersedeOld);
+        assert_eq!(v.rule, "recency_supersede");
+        // Backfilling an OLD memory must not overwrite the current value.
+        let v = triage(&old, &new);
+        assert_eq!(v.class, ConflictClass::SupersedeNew);
+        assert_eq!(v.rule, "recency_stale");
+    }
+
+    #[test]
+    fn two_values_from_one_memory_are_a_real_contradiction() {
+        let mut old = stored("Carol", "works_at", "Acme", "2026-01-01");
+        let mut new = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
+        new.source_memory_id = Uuid::new_v4();
+        old.source_memory_id = new.source_memory_id;
+        // Even with a clock gap: one text, two employers, no ordering.
+        new.valid_from = Some(moment("2026-06-01"));
+        let v = triage(&new, &old);
+        assert_eq!(v.class, ConflictClass::Queue);
+        assert_eq!(v.rule, "same_source_contradiction");
+    }
+
+    #[test]
+    fn comparable_values_stay_queued_in_triage_but_last_writer_wins_at_write_time() {
+        let old = stored("Elias", "works_at", "Acme", "2026-01-01");
+        let mut new = stored("Elias", "works_at", "Beta Corp", "2026-01-01");
+        new.created_at = old.created_at;
+        let v = triage(&new, &old);
+        assert_eq!(v.class, ConflictClass::Queue);
+        assert_eq!(v.rule, "comparable_values");
+        // The write path has one more piece of evidence — an agent is
+        // asserting this value right now — and keeps write-path v2's tag.
+        let v = classify_pair(&new, &old, None, ClassifyMode::Write);
+        assert_eq!(v.class, ConflictClass::SupersedeOld);
+        assert_eq!(v.rule, "slot_lww");
+    }
+
+    #[test]
+    fn a_wide_confidence_gap_settles_a_slot_without_a_human() {
+        let old = stored("Elias", "works_at", "Acme", "2026-01-01");
+        let mut new = stored("Elias", "works_at", "Beta Corp", "2026-01-01");
+        new.created_at = old.created_at;
+        new.confidence = 1.0;
+        let mut old_weak = old.clone();
+        old_weak.confidence = 0.4;
+        let v = triage(&new, &old_weak);
+        assert_eq!(v.class, ConflictClass::SupersedeOld);
+        assert_eq!(v.rule, "confidence_gap");
+        // A guess must not overwrite a confident value either.
+        let v = triage(&old_weak, &new);
+        assert_eq!(v.class, ConflictClass::SupersedeNew);
+        assert_eq!(v.rule, "confidence_gap");
+    }
+
+    #[test]
+    fn an_already_superseded_fact_leaves_nothing_to_decide() {
+        let mut old = stored("Elias", "works_at", "Acme", "2026-01-01");
+        let new = stored("Elias", "works_at", "Beta Corp", "2026-02-01");
+        old.superseded_by = Some(Uuid::new_v4());
+        let v = triage(&new, &old);
+        assert_eq!(v.class, ConflictClass::Settled);
+        assert_eq!(v.rule, "already_settled");
+        assert!(v.is_auto_resolvable());
+    }
+
+    #[test]
+    fn only_the_queue_class_needs_a_human() {
+        for (class, expected) in [
+            (ConflictClass::Coexist, true),
+            (ConflictClass::Duplicate, true),
+            (ConflictClass::SupersedeOld, true),
+            (ConflictClass::SupersedeNew, true),
+            (ConflictClass::Settled, true),
+            (ConflictClass::Queue, false),
+        ] {
+            assert_eq!(
+                Verdict::new(class, "test").is_auto_resolvable(),
+                expected,
+                "{class:?}"
+            );
+        }
     }
 }

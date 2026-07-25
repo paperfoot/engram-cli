@@ -3992,6 +3992,154 @@ impl SqliteStore {
             .map_err(StorageError::from)
     }
 
+    /// How many conflicts are still awaiting a decision. Cheap enough to
+    /// report on every conflict listing, which is the only way a caller
+    /// learns that a backlog exists at all.
+    pub fn count_open_fact_conflicts(
+        &self,
+        diary: Option<&str>,
+        kb: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fact_conflict_queue
+             WHERE status = 'open'
+                   AND (?1 IS NULL OR diary = ?1)
+                   AND (?2 IS NULL OR kb = ?2)",
+            params![diary, kb],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Open conflicts joined to BOTH facts in one pass, newest first.
+    ///
+    /// `facts triage` re-classifies the whole backlog; fetching each side
+    /// with a separate `get_fact` turned a 9,510-row queue into ~19,000 point
+    /// queries. `subject` (optional) matches either side's `subject_norm` as
+    /// a substring, so a person's backlog can be inspected on its own.
+    /// Rows whose facts were deleted are absent by construction — see
+    /// `resolve_orphan_fact_conflicts`.
+    pub fn list_open_fact_conflicts_with_facts(
+        &self,
+        diary: Option<&str>,
+        kb: Option<&str>,
+        subject: Option<&str>,
+        limit: usize,
+    ) -> Result<
+        Vec<(
+            FactConflictRow,
+            engram_core::types::Fact,
+            engram_core::types::Fact,
+        )>,
+        StorageError,
+    > {
+        let subject_like = subject
+            .map(|s| format!("%{}%", s.trim().to_lowercase()))
+            .filter(|s| s.len() > 2);
+        let mut stmt = self.conn.prepare(
+            "SELECT q.id, q.new_fact_id, q.old_fact_id, q.diary, q.kb, q.detector,
+                    q.score, q.suggested, q.note, q.status, q.created_at,
+                    q.resolved_at, q.resolved_by,
+                    nf.id, nf.source_memory_id, nf.subject, nf.subject_norm,
+                    nf.predicate, nf.object, nf.object_norm, nf.confidence,
+                    nf.created_at, nf.superseded_by, nf.superseded_at, nf.diary,
+                    nf.fact_type, nf.valid_from, nf.valid_until, nf.resolution,
+                    nf.source_kind, nf.confirmations,
+                    of.id, of.source_memory_id, of.subject, of.subject_norm,
+                    of.predicate, of.object, of.object_norm, of.confidence,
+                    of.created_at, of.superseded_by, of.superseded_at, of.diary,
+                    of.fact_type, of.valid_from, of.valid_until, of.resolution,
+                    of.source_kind, of.confirmations
+             FROM fact_conflict_queue q
+             JOIN facts nf ON nf.id = q.new_fact_id
+             JOIN facts of ON of.id = q.old_fact_id
+             WHERE q.status = 'open'
+                   AND (?1 IS NULL OR q.diary = ?1)
+                   AND (?2 IS NULL OR q.kb = ?2)
+                   AND (?3 IS NULL OR nf.subject_norm LIKE ?3 OR of.subject_norm LIKE ?3)
+             ORDER BY q.created_at DESC, q.id LIMIT ?4",
+        )?;
+        // `facts triage` asks for the whole backlog by passing usize::MAX;
+        // casting that straight to i64 wraps to -1, which SQLite happens to
+        // read as "no limit". Saturating is the same behaviour on purpose.
+        let capped = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![diary, kb, subject_like, capped], |r| {
+            let row = parse_conflict_row(r)?;
+            let new_fact = parse_fact_from_offset(r, 13)?;
+            let old_fact = parse_fact_from_offset(r, 31)?;
+            Ok((row, new_fact, old_fact))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Close open conflicts whose facts no longer exist. A hard-deleted
+    /// memory takes its facts with it; without this the queue keeps rows that
+    /// can never be adjudicated and that inflate every backlog count.
+    /// Returns the number of rows closed.
+    pub fn resolve_orphan_fact_conflicts(
+        &self,
+        diary: Option<&str>,
+        kb: Option<&str>,
+        resolved_by: &str,
+    ) -> Result<usize, StorageError> {
+        let n = self.conn.execute(
+            "UPDATE fact_conflict_queue
+             SET status = 'resolved', resolved_at = ?1, resolved_by = ?2,
+                 note = COALESCE(note, 'auto: referenced facts no longer exist')
+             WHERE status = 'open'
+                   AND (?3 IS NULL OR diary = ?3)
+                   AND (?4 IS NULL OR kb = ?4)
+                   AND (new_fact_id NOT IN (SELECT id FROM facts)
+                        OR old_fact_id NOT IN (SELECT id FROM facts))",
+            params![chrono::Utc::now().to_rfc3339(), resolved_by, diary, kb],
+        )?;
+        Ok(n)
+    }
+
+    /// Source-memory preview for each fact id: `(memory_id, first line)`.
+    /// A queued conflict is unreadable without the sentences the two values
+    /// came from — "Lisbon vs Porto" says nothing on its own.
+    pub fn fact_source_previews(
+        &self,
+        fact_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, (Uuid, String)>, StorageError> {
+        let mut out = std::collections::HashMap::new();
+        if fact_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = (1..=fact_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT f.id, m.id, m.content FROM facts f
+             JOIN memories m ON m.id = f.source_memory_id
+             WHERE f.id IN ({placeholders})"
+        );
+        let binds: Vec<String> = fact_ids.iter().map(|i| i.to_string()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (fid, mid, content) = row?;
+            let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut preview: String = flat.chars().take(120).collect();
+            if flat.chars().count() > 120 {
+                preview.push('…');
+            }
+            if let (Ok(fid), Ok(mid)) = (Uuid::parse_str(&fid), Uuid::parse_str(&mid)) {
+                out.insert(fid, (mid, preview));
+            }
+        }
+        Ok(out)
+    }
+
     /// Mark a queued conflict resolved. Returns false when the row was not
     /// open (already resolved or unknown id).
     pub fn resolve_fact_conflict(
@@ -5234,6 +5382,128 @@ mod tests {
         let row = store.get_fact_conflict(qid).unwrap().unwrap();
         assert_eq!(row.status, "resolved");
         assert_eq!(row.note.as_deref(), Some("user confirmed"));
+    }
+
+    /// `facts triage` re-classifies a whole backlog, so it needs both facts
+    /// of every open row in ONE query, a total to report against, and a way
+    /// to close rows whose facts are gone.
+    #[test]
+    fn open_conflicts_join_both_facts_and_count_and_survive_deleted_facts() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let old_f = test_fact(&store, "Ana", "allergic_to", "penicillin");
+        let new_f = test_fact(&store, "Ana", "allergic_to", "amoxicillin");
+        let unrelated = test_fact(&store, "Bob", "lives_in", "Porto");
+        let other = test_fact(&store, "Bob", "lives_in", "Berlin");
+        for f in [&old_f, &new_f, &unrelated, &other] {
+            store.insert_fact(f).unwrap();
+        }
+        let ana = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        store
+            .insert_fact_conflict(
+                ana,
+                new_f.id,
+                old_f.id,
+                "default",
+                "default",
+                "slot",
+                None,
+                "supersede-old",
+            )
+            .unwrap();
+        store
+            .insert_fact_conflict(
+                bob,
+                other.id,
+                unrelated.id,
+                "default",
+                "personal",
+                "semantic_cosine",
+                Some(0.8),
+                "keep-both",
+            )
+            .unwrap();
+
+        assert_eq!(store.count_open_fact_conflicts(None, None).unwrap(), 2);
+        assert_eq!(
+            store
+                .count_open_fact_conflicts(None, Some("personal"))
+                .unwrap(),
+            1
+        );
+
+        let joined = store
+            .list_open_fact_conflicts_with_facts(None, None, None, 10)
+            .unwrap();
+        assert_eq!(joined.len(), 2);
+        for (row, nf, of) in &joined {
+            assert_eq!(row.status, "open");
+            assert_eq!(nf.id, if row.id == ana { new_f.id } else { other.id });
+            assert_eq!(
+                of.id,
+                if row.id == ana {
+                    old_f.id
+                } else {
+                    unrelated.id
+                }
+            );
+            // The join must hydrate the fields the classifier reads.
+            assert!(nf.valid_from.is_some());
+            assert!(of.superseded_by.is_none());
+        }
+
+        // Subject filter narrows to one person's backlog.
+        let ana_only = store
+            .list_open_fact_conflicts_with_facts(None, None, Some("ana"), 10)
+            .unwrap();
+        assert_eq!(ana_only.len(), 1);
+        assert_eq!(ana_only[0].0.id, ana);
+
+        // Both values' source sentences are available for review.
+        let previews = store.fact_source_previews(&[new_f.id, old_f.id]).unwrap();
+        assert_eq!(previews.len(), 2);
+        assert!(previews[&new_f.id].1.contains("amoxicillin"));
+
+        // A fact deleted without the cascade (an older schema, a manual
+        // repair) leaves a row nobody can ever adjudicate.
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM facts WHERE id = ?1",
+                params![unrelated.id.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        assert_eq!(store.count_open_fact_conflicts(None, None).unwrap(), 2);
+        assert_eq!(
+            store
+                .list_open_fact_conflicts_with_facts(None, None, None, 10)
+                .unwrap()
+                .len(),
+            1,
+            "a row whose fact is gone must not be handed to the classifier"
+        );
+        assert_eq!(
+            store
+                .resolve_orphan_fact_conflicts(None, None, "triage")
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.count_open_fact_conflicts(None, None).unwrap(), 1);
+        // Idempotent: nothing left to close.
+        assert_eq!(
+            store
+                .resolve_orphan_fact_conflicts(None, None, "triage")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

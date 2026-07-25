@@ -3839,7 +3839,10 @@ fn facts_list_spans_every_diary_by_default_and_says_so() {
 
     // Unscoped: the work-diary fact must appear, labelled with its scope.
     let v = run_json(&mut cmd_in(&tmp), &["facts", "list"]);
-    assert_eq!(v["data"]["count"], 1, "unscoped facts list must span diaries");
+    assert_eq!(
+        v["data"]["count"], 1,
+        "unscoped facts list must span diaries"
+    );
     assert_eq!(v["data"]["diary"], "*");
     assert_eq!(v["data"]["diary_scope"], "all_diaries");
     assert_eq!(v["data"]["facts"][0]["subject"], "Priya Raman");
@@ -3850,4 +3853,437 @@ fn facts_list_spans_every_diary_by_default_and_says_so() {
     assert_eq!(v["data"]["diary_scope"], "flag");
     let v = run_json(&mut cmd_in(&tmp), &["facts", "list", "--diary", "personal"]);
     assert_eq!(v["data"]["count"], 0);
+}
+
+// ===========================================================================
+// Conflict triage: the fact layer has to survive real volume.
+//
+// Importing 1,332 memories produced 2,953 facts and 9,510 queued conflicts —
+// a backlog nobody adjudicates, which buries the handful of contradictions
+// that matter. These tests pin the classification that keeps the queue small
+// and the `facts triage` sweep that shrinks a backlog already on disk.
+// ===========================================================================
+
+/// Store facts through the CURRENT write path with the novelty gate forced
+/// into its "everything is uncertain" band, which is what a store with
+/// thousands of facts looks like: every write finds similar-enough neighbours.
+fn remember_dense(tmp: &tempfile::TempDir, content: &str, facts: &str) -> Value {
+    let out = cmd_in(tmp)
+        .env("ENGRAM_FACT_NOVEL_THRESHOLD", "0.0")
+        .env("ENGRAM_FACT_DUP_THRESHOLD", "0.999")
+        .args([
+            "remember",
+            content,
+            "--kb",
+            "personal",
+            "--facts-json",
+            facts,
+        ])
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    parse_stdout(&out)
+}
+
+/// Store facts through the PRE-TRIAGE write path: every conflict candidate is
+/// queued, the way the import that produced 9,510 rows did. This is how a
+/// legacy backlog is built for `facts triage` to clean up.
+fn remember_legacy(tmp: &tempfile::TempDir, content: &str, facts: &str) -> Value {
+    let out = cmd_in(tmp)
+        .env("ENGRAM_FACT_QUEUE_ALL", "1")
+        .env("ENGRAM_FACT_NOVEL_THRESHOLD", "0.0")
+        .env("ENGRAM_FACT_DUP_THRESHOLD", "0.999")
+        .args([
+            "remember",
+            content,
+            "--kb",
+            "personal",
+            "--facts-json",
+            facts,
+        ])
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    parse_stdout(&out)
+}
+
+/// The address book: a person's second acquaintance is an addition, not a
+/// contradiction. This one rule is most of the 9,510.
+#[test]
+fn multi_valued_predicates_coexist_instead_of_queueing() {
+    let (tmp, _cmd) = with_isolated_home();
+    for (content, facts) in [
+        (
+            "Elias met Alice at the mixer.",
+            r#"[{"subject":"Elias","predicate":"knows","object":"Alice"}]"#,
+        ),
+        (
+            "Elias knows Bob from the fund.",
+            r#"[{"subject":"Elias","predicate":"knows","object":"Bob"}]"#,
+        ),
+        (
+            "Elias knows Carol via Alice.",
+            r#"[{"subject":"Elias","predicate":"knows","object":"Carol"}]"#,
+        ),
+        (
+            "Elias is friends with Dan.",
+            r#"[{"subject":"Elias","predicate":"friend_of","object":"Dan"}]"#,
+        ),
+        (
+            "Elias met Erin at the conference.",
+            r#"[{"subject":"Elias","predicate":"met_at","object":"Erin"}]"#,
+        ),
+    ] {
+        let v = remember_dense(&tmp, content, facts);
+        assert_eq!(
+            v["data"]["adjudication_needed"].as_array().unwrap().len(),
+            0,
+            "a second value of a multi-valued predicate must not queue: {content}"
+        );
+        assert_eq!(v["data"]["facts_added"], 1, "{content}");
+    }
+
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "show", "Elias", "--kb", "personal", "--diary", "*"],
+    );
+    assert_eq!(
+        v["data"]["active_count"], 5,
+        "every relationship must stay active: {:?}",
+        v["data"]["active"]
+    );
+    assert_eq!(v["data"]["historic_count"], 0, "nothing may be superseded");
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"]);
+    assert_eq!(v["data"]["total_open"], 0);
+}
+
+/// A single-valued slot still behaves: newest value wins, old value kept.
+/// And an OLDER value arriving late (a backfill of a 2015 memory) must not
+/// overwrite the current one.
+#[test]
+fn single_valued_slots_supersede_by_event_time_in_both_directions() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_dense(
+        &tmp,
+        "Elias moved to Lisbon in 2024.",
+        r#"[{"subject":"Elias","predicate":"lives_in","object":"Lisbon","valid_from":"2024-02-01"}]"#,
+    );
+    let v = remember_dense(
+        &tmp,
+        "Elias lived in London back in 2015.",
+        r#"[{"subject":"Elias","predicate":"lives_in","object":"London","valid_from":"2015-06-01"}]"#,
+    );
+    assert_eq!(
+        v["data"]["adjudication_needed"].as_array().unwrap().len(),
+        0,
+        "an out-of-order backfill is not a question for a human"
+    );
+    let conflicts = v["data"]["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["resolution"], "recency_stale");
+
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "show", "Elias", "--kb", "personal", "--diary", "*"],
+    );
+    assert_eq!(v["data"]["active_count"], 1);
+    assert_eq!(
+        v["data"]["active"][0]["object"], "Lisbon",
+        "the stale 2015 value must not become the current one"
+    );
+    assert_eq!(v["data"]["historic"][0]["object"], "London");
+}
+
+/// Seed a legacy backlog of mixed conflicts: multi-valued additions,
+/// candidates about other people, other attributes of one person, one slot
+/// with a clear event-time ordering, one genuine same-memo contradiction,
+/// and one safety slot.
+fn seed_legacy_backlog(tmp: &tempfile::TempDir) {
+    for (content, facts) in [
+        (
+            "Elias met Alice at the London biotech mixer.",
+            r#"[{"subject":"Elias","predicate":"knows","object":"Alice"}]"#,
+        ),
+        (
+            "Elias knows Bob from the fund.",
+            r#"[{"subject":"Elias","predicate":"knows","object":"Bob"}]"#,
+        ),
+        (
+            "Elias knows Carol via Alice.",
+            r#"[{"subject":"Elias","predicate":"knows","object":"Carol"}]"#,
+        ),
+        (
+            "Alice lives in Berlin.",
+            r#"[{"subject":"Alice","predicate":"lives_in","object":"Berlin"}]"#,
+        ),
+        (
+            "Bob lives in Porto.",
+            r#"[{"subject":"Bob","predicate":"lives_in","object":"Porto"}]"#,
+        ),
+        (
+            "Elias lived in London back in 2015.",
+            r#"[{"subject":"Elias","predicate":"lives_in","object":"London","valid_from":"2015-06-01"}]"#,
+        ),
+        (
+            "Elias moved to Lisbon in 2024.",
+            r#"[{"subject":"Elias","predicate":"lives_in","object":"Lisbon","valid_from":"2024-02-01"}]"#,
+        ),
+        (
+            "Ana is allergic to penicillin.",
+            r#"[{"subject":"Ana","predicate":"allergic_to","object":"penicillin"}]"#,
+        ),
+        (
+            "Ana is allergic to amoxicillin, per her chart.",
+            r#"[{"subject":"Ana","predicate":"allergic_to","object":"amoxicillin"}]"#,
+        ),
+        (
+            "One memo says Carol is at Acme, the next line says Beta Corp.",
+            r#"[{"subject":"Carol","predicate":"works_at","object":"Acme"},
+                {"subject":"Carol","predicate":"works_at","object":"Beta Corp"}]"#,
+        ),
+        (
+            "Elias has the role of CEO.",
+            r#"[{"subject":"Elias","predicate":"has_role","object":"CEO"}]"#,
+        ),
+    ] {
+        remember_legacy(tmp, content, facts);
+    }
+}
+
+#[test]
+fn triage_resolves_the_obvious_and_keeps_the_real_contradictions() {
+    let (tmp, _cmd) = with_isolated_home();
+    seed_legacy_backlog(&tmp);
+
+    let before = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"]);
+    let queued = before["data"]["total_open"].as_i64().unwrap();
+    assert!(
+        queued >= 20,
+        "the legacy write path should bury the user in conflicts, got {queued}"
+    );
+
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "triage"]);
+    let d = &v["data"];
+    assert_eq!(d["scanned"], queued);
+    assert_eq!(d["remaining"], 2, "{:?}", d["remaining_samples"]);
+    assert_eq!(d["resolved"].as_i64().unwrap(), queued - 2);
+    assert!(
+        d["reduction_ratio"].as_f64().unwrap() > 0.9,
+        "reduction ratio was {}",
+        d["reduction_ratio"]
+    );
+
+    // Every rule that fired is named, and the ones that fired are the ones
+    // this fixture was built to exercise.
+    let by_rule = d["resolved_by_rule"].as_object().unwrap();
+    for rule in ["multi_valued", "different_subject", "different_predicate"] {
+        assert!(
+            by_rule.get(rule).and_then(|v| v.as_u64()).unwrap_or(0) > 0,
+            "rule {rule} never fired: {by_rule:?}"
+        );
+    }
+    assert_eq!(
+        by_rule.get("recency_supersede").and_then(|v| v.as_u64()),
+        Some(1),
+        "the 2015 → 2024 move is the one slot with a clear ordering"
+    );
+    assert_eq!(d["facts_superseded"], 1);
+
+    // What is left is exactly the safety slot and the one-memo contradiction.
+    let reasons = d["remaining_by_reason"].as_object().unwrap();
+    assert_eq!(reasons.get("safety_slot").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(
+        reasons
+            .get("same_source_contradiction")
+            .and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert_eq!(d["safety_slots_kept"], 1);
+
+    // Coexisting values are untouched: nothing was superseded to empty a queue.
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "show", "Elias", "--kb", "personal", "--diary", "*"],
+    );
+    let active: Vec<&str> = v["data"]["active"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["object"].as_str().unwrap())
+        .collect();
+    for who in ["Alice", "Bob", "Carol"] {
+        assert!(active.contains(&who), "triage dropped {who}: {active:?}");
+    }
+    assert!(active.contains(&"Lisbon"));
+    assert!(!active.contains(&"London"), "the 2015 value stays historic");
+    assert_eq!(
+        v["data"]["historic"][0]["resolution"], "triage_recency",
+        "a triage supersession must be auditable"
+    );
+
+    // Ana keeps BOTH allergy values active — a safety slot is never decided
+    // by a sweep.
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "show", "Ana", "--kb", "personal", "--diary", "*"],
+    );
+    assert_eq!(v["data"]["active_count"], 2);
+
+    // The remainder is still resolvable by hand.
+    let open = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"]);
+    assert_eq!(open["data"]["total_open"], 2);
+    let id = open["data"]["open_conflicts"][0]["conflict_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "resolve", &id, "--action", "keep-both"],
+    );
+    assert_eq!(v["data"]["resolved"], true);
+    let open = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"]);
+    assert_eq!(open["data"]["total_open"], 1);
+}
+
+#[test]
+fn triage_dry_run_writes_nothing_and_reports_the_real_numbers() {
+    let (tmp, _cmd) = with_isolated_home();
+    seed_legacy_backlog(&tmp);
+    let before = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"]);
+    let queued = before["data"]["total_open"].as_i64().unwrap();
+
+    let dry = run_json(&mut cmd_in(&tmp), &["facts", "triage", "--dry-run"]);
+    assert_eq!(dry["data"]["dry_run"], true);
+    assert_eq!(dry["data"]["facts_superseded"], 0);
+    assert!(dry["data"]["resolved"].as_i64().unwrap() > 0);
+
+    // Nothing moved: same queue, same facts.
+    let after = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"]);
+    assert_eq!(after["data"]["total_open"], queued);
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "show", "Elias", "--kb", "personal", "--diary", "*"],
+    );
+    assert_eq!(
+        v["data"]["historic_count"], 0,
+        "a dry run must not supersede a fact"
+    );
+
+    // And the numbers it printed are the numbers the real run produces.
+    let real = run_json(&mut cmd_in(&tmp), &["facts", "triage"]);
+    assert_eq!(real["data"]["resolved"], dry["data"]["resolved"]);
+    assert_eq!(real["data"]["remaining"], dry["data"]["remaining"]);
+    assert_eq!(
+        real["data"]["resolved_by_rule"],
+        dry["data"]["resolved_by_rule"]
+    );
+}
+
+#[test]
+fn triage_is_idempotent() {
+    let (tmp, _cmd) = with_isolated_home();
+    seed_legacy_backlog(&tmp);
+    let first = run_json(&mut cmd_in(&tmp), &["facts", "triage"]);
+    let remaining = first["data"]["remaining"].as_i64().unwrap();
+    assert!(first["data"]["resolved"].as_i64().unwrap() > 0);
+
+    let second = run_json(&mut cmd_in(&tmp), &["facts", "triage"]);
+    assert_eq!(
+        second["data"]["resolved"], 0,
+        "a re-run must resolve nothing"
+    );
+    assert_eq!(second["data"]["scanned"], remaining);
+    assert_eq!(second["data"]["remaining"], remaining);
+    assert_eq!(second["data"]["facts_superseded"], 0);
+
+    let third = run_json(&mut cmd_in(&tmp), &["facts", "triage", "--dry-run"]);
+    assert_eq!(third["data"]["resolved"], 0);
+}
+
+/// A queue is only reviewable if its shape is visible: grouped by subject and
+/// predicate, with both values and the sentence each came from.
+#[test]
+fn open_conflicts_are_grouped_by_subject_and_predicate_with_sources() {
+    let (tmp, _cmd) = with_isolated_home();
+    seed_legacy_backlog(&tmp);
+    cmd_in(&tmp)
+        .args(["facts", "triage", "--json"])
+        .assert()
+        .success();
+
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"]);
+    let groups = v["data"]["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{groups:?}");
+    let ana = groups
+        .iter()
+        .find(|g| g["subject"] == "Ana")
+        .expect("Ana group");
+    assert_eq!(ana["predicate"], "allergic_to");
+    assert_eq!(ana["safety_slot"], true);
+    assert_eq!(ana["arity"], "single");
+    assert_eq!(ana["conflict_count"], 1);
+    let entry = &ana["conflicts"][0];
+    assert_eq!(entry["triage"]["auto_resolvable"], false);
+    assert_eq!(entry["triage"]["rule"], "safety_slot");
+    assert!(entry["resolve_command"]
+        .as_str()
+        .unwrap()
+        .starts_with("engram facts resolve "));
+    // Both values, and where each came from.
+    let objects = [
+        entry["new"]["object"].as_str().unwrap(),
+        entry["old"]["object"].as_str().unwrap(),
+    ];
+    assert!(objects.contains(&"penicillin") && objects.contains(&"amoxicillin"));
+    assert!(entry["new"]["source_preview"]
+        .as_str()
+        .unwrap()
+        .contains("allergic"));
+    assert!(entry["new"]["source_memory_id"].is_string());
+
+    // A subject filter narrows to one person's backlog, without --open.
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "conflicts", "--subject", "ana"],
+    );
+    assert_eq!(v["data"]["count"], 1);
+    assert_eq!(v["data"]["groups"][0]["subject"], "Ana");
+
+    // The history view advertises the backlog rather than hiding it.
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "conflicts"]);
+    assert_eq!(v["data"]["open_count"], 2);
+    assert!(v["data"]["next_action"].is_string());
+}
+
+/// Triage must respect the scope it was given: another KB's backlog is not
+/// its business.
+#[test]
+fn triage_scopes_to_the_requested_kb() {
+    let (tmp, _cmd) = with_isolated_home();
+    seed_legacy_backlog(&tmp);
+    let before = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"])["data"]
+        ["total_open"]
+        .as_i64()
+        .unwrap();
+
+    let v = run_json(
+        &mut cmd_in(&tmp),
+        &["facts", "triage", "--kb", "unrelated-kb"],
+    );
+    assert_eq!(v["data"]["scanned"], 0);
+    assert_eq!(v["data"]["resolved"], 0);
+    let after = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"])["data"]
+        ["total_open"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(after, before, "another KB's queue must be untouched");
+
+    let v = run_json(&mut cmd_in(&tmp), &["facts", "triage", "--kb", "personal"]);
+    assert!(v["data"]["resolved"].as_i64().unwrap() > 0);
 }
