@@ -34,7 +34,33 @@
 //!    64, 28 and 11 mentions in the real store. The leading word is dropped so
 //!    the mention counts for the human, and — like a greeting — it is NOT kept
 //!    as an alias, because "Partner Rosalie" is nobody's name. Standing alone,
-//!    `Partner`, `Doctor`, `Said` and `Says` are rejected outright.
+//!    `Partner`, `Doctor`, `Said` and `Says` are rejected outright. Gerunds
+//!    (`Reading Lira`) lead a clause exactly like the finite forms and are
+//!    stripped with them.
+//! 8. **A possessive followed by more words names a THING, not a person.**
+//!    `Noemi's Southwark`, `Avi's One Blackfriars`, `Noemi Varkoni's Lipitrex`
+//!    are a flat, a party and a prescription. Only the owner survives, and the
+//!    compound is NOT kept as an alias — it is no spelling of anyone's name.
+//!    (A bare possessive is different: `Elias's` still folds onto `Elias` and
+//!    keeps the written form as an alias — see rule 2.)
+//! 9. **Dates and periods terminate a name.** `Maria Nov-2025`, `Maria
+//!    June-2026`, `Maria Ibiza-period` are a woman plus a timestamp; the
+//!    leading personal-name run is kept and the rest dropped.
+//! 10. **A SHOUTED verb or adverb after a name is emphasis, not a surname.**
+//!     `MARIA RE-INITIATES AGAIN`, `Maria Marenova PERSONALLY ORGANISES`.
+//!     Truncated only on evidence that the caps token is a verb/adverb, or
+//!     that the name in front of it is already complete — real ALL-CAPS
+//!     surnames exist, and a shouted WhatsApp header is a whole name.
+//! 11. **Profile slugs are never names.** `maria-marenova-9398b6108` is a
+//!     LinkedIn URL fragment: hyphenated lowercase words plus an opaque id.
+//!
+//! Rules 8–11 exist because JUNK ENTITIES BLOCK UNIFICATION. The fold that
+//! merges a bare first name into a full name refuses when two full names
+//! compete for it (two Lauras must never fuse), and on the real store
+//! "Maria Ibiza-period" and "Noemi Varkoni's Lipitrex" were exactly such
+//! rival "full names" — which is why "Maria" (431 mentions) never joined
+//! "Maria Marenova" (22), and "Noemi" (119) never joined "Noemi Varkoni"
+//! (54). Deleting the junk is what repairs the merge.
 
 use crate::gazetteer;
 use std::collections::HashSet;
@@ -521,6 +547,13 @@ const FILLER_WORDS: &[&str] = &[
 /// These say nothing about whether what follows is human, so stripping one
 /// does not set [`Canonical::person_hint`]; see [`HUMAN_OBJECT_VERBS`] for the
 /// ones that do.
+///
+/// The `-ing` forms are here for the same reason the finite forms are:
+/// "Reading Lira" opened a WhatsApp line 449 times in the real store and was
+/// typed as a person, because v3 only knew the finite verbs. Gerunds that are
+/// as often a noun modifier ("Meeting Notes", "Booking Reference", "Training
+/// Plan") are deliberately absent — stripping those would invent an entity
+/// called "Notes".
 const LEADING_VERBS: &[&str] = &[
     "said",
     "says",
@@ -567,6 +600,35 @@ const LEADING_VERBS: &[&str] = &[
     "sees",
     "brought",
     "brings",
+    // Gerunds — same clause-opening role, same treatment.
+    "reading",
+    "writing",
+    "sending",
+    "wanting",
+    "needing",
+    "thinking",
+    "feeling",
+    "liking",
+    "loving",
+    "hating",
+    "mentioning",
+    "replying",
+    "confirming",
+    "promising",
+    "suggesting",
+    "offering",
+    "deciding",
+    "forgetting",
+    "seeing",
+    "bringing",
+    "chasing",
+    "collecting",
+    "fetching",
+    "dropping",
+    "picking",
+    "watching",
+    "helping",
+    "reminding",
 ];
 
 /// Verbs whose object is a human by construction ("Told Noemi", "Met Elias",
@@ -605,6 +667,20 @@ const HUMAN_OBJECT_VERBS: &[&str] = &[
     "visits",
     "knows",
     "knew",
+    // Gerunds whose object is still a human ("Telling Noemi", "Calling Avi").
+    "telling",
+    "asking",
+    "texting",
+    "emailing",
+    "messaging",
+    "phoning",
+    "pinging",
+    "thanking",
+    "inviting",
+    "introducing",
+    "visiting",
+    "calling",
+    "congratulating",
 ];
 
 /// Words for a human role or family tie. "Partner Rosalie" is a relationship
@@ -746,6 +822,95 @@ const GREETING_PREFIXES: &[&str] = &[
 /// Second word of a "Good <time>" greeting. "Good" only leads a greeting in
 /// this company, so "Good Health Clinic" is left intact.
 const GOOD_TIMES: &[&str] = &["morning", "afternoon", "evening", "night", "day", "luck"];
+
+/// Nouns that turn the token they end into a span of TIME rather than a name
+/// ("Ibiza-period", "lockdown-era"). Only ever consulted as the tail of a
+/// hyphenated token, so an ordinary word is unaffected.
+const PERIOD_WORDS: &[&str] = &[
+    "period",
+    "periods",
+    "era",
+    "eras",
+    "phase",
+    "phases",
+    "window",
+    "stint",
+    "season",
+    "seasons",
+    "timeframe",
+    "days",
+    "weeks",
+    "months",
+    "years",
+    "decade",
+    "decades",
+];
+
+/// Verbs and adverbs that a writer SHOUTS after a name for emphasis. None of
+/// them is anybody's surname, which is what makes truncating at one safe;
+/// see [`shouted_stop_index`] for the two other, structural triggers.
+const SHOUTED_STOP_WORDS: &[&str] = &[
+    // Adverbs of emphasis
+    "once",
+    "again",
+    "always",
+    "never",
+    "already",
+    "finally",
+    "personally",
+    "officially",
+    "apparently",
+    "urgently",
+    "immediately",
+    "repeatedly",
+    "constantly",
+    "definitely",
+    "absolutely",
+    "seriously",
+    "literally",
+    "actually",
+    "really",
+    // Verbs a chat line shouts about a person
+    "initiate",
+    "initiates",
+    "initiated",
+    "organise",
+    "organises",
+    "organised",
+    "organize",
+    "organizes",
+    "organized",
+    "arrange",
+    "arranges",
+    "arranged",
+    "cancel",
+    "cancels",
+    "cancelled",
+    "canceled",
+    "insists",
+    "insisted",
+    "refuses",
+    "refused",
+    "agrees",
+    "agreed",
+    "demands",
+    "demanded",
+    "promises",
+    "promised",
+    "confirms",
+    "confirmed",
+    "decides",
+    "decided",
+    "wants",
+    "needs",
+    "says",
+    "said",
+];
+
+/// Prefixes that make a hyphenated ALL-CAPS token a VERB ("RE-INITIATES",
+/// "OVER-PROMISES"). Name prefixes — Al-, Ben-, Mc-, O'- — are deliberately
+/// absent, so "AL-FARSI" is never truncated.
+const VERBAL_HYPHEN_PREFIXES: &[&str] = &["re", "un", "over", "under", "out", "mis", "pre"];
 
 /// Suffixes that follow an apostrophe in an English contraction or possessive.
 const CONTRACTION_SUFFIXES: &[&str] = &["s", "m", "re", "ve", "ll", "d", "t"];
@@ -924,6 +1089,142 @@ fn strip_leading_noise(parts: &mut Vec<String>) -> bool {
     }
 }
 
+/// Split a token into its hyphen-separated components, lowercased.
+fn hyphen_parts(token: &str) -> Vec<String> {
+    token
+        .to_ascii_lowercase()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect()
+}
+
+/// A four-digit year (1000–2999). Shorter numbers are left alone so the
+/// phrase interior of "Type 2 Diabetes" is not mistaken for a date.
+fn is_year(token: &str) -> bool {
+    token.len() == 4 && token.chars().all(|c| c.is_ascii_digit()) && token.starts_with(['1', '2'])
+}
+
+/// Does this token stamp a DATE or a PERIOD onto the name in front of it?
+///
+/// "Nov-2025", "June-2026", "Ibiza-period", a bare month, a bare year. Real
+/// hyphenated names ("Jean-Pierre", "Lloyd-Webber") carry neither a year nor a
+/// period noun and are untouched.
+fn is_date_or_period_token(token: &str) -> bool {
+    if is_temporal(token) || is_year(token) {
+        return true;
+    }
+    let parts = hyphen_parts(token);
+    if parts.len() < 2 {
+        return false;
+    }
+    if parts.iter().any(|p| is_temporal(p))
+        && parts
+            .iter()
+            .any(|p| p.chars().all(|c| c.is_ascii_digit()) && p.len() >= 2)
+    {
+        return true;
+    }
+    parts
+        .last()
+        .is_some_and(|last| PERIOD_WORDS.contains(&last.as_str()))
+}
+
+/// Is this token SHOUTED — two or more characters, at least one uppercase
+/// letter, and no lowercase one ("MARIA", "RE-INITIATES")?
+fn is_shouted(token: &str) -> bool {
+    token.chars().count() >= 2
+        && token.chars().any(|c| c.is_uppercase())
+        && !token.chars().any(|c| c.is_lowercase())
+}
+
+/// A LinkedIn/profile URL fragment: hyphenated lowercase words plus an opaque
+/// alphanumeric id ("maria-marenova-9398b6108"). Never a person, never worth a
+/// node.
+///
+/// Three components are required, and one of them must mix letters and digits
+/// over at least five characters — which is what keeps "SARS-CoV-2" and
+/// "HIF-1alpha" out of it.
+fn is_identifier_slug(token: &str) -> bool {
+    let parts = hyphen_parts(token);
+    if parts.len() < 3 {
+        return false;
+    }
+    let word_run = parts
+        .iter()
+        .any(|p| p.chars().count() >= 3 && p.chars().all(|c| c.is_ascii_alphabetic()));
+    let opaque_id = parts.iter().any(|p| {
+        p.chars().count() >= 5
+            && p.chars().any(|c| c.is_ascii_digit())
+            && p.chars().any(|c| c.is_ascii_alphabetic())
+    });
+    word_run && opaque_id
+}
+
+/// Index of the first token that carries a possessive `'s` while MORE tokens
+/// follow it — the shape of a thing that belongs to somebody ("Noemi's
+/// Southwark", "Noemi Varkoni's Lipitrex", "Avi's One Blackfriars").
+///
+/// A possessive on the LAST token is a different animal: "Elias's" is a
+/// spelling of Elias and is handled (with an alias) by the caller.
+fn possessive_owner_end(parts: &[String]) -> Option<usize> {
+    if parts.len() < 2 {
+        return None;
+    }
+    for (idx, token) in parts.iter().enumerate().take(parts.len() - 1) {
+        let Some((stem, suffix)) = split_apostrophe(token) else {
+            continue;
+        };
+        if !suffix.eq_ignore_ascii_case("s") || stem.chars().count() < 2 {
+            continue;
+        }
+        // "It's Friday" is a contraction, not an owner.
+        if is_stopword(stem) || is_filler(stem) {
+            continue;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+/// Index at which a date or period token terminates the name ("Maria
+/// Nov-2025" → 1). Never zero: a candidate that STARTS with a date was
+/// already handled by the standalone-temporal rule.
+fn date_stop_index(parts: &[String]) -> Option<usize> {
+    (1..parts.len()).find(|&idx| is_date_or_period_token(&parts[idx]))
+}
+
+/// Index at which a SHOUTED verb/adverb terminates the name.
+///
+/// Three triggers, in ascending order of how much they assume:
+/// 1. the shouted word is a known verb or adverb ("MARIA ONCE");
+/// 2. it is hyphenated behind a verbal prefix ("MARIA RE-INITIATES") — no
+///    surname is spelled that way;
+/// 3. the name in front of it is a complete, NOT-shouted first+last name
+///    ("Maria Marenova PERSONALLY"). Requiring the prefix to be mixed-case is
+///    what protects a wholly shouted WhatsApp header: "MARIA MARENOVA" stays
+///    one name, and so does "PATRICK ASHCOMB PRUETT".
+fn shouted_stop_index(parts: &[String]) -> Option<usize> {
+    (1..parts.len()).find(|&idx| {
+        let token = &parts[idx];
+        if !is_shouted(token) {
+            return false;
+        }
+        let lower = token.to_ascii_lowercase();
+        if SHOUTED_STOP_WORDS.contains(&lower.as_str()) || is_filler(token) {
+            return true;
+        }
+        let hyphenated = hyphen_parts(token);
+        if hyphenated.len() >= 2
+            && VERBAL_HYPHEN_PREFIXES.contains(&hyphenated[0].as_str())
+            && hyphenated[1].chars().count() >= 3
+        {
+            return true;
+        }
+        idx >= 2 && !parts[..idx].iter().any(|p| is_shouted(p))
+    })
+}
+
 /// Does this token look like one component of a personal name — Title-Case (or
 /// a single initial), and not a word that only ever appears in a contact label?
 fn plausible_name_token(token: &str) -> bool {
@@ -1037,6 +1338,10 @@ pub fn canonicalize_surface(surface: &str) -> Option<Canonical> {
     if parts.is_empty() {
         return None;
     }
+    // A profile slug is not a name in any position.
+    if parts.iter().any(|p| is_identifier_slug(p)) {
+        return None;
+    }
 
     let original = parts.join(" ");
     let mut aliases = Vec::new();
@@ -1061,6 +1366,20 @@ pub fn canonicalize_surface(surface: &str) -> Option<Canonical> {
         }
     }
 
+    // "Noemi's Southwark", "Avi's One Blackfriars", "Noemi Varkoni's Lipitrex"
+    // — a possessive with more words behind it names a FLAT, a PARTY, a
+    // PRESCRIPTION. Keep the owner, drop the rest, and keep no alias: the
+    // compound is not a spelling of her name, and as a rival "full name" it
+    // was blocking the very fold that should have merged her two rows.
+    if let Some(owner_end) = possessive_owner_end(&parts) {
+        parts.truncate(owner_end + 1);
+        if let Some((stem, _)) = split_apostrophe(&parts[owner_end]) {
+            parts[owner_end] = stem.to_string();
+        }
+        // Any alias collected so far spells the compound, not the owner.
+        aliases.clear();
+    }
+
     // "Heyy Elias", "Good morning Noemi", "Partner Rosalie", "Wants Elias" —
     // one capitalized run to the extractor, one piece of noise plus one human
     // to a reader. Strip the prefix so the mention counts for the human. Runs
@@ -1076,6 +1395,18 @@ pub fn canonicalize_surface(surface: &str) -> Option<Canonical> {
         if !aliases.contains(&full) {
             aliases.push(full);
         }
+    }
+
+    // "Maria Nov-2025", "Maria Ibiza-period", "MARIA RE-INITIATES AGAIN",
+    // "Maria Marenova PERSONALLY ORGANISES" — a name plus a timestamp or a
+    // shouted clause. Cut at whichever comes first and keep the name; the
+    // tail is nobody's name, so it is not kept as an alias either.
+    if let Some(stop) = [date_stop_index(&parts), shouted_stop_index(&parts)]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        parts.truncate(stop);
     }
 
     // "Maria Microsoft London Tech" is a contact label: keep "Maria" as the
@@ -1356,6 +1687,153 @@ mod tests {
         let c = canonicalize_surface("Ana Lopez Gym").expect("kept");
         assert_eq!(c.name, "Ana Lopez");
         assert_eq!(c.aliases, vec!["Ana Lopez Gym".to_string()]);
+    }
+
+    /// A possessive with more words behind it names a THING. Every string
+    /// here was a `person` row in the real store, competing with the woman it
+    /// belongs to.
+    #[test]
+    fn a_possessive_compound_resolves_to_its_owner() {
+        for (surface, expected) in [
+            ("Noemi's Southwark", "Noemi"),
+            ("Noemi's June", "Noemi"),
+            ("Noemi Varkoni's Lipitrex", "Noemi Varkoni"),
+            ("Avi's One Blackfriars", "Avi"),
+            ("Avi's Thanksgiving", "Avi"),
+            ("Maria's Nov 2025 Egypt", "Maria"),
+            ("Maria's Egypt-invite PDF", "Maria"),
+        ] {
+            let c = canonicalize_surface(surface).expect("kept");
+            assert_eq!(c.name, expected, "{surface} must resolve to its owner");
+            // The compound is not a spelling of her name.
+            assert!(
+                c.aliases.is_empty(),
+                "{surface} left a junk alias: {:?}",
+                c.aliases
+            );
+        }
+    }
+
+    /// The conservative half: a BARE possessive is still a spelling of its
+    /// owner and still keeps the written form as an alias.
+    #[test]
+    fn a_bare_possessive_still_keeps_its_written_spelling() {
+        let c = canonicalize_surface("Elias's").expect("kept");
+        assert_eq!(c.name, "Elias");
+        assert_eq!(c.aliases, vec!["Elias's".to_string()]);
+        let c = canonicalize_surface("Avi Roy's").expect("kept");
+        assert_eq!(c.name, "Avi Roy");
+        assert_eq!(c.aliases, vec!["Avi Roy's".to_string()]);
+    }
+
+    #[test]
+    fn a_date_or_period_terminates_a_name() {
+        for (surface, expected) in [
+            ("Maria Nov-2025", "Maria"),
+            ("Maria June-2026", "Maria"),
+            ("Maria Ibiza-period", "Maria"),
+            ("Noemi 2025", "Noemi"),
+            ("Avi Roy 2026", "Avi Roy"),
+        ] {
+            let c = canonicalize_surface(surface).expect("kept");
+            assert_eq!(c.name, expected, "{surface} must lose its timestamp");
+            assert!(c.aliases.is_empty(), "{surface}: {:?}", c.aliases);
+        }
+        // A hyphenated name carries neither a year nor a period noun.
+        assert_eq!(
+            canonicalize_surface("Jean-Pierre Dupont").unwrap().name,
+            "Jean-Pierre Dupont"
+        );
+        assert_eq!(
+            canonicalize_surface("Andrew Lloyd-Webber").unwrap().name,
+            "Andrew Lloyd-Webber"
+        );
+        // An interior number that binds a phrase is not a date.
+        assert_eq!(
+            canonicalize_surface("Type 2 Diabetes").unwrap().name,
+            "Type 2 Diabetes"
+        );
+    }
+
+    #[test]
+    fn a_shouted_verb_after_a_name_is_not_a_surname() {
+        for (surface, expected) in [
+            ("MARIA RE-INITIATES AGAIN", "MARIA"),
+            ("MARIA RE-INITIATED", "MARIA"),
+            ("Maria Marenova PERSONALLY ORGANISES", "Maria Marenova"),
+            ("Maria ONCE", "Maria"),
+            ("Noemi CONFIRMED", "Noemi"),
+        ] {
+            let c = canonicalize_surface(surface).expect("kept");
+            assert_eq!(c.name, expected, "{surface} must lose the shouted clause");
+            assert!(c.aliases.is_empty(), "{surface}: {:?}", c.aliases);
+        }
+    }
+
+    /// SAFETY: a WhatsApp export shouts the whole contact name, and ALL-CAPS
+    /// surnames are real. Truncating those would split a person in two.
+    #[test]
+    fn a_wholly_shouted_name_survives_intact() {
+        for shouted in [
+            "MARIA MARENOVA",
+            "PATRICK ASHCOMB PRUETT",
+            "NOEMI VARKONI",
+            "AHMED AL-FARSI",
+            "JISOO PARK",
+        ] {
+            assert_eq!(
+                canonicalize_surface(shouted).map(|c| c.name),
+                Some(shouted.to_string()),
+                "{shouted} is a name, not a name plus a verb"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_slug_is_never_an_entity() {
+        for slug in [
+            "maria-marenova-9398b6108",
+            "noemi-varkoni-4b21ff903",
+            "avi-roy-7ab29c114",
+        ] {
+            assert!(
+                canonicalize_surface(slug).is_none(),
+                "{slug} is a URL fragment, not a person"
+            );
+        }
+        // …and the hyphenated domain terms that look a little like one live.
+        for term in ["SARS-CoV-2", "HIF-1alpha", "IL-6", "COVID-19"] {
+            assert_eq!(
+                canonicalize_surface(term).map(|c| c.name),
+                Some(term.to_string()),
+                "{term} must survive the slug filter"
+            );
+        }
+    }
+
+    /// v3 stripped the finite verbs; the gerunds walked straight past it, and
+    /// "Reading Lira" was a 449-mention `person` in the real store.
+    #[test]
+    fn a_gerund_folds_into_the_name_behind_it() {
+        for (surface, expected) in [
+            ("Reading Lira", "Lira"),
+            ("Calling Noemi", "Noemi"),
+            ("Telling Avi Roy", "Avi Roy"),
+            ("Chasing Elias", "Elias"),
+            ("Thanking Maria Marenova", "Maria Marenova"),
+        ] {
+            let c = canonicalize_surface(surface).expect("kept");
+            assert_eq!(c.name, expected, "{surface} must fold onto {expected}");
+            assert!(
+                c.aliases.is_empty(),
+                "{surface} left a junk alias: {:?}",
+                c.aliases
+            );
+        }
+        // A gerund with a human object is itself the evidence; a plain one
+        // says nothing about what follows.
+        assert!(canonicalize_surface("Calling Noemi").unwrap().person_hint);
+        assert!(!canonicalize_surface("Reading Lira").unwrap().person_hint);
     }
 
     #[test]
