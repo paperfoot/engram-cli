@@ -24,7 +24,8 @@
 use crate::extract::{candidates, Phrase, Token};
 use crate::gazetteer;
 use crate::hygiene::{self, Canonical};
-use std::collections::HashMap;
+use engram_core::names;
+use std::collections::{BTreeMap, HashMap};
 
 /// Entity kind stored in `entities.kind`.
 pub const KIND_PERSON: &str = "person";
@@ -372,6 +373,13 @@ fn is_non_person_word(lower: &str) -> bool {
 }
 
 /// Does this token look like one component of a human name?
+///
+/// A double-barrelled surname and an Irish one are COMPOUNDS: "Brandtke-Wendel"
+/// and "O'Brien" each carry an interior capital, which the flat Title-Case test
+/// this used to be read as an acronym. So "Rosalie Brandtke-Wendel" was typed
+/// `concept`, was never a fold candidate, and "Rosalie" (65 mentions) stayed a
+/// bare first name forever. Each hyphen/apostrophe-separated piece is therefore
+/// tested on its own.
 fn name_token(token: &str) -> bool {
     let lower = token.to_lowercase();
     if NAME_PARTICLES.contains(&lower.as_str()) {
@@ -386,24 +394,33 @@ fn name_token(token: &str) -> bool {
     if is_non_person_word(&lower) || hygiene::is_stopword(token) || hygiene::is_temporal(token) {
         return false;
     }
-    let mut chars = token.chars();
+    // A digit anywhere makes it a symbol, not a name ("SARS-CoV-2", "IL-6").
+    if token.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut segments = token
+        .split(['-', '\'', '\u{2019}'])
+        .filter(|s| !s.is_empty())
+        .peekable();
+    segments.peek().is_some() && segments.all(name_segment)
+}
+
+/// One hyphen- or apostrophe-separated piece of a name token.
+///
+/// Title-Case, a single initial ("J"), or a lowercase particle ("van", "de").
+/// An ALL-CAPS piece is an acronym, not a given name — which is what keeps
+/// `looks_like_person_name` refusing a shouted spelling, the refusal
+/// [`as_written_name`] exists to work around.
+fn name_segment(segment: &str) -> bool {
+    let lower = segment.to_lowercase();
+    if NAME_PARTICLES.contains(&lower.as_str()) {
+        return true;
+    }
+    let mut chars = segment.chars();
     let Some(first) = chars.next() else {
         return false;
     };
-    if !first.is_uppercase() {
-        return false;
-    }
-    // A single initial ("J") is fine; anything longer must be Title-Case
-    // (an ALL-CAPS token is an acronym, not a given name).
-    let rest: Vec<char> = chars.collect();
-    if rest.is_empty() {
-        return true;
-    }
-    if rest.iter().any(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    rest.iter()
-        .all(|c| c.is_lowercase() || *c == '\'' || *c == '-' || *c == '.')
+    first.is_uppercase() && chars.all(|c| c.is_lowercase() || c == '.')
 }
 
 /// Could `name` be a human name at all (before context is considered)?
@@ -602,6 +619,10 @@ impl Extraction {
 pub struct PersonIndex {
     /// Case-folded key → the spelling the KB should display.
     display: HashMap<String, String>,
+    /// A full name that is a shorter or differently-accented writing of
+    /// ANOTHER full name → the key of the fullest one. "Patrick Pruett" →
+    /// "Patrick Ashcomb Pruett", "Francisco Ferro" → "Francisco Ferró Oliver".
+    variants: HashMap<String, String>,
     /// First name → the full-name keys starting with it, sorted. Two entries
     /// under one first name is the ambiguity that blocks every fold.
     by_first_name: HashMap<String, Vec<String>>,
@@ -673,6 +694,14 @@ impl PersonIndex {
             .collect();
         full_names.sort();
 
+        // ONE PERSON PER FULL NAME, before anything folds into one. "Patrick
+        // Pruett" and "Patrick Ashcomb Pruett" are one man, and while both
+        // stand they are two rival full names under one first name — so the
+        // bare "Patrick" (18 mentions) folded into neither. Collapse them
+        // first; the survivors are what the inverted indexes below see.
+        let variants = variant_targets(&full_names);
+        full_names.retain(|key| !variants.contains_key(key));
+
         // Inverted indexes, so a chunk pays a hash lookup per bare name rather
         // than a scan of every person in the KB.
         let mut by_first_name: HashMap<String, Vec<String>> = HashMap::new();
@@ -694,6 +723,7 @@ impl PersonIndex {
         }
         Self {
             display,
+            variants,
             by_first_name,
             by_part,
         }
@@ -740,6 +770,18 @@ impl PersonIndex {
         (any.len() == 1).then(|| any.into_iter().next().unwrap_or_default())
     }
 
+    /// The fullest spelling of a full name that is a shorter or
+    /// differently-accented writing of another one, as a case-folded key.
+    fn variant_target(&self, key: &str) -> Option<String> {
+        self.variants.get(key).cloned()
+    }
+
+    /// Resolve one case-folded key to the person it belongs to, following a
+    /// full-name variant when there is one.
+    fn canonical_key(&self, key: &str) -> String {
+        self.variant_target(key).unwrap_or_else(|| key.to_string())
+    }
+
     /// The spelling this KB should display for `name`.
     ///
     /// Folds case variants: a WhatsApp export that shouts "MARIA MARENOVA"
@@ -755,6 +797,97 @@ impl PersonIndex {
     fn name_for_key(&self, key: &str) -> Option<&str> {
         self.display.get(key).map(|s| s.as_str())
     }
+}
+
+/// Which of two equally-folded spellings of a name to keep: the one that still
+/// carries its diacritics. "Francisco Ferró" is how he writes it; "Francisco
+/// Ferro" is what a keyboard without the accent produced.
+fn accent_rank(key: &str) -> u8 {
+    u8::from(key == names::accent_fold(key))
+}
+
+/// Full names that are two spellings, or two lengths, of ONE person.
+///
+/// Returns each redundant full-name key mapped to the key of the fullest
+/// spelling of that person. Two rules, applied in order:
+///
+/// 1. **Accent variants are one name.** `francisco ferro` and `francisco
+///    ferró` fold to the same accent-stripped key; the accented spelling is
+///    kept, because that is how the man writes it.
+/// 2. **A fuller spelling absorbs a shorter one.** `patrick pruett` is
+///    `patrick ashcomb pruett` with the middle name left out, and `ming su` is
+///    `ming su lim` with the surname left out — every token in order, plus
+///    more (see [`names::is_fuller_name`]).
+///
+/// SAFETY — rule 2 keeps the ambiguity guard that keeps two Lauras apart, in
+/// the form it takes for full names: a name yields only when exactly one
+/// person can claim it. Where several fuller names compete they must form a
+/// CHAIN (`A B` ⊂ `A B C` ⊂ `A B C D`, one person written out by degrees);
+/// a FORK (`Maria Lopez` under both `Maria Lopez Garcia` and `Maria Lopez
+/// Fernandez`) is two people who share two names, and nothing merges.
+fn variant_targets(full_names: &[String]) -> HashMap<String, String> {
+    let mut merged: HashMap<String, String> = HashMap::new();
+
+    // 1 — accent variants. BTreeMap so the grouping order never depends on
+    // hashing and a KB compiles to the same graph on every run.
+    let mut by_fold: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for key in full_names {
+        by_fold
+            .entry(names::accent_fold(key))
+            .or_default()
+            .push(key.clone());
+    }
+    let mut representatives: Vec<String> = Vec::new();
+    for (_, mut group) in by_fold {
+        group.sort_by(|a, b| accent_rank(a).cmp(&accent_rank(b)).then_with(|| a.cmp(b)));
+        let Some((keep, rest)) = group.split_first() else {
+            continue;
+        };
+        for key in rest {
+            merged.insert(key.clone(), keep.clone());
+        }
+        representatives.push(keep.clone());
+    }
+    representatives.sort();
+
+    // 2 — a fuller spelling of the same name.
+    for short in &representatives {
+        let mut fuller: Vec<&String> = representatives
+            .iter()
+            .filter(|long| names::is_fuller_name(short, long))
+            .collect();
+        fuller.sort_by_key(|k| (k.split(' ').count(), (*k).clone()));
+        let Some(fullest) = fuller.last().copied() else {
+            continue;
+        };
+        // A chain collapses onto its longest link; a fork stays two people.
+        if fuller
+            .iter()
+            .all(|c| *c == fullest || names::is_fuller_name(c, fullest))
+        {
+            merged.insert(short.clone(), fullest.clone());
+        }
+    }
+
+    // Follow the chains: "francisco ferro" → "francisco ferró" → "francisco
+    // ferró oliver". Every hop either drops an accent variant or adds a token,
+    // so the walk cannot cycle; the bound is belt-and-braces.
+    let keys: Vec<String> = merged.keys().cloned().collect();
+    for key in keys {
+        let mut target = merged[&key].clone();
+        for _ in 0..representatives.len() {
+            match merged.get(&target) {
+                Some(next) if *next != target => target = next.clone(),
+                _ => break,
+            }
+        }
+        if target == key {
+            merged.remove(&key);
+        } else {
+            merged.insert(key, target);
+        }
+    }
+    merged
 }
 
 /// How badly a spelling reads as a written name: SHOUTED tokens first ("MARIA
@@ -1089,27 +1222,38 @@ pub fn analyze_with_index(text: &str, index: &PersonIndex) -> Extraction {
     // knows, which is what makes the fold work across chunks — and what makes
     // the ambiguity test honest: two Lauras anywhere in the KB block the fold
     // in every chunk, including the ones that mention only one of them.
+    // Each local full name is named by the person it belongs to, not by the
+    // spelling this chunk happened to use: a chunk that writes "Patrick
+    // Pruett" must not make "Patrick" ambiguous against the KB's "Patrick
+    // Ashcomb Pruett", because those are the same man.
     let local_full: Vec<String> = acc
         .values()
         .filter(|a| a.kind == KIND_PERSON && a.name.split_whitespace().count() >= 2)
-        .map(|a| hygiene::dedup_key(&a.name))
+        .map(|a| index.canonical_key(&hygiene::dedup_key(&a.name)))
         .collect();
 
     let mut merge_order: Vec<(String, String)> = Vec::new();
     for (key, entry) in acc.iter() {
-        if entry.name.split_whitespace().count() != 1 {
-            continue;
-        }
         if entry.kind == KIND_ORGANIZATION || entry.kind == KIND_GENE_OR_PROTEIN {
             continue;
         }
-        // A place or a creed never folds into a person, whatever it resembles.
-        // The test reads a shouted spelling as the name it is, so "MARIA:" is
-        // eligible for the same fold as "Maria".
-        if !looks_like_person_name(&as_written_name(&entry.name)) {
-            continue;
-        }
-        if let Some(full) = index.fold_target(key, &local_full) {
+        let target = if entry.name.split_whitespace().count() == 1 {
+            // A place or a creed never folds into a person, whatever it
+            // resembles. The test reads a shouted spelling as the name it is,
+            // so "MARIA:" is eligible for the same fold as "Maria".
+            if !looks_like_person_name(&as_written_name(&entry.name)) {
+                continue;
+            }
+            index.fold_target(key, &local_full)
+        } else {
+            // A full name that is a shorter or differently-accented writing of
+            // another full name is the same person: "Patrick Pruett" into
+            // "Patrick Ashcomb Pruett", "Francisco Ferro" into "Francisco
+            // Ferró Oliver". This verdict is KB-wide by construction — one
+            // chunk cannot know which other spellings exist.
+            index.variant_target(key)
+        };
+        if let Some(full) = target.filter(|full| full != key) {
             merge_order.push((key.clone(), full));
         }
     }
@@ -1890,6 +2034,222 @@ mod tests {
         // The human owns the canonical slot in the chunk that describes her.
         let ex = analyze_with_index(chunks[1], &index);
         assert_eq!(ex.kind_of("Lira"), Some(KIND_PERSON));
+    }
+
+    /// A double-barrelled surname carries an interior capital, which the flat
+    /// Title-Case token test read as an acronym. "Rosalie Brandtke-Wendel" was
+    /// therefore typed `concept`, was never a fold candidate, and "Rosalie"
+    /// (65 mentions in the real store) stayed a bare first name.
+    #[test]
+    fn a_compound_surname_is_still_a_person() {
+        let k = kinds(
+            "Rosalie Brandtke-Wendel sent the tenancy paperwork. Jean-Pierre Dupont replied. \
+             Andrew Lloyd-Webber called about the score. Sinead O'Brien joined the board.",
+        );
+        for person in [
+            "Rosalie Brandtke-Wendel",
+            "Jean-Pierre Dupont",
+            "Andrew Lloyd-Webber",
+            "Sinead O'Brien",
+        ] {
+            assert_eq!(
+                k.get(person).copied(),
+                Some(KIND_PERSON),
+                "{person} must be a person: {k:?}"
+            );
+        }
+        // …and the hyphenated things that are NOT names stay out.
+        let k = kinds("SARS-CoV-2 and IL-6 rose. New York was cold.");
+        for junk in ["SARS-CoV-2", "IL-6", "New York"] {
+            assert_ne!(k.get(junk).copied(), Some(KIND_PERSON), "{junk}: {k:?}");
+        }
+    }
+
+    /// The bare first name only folds when ONE full name can claim it, and
+    /// "Patrick Pruett" and "Patrick Ashcomb Pruett" were two — so "Patrick"
+    /// (18 mentions) joined neither, and one man held two rows.
+    #[test]
+    fn a_middle_name_is_not_a_different_man() {
+        let chunks = [
+            "Patrick Pruett asked about the raise and he sounded positive.",
+            "Patrick Ashcomb Pruett signed the term sheet on Tuesday.",
+            "Patrick texted me about dinner on Sunday.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+
+        for chunk in &chunks {
+            let ex = analyze_with_index(chunk, &index);
+            assert!(
+                ex.entities
+                    .iter()
+                    .any(|e| e.name == "Patrick Ashcomb Pruett"),
+                "every spelling must resolve to the fullest name: {:?}",
+                ex.entities
+            );
+            for rival in ["Patrick", "Patrick Pruett"] {
+                assert!(
+                    !ex.entities.iter().any(|e| e.name == rival),
+                    "{rival} stood up its own node: {:?}",
+                    ex.entities
+                );
+            }
+        }
+        let short = analyze_with_index(chunks[0], &index);
+        let patrick = short
+            .entities
+            .iter()
+            .find(|e| e.name == "Patrick Ashcomb Pruett")
+            .expect("the fullest name owns the node");
+        assert_eq!(patrick.kind, KIND_PERSON);
+        assert!(
+            patrick.aliases.contains(&"Patrick Pruett".to_string()),
+            "the shorter spelling must stay resolvable: {:?}",
+            patrick.aliases
+        );
+    }
+
+    /// One man, two keyboards. "Francisco Ferro", "Francisco Ferró" and
+    /// "Francisco Ferró Oliver" were three person rows, and three rival full
+    /// names under one first name — so "Francisco" (42) folded into none.
+    #[test]
+    fn an_accent_is_not_a_different_man() {
+        let chunks = [
+            "Francisco Ferro wrote back about the Barcelona flat.",
+            "Francisco Ferró is my friend from the Madrid trip.",
+            "Francisco Ferró Oliver was copied on the same email thread.",
+            "I called Francisco this morning about the paperwork.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+
+        for chunk in &chunks {
+            let ex = analyze_with_index(chunk, &index);
+            assert!(
+                ex.entities
+                    .iter()
+                    .any(|e| e.name == "Francisco Ferró Oliver"),
+                "every spelling must resolve to the one man: {:?}",
+                ex.entities
+            );
+        }
+        // The unaccented spelling is kept as a spelling, never as a person.
+        let ascii = analyze_with_index(chunks[0], &index);
+        let francisco = ascii
+            .entities
+            .iter()
+            .find(|e| e.name == "Francisco Ferró Oliver")
+            .expect("the accented, fullest name owns the node");
+        assert!(
+            francisco
+                .aliases
+                .contains(&"Francisco Ferro".to_string()),
+            "the unaccented spelling must stay resolvable: {:?}",
+            francisco.aliases
+        );
+    }
+
+    /// SAFETY, the full-name form of the two-Lauras rule: a shorter name that
+    /// TWO fuller names could claim belongs to neither. Spanish double
+    /// surnames are the everyday case — Maria Lopez Garcia and Maria Lopez
+    /// Fernandez are two women, not one written out twice.
+    #[test]
+    fn a_name_two_fuller_names_could_claim_merges_into_neither() {
+        let chunks = [
+            "Maria Lopez Garcia is my colleague and she reviewed the deck.",
+            "Maria Lopez Fernandez is my dentist and she called back.",
+            "Maria Lopez sent the invoice this morning.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+
+        for (chunk, expected) in chunks.iter().zip([
+            "Maria Lopez Garcia",
+            "Maria Lopez Fernandez",
+            "Maria Lopez",
+        ]) {
+            let ex = analyze_with_index(chunk, &index);
+            assert!(
+                ex.entities.iter().any(|e| e.name == expected),
+                "{expected} was fused away: {:?}",
+                ex.entities
+            );
+            for person in &ex.entities {
+                assert!(
+                    !person.aliases.iter().any(|a| a == "Maria Lopez")
+                        || person.name == "Maria Lopez",
+                    "{} absorbed the ambiguous name: {:?}",
+                    person.name,
+                    person.aliases
+                );
+            }
+        }
+    }
+
+    /// A CV section heading makes a second person-typed "full name" under one
+    /// first name, which is the ambiguity that blocked the fold: "Avi" (60
+    /// mentions) never joined "Avi Roy" (22) while "Avi Roy Professional
+    /// Background" stood beside it.
+    #[test]
+    fn a_heading_full_name_no_longer_blocks_the_fold() {
+        let chunks = [
+            "Avi Roy Professional Background is the section I pasted out of his CV.",
+            "Avi Roy runs the longevity fund and he called about the raise.",
+            "Avi is a friend from the longevity circuit and he called today.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+
+        for chunk in &chunks {
+            let ex = analyze_with_index(chunk, &index);
+            assert!(
+                !ex.entities
+                    .iter()
+                    .any(|e| e.name == "Avi Roy Professional Background"),
+                "the heading survived: {:?}",
+                ex.entities
+            );
+        }
+        let bare = analyze_with_index(chunks[2], &index);
+        let avi = bare
+            .entities
+            .iter()
+            .find(|e| e.name == "Avi Roy")
+            .unwrap_or_else(|| panic!("Avi did not fold into Avi Roy: {:?}", bare.entities));
+        assert_eq!(avi.kind, KIND_PERSON);
+        assert!(avi.aliases.contains(&"Avi".to_string()));
+    }
+
+    /// The variant merge must not drift between runs: it is built from a
+    /// HashMap of kinds, so the grouping is sorted before anything collapses.
+    #[test]
+    fn variant_merging_is_deterministic() {
+        let chunks = [
+            "Patrick Pruett asked about the raise.",
+            "Patrick Ashcomb Pruett signed the term sheet.",
+            "Francisco Ferro wrote back about the flat.",
+            "Francisco Ferró Oliver was copied on the thread.",
+            "Ming Su Lim is my colleague and she reviewed the deck.",
+            "Ming Su sent the revised deck this afternoon.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+        for chunk in &chunks {
+            let a = analyze_with_index(chunk, &index);
+            let b = analyze_with_index(chunk, &index);
+            assert_eq!(
+                a.entities.iter().map(|e| &e.name).collect::<Vec<_>>(),
+                b.entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+        }
+        // A two-token given name plus a surname is the same shape as a middle
+        // name, and merges the same way.
+        let ex = analyze_with_index(chunks[5], &index);
+        assert!(
+            ex.entities.iter().any(|e| e.name == "Ming Su Lim"),
+            "{:?}",
+            ex.entities
+        );
     }
 
     #[test]
