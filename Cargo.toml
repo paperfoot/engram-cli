@@ -83,6 +83,9 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # Numeric
 ordered-float = { version = "4", features = ["serde"] }
 
+# Text — accent folding for name comparison keys (display is never rewritten)
+unicode-normalization = "0.1"
+
 [profile.release]
 lto = true
 codegen-units = 1

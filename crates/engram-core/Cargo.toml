@@ -17,5 +17,6 @@ thiserror.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 ordered-float.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
