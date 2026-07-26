@@ -5130,3 +5130,354 @@ fn hygiene_v3_recompile_is_stable() {
         "recompiling must converge, not drift"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ENTITY HYGIENE v4 — the junk that BLOCKED unification.
+//
+// v3 fixed the fold and the storage merge, and on the real 737-person store
+// neither fired: "Noemi" (119 mentions) still sat beside "Noemi Varkoni" (54),
+// "Maria" (431) beside "Maria Marenova" (22). The fold rule was right — it
+// refuses when two full names compete for one first name, which is the rule
+// that keeps two Lauras apart — but the KB was full of junk that LOOKED like
+// a competing full name:
+//
+//   Maria Ibiza-period · Maria Nov-2025 · Maria's Nov 2025 Egypt
+//   MARIA RE-INITIATES AGAIN · Maria Marenova PERSONALLY ORGANISES
+//   Noemi Varkoni's Lipitrex · Noemi's Southwark · maria-marenova-9398b6108
+//
+// Two had gone further and taken the canonical slot off the human: "Reading
+// Lira" (449 mentions, aliases Lira/Lira's) and "Avi's One Blackfriars" (58,
+// aliases Avi/Avi's) — the bare name folded INTO the junk, because the junk
+// was the only "full name" carrying it.
+//
+// Measured on this fixture BEFORE: 29 entities, of which 15 were junk rows (5
+// of them person-typed) plus one junk alias, with Maria split 3/1 across two
+// rows and Noemi 1/1. AFTER: 13 entities, no junk, one row each.
+// ---------------------------------------------------------------------------
+
+/// WhatsApp-shaped one-liners, one memory each, so the bare first names land
+/// in chunks that never see the full name and unification has to work KB-wide.
+const HYGIENE_V4_FIXTURE: &[&str] = &[
+    "MARIA: call me back when you get a chance about the Egypt trip.",
+    "Maria cooked dinner tonight and it was completely excellent.",
+    "Maria Microsoft London Tech sent the signed invoice over this morning.",
+    "Maria Marenova is my partner and we have lived together for years.",
+    "MARIA RE-INITIATES AGAIN on the Egypt plan and wants an answer.",
+    "MARIA RE-INITIATED the visa paperwork thread with the agency.",
+    "Maria Marenova PERSONALLY ORGANISES the whole trip every single year.",
+    "Maria ONCE told me she never wanted to fly on a Monday again.",
+    "Maria Nov-2025 receipts are still sitting in the shared folder.",
+    "Maria June-2026 flights were booked on the cheaper airline.",
+    "Maria Ibiza-period photos were finally uploaded to the album.",
+    "Maria's Nov 2025 Egypt itinerary landed in my inbox last night.",
+    "Maria's Egypt-invite PDF is attached to the same email thread.",
+    "Her LinkedIn is maria-marenova-9398b6108 if you want to connect.",
+    "Noemi sent the deck this morning and she was thrilled with it.",
+    "Noemi Varkoni introduced me to my friend Avi at the Longevity Summit.",
+    "Noemi's Southwark flat viewing is booked for Tuesday afternoon.",
+    "Noemi's June was busy with three separate shoots in one week.",
+    "Noemi Varkoni's Lipitrex prescription was renewed by the clinic.",
+    "Reading Lira a bedtime story is the best part of my whole day.",
+    "Lira is my daughter and she turned four in the spring.",
+    "Avi's One Blackfriars party was packed with the fund crowd.",
+    "Avi's Thanksgiving dinner ran until two in the morning.",
+    "Avi is a friend from the longevity circuit and he called today.",
+    "Laura Corvo is a good friend from the Barcelona trip last year.",
+    "Laura Quiroz is someone I met through a dating app in October.",
+    "Laura texted me about dinner and asked to move it to Sunday.",
+    "Jisoo Park is my colleague and Jordan Peterson wrote back today.",
+];
+
+/// Every junk surface the fixture writes. None of them names a human.
+const HYGIENE_V4_JUNK: &[&str] = &[
+    "Maria Ibiza-period",
+    "Maria Nov-2025",
+    "Maria June-2026",
+    "Maria ONCE",
+    "Maria's Nov 2025 Egypt",
+    "Maria's Egypt-invite PDF",
+    "MARIA RE-INITIATES AGAIN",
+    "MARIA RE-INITIATED",
+    "Maria Marenova PERSONALLY ORGANISES",
+    "maria-marenova-9398b6108",
+    "Noemi's Southwark",
+    "Noemi's June",
+    "Noemi Varkoni's Lipitrex",
+    "Reading Lira",
+    "Avi's One Blackfriars",
+    "Avi's Thanksgiving",
+];
+
+fn hygiene_v4_kb() -> tempfile::TempDir {
+    let (tmp, _) = with_isolated_home();
+    for line in HYGIENE_V4_FIXTURE {
+        cmd_in(&tmp)
+            .args([
+                "remember",
+                line,
+                "--kb",
+                "hygiene4",
+                "--no-extract-facts",
+                "--json",
+            ])
+            .assert()
+            .success();
+    }
+    json_cmd(&tmp, &["compile", "--kb", "hygiene4", "--all"]);
+    tmp
+}
+
+/// Every entity in the KB as (canonical_name, kind, mention_count, aliases).
+fn hygiene_v4_entities(tmp: &tempfile::TempDir) -> Vec<(String, String, u64, Vec<String>)> {
+    let v = json_cmd(
+        tmp,
+        &["entities", "list", "--kb", "hygiene4", "--limit", "500"],
+    );
+    v["data"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["canonical_name"].as_str().unwrap_or("").to_string(),
+                e["kind"].as_str().unwrap_or("").to_string(),
+                e["mention_count"].as_u64().unwrap_or(0),
+                e["aliases"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn possessives_dates_shouts_and_slugs_never_reach_the_entity_layer() {
+    let tmp = hygiene_v4_kb();
+    let entities = hygiene_v4_entities(&tmp);
+    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
+
+    for junk in HYGIENE_V4_JUNK {
+        assert!(
+            !names.iter().any(|n| n.eq_ignore_ascii_case(junk)),
+            "junk entity {junk} survived: {names:?}"
+        );
+    }
+    // Nor as a spelling of anybody: none of it is a name.
+    for (name, _, _, aliases) in &entities {
+        for junk in HYGIENE_V4_JUNK {
+            assert!(
+                !aliases.iter().any(|a| a.eq_ignore_ascii_case(junk)),
+                "{name} kept junk alias {junk}: {aliases:?}"
+            );
+        }
+    }
+    // No person may carry a possessive or a digit: both mean the surface named
+    // a thing, not a human.
+    for (name, kind, ..) in &entities {
+        if kind != "person" {
+            continue;
+        }
+        assert!(
+            !name.contains('\'') && !name.chars().any(|c| c.is_ascii_digit()),
+            "{name} is not a human name"
+        );
+    }
+}
+
+#[test]
+fn the_junk_that_blocked_unification_is_gone_and_the_names_merge() {
+    let tmp = hygiene_v4_kb();
+    let entities = hygiene_v4_entities(&tmp);
+
+    // ONE row per woman, canonicalised to the name that identifies her, with
+    // every spelling's mentions summed onto it. Both stayed split on the real
+    // store for exactly as long as the junk existed.
+    for (bare, full, expected_mentions) in [
+        ("Maria", "Maria Marenova", 13),
+        ("Noemi", "Noemi Varkoni", 5),
+    ] {
+        let matching: Vec<&(String, String, u64, Vec<String>)> = entities
+            .iter()
+            .filter(|(n, ..)| n.to_lowercase().starts_with(&bare.to_lowercase()))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{bare}/{full} must collapse to one entity, got {matching:?}"
+        );
+        let (name, kind, mentions, aliases) = matching[0];
+        assert_eq!(name, full, "the full name must win the canonical slot");
+        assert_eq!(kind, "person");
+        assert_eq!(
+            *mentions, expected_mentions,
+            "mentions from every spelling must be summed: {matching:?}"
+        );
+        assert!(
+            aliases.iter().any(|a| a == bare),
+            "the bare form must stay resolvable: {aliases:?}"
+        );
+    }
+    // …and the messaging-app contact label resolves to her too.
+    let maria = entities
+        .iter()
+        .find(|(n, ..)| n == "Maria Marenova")
+        .expect("Maria Marenova");
+    assert!(
+        maria.3.iter().any(|a| a == "Maria Microsoft London Tech"),
+        "the contact label must resolve to her: {:?}",
+        maria.3
+    );
+    for spelling in ["Maria", "Maria Marenova", "Maria Microsoft London Tech"] {
+        let v = json_cmd(&tmp, &["people", "show", spelling, "--kb", "hygiene4"]);
+        assert_eq!(
+            v["data"]["person"]["name"], "Maria Marenova",
+            "{spelling} resolved elsewhere"
+        );
+    }
+}
+
+#[test]
+fn a_junk_compound_never_owns_the_canonical_slot_of_the_human_inside_it() {
+    let tmp = hygiene_v4_kb();
+    let entities = hygiene_v4_entities(&tmp);
+
+    // The four hijack surfaces resolve to the real human, who owns her own
+    // canonical slot and counts the mentions the junk had taken.
+    for (human, expected_mentions, surfaces) in [
+        ("Lira", 2u64, vec!["Reading Lira"]),
+        (
+            "Avi",
+            4,
+            vec!["Avi's One Blackfriars", "Avi's Thanksgiving"],
+        ),
+        (
+            "Noemi Varkoni",
+            5,
+            vec!["Noemi's Southwark", "Noemi Varkoni's Lipitrex"],
+        ),
+        (
+            "Maria Marenova",
+            13,
+            vec!["Maria's Nov 2025 Egypt", "Maria's Egypt-invite PDF"],
+        ),
+    ] {
+        let (name, kind, mentions, _) = entities
+            .iter()
+            .find(|(n, ..)| n == human)
+            .unwrap_or_else(|| panic!("{human} missing: {entities:?}"));
+        assert_eq!(kind, "person", "{name} must be the human, not a thing");
+        assert_eq!(
+            *mentions, expected_mentions,
+            "{name} must keep the mentions the junk had taken"
+        );
+        for surface in surfaces {
+            assert!(
+                !entities.iter().any(|(n, ..)| n == surface),
+                "{surface} still stands as its own row"
+            );
+        }
+    }
+}
+
+#[test]
+fn hygiene_v4_keeps_the_two_lauras_apart() {
+    let tmp = hygiene_v4_kb();
+    let entities = hygiene_v4_entities(&tmp);
+    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
+    for real in [
+        "Laura Corvo",
+        "Laura Quiroz",
+        "Jisoo Park",
+        "Jordan Peterson",
+    ] {
+        assert!(names.contains(&real), "{real} was lost: {names:?}");
+    }
+    // The shared first name belongs to neither of them.
+    for (name, _, _, aliases) in &entities {
+        if name.starts_with("Laura ") {
+            assert!(
+                !aliases.iter().any(|a| a == "Laura"),
+                "{name} absorbed the ambiguous bare name: {aliases:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hygiene_v4_recompile_is_stable() {
+    let tmp = hygiene_v4_kb();
+    let before = hygiene_v4_entities(&tmp);
+    json_cmd(&tmp, &["compile", "--kb", "hygiene4", "--all"]);
+    json_cmd(&tmp, &["compile", "--kb", "hygiene4", "--all"]);
+    let after = hygiene_v4_entities(&tmp);
+
+    let fingerprint = |rows: &[(String, String, u64, Vec<String>)]| -> Vec<String> {
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|(name, kind, mentions, aliases)| {
+                let mut aliases = aliases.clone();
+                aliases.sort();
+                format!("{name}|{kind}|{mentions}|{}", aliases.join(","))
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        fingerprint(&before),
+        fingerprint(&after),
+        "recompiling v4 must converge, not drift"
+    );
+}
+
+/// The wiki index and its entity pages are the compiler's only human-readable
+/// output, and both were ordered ALPHABETICALLY: `.rev()` on a name-keyed
+/// BTreeMap took the last 25 names as "Top entities", `.take(50)` the first 50
+/// for page creation. On this fixture that led with Lira (2 mentions) and left
+/// the woman mentioned 13 times at the bottom of the list.
+#[test]
+fn the_wiki_ranks_entities_by_mentions_not_by_spelling() {
+    let tmp = hygiene_v4_kb();
+    let index = json_cmd(&tmp, &["wiki", "index.md", "--kb", "hygiene4"]);
+    let body = index["data"]["page"]["content"]
+        .as_str()
+        .expect("index page content")
+        .to_string();
+
+    let top: Vec<&str> = body.lines().filter(|l| l.starts_with("- [")).collect();
+    assert!(!top.is_empty(), "no top entities listed: {body}");
+    assert!(
+        top[0].starts_with("- [Maria Marenova]"),
+        "the most-mentioned entity must lead: {top:?}"
+    );
+    let counts: Vec<u64> = top
+        .iter()
+        .filter_map(|l| l.rsplit_once('(').map(|(_, c)| c.trim_end_matches(')')))
+        .filter_map(|c| c.parse().ok())
+        .collect();
+    assert_eq!(
+        counts.len(),
+        top.len(),
+        "unparsed mention counts in {top:?}"
+    );
+    assert!(
+        counts.windows(2).all(|w| w[0] >= w[1]),
+        "top entities are not ranked by mentions: {top:?}"
+    );
+
+    // …and the page for the most-mentioned person exists.
+    let page = json_cmd(
+        &tmp,
+        &["wiki", "entities/maria-marenova.md", "--kb", "hygiene4"],
+    );
+    assert_eq!(page["status"], "success");
+    assert!(page["data"]["page"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Mention count: 13"));
+}
