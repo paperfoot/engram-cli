@@ -2141,9 +2141,7 @@ mod tests {
             .find(|e| e.name == "Francisco Ferró Oliver")
             .expect("the accented, fullest name owns the node");
         assert!(
-            francisco
-                .aliases
-                .contains(&"Francisco Ferro".to_string()),
+            francisco.aliases.contains(&"Francisco Ferro".to_string()),
             "the unaccented spelling must stay resolvable: {:?}",
             francisco.aliases
         );
@@ -2163,11 +2161,11 @@ mod tests {
         let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
         let index = PersonIndex::build(&first);
 
-        for (chunk, expected) in chunks.iter().zip([
-            "Maria Lopez Garcia",
-            "Maria Lopez Fernandez",
-            "Maria Lopez",
-        ]) {
+        for (chunk, expected) in
+            chunks
+                .iter()
+                .zip(["Maria Lopez Garcia", "Maria Lopez Fernandez", "Maria Lopez"])
+        {
             let ex = analyze_with_index(chunk, &index);
             assert!(
                 ex.entities.iter().any(|e| e.name == expected),

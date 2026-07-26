@@ -6094,10 +6094,16 @@ mod tests {
             "Patrick Ashcomb Pruett"
         ));
         assert!(promotes_canonical("Ming Su", "Ming Su Lim"));
-        assert!(promotes_canonical("Francisco Ferro", "Francisco Ferró Oliver"));
+        assert!(promotes_canonical(
+            "Francisco Ferro",
+            "Francisco Ferró Oliver"
+        ));
         assert!(promotes_canonical("Rosalie", "Rosalie Brandtke-Wendel"));
         // Same tokens in another order is a convention, not more of the name.
-        assert!(!promotes_canonical("Patrick Pruett", "Pruett Ashcomb Patrick"));
+        assert!(!promotes_canonical(
+            "Patrick Pruett",
+            "Pruett Ashcomb Patrick"
+        ));
     }
 
     /// The whole point of the promotion, end to end: the fullest spelling owns

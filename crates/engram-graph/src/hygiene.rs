@@ -2096,7 +2096,10 @@ mod tests {
             ("Lira DNA", "Lira"),
             ("LIRA PHYSICAL INTIMACY", "LIRA"),
             ("Rosalie Travel Plan", "Rosalie"),
-            ("Patrick Ashcomb Pruett Meeting Notes", "Patrick Ashcomb Pruett"),
+            (
+                "Patrick Ashcomb Pruett Meeting Notes",
+                "Patrick Ashcomb Pruett",
+            ),
         ] {
             let c = canonicalize_surface(surface).expect("kept");
             assert_eq!(c.name, expected, "{surface} must lose the heading");
