@@ -53,8 +53,12 @@
 //!     surnames exist, and a shouted WhatsApp header is a whole name.
 //! 11. **Profile slugs are never names.** `maria-marenova-9398b6108` is a
 //!     LinkedIn URL fragment: hyphenated lowercase words plus an opaque id.
+//! 12. **A Title-Case common noun after a name is a HEADING, not more name.**
+//!     `Avi Roy Professional Background`, `Elias ADHD`, `Lira DNA`, `LIRA
+//!     PHYSICAL INTIMACY` are section titles and topic tags pasted out of a CV
+//!     or a therapy note. The name is kept and the noun phrase dropped.
 //!
-//! Rules 8–11 exist because JUNK ENTITIES BLOCK UNIFICATION. The fold that
+//! Rules 8–12 exist because JUNK ENTITIES BLOCK UNIFICATION. The fold that
 //! merges a bare first name into a full name refuses when two full names
 //! compete for it (two Lauras must never fuse), and on the real store
 //! "Maria Ibiza-period" and "Noemi Varkoni's Lipitrex" were exactly such
@@ -912,6 +916,201 @@ const SHOUTED_STOP_WORDS: &[&str] = &[
 /// absent, so "AL-FARSI" is never truncated.
 const VERBAL_HYPHEN_PREFIXES: &[&str] = &["re", "un", "over", "under", "out", "mis", "pre"];
 
+/// Common nouns, topic tags and acronyms that make the capitalized run they
+/// stand in a DOCUMENT HEADING rather than a longer name: "Avi Roy
+/// Professional Background" (a section pasted out of a CV), "Elias ADHD",
+/// "Lira DNA", "LIRA PHYSICAL INTIMACY", "Rosalie Travel Plan".
+///
+/// This is the fifth junk class that BLOCKS UNIFICATION, and the costliest:
+/// "Avi Roy Professional Background" is a second person-typed "full name"
+/// starting with Avi, so the unambiguous-fold rule correctly refused and "Avi"
+/// (60 mentions) never joined "Avi Roy" (22). Deleting the heading is what
+/// repairs the merge — see [`heading_stop_index`] for the guards.
+///
+/// Everyday surnames are deliberately absent — Hunt, Chase, Cook, Baker,
+/// Butler, Reed, Fields, Grace, Faith — because truncating at one would cut a
+/// real name in half. Every word here is one no human is called.
+const HEADING_NOUNS: &[&str] = &[
+    // Document structure
+    "background",
+    "professional",
+    "personal",
+    "profile",
+    "biography",
+    "bio",
+    "overview",
+    "summary",
+    "notes",
+    "note",
+    "timeline",
+    "history",
+    "update",
+    "updates",
+    "recap",
+    "transcript",
+    "log",
+    "logs",
+    "journal",
+    "diary",
+    "agenda",
+    "minutes",
+    "checklist",
+    "todo",
+    "tasks",
+    "plan",
+    "plans",
+    "planning",
+    "draft",
+    "outline",
+    "briefing",
+    "memo",
+    "doc",
+    "docs",
+    "document",
+    "documents",
+    "folder",
+    "spreadsheet",
+    "session",
+    "sessions",
+    "thread",
+    "conversation",
+    "chat",
+    "call",
+    "calls",
+    "interview",
+    "meeting",
+    "meetings",
+    "booking",
+    "reminder",
+    "reminders",
+    "faq",
+    "info",
+    "information",
+    "details",
+    "context",
+    "status",
+    "snapshot",
+    "dossier",
+    "digest",
+    "highlights",
+    "takeaways",
+    "learnings",
+    "insights",
+    "questions",
+    "answers",
+    "feedback",
+    "thoughts",
+    "ideas",
+    "observations",
+    "reflections",
+    // Topic tags a personal store files a human under
+    "career",
+    "experience",
+    "education",
+    "skills",
+    "achievements",
+    "credentials",
+    "qualifications",
+    "publications",
+    "portfolio",
+    "resume",
+    "availability",
+    "logistics",
+    "preferences",
+    "requirements",
+    "expectations",
+    "boundaries",
+    "dynamics",
+    "relationship",
+    "relationships",
+    "communication",
+    "compatibility",
+    "intimacy",
+    "sexuality",
+    "personality",
+    "traits",
+    "values",
+    "goals",
+    "habits",
+    "routine",
+    "routines",
+    "interests",
+    "hobbies",
+    "quirks",
+    "triggers",
+    "patterns",
+    "strengths",
+    "weaknesses",
+    "concerns",
+    "symptoms",
+    "diagnosis",
+    "medication",
+    "medications",
+    "meds",
+    "health",
+    "medical",
+    "fitness",
+    "diet",
+    "nutrition",
+    "sleep",
+    "finances",
+    "expenses",
+    "salary",
+    "travel",
+    "itinerary",
+    "schedule",
+    "calendar",
+    "family",
+    "friends",
+    "work",
+    // Adjectives that head such a phrase
+    "physical",
+    "emotional",
+    "mental",
+    "social",
+    "sexual",
+    "romantic",
+    "financial",
+    "weekly",
+    "monthly",
+    "daily",
+    // Gerunds that head one ("ELIAS CREATING", "Rosalie Planning")
+    "creating",
+    "building",
+    "tracking",
+    "coaching",
+    "onboarding",
+    "journaling",
+    "budgeting",
+    "parenting",
+    "training",
+    // Acronyms that are never anybody's surname
+    "adhd",
+    "ocd",
+    "ptsd",
+    "asd",
+    "hiv",
+    "dna",
+    "rna",
+    "iq",
+    "bmi",
+    "hrv",
+    "ivf",
+    "pms",
+    "cbt",
+    "emdr",
+    "nhs",
+    "kpi",
+    "okr",
+    "roi",
+    "pdf",
+    "csv",
+    "cv",
+    "eta",
+    "dob",
+    "nda",
+];
+
 /// Suffixes that follow an apostrophe in an English contraction or possessive.
 const CONTRACTION_SUFFIXES: &[&str] = &["s", "m", "re", "ve", "ll", "d", "t"];
 
@@ -992,6 +1191,21 @@ fn greeting_set() -> &'static HashSet<&'static str> {
 fn relationship_set() -> &'static HashSet<&'static str> {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| RELATIONSHIP_WORDS.iter().copied().collect())
+}
+
+fn heading_noun_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| HEADING_NOUNS.iter().copied().collect())
+}
+
+/// Is `text` a common noun, topic tag or acronym that heads a document
+/// section rather than continuing a name ("Background", "ADHD", "Timeline")?
+pub fn is_heading_noun(text: &str) -> bool {
+    heading_noun_set().contains(
+        text.trim_end_matches([':', ',', '.', ';'])
+            .to_ascii_lowercase()
+            .as_str(),
+    )
 }
 
 fn verb_prefix_set() -> &'static HashSet<&'static str> {
@@ -1225,6 +1439,33 @@ fn shouted_stop_index(parts: &[String]) -> Option<usize> {
     })
 }
 
+/// Index at which a Title-Case common-noun phrase terminates the name.
+///
+/// "Avi Roy Professional Background" is a heading pasted out of a CV; "Elias
+/// ADHD" and "LIRA PHYSICAL INTIMACY" are topic tags. All three are one
+/// capitalized run to the extractor, and the first of them was a person-typed
+/// rival "full name" blocking Avi's merge.
+///
+/// Two guards keep it from eating real phrases:
+/// 1. everything BEFORE the noun must plausibly be a name — Title-Case, no
+///    digits, no filler ("Good Health Clinic" is refused because "Good" is
+///    filler, so the clinic keeps its name), and no heading noun of its own
+///    ("Session Notes" is refused because "Session" is one);
+/// 2. that prefix must not be a place or a creed, so "Egypt Travel Plan" is
+///    not shortened to a person called Egypt.
+fn heading_stop_index(parts: &[String]) -> Option<usize> {
+    (1..parts.len()).find(|&idx| {
+        if !is_heading_noun(&parts[idx]) {
+            return false;
+        }
+        let prefix = &parts[..idx];
+        prefix
+            .iter()
+            .all(|p| plausible_name_token(p) && !is_filler(p) && !is_heading_noun(p))
+            && !gazetteer::is_never_person(&prefix.join(" "))
+    })
+}
+
 /// Does this token look like one component of a personal name — Title-Case (or
 /// a single initial), and not a word that only ever appears in a contact label?
 fn plausible_name_token(token: &str) -> bool {
@@ -1398,13 +1639,18 @@ pub fn canonicalize_surface(surface: &str) -> Option<Canonical> {
     }
 
     // "Maria Nov-2025", "Maria Ibiza-period", "MARIA RE-INITIATES AGAIN",
-    // "Maria Marenova PERSONALLY ORGANISES" — a name plus a timestamp or a
-    // shouted clause. Cut at whichever comes first and keep the name; the
-    // tail is nobody's name, so it is not kept as an alias either.
-    if let Some(stop) = [date_stop_index(&parts), shouted_stop_index(&parts)]
-        .into_iter()
-        .flatten()
-        .min()
+    // "Maria Marenova PERSONALLY ORGANISES", "Avi Roy Professional Background"
+    // — a name plus a timestamp, a shouted clause or a section heading. Cut at
+    // whichever comes first and keep the name; the tail is nobody's name, so it
+    // is not kept as an alias either.
+    if let Some(stop) = [
+        date_stop_index(&parts),
+        shouted_stop_index(&parts),
+        heading_stop_index(&parts),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
     {
         parts.truncate(stop);
     }
@@ -1834,6 +2080,57 @@ mod tests {
         // says nothing about what follows.
         assert!(canonicalize_surface("Calling Noemi").unwrap().person_hint);
         assert!(!canonicalize_surface("Reading Lira").unwrap().person_hint);
+    }
+
+    /// The junk class that survived v4: a Title-Case noun phrase pasted from a
+    /// CV or a therapy note. "Avi Roy Professional Background" was a
+    /// person-typed rival full name, which is why "Avi" (60 mentions) never
+    /// folded into "Avi Roy" (22).
+    #[test]
+    fn a_heading_noun_after_a_name_is_not_more_name() {
+        for (surface, expected) in [
+            ("Avi Roy Professional Background", "Avi Roy"),
+            ("Avi Roy Career History", "Avi Roy"),
+            ("Elias ADHD", "Elias"),
+            ("ELIAS CREATING", "ELIAS"),
+            ("Lira DNA", "Lira"),
+            ("LIRA PHYSICAL INTIMACY", "LIRA"),
+            ("Rosalie Travel Plan", "Rosalie"),
+            (
+                "Patrick Ashcomb Pruett Meeting Notes",
+                "Patrick Ashcomb Pruett",
+            ),
+        ] {
+            let c = canonicalize_surface(surface).expect("kept");
+            assert_eq!(c.name, expected, "{surface} must lose the heading");
+            // A section title is nobody's name, so it is not hoarded either.
+            assert!(c.aliases.is_empty(), "{surface}: {:?}", c.aliases);
+        }
+    }
+
+    /// The conservative half. Every guard in `heading_stop_index` earns its
+    /// keep here: filler prefixes, heading-noun prefixes, and places.
+    #[test]
+    fn a_heading_noun_never_cuts_a_phrase_that_is_not_a_name() {
+        for intact in [
+            // "Good" is filler — the clinic is not a person called Good.
+            "Good Health Clinic",
+            // "Session" is itself a heading noun, so it cannot head a name.
+            "Session Notes",
+            "Meeting Notes",
+            // A place, not a person called Egypt.
+            "Egypt Travel Plan",
+            // No heading noun anywhere in it.
+            "Maria Marenova",
+            "Great Ormond Street",
+            "Monday Standup",
+        ] {
+            assert_eq!(
+                canonicalize_surface(intact).map(|c| c.name),
+                Some(intact.to_string()),
+                "{intact} must survive the heading filter"
+            );
+        }
     }
 
     #[test]

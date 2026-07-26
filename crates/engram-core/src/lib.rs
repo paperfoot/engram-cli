@@ -6,6 +6,7 @@
 pub mod error;
 pub mod fusion;
 pub mod layers;
+pub mod names;
 pub mod temporal;
 pub mod types;
 

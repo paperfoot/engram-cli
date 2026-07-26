@@ -5208,23 +5208,21 @@ fn kind_rank(kind: &str) -> u8 {
 /// Should `incoming` take over as the canonical name of a row currently called
 /// `existing`?
 ///
-/// Only in the one direction that identifies a human better than before: the
-/// stored name is a strict SUBSET of the incoming one, so "Noemi" yields to
-/// "Noemi Varkoni" and "Maria" to "Maria Marenova". The containment test is
-/// what keeps it honest — a messaging-app label ("Maria Microsoft London
-/// Tech") is longer but does not contain "Marenova", so it can never displace
-/// the real name, and two unrelated names never swap places.
+/// Only in the one direction that identifies a human better than before: every
+/// token of the stored name appears in the incoming one IN ORDER, and the
+/// incoming one says more. So "Noemi" yields to "Noemi Varkoni", "Maria" to
+/// "Maria Marenova", "Patrick Pruett" to "Patrick Ashcomb Pruett" (a middle
+/// name inserted), and "Francisco Ferro" to "Francisco Ferró Oliver" — the
+/// comparison ignores accents, because a man who writes his name with one is
+/// not two people.
+///
+/// Containment is what keeps it honest: a messaging-app label ("Maria
+/// Microsoft London Tech") is longer but does not contain "Marenova", so it
+/// can never displace the real name, and two unrelated names never swap
+/// places. ORDER is what keeps a surname-first convention ("Pruett Patrick")
+/// from passing as a fuller name.
 fn promotes_canonical(existing: &str, incoming: &str) -> bool {
-    let parts = |s: &str| -> Vec<String> {
-        s.split_whitespace()
-            .map(|w| w.to_ascii_lowercase())
-            .collect()
-    };
-    let existing = parts(existing);
-    let incoming = parts(incoming);
-    !existing.is_empty()
-        && incoming.len() > existing.len()
-        && existing.iter().all(|p| incoming.contains(p))
+    engram_core::names::is_fuller_name(existing, incoming)
 }
 
 fn parse_entity_row(r: &rusqlite::Row) -> rusqlite::Result<EntityRecord> {
@@ -6080,6 +6078,63 @@ mod tests {
         assert!(!promotes_canonical("Laura Corvo", "Laura Quiroz"));
         assert!(!promotes_canonical("Elias", "Elias"));
         assert!(!promotes_canonical("", "Anything At All"));
+    }
+
+    /// A middle name and a missing accent are not a different man.
+    ///
+    /// The set-containment rule this replaced let "Patrick Pruett" yield to
+    /// "Patrick Ashcomb Pruett" but not to anything spelled with a diacritic —
+    /// so "Francisco Ferro" kept the canonical slot from "Francisco Ferró
+    /// Oliver" and the store showed one man twice. It also accepted a
+    /// surname-first reshuffle as an improvement, which is not a fuller name.
+    #[test]
+    fn canonical_promotion_ignores_accents_but_not_word_order() {
+        assert!(promotes_canonical(
+            "Patrick Pruett",
+            "Patrick Ashcomb Pruett"
+        ));
+        assert!(promotes_canonical("Ming Su", "Ming Su Lim"));
+        assert!(promotes_canonical(
+            "Francisco Ferro",
+            "Francisco Ferró Oliver"
+        ));
+        assert!(promotes_canonical("Rosalie", "Rosalie Brandtke-Wendel"));
+        // Same tokens in another order is a convention, not more of the name.
+        assert!(!promotes_canonical(
+            "Patrick Pruett",
+            "Pruett Ashcomb Patrick"
+        ));
+    }
+
+    /// The whole point of the promotion, end to end: the fullest spelling owns
+    /// the row, the shorter ones stay resolvable, and the mentions are summed.
+    #[test]
+    fn the_fullest_name_takes_the_canonical_slot_from_the_shorter_one() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.ensure_kb("kb", None).unwrap();
+        // The shorter spelling compiles first and creates the row.
+        let id = store
+            .upsert_entity("kb", "Francisco Ferro", "person", 40)
+            .unwrap();
+        // The fuller one arrives later carrying the shorter as an alias.
+        store
+            .upsert_entity_with_aliases(
+                "kb",
+                "Francisco Ferró Oliver",
+                "person",
+                1,
+                &["Francisco Ferro".into(), "Francisco".into()],
+            )
+            .unwrap();
+        for spelling in ["Francisco", "Francisco Ferro", "Francisco Ferró Oliver"] {
+            let entity = store
+                .find_entity(Some("kb"), spelling)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{spelling} resolved nowhere"));
+            assert_eq!(entity.id, id, "{spelling} stood up a second row");
+            assert_eq!(entity.canonical_name, "Francisco Ferró Oliver");
+            assert_eq!(entity.mention_count, 41);
+        }
     }
 
     #[test]

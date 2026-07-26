@@ -5481,3 +5481,290 @@ fn the_wiki_ranks_entities_by_mentions_not_by_spelling() {
         .unwrap_or_default()
         .contains("Mention count: 13"));
 }
+
+// ---------------------------------------------------------------------------
+// ENTITY HYGIENE v5 — a person is shown by the FULLEST name they are known by.
+//
+// After v4 the real store still displayed people by whichever spelling
+// happened to be commonest, not by the one that identifies them:
+//
+//   Avi 60 · Avi Roy 22 · Avi Roy Professional Background 1
+//   Rosalie 65 · Rosalie Brandtke-Wendel 2 (typed `concept`)
+//   Patrick Pruett 47 · Patrick 18 · Patrick Ashcomb Pruett 2
+//   Francisco 42 · Francisco Ferro 1 · Francisco Ferró 1 · Francisco Ferró Oliver 1
+//   Ming Su 29 · Ming Su Lim 1
+//
+// Five causes, one symptom. A CV section heading ("Avi Roy Professional
+// Background") stood as a second full name and blocked the fold. A compound
+// surname was read as an acronym, so "Rosalie Brandtke-Wendel" was never a
+// person at all. A middle name, and a missing accent, each made one man into
+// two rival full names — and two rivals block the fold by design, because that
+// is the rule that keeps two Lauras apart. And the store's canonical promotion
+// compared token sets, so the accented spelling could never take the slot.
+//
+// Measured on this fixture BEFORE: 31 entities, five humans spread over twelve
+// rows plus five junk rows. AFTER: 18 entities, one row each, canonical = the
+// fullest name, every shorter spelling still resolvable as an alias.
+// ---------------------------------------------------------------------------
+
+/// One memory per line, so every bare first name lands in a chunk that never
+/// sees the full name and unification has to work KB-wide.
+const HYGIENE_V5_FIXTURE: &[&str] = &[
+    // A section heading pasted out of a CV — a rival "full name" for Avi.
+    "Avi Roy Professional Background is the section I pasted out of his CV.",
+    "Avi Roy runs the longevity fund and he called about the raise.",
+    "Avi is a friend from the longevity circuit and he called today.",
+    "Avi sent the term sheet over to the lawyers this afternoon.",
+    // A compound surname, which used to be typed `concept`.
+    "Rosalie Brandtke-Wendel signed the tenancy paperwork this morning.",
+    "Rosalie is my partner and she cooked dinner tonight.",
+    "Rosalie texted me about the Vienna trip in September.",
+    // A middle name is not a different man.
+    "Patrick Pruett asked about the raise and he sounded positive.",
+    "Patrick Ashcomb Pruett signed the term sheet on Tuesday.",
+    "Patrick Pruett called back about the valuation this evening.",
+    "Patrick texted me about dinner on Sunday.",
+    // An accent is not a different man either.
+    "Francisco Ferro wrote back about the Barcelona flat.",
+    "Francisco Ferró is my friend from the Madrid trip.",
+    "Francisco Ferró Oliver was copied on the same email thread.",
+    "I called Francisco this morning about the paperwork.",
+    // A two-token given name plus a surname: the same shape as a middle name.
+    "Ming Su Lim is my colleague and she reviewed the deck.",
+    "Ming Su sent the revised deck this afternoon.",
+    // Lira has no full name anywhere — she must stay exactly as she is.
+    "Lira is my daughter and she turned four in the spring.",
+    "LIRA PHYSICAL INTIMACY is a heading in the therapy notes.",
+    "Lira DNA results came back from the lab this week.",
+    "Reading Lira a bedtime story is the best part of my whole day.",
+    // Topic-tag junk that must never become a person.
+    "Elias ADHD notes are in the shared folder.",
+    "ELIAS CREATING the deck took the whole afternoon.",
+    "Elias is my brother and he called on Sunday.",
+    // Already correct after v4 — this must not regress.
+    "Branislava Marenovic is my colleague and she reviewed the contract.",
+    "BRANISLAVA MARENOVIC: call me back when you can.",
+    // Two women who share a first name.
+    "Laura Corvo is a good friend from the Barcelona trip last year.",
+    "Laura Quiroz is someone I met through a dating app in October.",
+    "Laura texted me about dinner and asked to move it to Sunday.",
+    // Two women who share TWO names — the full-name form of the same rule.
+    "Maria Lopez Garcia is my colleague and she reviewed the deck.",
+    "Maria Lopez Fernandez is my dentist and she called back.",
+    "Maria Lopez sent the invoice this morning.",
+];
+
+/// Heading and topic-tag surfaces the fixture writes. None of them is a name.
+const HYGIENE_V5_JUNK: &[&str] = &[
+    "Avi Roy Professional Background",
+    "Elias ADHD",
+    "ELIAS CREATING",
+    "Lira DNA",
+    "LIRA PHYSICAL INTIMACY",
+];
+
+fn hygiene_v5_kb() -> tempfile::TempDir {
+    let (tmp, _) = with_isolated_home();
+    for line in HYGIENE_V5_FIXTURE {
+        cmd_in(&tmp)
+            .args([
+                "remember",
+                line,
+                "--kb",
+                "hygiene5",
+                "--no-extract-facts",
+                "--json",
+            ])
+            .assert()
+            .success();
+    }
+    json_cmd(&tmp, &["compile", "--kb", "hygiene5", "--all"]);
+    tmp
+}
+
+/// Every entity in the KB as (canonical_name, kind, mention_count, aliases).
+fn hygiene_v5_entities(tmp: &tempfile::TempDir) -> Vec<(String, String, u64, Vec<String>)> {
+    let v = json_cmd(
+        tmp,
+        &["entities", "list", "--kb", "hygiene5", "--limit", "500"],
+    );
+    v["data"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["canonical_name"].as_str().unwrap_or("").to_string(),
+                e["kind"].as_str().unwrap_or("").to_string(),
+                e["mention_count"].as_u64().unwrap_or(0),
+                e["aliases"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// THE REQUIREMENT: one row per human, named by the fullest form of their name,
+/// with every shorter spelling kept as a resolvable alias and the mentions of
+/// all of them summed onto it.
+#[test]
+fn a_person_is_shown_by_the_fullest_name_they_are_known_by() {
+    let tmp = hygiene_v5_kb();
+    let entities = hygiene_v5_entities(&tmp);
+
+    for (fullest, mentions, shorter) in [
+        ("Avi Roy", 4u64, vec!["Avi"]),
+        ("Rosalie Brandtke-Wendel", 3, vec!["Rosalie"]),
+        (
+            "Patrick Ashcomb Pruett",
+            4,
+            vec!["Patrick", "Patrick Pruett"],
+        ),
+        (
+            // His father's second surname per the user, but structurally a
+            // token inserted into the same name — treated by rule, not by
+            // special case, so the data is the thing to correct if it is wrong.
+            "Francisco Ferró Oliver",
+            4,
+            vec!["Francisco", "Francisco Ferro", "Francisco Ferró"],
+        ),
+        ("Ming Su Lim", 2, vec!["Ming Su"]),
+    ] {
+        let first = fullest.split(' ').next().unwrap();
+        let rows: Vec<&(String, String, u64, Vec<String>)> = entities
+            .iter()
+            .filter(|(n, ..)| n.split(' ').next() == Some(first))
+            .collect();
+        assert_eq!(rows.len(), 1, "{fullest} must be ONE entity, got {rows:?}");
+        let (name, kind, count, aliases) = rows[0];
+        assert_eq!(
+            name, fullest,
+            "the fullest name must own the canonical slot"
+        );
+        assert_eq!(kind, "person", "{name} is a human");
+        assert_eq!(
+            *count, mentions,
+            "every spelling's mentions must be summed onto {name}: {rows:?}"
+        );
+        for short in &shorter {
+            assert!(
+                aliases.iter().any(|a| a == short),
+                "{short} must stay resolvable on {name}: {aliases:?}"
+            );
+            // …and resolvable through the surface an agent actually calls.
+            let v = json_cmd(&tmp, &["people", "show", short, "--kb", "hygiene5"]);
+            assert_eq!(
+                v["data"]["person"]["name"], *fullest,
+                "{short} resolved somewhere else"
+            );
+        }
+    }
+}
+
+/// A Title-Case noun phrase after a name is a document heading. One of these
+/// was person-typed and blocked Avi's merge; the rest diluted mention counts.
+#[test]
+fn heading_and_topic_junk_never_reaches_the_entity_layer() {
+    let tmp = hygiene_v5_kb();
+    let entities = hygiene_v5_entities(&tmp);
+    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
+
+    for junk in HYGIENE_V5_JUNK {
+        assert!(
+            !names.iter().any(|n| n.eq_ignore_ascii_case(junk)),
+            "junk entity {junk} survived: {names:?}"
+        );
+    }
+    for (name, _, _, aliases) in &entities {
+        for junk in HYGIENE_V5_JUNK {
+            assert!(
+                !aliases.iter().any(|a| a.eq_ignore_ascii_case(junk)),
+                "{name} kept junk alias {junk}: {aliases:?}"
+            );
+        }
+    }
+    // The mentions the junk had taken belong to the humans inside it.
+    for (human, mentions) in [("Lira", 4u64), ("Elias", 3)] {
+        let (name, kind, count, _) = entities
+            .iter()
+            .find(|(n, ..)| n == human)
+            .unwrap_or_else(|| panic!("{human} missing: {entities:?}"));
+        assert_eq!(kind, "person", "{name} must stay the human");
+        assert_eq!(
+            *count, mentions,
+            "{name} must keep the mentions the headings had taken"
+        );
+    }
+}
+
+/// The safety half. Merging by "the fullest name wins" must not fuse people
+/// who merely share a name, and must not rename anybody who is already right.
+#[test]
+fn hygiene_v5_never_fuses_two_people_who_share_a_name() {
+    let tmp = hygiene_v5_kb();
+    let entities = hygiene_v5_entities(&tmp);
+    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
+
+    for separate in [
+        // Two women, one first name.
+        "Laura Corvo",
+        "Laura Quiroz",
+        // Two women, TWO shared names: the shorter form belongs to neither.
+        "Maria Lopez Garcia",
+        "Maria Lopez Fernandez",
+        "Maria Lopez",
+        // No fuller spelling exists anywhere, so she keeps the name she has.
+        "Lira",
+        // Already unified before v5 — the shouted export folds onto her.
+        "Branislava Marenovic",
+    ] {
+        assert!(names.contains(&separate), "{separate} was lost: {names:?}");
+    }
+    for (name, _, _, aliases) in &entities {
+        if name.starts_with("Laura ") {
+            assert!(
+                !aliases.iter().any(|a| a == "Laura"),
+                "{name} absorbed the ambiguous bare name: {aliases:?}"
+            );
+        }
+        if name.starts_with("Maria Lopez ") {
+            assert!(
+                !aliases.iter().any(|a| a == "Maria Lopez"),
+                "{name} absorbed the ambiguous shorter name: {aliases:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hygiene_v5_recompile_is_stable() {
+    let tmp = hygiene_v5_kb();
+    let before = hygiene_v5_entities(&tmp);
+    json_cmd(&tmp, &["compile", "--kb", "hygiene5", "--all"]);
+    json_cmd(&tmp, &["compile", "--kb", "hygiene5", "--all"]);
+    let after = hygiene_v5_entities(&tmp);
+
+    let fingerprint = |rows: &[(String, String, u64, Vec<String>)]| -> Vec<String> {
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|(name, kind, mentions, aliases)| {
+                let mut aliases = aliases.clone();
+                aliases.sort();
+                format!("{name}|{kind}|{mentions}|{}", aliases.join(","))
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        fingerprint(&before),
+        fingerprint(&after),
+        "recompiling v5 must converge, not drift"
+    );
+}
