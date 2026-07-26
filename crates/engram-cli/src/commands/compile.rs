@@ -120,7 +120,10 @@ pub async fn run(
             stats
         }
         Err(err) => {
-            ctx.store.finish_compile_job(
+            // Bookkeeping must never mask the failure it is recording: if the
+            // job row was already abandoned by a newer compile, say so and
+            // still return the error the user actually needs to see.
+            if let Err(bookkeeping) = ctx.store.finish_compile_job(
                 job_id,
                 "failed",
                 Some(&err.to_string()),
@@ -129,7 +132,9 @@ pub async fn run(
                     "extraction_model": options.extraction_model,
                     "synthesis_model": options.synthesis_model,
                 }),
-            )?;
+            ) {
+                tracing::warn!("could not mark compile job {job_id} failed: {bookkeeping}");
+            }
             return Err(err);
         }
     };
