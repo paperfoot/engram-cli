@@ -120,7 +120,10 @@ pub async fn run(
             stats
         }
         Err(err) => {
-            ctx.store.finish_compile_job(
+            // Bookkeeping must never mask the failure it is recording: if the
+            // job row was already abandoned by a newer compile, say so and
+            // still return the error the user actually needs to see.
+            if let Err(bookkeeping) = ctx.store.finish_compile_job(
                 job_id,
                 "failed",
                 Some(&err.to_string()),
@@ -129,7 +132,9 @@ pub async fn run(
                     "extraction_model": options.extraction_model,
                     "synthesis_model": options.synthesis_model,
                 }),
-            )?;
+            ) {
+                tracing::warn!("could not mark compile job {job_id} failed: {bookkeeping}");
+            }
             return Err(err);
         }
     };
@@ -1206,8 +1211,19 @@ fn write_wiki(
         "Compiled from {} chunks. Every paragraph below is derived from stored chunks and claims.\n\n",
         chunks.len()
     ));
+    // BY MENTIONS, NOT BY SPELLING. `entity_mentions` is a BTreeMap keyed on
+    // the display name, so `.rev().take(25)` used to publish the alphabetically
+    // LAST 25 entities as "Top entities" and `.take(50)` gave pages to the
+    // alphabetically first 50 — on a personal store that is a wiki about
+    // Zurich and Lira with no page for the person mentioned 431 times. Ties
+    // break on the name so the output stays byte-identical across recompiles.
+    let mut ranked: Vec<(&String, &usize)> = entity_mentions.iter().collect();
+    ranked.sort_by(|(a_name, a_count), (b_name, b_count)| {
+        b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+    });
+
     index.push_str("## Top entities\n\n");
-    for (name, count) in entity_mentions.iter().rev().take(25) {
+    for (name, count) in ranked.iter().take(25) {
         index.push_str(&format!(
             "- [{}](entities/{}.md) ({count})\n",
             name,
@@ -1217,7 +1233,7 @@ fn write_wiki(
     ctx.store.upsert_wiki_page(kb, "index.md", kb, &index)?;
     pages += 1;
 
-    for (name, count) in entity_mentions.iter().take(50) {
+    for (name, count) in ranked.iter().take(50) {
         let slug = slugify(name);
         let mut content = format!("# {name}\n\nMention count: {count}\n\n## Evidence snippets\n\n");
         for chunk in chunks

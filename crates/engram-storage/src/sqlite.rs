@@ -2615,6 +2615,15 @@ impl SqliteStore {
         Ok(id)
     }
 
+    /// Move a running compile job to its terminal state.
+    ///
+    /// The `status = 'running'` guard means the update can legitimately match
+    /// NOTHING: the job was already finished, or a newer compile of the same
+    /// KB abandoned it (see [`Self::create_compile_job`]). Reporting that as
+    /// success used to hide it — the caller printed a completed compile whose
+    /// job row still said `abandoned`, and `jobs list` disagreed with the
+    /// command that had just run. A no-op transition is now an error, so the
+    /// caller decides whether it matters.
     pub fn finish_compile_job(
         &self,
         id: Uuid,
@@ -2623,7 +2632,7 @@ impl SqliteStore {
         metadata: serde_json::Value,
     ) -> Result<(), StorageError> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE compile_jobs
              SET status = ?1, message = ?2, metadata_json = ?3, updated_at = ?4
              WHERE id = ?5 AND status = 'running'",
@@ -2635,6 +2644,22 @@ impl SqliteStore {
                 id.to_string()
             ],
         )?;
+        if changed == 0 {
+            let current: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT status FROM compile_jobs WHERE id = ?1",
+                    params![id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            return Err(StorageError::NotFound(match current {
+                Some(current) => format!(
+                    "compile job {id} is '{current}', not 'running' — cannot finish it as '{status}'"
+                ),
+                None => format!("compile job {id} no longer exists"),
+            }));
+        }
         Ok(())
     }
 
@@ -6267,5 +6292,53 @@ mod tests {
             .claims_visible_in_diary(&[claim], "private")
             .unwrap()
             .is_empty());
+    }
+
+    /// `finish_compile_job` guards on `status = 'running'`, so the update can
+    /// match nothing. Reporting that as success made `jobs list` disagree with
+    /// the command that had just run: the job row said `abandoned` while the
+    /// caller printed a completed compile.
+    #[test]
+    fn finishing_a_job_that_is_not_running_is_an_error() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let job = store
+            .create_compile_job("kb", "evidence", serde_json::json!({}))
+            .unwrap();
+        store
+            .finish_compile_job(job, "completed", None, serde_json::json!({}))
+            .expect("a running job finishes");
+
+        // Second transition: nothing to update.
+        let err = store
+            .finish_compile_job(job, "completed", None, serde_json::json!({}))
+            .expect_err("a finished job cannot be finished again");
+        assert!(
+            matches!(&err, StorageError::NotFound(m) if m.contains("completed")),
+            "unexpected error: {err}"
+        );
+
+        // …and the same for a job a newer compile abandoned underneath us.
+        let stale = store
+            .create_compile_job("kb", "evidence", serde_json::json!({}))
+            .unwrap();
+        let _newer = store
+            .create_compile_job("kb", "evidence", serde_json::json!({}))
+            .unwrap();
+        let err = store
+            .finish_compile_job(stale, "completed", None, serde_json::json!({}))
+            .expect_err("an abandoned job cannot be completed");
+        assert!(
+            matches!(&err, StorageError::NotFound(m) if m.contains("abandoned")),
+            "unexpected error: {err}"
+        );
+
+        // An unknown id says so rather than passing silently.
+        let err = store
+            .finish_compile_job(Uuid::new_v4(), "completed", None, serde_json::json!({}))
+            .expect_err("an unknown job cannot be finished");
+        assert!(
+            matches!(&err, StorageError::NotFound(m) if m.contains("no longer exists")),
+            "unexpected error: {err}"
+        );
     }
 }

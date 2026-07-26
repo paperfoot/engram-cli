@@ -1803,6 +1803,95 @@ mod tests {
         );
     }
 
+    /// THE CONSEQUENCE the junk filters exist for.
+    ///
+    /// On the real store "Maria" (431 mentions) never joined "Maria Marenova"
+    /// (22) and "Noemi" (119) never joined "Noemi Varkoni" (54). The fold rule
+    /// was right — it refuses when two full names compete for a first name —
+    /// but the KB was full of junk that LOOKED like competing full names:
+    /// "Maria Ibiza-period", "Noemi Varkoni's Lipitrex". With the junk gone
+    /// there is exactly one candidate again and the fold fires.
+    #[test]
+    fn junk_full_names_no_longer_block_the_kb_wide_fold() {
+        let chunks = [
+            "Maria Marenova is my partner and she cooked dinner.",
+            "Maria Ibiza-period photos were uploaded to the album.",
+            "Maria's Nov 2025 Egypt itinerary arrived last night.",
+            "MARIA RE-INITIATES AGAIN about the Egypt plan.",
+            "Noemi Varkoni introduced me to Avi at the summit.",
+            "Noemi Varkoni's Lipitrex prescription was renewed.",
+            "Noemi's Southwark flat viewing is on Tuesday.",
+            "Maria sent the invoice this morning.",
+            "Noemi sent the deck this morning.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+
+        for (bare_chunk, full) in [(7, "Maria Marenova"), (8, "Noemi Varkoni")] {
+            let ex = analyze_with_index(chunks[bare_chunk], &index);
+            let bare = full.split(' ').next().unwrap();
+            assert!(
+                !ex.entities.iter().any(|e| e.name == bare),
+                "{bare} stood up a second node: {:?}",
+                ex.entities
+            );
+            let person = ex
+                .entities
+                .iter()
+                .find(|e| e.name == full)
+                .unwrap_or_else(|| panic!("{bare} did not fold into {full}: {:?}", ex.entities));
+            assert_eq!(person.kind, KIND_PERSON);
+            assert!(person.aliases.contains(&bare.to_string()));
+        }
+
+        // …and no junk survived as a person to compete in the first place.
+        for chunk in &chunks {
+            let ex = analyze_with_index(chunk, &index);
+            for junk in [
+                "Maria Ibiza-period",
+                "Maria's Nov 2025 Egypt",
+                "MARIA RE-INITIATES AGAIN",
+                "Noemi Varkoni's Lipitrex",
+                "Noemi's Southwark",
+            ] {
+                assert!(
+                    !ex.entities.iter().any(|e| e.name == junk),
+                    "{junk} survived: {:?}",
+                    ex.entities
+                );
+            }
+        }
+    }
+
+    /// The hijack: a junk "full name" that CONTAINS a real human's name steals
+    /// the canonical slot through the bare-surname fallback. "Reading Lira"
+    /// (449 mentions) owned Lira, with the woman herself demoted to an alias.
+    #[test]
+    fn a_verb_prefixed_junk_name_no_longer_absorbs_the_human() {
+        let chunks = [
+            "Reading Lira a bedtime story is the best part of the day.",
+            "Lira is my daughter and she turned four in the spring.",
+            "Avi's One Blackfriars party was packed with the fund crowd.",
+            "Avi is a friend from the longevity circuit.",
+        ];
+        let first: Vec<Extraction> = chunks.iter().map(|c| analyze(c)).collect();
+        let index = PersonIndex::build(&first);
+        for (chunk, human) in [(0, "Lira"), (2, "Avi")] {
+            let ex = analyze_with_index(chunks[chunk], &index);
+            assert_eq!(
+                ex.entities
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![human],
+                "the junk surface must resolve to {human} alone"
+            );
+        }
+        // The human owns the canonical slot in the chunk that describes her.
+        let ex = analyze_with_index(chunks[1], &index);
+        assert_eq!(ex.kind_of("Lira"), Some(KIND_PERSON));
+    }
+
     #[test]
     fn analysis_is_deterministic() {
         let text =

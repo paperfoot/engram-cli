@@ -194,12 +194,19 @@ async fn route(
                         stats
                     }
                     Err(err) => {
-                        ctx.store.finish_compile_job(
+                        // The compile error is the one the caller needs; a
+                        // job row that is no longer 'running' must not
+                        // replace it.
+                        if let Err(bookkeeping) = ctx.store.finish_compile_job(
                             job_id,
                             "failed",
                             Some(&err.to_string()),
                             json!({}),
-                        )?;
+                        ) {
+                            tracing::warn!(
+                                "could not mark compile job {job_id} failed: {bookkeeping}"
+                            );
+                        }
                         return Err(err);
                     }
                 };
