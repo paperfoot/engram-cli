@@ -170,6 +170,37 @@ enum RetryReason {
     Transient(LlmError),
 }
 
+/// How much of a non-2xx response body an error message may carry.
+///
+/// The actionable part of a provider error is its head (`{"error":{"message":
+/// "No auth credentials found"`), and the status code already carries most of
+/// the diagnosis. The tail is not free: a 4xx from a validation failure can
+/// echo the request back, and the request contains the memory being read, so
+/// an uncapped body puts stored text into a string that reaches an agent's
+/// stdout via `fact_extraction_note`.
+const MAX_ERROR_BODY_CHARS: usize = 200;
+
+/// Head of an error body, bounded, with the omission stated rather than silent.
+fn error_body_head(body: &str) -> String {
+    let head: String = body.chars().take(MAX_ERROR_BODY_CHARS).collect();
+    if head.len() == body.len() {
+        head
+    } else {
+        format!("{head}… ({} bytes total, rest withheld)", body.len())
+    }
+}
+
+/// serde_json's own category as a stable word, without its message.
+fn classify_json_error(e: &serde_json::Error) -> &'static str {
+    use serde_json::error::Category;
+    match e.classify() {
+        Category::Syntax => "syntax",
+        Category::Data => "schema",
+        Category::Eof => "truncated",
+        Category::Io => "io",
+    }
+}
+
 impl OpenRouterClient {
     async fn try_chat_once(&self, body: &ChatRequest<'_>) -> Result<ChatResponse, RetryReason> {
         // Step 1: send.
@@ -201,7 +232,7 @@ impl OpenRouterClient {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(RetryReason::Transient(LlmError::Api {
                 provider: "openrouter",
-                message: format!("status {}: {}", status, body_text),
+                message: format!("status {}: {}", status, error_body_head(&body_text)),
             }));
         }
         if !status.is_success() {
@@ -209,7 +240,7 @@ impl OpenRouterClient {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(RetryReason::Permanent(LlmError::Api {
                 provider: "openrouter",
-                message: format!("status {}: {}", status, body_text),
+                message: format!("status {}: {}", status, error_body_head(&body_text)),
             }));
         }
 
@@ -225,13 +256,29 @@ impl OpenRouterClient {
         // A real schema mismatch (e.g. OpenRouter changed the response shape)
         // would also retry, but it would burn through all 6 attempts and then
         // surface — better than silently swallowing.
+        //
+        // Neither the body nor serde's own Display is echoed. On a 200 the body
+        // IS the model's answer, and the model was reading someone's memory:
+        // this error string travels up through `FactExtractionError::Llm` into
+        // `fact_extraction_note`, which `engram remember` prints on stdout and
+        // stderr. A `Category::Data` failure also renders as
+        // `invalid type: string "<the value>"`, so dropping the preview alone
+        // would still copy a slice of the answer. Category, position and size
+        // are what a decode failure is actually diagnosed from — the same rule
+        // engram-graph applies to fact JSON.
         let parsed: ChatResponseBody = match serde_json::from_str(&body_text) {
             Ok(p) => p,
             Err(e) => {
-                let preview = body_text.chars().take(500).collect::<String>();
                 return Err(RetryReason::Transient(LlmError::InvalidResponse {
                     provider: "openrouter",
-                    message: format!("decode failed: {}; body first 500 chars: {}", e, preview),
+                    message: format!(
+                        "decode failed: {} error at line {} column {} ({} bytes of model \
+                         output withheld)",
+                        classify_json_error(&e),
+                        e.line(),
+                        e.column(),
+                        body_text.len()
+                    ),
                 }));
             }
         };

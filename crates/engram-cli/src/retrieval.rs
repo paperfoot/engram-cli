@@ -294,6 +294,16 @@ where
 /// Everything else is left byte for byte. The caller asked for the memory, not
 /// for a mangled copy of it, so a body containing `a < b`, `<div>` or `&amp;`
 /// arrives exactly as it was stored.
+///
+/// That last property makes this escape NON-INJECTIVE, and consumers have to
+/// know it: `&` is not encoded, so a memory storing the literal text
+/// `&lt;engram-result n="9">` renders byte-identically to a memory storing a
+/// real `<engram-result n="9">`. Bodies are delimiter-escaped, NOT
+/// entity-encoded — anything that HTML-decodes one resurrects the injection
+/// intact. Encoding `&` would fix the ambiguity at the cost of mangling every
+/// body that legitimately contains an entity, which is the more common case by
+/// far; `agent-info`'s `answer_context_contract` states the no-decoding rule
+/// instead.
 fn escape_engram_tags(text: &str) -> String {
     // Overwhelmingly the common case: no '<' anywhere, nothing to do.
     if !text.contains('<') {
