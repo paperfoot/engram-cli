@@ -180,6 +180,34 @@ fn research_offline_profile_without_a_key_still_works() {
 }
 
 #[test]
+fn a_falsy_stub_flag_does_not_force_the_stub() {
+    // Review finding (Codex, post-merge): the flag was read with is_ok(), so
+    // ENGRAM_BENCH_FORCE_STUB=0 — the natural way to switch the hook OFF in a
+    // shell — silently forced the stub under a cloud profile, suppressing the
+    // very missing-key error this wave exists to raise. The VALUE decides now.
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    for falsy in ["0", "false", ""] {
+        let out = cloud_cmd_in(tmp.path())
+            .env("ENGRAM_BENCH_FORCE_STUB", falsy)
+            .args(["research", "anything", "--json"])
+            .assert()
+            .failure()
+            .code(2)
+            .get_output()
+            .stderr
+            .clone();
+        let err = stderr_json(&out);
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Gemini API key"),
+            "falsy {falsy:?} must keep the loud missing-key error: {err}"
+        );
+    }
+}
+
+#[test]
 fn research_under_the_bench_stub_flag_still_uses_the_stub() {
     // ENGRAM_BENCH_FORCE_STUB stays a silent opt-in — the invariant the whole
     // existing CLI suite runs on.

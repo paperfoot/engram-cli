@@ -147,6 +147,7 @@ fn import_v1(
 
     let mut imported = 0u32;
     let mut chunks_created = 0u32;
+    let mut skipped_empty = 0u32;
     // Resolved ONCE, outside the transaction. `resolve_policy` reads three
     // settings, and each one re-reads the config file; doing that per memory
     // would put file IO inside a write transaction holding SQLite's writer
@@ -157,6 +158,14 @@ fn import_v1(
             let Ok(memory) = serde_json::from_value::<Memory>(m_json.clone()) else {
                 continue;
             };
+            // A whitespace-only record would import a memory row that chunks
+            // to nothing — committed but invisible to every recall path, the
+            // same black hole the atomic `remember` fix and the `edit` empty
+            // guard close. A legacy backup cannot be a third door to it.
+            if memory.content.trim().is_empty() {
+                skipped_empty += 1;
+                continue;
+            }
             // Storage will reject dupes via UNIQUE.
             if store.insert_memory(&memory).is_ok() {
                 imported += 1;
@@ -181,11 +190,13 @@ fn import_v1(
     meta.add("format_version", 1);
     meta.add("imported", imported);
     meta.add("chunks_created", chunks_created);
+    meta.add("skipped_empty", skipped_empty);
     Ok((
         json!({
             "format_version": 1,
             "imported": imported,
             "chunks_created": chunks_created,
+            "skipped_empty": skipped_empty,
             "next_step": "legacy v1 export has no embeddings; run `engram reindex --all` to restore dense search",
         }),
         meta,

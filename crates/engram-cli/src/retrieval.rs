@@ -147,7 +147,7 @@ pub fn resolve_retrieval_backends(
     profile: RetrievalProfile,
     budget_kb: Option<&str>,
 ) -> Result<RetrievalBackends, crate::error::CliError> {
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let cohere_model = engram_rerank::cohere::resolve_model();

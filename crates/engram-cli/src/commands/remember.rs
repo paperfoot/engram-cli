@@ -268,7 +268,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
 
     // Embed every chunk. Gemini if available (env or config file), stub otherwise.
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let have_gemini = !force_stub && gemini_key.is_some();
     let embedder: Box<dyn Embedder> = if have_gemini {

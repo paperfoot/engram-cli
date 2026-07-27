@@ -288,3 +288,19 @@ pub fn rerank_disabled() -> bool {
         .map(|v| v.eq_ignore_ascii_case("none"))
         .unwrap_or(false)
 }
+
+/// True when ENGRAM_BENCH_FORCE_STUB asks for the deterministic stub
+/// embedder. The VALUE decides, not the variable's presence: the old
+/// `env::var(..).is_ok()` check meant `ENGRAM_BENCH_FORCE_STUB=0` — the
+/// natural way to switch the hook OFF in a shell — silently forced the
+/// stub under a cloud profile, suppressing the missing-key error the
+/// provider-parity fix exists to raise. One reader, shared by every
+/// write and read path that can select an embedder.
+pub fn stub_forced() -> bool {
+    std::env::var("ENGRAM_BENCH_FORCE_STUB")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}

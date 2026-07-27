@@ -238,8 +238,7 @@ fn edit_rejects_a_rewrite_that_would_leave_no_chunks() {
             .get_output()
             .stderr
             .clone();
-        let err: Value =
-            serde_json::from_slice(&out).expect("JSON error on stderr");
+        let err: Value = serde_json::from_slice(&out).expect("JSON error on stderr");
         assert!(
             err["error"]["message"]
                 .as_str()
@@ -306,6 +305,22 @@ fn v1_import_chunks_with_the_shared_policy() {
         .as_str()
         .unwrap_or_default()
         .contains("reindex"));
+}
+
+#[test]
+fn v1_import_skips_a_whitespace_only_record() {
+    // Review finding (Codex, post-merge): a whitespace-only v1 record chunked
+    // to nothing but was still counted as imported — a committed memory with
+    // zero chunk rows, invisible to every recall path. A legacy backup must
+    // not be a third door to the black hole `remember` and `edit` now refuse.
+    let home = tempfile::tempdir().expect("tmp dir");
+    let file = v1_export_file(home.path(), "   \n\n  ");
+
+    let v = run_json(&mut engram(&home), &["import", file.to_str().unwrap()]);
+    assert_eq!(v["data"]["format_version"], 1);
+    assert_eq!(v["data"]["imported"], 0, "{}", v["data"]);
+    assert_eq!(v["data"]["chunks_created"], 0);
+    assert_eq!(v["data"]["skipped_empty"], 1);
 }
 
 #[test]

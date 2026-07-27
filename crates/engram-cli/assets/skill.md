@@ -38,7 +38,7 @@ engram remember "Chose Postgres over DynamoDB: relational reporting beat write t
 ```
 <engram-notice>...</engram-notice>
 <engram-result n="1" kind="chunk" kb="personal" id="..." source="notes.md">
-the stored text, verbatim
+the stored text (trimmed of leading/trailing whitespace)
 </engram-result>
 ```
 
@@ -122,7 +122,7 @@ An unscoped directory ingest is refused by default: `--dry-run --include '...' -
 - **Errors are JSON on stderr**, never stdout. Exit codes: 1 transient (retry with backoff), 2 config (`engram config check`), 3 bad input (fix args, don't retry identically), 4 rate limited (wait).
 - Every command returns `{version, status, data, metadata}`; `--json` is automatic when stdout is piped.
 - **Memories missing from `engram kb list`?** Run `engram kb repair --dry-run`, then without the flag. Additive, idempotent, and it won't resurrect a KB you deleted.
-- **`forget` does not unseal another diary's derived content** — a KB's compiled wiki/entities stay withheld until a post-deletion `compile` purges them; `recall` reports it in `metadata.diary_isolation`. Schema is v8 (`doctor --json` → `data.db.schema_version`).
+- **`forget` does not unseal another diary's derived content** — a KB's compiled wiki/entities stay withheld until a post-deletion `compile` purges them; `recall` reports it in `metadata.diary_isolation`. Schema is v9 (`doctor --json` → `data.db.schema_version`).
 - **After changing embedding model/dimensions/prompt format, run `engram reindex --kb <name>`** — legacy embeddings are refused by default.
 - `engram forget <id>` requires `--confirm`. `engram update` (without `--check`) mutates the install — only on user request.
 - `engram skill install` refuses to overwrite a SKILL.md you edited by hand; pass `--force` if you mean it.

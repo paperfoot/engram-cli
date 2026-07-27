@@ -254,9 +254,9 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "ENGRAM_UPDATE_CRATE": "crates.io package used by cargo updates. Default paperfoot-engram.",
             "ENGRAM_UPDATE_HOMEBREW_FORMULA": "Homebrew formula used by brew updates. Default paperfoot/tap/engram.",
             "ENGRAM_DEFAULT_KB": "Pin reads to one KB when no --kb is given. Unset (the default) means recall spans every KB. Same as config `retrieval.default_kb`.",
-            "ENGRAM_EMBEDDER": "NOT IMPLEMENTED — nothing reads this. To read with the offline stub, pass --profile offline (or \"profile\": \"offline\" over the API); a cloud profile without GEMINI_API_KEY is exit 2, and no env var overrides that.",
+            "ENGRAM_EMBEDDER": "NOT IMPLEMENTED — nothing reads this. To read with the offline stub, pass --profile offline (or \"profile\": \"offline\" over the API); a cloud profile without GEMINI_API_KEY is exit 2. The sole override is the test hook ENGRAM_BENCH_FORCE_STUB with a truthy value (1/true); 0, false or empty leaves cloud semantics intact.",
             "ENGRAM_COHERE_RERANK_MODEL": "Override the Cohere rerank model slug (default rerank-v4.0-pro; e.g. rerank-v4.0-fast).",
-            "ENGRAM_RERANK_PROVIDER": "Reranker selector: cohere|zerank2|none. recall/research/serve use Cohere when COHERE_API_KEY is set; set `none` to disable reranking explicitly (e.g. Cohere billing failure) — retrieval then returns hybrid-fused order.",
+            "ENGRAM_RERANK_PROVIDER": "Production values: cohere (default when COHERE_API_KEY is set) or none (disable reranking explicitly, e.g. Cohere billing failure — retrieval then returns hybrid-fused order). zerank2 is recognized by `bench` only, never by recall/research/serve.",
             "ENGRAM_LME_SPLIT": "LongMemEval split: s|oracle (default: s)"
         },
         "config_keys": {
