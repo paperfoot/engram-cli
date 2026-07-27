@@ -220,6 +220,42 @@ fn edit_keeps_a_legitimately_short_memory_as_one_chunk() {
 }
 
 #[test]
+fn edit_rejects_a_rewrite_that_would_leave_no_chunks() {
+    // Review finding (Grok, post-merge): `remember` rejects empty content but
+    // `edit` did not — `edit <id> --content ""` chunked to nothing, then the
+    // transaction deleted every existing chunk and inserted zero, committing
+    // an invisible memory. The exact black hole the atomic-remember fix
+    // closed, reopened through a path the same wave touched.
+    let home = tempfile::tempdir().expect("tmp dir");
+    let id = seed_memory(&home, "wave0-edit-empty");
+
+    for empty in ["", "   \n\n  "] {
+        let out = engram(&home)
+            .args(["edit", id.as_str(), "--content", empty])
+            .assert()
+            .failure()
+            .code(3) // bad_input
+            .get_output()
+            .stderr
+            .clone();
+        let err: Value =
+            serde_json::from_slice(&out).expect("JSON error on stderr");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cannot be empty"),
+            "error must say why: {err}"
+        );
+    }
+    // The original memory is untouched: its one chunk is still findable.
+    assert_eq!(
+        chunk_texts(&stored_chunk_rows(&home, "wave0-edit-empty")),
+        vec!["Seed note, replaced by the edit under test.".to_string()]
+    );
+}
+
+#[test]
 fn edit_honors_the_chunk_policy_override() {
     // ENGRAM_CHUNK_MIN_CHARS=1 disables the floor, reproducing a pre-fix store.
     // Before the fix this knob had NO effect on `edit` at all; that it bites now

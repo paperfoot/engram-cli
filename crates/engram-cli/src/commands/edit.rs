@@ -34,6 +34,18 @@ pub async fn run(
             return Err(CliError::BadInput("importance must be 0..=10".into()));
         }
     }
+    if let Some(c) = content.as_deref() {
+        // An empty rewrite would chunk to nothing: the transaction below
+        // deletes every existing chunk and would insert zero, leaving a
+        // committed memory invisible to recall — the same black hole the
+        // atomic `remember` fix closed. `remember` rejects empty content;
+        // `edit` must too. Removing a memory is `forget`'s job.
+        if c.trim().is_empty() {
+            return Err(CliError::BadInput(
+                "content cannot be empty; use `engram forget <id>` to remove a memory".into(),
+            ));
+        }
+    }
     let uuid =
         Uuid::parse_str(&id).map_err(|e| CliError::BadInput(format!("invalid UUID {id}: {e}")))?;
 
@@ -49,6 +61,14 @@ pub async fn run(
         // `chunking.*` config knobs.
         let policy = crate::commands::chunks::resolve_policy();
         let new_chunks = chunk_memory(new_content, policy);
+        // Invariant, not just input validation: whatever the chunker does in
+        // the future, a rewrite that would leave this memory with zero chunks
+        // must never reach the delete-and-reinsert below.
+        if new_chunks.is_empty() {
+            return Err(CliError::BadInput(
+                "new content produced no chunks; memory left unchanged".into(),
+            ));
+        }
 
         let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
         let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
