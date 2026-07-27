@@ -3,9 +3,11 @@
 //! Understands two formats:
 //! - **v2** (current): full-fidelity restore of KBs, documents, memories,
 //!   chunks (embeddings included, no re-embedding needed), and facts.
-//! - **v1** (legacy): memories-only exports. Content is re-chunked without
-//!   embeddings; run `engram reindex` afterwards to restore dense
-//!   search.
+//! - **v1** (legacy): memories-only exports. Content is re-chunked through the
+//!   same policy `remember` uses, so a legacy restore cannot smuggle in the
+//!   degenerate fragments the floor exists to stop. Chunks land WITHOUT
+//!   embeddings by design; run `engram reindex --all` afterwards to restore
+//!   dense search.
 //!
 //! Both formats are accepted raw or wrapped in the CLI JSON envelope
 //! (`{"status":"success","data":{...}}`), so `engram export --json >
@@ -15,7 +17,7 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use engram_core::types::Memory;
-use engram_ingest::chunker::naive_split;
+use engram_ingest::memory::chunk_memory;
 use engram_storage::{
     ChunkExportRow, DocumentExportRow, FactExportRow, KbExportRow, MemoryExportRow,
 };
@@ -145,6 +147,11 @@ fn import_v1(
 
     let mut imported = 0u32;
     let mut chunks_created = 0u32;
+    // Resolved ONCE, outside the transaction. `resolve_policy` reads three
+    // settings, and each one re-reads the config file; doing that per memory
+    // would put file IO inside a write transaction holding SQLite's writer
+    // lock for the whole import.
+    let policy = crate::commands::chunks::resolve_policy();
     ctx.store.with_tx(|store| {
         for m_json in memories_json {
             let Ok(memory) = serde_json::from_value::<Memory>(m_json.clone()) else {
@@ -153,7 +160,10 @@ fn import_v1(
             // Storage will reject dupes via UNIQUE.
             if store.insert_memory(&memory).is_ok() {
                 imported += 1;
-                for chunk in naive_split(&memory.content) {
+                // Same chunker as `remember` and `edit`. Restoring a legacy
+                // backup must not be a back door that re-fills the index with
+                // bare date stamps and speaker labels.
+                for chunk in chunk_memory(&memory.content, policy) {
                     store.insert_chunk(
                         Uuid::new_v4(),
                         memory.id,

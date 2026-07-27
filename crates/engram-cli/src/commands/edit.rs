@@ -1,9 +1,11 @@
 //! `engram edit <id>` — update a memory's content or importance.
 //!
 //! If `--content` is provided, the memory's chunks are deleted, the new
-//! content is re-split and re-embedded, then new chunks are inserted. This
-//! keeps `chunks.content` (what `recall` actually searches) in sync with
-//! `memories.content`.
+//! content is re-chunked through the SAME policy `remember` uses
+//! (`chunk_memory` + `chunks::resolve_policy`), re-embedded, and reinserted.
+//! This keeps `chunks.content` (what `recall` actually searches) in sync with
+//! `memories.content`, and keeps an edited memory from being the one write
+//! path that still emits degenerate sub-60-character fragments.
 
 use crate::commands::usage::{estimated_tokens_for_texts, gemini_embed_cost_usd};
 use crate::context::AppContext;
@@ -12,7 +14,7 @@ use crate::output::{print_success, Metadata};
 use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
-use engram_ingest::chunker::naive_split;
+use engram_ingest::memory::chunk_memory;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -38,7 +40,15 @@ pub async fn run(
     let mut chunks_replaced = 0usize;
     if let Some(new_content) = content.as_deref() {
         let document_id = ctx.store.document_for_memory(uuid)?;
-        let new_chunks = naive_split(new_content);
+        // CHUNKING. This was a bare `naive_split`: paragraph split, no merge,
+        // no floor, no ceiling. Editing a memory therefore re-created exactly
+        // the fragments `remember` stopped producing — a lone `Sep 16, 2025`
+        // became its own embedded chunk and, being nearly pure signal for the
+        // few tokens it holds, outranked the paragraph that answers the query.
+        // One chunker for every write path: same floor, same ceiling, same
+        // `chunking.*` config knobs.
+        let policy = crate::commands::chunks::resolve_policy();
+        let new_chunks = chunk_memory(new_content, policy);
 
         let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
         let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
