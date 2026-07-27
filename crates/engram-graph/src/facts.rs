@@ -18,7 +18,10 @@
 //! - `adjudicate` resolves uncertain conflicts with one LLM call when the
 //!   caller opts into full autonomy; otherwise conflicts queue for the
 //!   calling agent, which has conversation context this system lacks.
-//! - JSON parsing stays forgiving: tolerates code fences and stray prose.
+//! - JSON parsing stays forgiving: tolerates code fences and stray prose. A
+//!   parse FAILURE reports where the response broke and how big it was, and
+//!   nothing from inside it: the extractor's answer restates the memory it was
+//!   given, so an error message is not a place to put it.
 
 use engram_llm::{ChatLlm, ChatMessage, LlmError};
 use serde::{Deserialize, Serialize};
@@ -77,8 +80,26 @@ fn default_confidence() -> f32 {
 pub enum FactExtractionError {
     #[error("llm error: {0}")]
     Llm(#[from] LlmError),
-    #[error("could not parse fact JSON: {0}")]
-    Parse(String),
+    /// A parse failure names WHERE the model's JSON broke and HOW BIG the
+    /// response was — never what it said. The extractor's answer restates the
+    /// memory it was extracted from, so echoing it copies private content into
+    /// stderr, the tracing log, and the `fact_extraction_note` an agent reads
+    /// back. Carrying a `&'static str` and three numbers instead of a free-form
+    /// String makes the leak unconstructible rather than merely absent, and
+    /// leaves nothing an untrusted response can inject into. The REMEDY is the
+    /// caller's to name: it knows the KB (see `ExtractionStatus::note`).
+    #[error(
+        "could not parse fact JSON: {kind} error at line {line} column {column} of the \
+         extracted JSON ({response_bytes} bytes of model output withheld)"
+    )]
+    Parse {
+        /// serde_json's own classification, as a word that is stable across
+        /// releases so an operator can grep a log for it.
+        kind: &'static str,
+        line: usize,
+        column: usize,
+        response_bytes: usize,
+    },
 }
 
 /// Extract `(subject, predicate, object)` triples from text via one LLM call.
@@ -94,6 +115,29 @@ pub async fn extract_facts<L: ChatLlm + ?Sized>(
         ])
         .await?;
     parse_extraction_output(&resp.content)
+}
+
+/// Describe a `serde_json` failure without quoting the data that caused it.
+///
+/// Forwarding serde_json's own Display is NOT safe here: a `Category::Data`
+/// error renders as `invalid type: string "<the value>", expected f32`, so
+/// merely dropping the raw suffix would still copy a slice of the model's
+/// answer — and therefore of the memory — into the message. Only the category,
+/// the position and the size survive.
+fn describe_parse_failure(e: &serde_json::Error, response_bytes: usize) -> FactExtractionError {
+    use serde_json::error::Category;
+    let kind = match e.classify() {
+        Category::Syntax => "syntax",
+        Category::Data => "schema",
+        Category::Eof => "truncated",
+        Category::Io => "io",
+    };
+    FactExtractionError::Parse {
+        kind,
+        line: e.line(),
+        column: e.column(),
+        response_bytes,
+    }
 }
 
 /// Parse the LLM's response, tolerating code fences and surrounding whitespace.
@@ -114,8 +158,11 @@ pub fn parse_extraction_output(content: &str) -> Result<Vec<ExtractedFact>, Fact
     let end = json.rfind(']').map(|i| i + 1).unwrap_or(json.len());
     let json = &json[..end];
 
+    // Not echoed anywhere: `content` is the model restating the memory. The
+    // length is of the WHOLE response; the line/column are into the JSON
+    // candidate sliced out of it above.
     serde_json::from_str::<Vec<ExtractedFact>>(json)
-        .map_err(|e| FactExtractionError::Parse(format!("{e}; raw: {}", content)))
+        .map_err(|e| describe_parse_failure(&e, content.len()))
 }
 
 /// Lowercase + trim normalization used for both subject and object lookups.
@@ -383,5 +430,67 @@ mod tests {
         let raw = "```json\n{\"action\":\"reject_new\"}\n```";
         let a = parse_adjudication_output(raw).unwrap();
         assert_eq!(a, AdjudicationAction::RejectNew);
+    }
+
+    /// A token that exists nowhere else in engram, so finding it in an error
+    /// can only mean the model's answer was echoed.
+    const LEAK_SENTINEL: &str = "QUOKKA-7F3A-DO-NOT-ECHO";
+
+    #[test]
+    fn a_parse_failure_never_echoes_the_model_response() {
+        let cases = [
+            // Prose wrapped around a truncated array: the whole response used
+            // to be appended after "raw:".
+            format!("Here are the facts about {LEAK_SENTINEL}: [{{\"subject\":\"Ana\","),
+            // A mistyped field — serde_json's OWN message quotes the value, so
+            // this one fails against a fix that merely drops the raw suffix.
+            format!(
+                "[{{\"subject\":\"Ana\",\"predicate\":\"lives_in\",\"object\":\"Lisbon\",\
+                 \"confidence\":\"{LEAK_SENTINEL}\"}}]"
+            ),
+            // A fenced response the model cut off mid-string.
+            format!("```json\n[{{\"subject\":\"{LEAK_SENTINEL}\"\n"),
+        ];
+        for raw in cases {
+            let rendered = parse_extraction_output(&raw).unwrap_err().to_string();
+            assert!(
+                !rendered.contains(LEAK_SENTINEL),
+                "the model response leaked into the error: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parse_failure_still_says_where_it_broke_and_how_big_it_was() {
+        let raw =
+            r#"[{"subject":"Ana","predicate":"lives_in","object":"Lisbon","confidence":"high"}]"#;
+        let rendered = parse_extraction_output(raw).unwrap_err().to_string();
+        assert!(rendered.contains("could not parse fact JSON"), "{rendered}");
+        assert!(
+            rendered.contains("schema"),
+            "a wrong type is a schema error: {rendered}"
+        );
+        assert!(rendered.contains("line 1"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("{} bytes", raw.len())),
+            "the size is the one number worth reporting: {rendered}"
+        );
+    }
+
+    #[test]
+    fn broken_json_and_wrong_types_are_told_apart() {
+        // Distinguishing these is the whole diagnostic value left: a syntax
+        // error means the model wrote junk, a schema error means the contract
+        // moved.
+        assert!(parse_extraction_output(r#"[{"subject": }]"#)
+            .unwrap_err()
+            .to_string()
+            .contains("syntax"));
+        assert!(
+            parse_extraction_output(r#"[{"subject":"Ana","confidence":"high"}]"#)
+                .unwrap_err()
+                .to_string()
+                .contains("schema")
+        );
     }
 }
