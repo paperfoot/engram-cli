@@ -143,6 +143,30 @@ pub fn parse_event_time(raw: &Option<String>) -> Result<Option<DateTime<Utc>>, C
     }
 }
 
+/// Test seam: make the embedding call fail on demand.
+///
+/// Set to any non-empty message and `remember` fails exactly where a network
+/// embed would — after chunking, before any database write. There is no other
+/// way to reproduce a failed embed offline, and "a committed memory with no
+/// chunks" is precisely the state this command must never be able to reach:
+/// dense recall can never return such a memory, and the exact-content dedup
+/// above turns every re-save into a successful-looking no-op, so the content is
+/// lost while the CLI reports success. Same shape as `ENGRAM_FACT_WRITE_FAIL`;
+/// never set in production use.
+pub const EMBED_FAIL_ENV: &str = "ENGRAM_EMBED_FAIL";
+
+fn injected_embed_failure() -> Option<CliError> {
+    let raw = std::env::var(EMBED_FAIL_ENV).ok()?;
+    let message = raw.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(CliError::Transient(format!(
+        "{EMBED_FAIL_ENV} injected an embedding failure ({message}); nothing was stored — \
+         re-run `engram remember` once the embedder is reachable"
+    )))
+}
+
 pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let RememberArgs {
         content,
@@ -231,7 +255,6 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         valid_until: None,
         tags,
     };
-    ctx.store.insert_memory_with_kb(&memory, &kb)?;
 
     // CHUNKING. This used to be a bare `naive_split`: paragraph split, no
     // merge, no size cap, no floor. Fed real content (a pasted WhatsApp thread,
@@ -265,27 +288,36 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let model_name = embedder.model();
     let dims = embedder.dimensions();
     let prompt_format = embedder.prompt_format().to_string();
+    // NOTHING IS WRITTEN UNTIL THE VECTORS ARE IN HAND. `embed_batch` is a
+    // NETWORK call: it can 429, time out, or come back short. Writing the memory
+    // row first (as this did) left a committed memory with no chunks whenever it
+    // did — dense recall can never return such a memory, and the exact-content
+    // dedup above turns every re-save into a successful-looking no-op, so the
+    // content is gone for good with the CLI reporting success. Embed, check the
+    // arity, and only then open one transaction for the row and its chunks.
+    if let Some(injected) = injected_embed_failure() {
+        return Err(injected);
+    }
     let embeddings = embedder
         .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
         .await?;
-
-    for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-        ctx.store.insert_chunk_with_embedding_meta(
-            Uuid::new_v4(),
-            memory.id,
-            &chunk.text,
-            chunk.position,
-            chunk.section.as_deref(),
-            emb,
-            &model_name,
-            dims,
-            &prompt_format,
-            None,
-        )?;
+    if embeddings.len() != chunks.len() {
+        return Err(CliError::Transient(format!(
+            "embedder returned {} embeddings for {} chunks; nothing was stored, so no chunk is \
+             indexed without a vector — retry `engram remember` with the same content",
+            embeddings.len(),
+            chunks.len(),
+        )));
     }
+
+    // The embedding call is paid the moment it returns, whether or not the write
+    // below commits, so the usage row is written FIRST and on its own. A failure
+    // to record it must not fail the command: the money is already spent, and
+    // losing the memory over a bookkeeping row is the worse lie. Same treatment
+    // as the extraction usage row in `extract_into`.
     if have_gemini && !chunk_texts.is_empty() {
         let tokens = estimated_tokens_for_texts(&chunk_texts);
-        ctx.store.record_usage_event(
+        if let Err(e) = ctx.store.record_usage_event(
             "gemini",
             "remember_embed",
             Some(&model_name),
@@ -302,8 +334,31 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 "prompt_format": prompt_format.clone(),
                 "estimated": true,
             }),
-        )?;
+        ) {
+            tracing::warn!("could not record remember embedding usage: {e}");
+        }
     }
+
+    // ONE unit of work: the memory row, the KB registration it implies, and
+    // every chunk land together or not at all.
+    let chunks_stored = ctx.store.with_tx(|store| {
+        store.insert_memory_with_kb(&memory, &kb)?;
+        for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
+            store.insert_chunk_with_embedding_meta(
+                Uuid::new_v4(),
+                memory.id,
+                &chunk.text,
+                chunk.position,
+                chunk.section.as_deref(),
+                emb,
+                &model_name,
+                dims,
+                &prompt_format,
+                None,
+            )?;
+        }
+        Ok(chunks.len())
+    })?;
 
     // Fact processing (extraction and/or caller-supplied triples) runs after
     // the memory is safely persisted so a fact failure never blocks `remember`.
@@ -400,7 +455,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         ..Default::default()
     };
     meta.add("memory_id", memory.id.to_string());
-    meta.add("chunks_stored", chunks.len());
+    meta.add("chunks_stored", chunks_stored);
     if let Some(note) = &truncation_note {
         meta.add("embed_truncation_note", note.clone());
     }
@@ -428,7 +483,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         json!({
             "id": memory.id,
             "stored": true,
-            "chunks": chunks.len(),
+            "chunks": chunks_stored,
             "embed_truncation_note": truncation_note,
             "kb": kb,
             "event_time": event_time.map(|t| t.to_rfc3339()),
@@ -444,7 +499,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             println!(
                 "Stored memory {} ({} chunks, {} facts, {} conflicts, {} queued for resolution)",
                 memory.id,
-                chunks.len(),
+                chunks_stored,
                 facts_added,
                 conflicts.len(),
                 adjudication_needed.len()
