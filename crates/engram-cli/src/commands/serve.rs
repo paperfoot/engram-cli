@@ -5,12 +5,9 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::OutputFormat;
 use crate::retrieval::{
-    hybrid_recall, resolve_kb_scope, Filters, HybridParams, RecallMode, RetrievalProfile,
+    hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
+    HybridParams, RecallMode, RetrievalProfile,
 };
-use engram_embed::gemini::{GeminiEmbedder, DEFAULT_DIMS, DEFAULT_MODEL, PROMPT_FORMAT};
-use engram_embed::stub::StubEmbedder;
-use engram_rerank::cohere::CohereReranker;
-use engram_rerank::passthrough::PassthroughReranker;
 use engram_storage::{paths, SqliteStore};
 use serde::Deserialize;
 use serde_json::json;
@@ -327,18 +324,14 @@ async fn route(
 async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Value, CliError> {
     let req: ResearchRequest = serde_json::from_str(body)?;
     let profile = RetrievalProfile::parse(req.profile.as_deref().unwrap_or("cloud_quality"))?;
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
-    let use_cloud = profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-    let use_cohere = profile != RetrievalProfile::Offline
-        && cohere_key.is_some()
-        && !force_stub
-        && !crate::commands::config::rerank_disabled();
-    let cohere_model = engram_rerank::cohere::resolve_model();
+    let kb_filter = req.kb.clone().filter(|k| k != "*");
     let rerank_candidates = req
         .rerank_top_n
         .unwrap_or_else(|| profile.default_rerank_top_n());
+    // The daemon is a retrieval surface like any other: a cloud profile with no
+    // key is a config error here too, and the caller's budget is checked before
+    // the paid call. It used to do neither and answer from the stub instead.
+    let backends = resolve_retrieval_backends(&store, profile, kb_filter.as_deref())?;
     let params = HybridParams {
         query: &req.query,
         top_k: req.top_k.unwrap_or(12),
@@ -346,7 +339,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
         rerank_top_n: rerank_candidates,
         filters: Filters {
             diary: req.diary.clone().filter(|d| d != "*"),
-            kb: req.kb.clone().filter(|k| k != "*"),
+            kb: kb_filter.clone(),
             since: None,
             until: None,
         },
@@ -354,21 +347,51 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
         graph_hops: 2,
         allow_mixed_embeddings: req.allow_mixed_embeddings.unwrap_or(false),
     };
-    let outcome = if use_cloud {
-        let embedder = GeminiEmbedder::new(gemini_key.unwrap());
-        if use_cohere {
-            let reranker = CohereReranker::new(cohere_key.unwrap());
-            hybrid_recall(&store, &embedder, Some(&reranker), params).await?
-        } else {
-            let reranker: Option<&PassthroughReranker> = None;
-            hybrid_recall(&store, &embedder, reranker, params).await?
-        }
-    } else {
-        let embedder = StubEmbedder::default();
-        let reranker: Option<&PassthroughReranker> = None;
-        hybrid_recall(&store, &embedder, reranker, params).await?
-    };
+    let outcome = hybrid_recall(
+        &store,
+        backends.embedder.as_ref(),
+        backends.reranker.as_deref(),
+        params,
+    )
+    .await?;
     let (results, notes) = (outcome.results, outcome.notes);
+    // A budget is a guardrail over RECORDED usage, so a surface that spends
+    // must record: this endpoint paid Gemini and told the ledger nothing, so
+    // daemon research traffic could never move a cap it now enforces.
+    if backends.cloud_embedder {
+        let tokens = estimated_tokens(&req.query);
+        store.record_usage_event(
+            "gemini",
+            "api_research_query_embed",
+            Some(backends.embed_model.as_str()),
+            kb_filter.as_deref(),
+            req.diary.as_deref().filter(|d| *d != "*"),
+            1,
+            1,
+            tokens,
+            0,
+            0.0,
+            gemini_embed_cost_usd(tokens),
+            json!({ "estimated": true, "api": true }),
+        )?;
+    }
+    if backends.use_cohere() && !results.is_empty() {
+        let search_units = 1.0;
+        store.record_usage_event(
+            "cohere",
+            "api_research_rerank",
+            Some(backends.cohere_model.as_str()),
+            kb_filter.as_deref(),
+            req.diary.as_deref().filter(|d| *d != "*"),
+            1,
+            rerank_candidates as i64,
+            0,
+            0,
+            search_units,
+            cohere_rerank_cost_usd(search_units),
+            json!({ "api": true }),
+        )?;
+    }
     let status = if results.is_empty() {
         "no_results"
     } else {
@@ -380,7 +403,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
         "data": {
             "status": status,
             "query": req.query,
-            "answer_context": results.iter().map(|r| r.content.as_str()).collect::<Vec<_>>().join("\n\n"),
+            "answer_context": render_answer_context(&results),
             "results": results.iter().map(|r| json!({
                 "id": r.id.to_string(),
                 "kind": r.kind,
@@ -393,7 +416,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
             })).collect::<Vec<_>>(),
             "metadata": {
                 "profile": profile.as_str(),
-                "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
+                "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
                 "diary_isolation": notes.diary_isolation_json(),
                 "temporal_scope": notes.temporal_scope_json()
@@ -411,27 +434,14 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
     let req_diary = req.diary.clone();
     let profile = RetrievalProfile::parse(req.profile.as_deref().unwrap_or("cloud_quality"))?;
     let mode = RecallMode::parse(req.mode.as_deref().unwrap_or("evidence"))?;
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
-    let use_cloud = profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-    let use_cohere = profile != RetrievalProfile::Offline
-        && cohere_key.is_some()
-        && !force_stub
-        && !crate::commands::config::rerank_disabled();
-    let cohere_model = engram_rerank::cohere::resolve_model();
     let rerank_candidates = req
         .rerank_top_n
         .unwrap_or_else(|| profile.default_rerank_top_n());
-    let (embed_model, embed_dims, prompt_format) = if use_cloud {
-        (
-            DEFAULT_MODEL.to_string(),
-            DEFAULT_DIMS,
-            PROMPT_FORMAT.to_string(),
-        )
-    } else {
-        ("stub-64".to_string(), 64, "stub-v1".to_string())
-    };
+    // Same provider + budget rule as `engram recall` (see
+    // `resolve_retrieval_backends`): no key under a cloud profile is a config
+    // error, not stub results dressed up as gemini ones. The embedder is also
+    // asked what it is rather than being hardcoded here.
+    let backends = resolve_retrieval_backends(&store, profile, scope.as_deref())?;
     let params = HybridParams {
         query: &req.query,
         top_k: req.top_k.unwrap_or(10),
@@ -447,27 +457,20 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
         graph_hops: req.graph_hops.unwrap_or(1),
         allow_mixed_embeddings: req.allow_mixed_embeddings.unwrap_or(false),
     };
-    let outcome = if use_cloud {
-        let embedder = GeminiEmbedder::new(gemini_key.unwrap());
-        if use_cohere {
-            let reranker = CohereReranker::new(cohere_key.unwrap());
-            hybrid_recall(&store, &embedder, Some(&reranker), params).await?
-        } else {
-            let reranker: Option<&PassthroughReranker> = None;
-            hybrid_recall(&store, &embedder, reranker, params).await?
-        }
-    } else {
-        let embedder = StubEmbedder::default();
-        let reranker: Option<&PassthroughReranker> = None;
-        hybrid_recall(&store, &embedder, reranker, params).await?
-    };
+    let outcome = hybrid_recall(
+        &store,
+        backends.embedder.as_ref(),
+        backends.reranker.as_deref(),
+        params,
+    )
+    .await?;
     let (results, notes) = (outcome.results, outcome.notes);
-    if use_cloud {
+    if backends.cloud_embedder {
         let tokens = estimated_tokens(&req.query);
         store.record_usage_event(
             "gemini",
             "api_recall_query_embed",
-            Some(engram_embed::gemini::DEFAULT_MODEL),
+            Some(backends.embed_model.as_str()),
             scope.as_deref(),
             req_diary.as_deref().filter(|d| *d != "*"),
             1,
@@ -479,12 +482,12 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
             json!({ "estimated": true, "api": true }),
         )?;
     }
-    if use_cohere && !results.is_empty() {
+    if backends.use_cohere() && !results.is_empty() {
         let search_units = 1.0;
         store.record_usage_event(
             "cohere",
             "api_recall_rerank",
-            Some(cohere_model.as_str()),
+            Some(backends.cohere_model.as_str()),
             scope.as_deref(),
             req_diary.as_deref().filter(|d| *d != "*"),
             1,
@@ -506,7 +509,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
         "status": status,
         "data": {
             "status": status,
-            "answer_context": results.iter().map(|r| r.content.as_str()).collect::<Vec<_>>().join("\n\n"),
+            "answer_context": render_answer_context(&results),
             "results": results.iter().map(|r| json!({
                 "id": r.id.to_string(),
                 "kind": r.kind,
@@ -519,10 +522,10 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
             })).collect::<Vec<_>>(),
             "metadata": {
                 "profile": profile.as_str(),
-                "embed_model": embed_model,
-                "embed_dims": embed_dims,
-                "prompt_format": prompt_format,
-                "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
+                "embed_model": backends.embed_model,
+                "embed_dims": backends.embed_dims,
+                "prompt_format": backends.prompt_format,
+                "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
                 "kb": scope.label(),
                 "kb_scope": scope.origin.as_str(),

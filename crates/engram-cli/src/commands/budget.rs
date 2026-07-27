@@ -4,6 +4,7 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use chrono::{Datelike, TimeZone, Utc};
+use engram_storage::SqliteStore;
 use serde_json::json;
 
 pub fn show(ctx: &AppContext, kb: Option<String>) -> Result<(), CliError> {
@@ -20,8 +21,8 @@ pub fn show(ctx: &AppContext, kb: Option<String>) -> Result<(), CliError> {
         .single()
         .unwrap()
         .to_rfc3339();
-    let daily = totals(ctx, kb.as_deref(), &today_start)?;
-    let monthly = totals(ctx, kb.as_deref(), &month_start)?;
+    let daily = totals(&ctx.store, kb.as_deref(), &today_start)?;
+    let monthly = totals(&ctx.store, kb.as_deref(), &month_start)?;
 
     let daily_budget = budget.as_ref().and_then(|b| b.daily_usd);
     let monthly_budget = budget.as_ref().and_then(|b| b.monthly_usd);
@@ -118,6 +119,10 @@ fn scope_for(kb: Option<&str>) -> String {
         .unwrap_or_else(|| "global".to_string())
 }
 
+pub fn enforce_budget(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError> {
+    enforce_budget_for_store(&ctx.store, kb)
+}
+
 /// Enforce spend guardrails BEFORE an operation makes paid API calls. Checks
 /// both the KB-scoped budget (if `kb` is set) and the global budget; if either
 /// daily or monthly recorded spend is already at/over its cap, returns a
@@ -127,7 +132,12 @@ fn scope_for(kb: Option<&str>) -> String {
 /// This is a guardrail over *recorded* usage estimates (provider invoices
 /// remain the source of truth), and it gates on spend already incurred — it
 /// does not pre-authorize the specific next call's cost.
-pub fn enforce_budget(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError> {
+///
+/// Takes a store rather than an `AppContext` because the daemon opens one
+/// `SqliteStore` per request and has no context to pass, and a budget that
+/// only binds on the CLI is not a budget. Mirrors `reindex::run` /
+/// `reindex_store`: one rule, two entry points, never a second copy of it.
+pub fn enforce_budget_for_store(store: &SqliteStore, kb: Option<&str>) -> Result<(), CliError> {
     // Disable with ENGRAM_BUDGET_ENFORCE=off for a one-off override.
     if std::env::var("ENGRAM_BUDGET_ENFORCE")
         .map(|v| {
@@ -141,7 +151,7 @@ pub fn enforce_budget(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError
         return Ok(());
     }
     for scope_kb in [kb, None] {
-        check_scope(ctx, scope_kb)?;
+        check_scope(store, scope_kb)?;
         if scope_kb.is_none() {
             break; // avoid checking global twice when kb is None
         }
@@ -149,9 +159,9 @@ pub fn enforce_budget(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError
     Ok(())
 }
 
-fn check_scope(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError> {
+fn check_scope(store: &SqliteStore, kb: Option<&str>) -> Result<(), CliError> {
     let scope = scope_for(kb);
-    let Some(budget) = ctx.store.get_usage_budget(&scope)? else {
+    let Some(budget) = store.get_usage_budget(&scope)? else {
         return Ok(());
     };
     let now = Utc::now();
@@ -161,7 +171,7 @@ fn check_scope(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError> {
             .single()
             .unwrap()
             .to_rfc3339();
-        let spent = totals(ctx, kb, &today_start)?.cost_usd_estimated;
+        let spent = totals(store, kb, &today_start)?.cost_usd_estimated;
         if spent >= cap {
             return Err(CliError::RateLimited(format!(
                 "daily budget for scope `{scope}` reached: ${spent:.4} spent of ${cap:.2} cap. \
@@ -177,7 +187,7 @@ fn check_scope(ctx: &AppContext, kb: Option<&str>) -> Result<(), CliError> {
             .single()
             .unwrap()
             .to_rfc3339();
-        let spent = totals(ctx, kb, &month_start)?.cost_usd_estimated;
+        let spent = totals(store, kb, &month_start)?.cost_usd_estimated;
         if spent >= cap {
             return Err(CliError::RateLimited(format!(
                 "monthly budget for scope `{scope}` reached: ${spent:.4} spent of ${cap:.2} cap. \
@@ -198,8 +208,8 @@ struct UsageTotals {
     cost_usd_estimated: f64,
 }
 
-fn totals(ctx: &AppContext, kb: Option<&str>, since: &str) -> Result<UsageTotals, CliError> {
-    let summary = ctx.store.usage_summary(kb, Some(since))?;
+fn totals(store: &SqliteStore, kb: Option<&str>, since: &str) -> Result<UsageTotals, CliError> {
+    let summary = store.usage_summary(kb, Some(since))?;
     Ok(UsageTotals {
         requests: summary.iter().map(|s| s.request_count).sum(),
         input_tokens_estimated: summary.iter().map(|s| s.input_tokens_estimated).sum(),
