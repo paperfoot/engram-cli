@@ -19,7 +19,7 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_write::{
     classify_pair, is_safety_slot, predicate_arity, write_fact, Arity, Autonomy, ClassifyMode,
-    ConflictClass, FactWriteCtx, FactWriteOutcome, Verdict,
+    ConflictClass, FactWriteCtx, FactWriteOutcome, MemoryTime, Verdict,
 };
 use crate::output::{print_success, Metadata};
 use engram_core::types::{Fact, SourceKind};
@@ -940,7 +940,13 @@ pub async fn backfill(
                 json!({ "estimated": true, "memory_id": memory.id.to_string() }),
             )?;
         }
-        let extracted = match extract_facts(llm.as_chat(), &memory.content).await {
+        let extracted = match extract_facts(
+            llm.as_chat(),
+            &memory.content,
+            memory.event_time.unwrap_or(memory.created_at),
+        )
+        .await
+        {
             Ok(facts) => facts,
             Err(e) => {
                 failed += 1;
@@ -956,7 +962,12 @@ pub async fn backfill(
             // Each memory's facts belong to that memory's OWN KB — a sweep
             // must not relabel them with the flag's (possibly absent) scope.
             kb: memory_kb,
-            event_time: memory.event_time,
+            // A backfilled memory is usually OLD: its facts inherit its own
+            // date, not the date of the sweep that finally read it.
+            memory_time: MemoryTime {
+                event_time: memory.event_time,
+                created_at: memory.created_at,
+            },
             embedder: Some(gate_embedder.as_ref()),
             llm: Some(llm.as_chat()),
             autonomy: Autonomy::default(),
@@ -1018,6 +1029,7 @@ pub async fn backfill(
     meta.add("facts_added", outcome.added);
     meta.add("facts_deduped", outcome.deduped);
     meta.add("conflicts_queued", outcome.queued.len());
+    meta.add("date_parse_warnings", outcome.date_warnings.len());
     meta.add("extraction_model", model.clone());
     print_success(
         ctx.format,
@@ -1033,6 +1045,7 @@ pub async fn backfill(
             "facts_deduped": outcome.deduped,
             "conflicts": outcome.conflicts,
             "adjudication_needed": outcome.queued,
+            "date_parse_warnings": outcome.date_warnings,
             "extraction_model": model,
         }),
         meta,

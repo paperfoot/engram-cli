@@ -20,6 +20,7 @@
 //!   calling agent, which has conversation context this system lacks.
 //! - JSON parsing stays forgiving: tolerates code fences and stray prose.
 
+use chrono::{DateTime, Utc};
 use engram_llm::{ChatLlm, ChatMessage, LlmError};
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +32,7 @@ RULES:
 - object: the value of the claim. Keep it concise (a name, place, number, date, or short noun phrase). For date-valued predicates (born_on, died_on, married_on, founded_on, graduated_on, joined_on, started_on, ended_on, hired_on) the object MUST be an ISO date (YYYY-MM-DD) whenever the text gives a full date — it is stored as the event time.
 - confidence: 0.0..=1.0. 1.0 = explicit declarative statement; 0.7 = paraphrase or implicit; 0.4 = inferred from indirect mention.
 - fact_type: one of profile_slot (single-valued attribute: employer, city, age), preference, relationship, event (something that happened at a time), procedural (how to do something), assertion (anything else).
-- valid_from: if the text explicitly states WHEN the fact became true ("since March 2026", "starting next year"), an ISO date (YYYY-MM-DD). Otherwise null.
+- valid_from: if the text states WHEN the fact became true, an ABSOLUTE ISO date (YYYY-MM-DD) resolved against the DATE CONTEXT below. Never a phrase ("last March", "since the summer") — a date nobody can parse is thrown away downstream. If you cannot resolve it to an absolute date, use null.
 
 SKIP:
 - Greetings, opinions, hedged statements ("might", "I think", "probably").
@@ -81,15 +82,44 @@ pub enum FactExtractionError {
     Parse(String),
 }
 
+/// The extraction system prompt, anchored to the date of the memory being
+/// read.
+///
+/// Without an anchor the model has nothing to resolve "last March" against, so
+/// it emits "last March" — and every reader downstream has to invent a date
+/// for it. Anchoring removes the input class instead of parsing it: a date the
+/// model resolves is a date the store can trust, and a date it cannot resolve
+/// is omitted rather than guessed.
+///
+/// Exposed so the anchoring can be checked without an LLM round-trip, the same
+/// way `parse_extraction_output` is.
+pub fn extraction_system_prompt(memory_date: DateTime<Utc>) -> String {
+    format!(
+        "{FACT_EXTRACTION_PROMPT}\n\n\
+         DATE CONTEXT:\n\
+         This memory is dated {date}. Resolve every relative expression \
+         (\"last March\", \"two years ago\", \"since the summer\") against that \
+         date and emit valid_from as an absolute YYYY-MM-DD. If you cannot \
+         resolve one to an absolute date, emit null — an omitted date is \
+         inherited from the memory, a guessed one silently overwrites true \
+         history.",
+        date = memory_date.format("%Y-%m-%d")
+    )
+}
+
 /// Extract `(subject, predicate, object)` triples from text via one LLM call.
 /// Returns an empty Vec if the LLM finds no extractable facts.
+///
+/// `memory_date` is the memory's own effective date (`--event-time`, else when
+/// the store recorded it) — see [`extraction_system_prompt`].
 pub async fn extract_facts<L: ChatLlm + ?Sized>(
     llm: &L,
     text: &str,
+    memory_date: DateTime<Utc>,
 ) -> Result<Vec<ExtractedFact>, FactExtractionError> {
     let resp = llm
         .chat(&[
-            ChatMessage::system(FACT_EXTRACTION_PROMPT),
+            ChatMessage::system(extraction_system_prompt(memory_date)),
             ChatMessage::user(text.to_string()),
         ])
         .await?;
@@ -266,6 +296,21 @@ pub fn parse_adjudication_output(content: &str) -> Result<AdjudicationAction, Fa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_extraction_prompt_carries_the_memory_date() {
+        use chrono::TimeZone;
+        let d = Utc.with_ymd_and_hms(2015, 6, 1, 0, 0, 0).unwrap();
+        let prompt = extraction_system_prompt(d);
+        assert!(prompt.contains("2015-06-01"), "no anchor date: {prompt}");
+        assert!(prompt.contains("DATE CONTEXT"));
+        // The rules the anchor exists to enforce.
+        assert!(prompt.contains("absolute YYYY-MM-DD"));
+        assert!(prompt.contains("null"));
+        // ...on top of the original prompt, not instead of it.
+        assert!(prompt.contains("RULES:"));
+        assert!(prompt.contains("subject"));
+    }
 
     #[test]
     fn parse_bare_array() {

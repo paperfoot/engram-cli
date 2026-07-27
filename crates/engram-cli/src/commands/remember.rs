@@ -18,7 +18,7 @@ use crate::commands::usage::{estimated_tokens, estimated_tokens_for_texts, gemin
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_llm::FactLlm;
-use crate::fact_write::{write_fact, Autonomy, FactWriteCtx, FactWriteOutcome};
+use crate::fact_write::{write_fact, Autonomy, FactWriteCtx, FactWriteOutcome, MemoryTime};
 use crate::output::{print_success, Metadata};
 use chrono::{DateTime, Utc};
 use engram_core::temporal::parse_moment;
@@ -376,7 +376,17 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         match &llm {
             Some(llm) => {
                 extraction_model = Some(llm.model());
-                match extract_into(ctx, llm, &content, &kb, &diary, &mut extracted).await {
+                match extract_into(
+                    ctx,
+                    llm,
+                    &content,
+                    &kb,
+                    &diary,
+                    event_time.unwrap_or(now),
+                    &mut extracted,
+                )
+                .await
+                {
                     Ok(()) if llm.is_live() => ExtractionStatus::Ran,
                     Ok(()) => ExtractionStatus::RanStub,
                     Err(e) => ExtractionStatus::Failed(e),
@@ -400,7 +410,10 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             memory_id: memory.id,
             diary: &diary,
             kb: &kb,
-            event_time,
+            memory_time: MemoryTime {
+                event_time,
+                created_at: now,
+            },
             embedder: gate_embedder.as_deref(),
             llm: llm.as_ref().map(|l| l.as_chat()),
             autonomy,
@@ -449,6 +462,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let conflicts = outcome.conflicts;
     let adjudication_needed = outcome.queued;
     let facts_deduped = outcome.deduped;
+    let date_warnings = outcome.date_warnings;
 
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -468,6 +482,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     meta.add("facts_deduped", facts_deduped);
     meta.add("conflicts_detected", conflicts.len());
     meta.add("conflicts_queued", adjudication_needed.len());
+    meta.add("date_parse_warnings", date_warnings.len());
     meta.add("fact_extraction", status.as_str());
     let note = status.note(&kb);
     if let Some(note) = &note {
@@ -476,6 +491,15 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         if !ctx.quiet {
             eprintln!("note: {note}");
         }
+    }
+    // Loud, not silent: an unreadable date is a fact dated by inference, and
+    // the agent that supplied it is the only one who can correct the source.
+    if !date_warnings.is_empty() && !ctx.quiet {
+        eprintln!(
+            "note: {} fact date(s) could not be read and were taken from the memory instead — \
+             see data.date_parse_warnings",
+            date_warnings.len()
+        );
     }
 
     print_success(
@@ -491,6 +515,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             "fact_extraction_note": note,
             "facts_added": facts_added,
             "facts_deduped": facts_deduped,
+            "date_parse_warnings": date_warnings,
             "conflicts": conflicts,
             "adjudication_needed": adjudication_needed,
         }),
@@ -513,6 +538,11 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
 /// An extraction failure is reported, never fatal — the memory is already
 /// stored and losing facts must not lose the memory.
 ///
+/// `memory_date` anchors the extraction prompt so relative expressions come
+/// back as absolute dates: an extractor that has nothing to resolve "last
+/// March" against emits "last March", and no reader downstream may invent a
+/// date for it.
+///
 /// Deliberately does NOT record the "already extracted" marker: that belongs
 /// after the facts are persisted, in the caller. See the marker-ordering note
 /// in `run`.
@@ -522,6 +552,7 @@ async fn extract_into(
     content: &str,
     kb: &str,
     diary: &str,
+    memory_date: DateTime<Utc>,
     out: &mut Vec<ExtractedFact>,
 ) -> Result<(), String> {
     let model = llm.model();
@@ -543,7 +574,7 @@ async fn extract_into(
             tracing::warn!("could not record fact extraction usage: {e}");
         }
     }
-    match extract_facts(llm.as_chat(), content).await {
+    match extract_facts(llm.as_chat(), content, memory_date).await {
         Ok(more) => {
             out.extend(more);
             Ok(())

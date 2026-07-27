@@ -316,6 +316,75 @@ fn write_supersede_rule(canonical: &str) -> &'static str {
     }
 }
 
+/// The memory a batch of facts came from, as far as time is concerned.
+///
+/// Bundled rather than passed as two loose fields because they are only ever
+/// meaningful together: `event_time` when it exists, otherwise `created_at` —
+/// and a caller that reads one without the other reintroduces the fabricated
+/// date this type exists to prevent.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryTime {
+    /// `--event-time`: when the content actually happened.
+    pub event_time: Option<DateTime<Utc>>,
+    /// When the store recorded the memory. Always known.
+    pub created_at: DateTime<Utc>,
+}
+
+impl MemoryTime {
+    /// The date a fact inherits when it has none of its own, plus the name of
+    /// that source for the warning payload.
+    fn anchor(&self) -> (DateTime<Utc>, &'static str) {
+        match self.event_time {
+            Some(t) => (t, "memory_event_time"),
+            None => (self.created_at, "memory_created_at"),
+        }
+    }
+}
+
+/// A date the extractor (or a `--facts-json` caller) supplied that could not be
+/// read, and what was used in its place.
+///
+/// Reported, never swallowed: a fact quietly dated "now" because nobody could
+/// parse "last March" is not a missing date, it is the NEWEST date in the
+/// store, and it wins recency supersession against the older true fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DateWarning {
+    pub field: &'static str,
+    /// The unreadable value, echoed back so the caller can fix the source.
+    pub value: String,
+    pub used: DateTime<Utc>,
+    /// Where `used` came from: memory_event_time | memory_created_at |
+    /// date_valued_object.
+    pub fallback: &'static str,
+}
+
+impl DateWarning {
+    /// The envelope payload: what was unreadable, what was used instead, and
+    /// the exact spelling that would have worked.
+    pub fn to_json(&self, subject: &str, predicate: &str) -> serde_json::Value {
+        json!({
+            "subject": subject,
+            "predicate": predicate,
+            "field": self.field,
+            "unreadable_value": self.value,
+            "used_instead": self.used.to_rfc3339(),
+            "fallback": self.fallback,
+            "hint": "emit valid_from as YYYY-MM-DD or RFC3339 (2026-03-01T09:30:00Z), or omit it — \
+                     a date the store cannot read must never become today's date",
+        })
+    }
+}
+
+/// Echo an unreadable date back to the caller, bounded so a pathological
+/// extractor cannot paste a whole memory into the envelope.
+fn truncate_for_report(raw: &str) -> String {
+    const MAX: usize = 64;
+    if raw.chars().count() <= MAX {
+        return raw.to_string();
+    }
+    raw.chars().take(MAX).chain(std::iter::once('…')).collect()
+}
+
 /// Aggregated outcome of writing one batch of extracted facts.
 #[derive(Debug, Default)]
 pub struct FactWriteOutcome {
@@ -325,6 +394,8 @@ pub struct FactWriteOutcome {
     pub conflicts: Vec<serde_json::Value>,
     /// Unresolved conflicts queued for the caller (`adjudication_needed`).
     pub queued: Vec<serde_json::Value>,
+    /// Unreadable extractor/caller dates, with the date used instead.
+    pub date_warnings: Vec<serde_json::Value>,
 }
 
 /// Thresholds for the novelty gate, env-overridable so they can be tuned on
@@ -343,27 +414,46 @@ fn gate_thresholds() -> (f32, f32) {
 
 /// When this fact became true, in the bi-temporal sense the v6 schema models.
 /// Precedence, most specific first:
-/// 1. an explicit `valid_from` from the extractor ("since March 2026");
+/// 1. an explicit `valid_from` that PARSES ("2026-03-01", RFC3339);
 /// 2. the object of a date-valued predicate — `born_on 1990-04-12` was true
 ///    in 1990, whatever today's date is;
-/// 3. the parent memory's `--event-time` — facts learned about an event
-///    inherit that event's time;
-/// 4. now, so the temporal model is never left NULL.
+/// 3. the parent memory's own date: its `--event-time`, or failing that when
+///    the store recorded it.
+///
+/// An explicit date that does NOT parse ("last March") falls to 2/3 and is
+/// REPORTED. It must never be read as `Utc::now()`: a fabricated now is not a
+/// missing date, it is the newest date in the store, so it wins recency
+/// supersession (`classify_pair`) against the older true fact and retires real
+/// history over a string the parser could not read. The fix for unreadable
+/// dates is the anchored extraction prompt, not a relative-date grammar here.
+///
+/// Returns the resolved time plus the warning, if any. Always `Some`: the
+/// temporal model is never left NULL.
 fn resolve_valid_from(
     ef: &ExtractedFact,
     predicate: &str,
-    memory_event_time: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
-    ef.valid_from
+    memory_time: MemoryTime,
+) -> (Option<DateTime<Utc>>, Option<DateWarning>) {
+    let supplied = ef
+        .valid_from
         .as_deref()
-        .and_then(parse_moment)
-        .or_else(|| {
-            date_valued_predicate(predicate)
-                .then(|| parse_moment(&ef.object))
-                .flatten()
-        })
-        .or(memory_event_time)
-        .or_else(|| Some(Utc::now()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(parsed) = supplied.and_then(parse_moment) {
+        return (Some(parsed), None);
+    }
+    let (at, fallback) = date_valued_predicate(predicate)
+        .then(|| parse_moment(&ef.object))
+        .flatten()
+        .map(|t| (t, "date_valued_object"))
+        .unwrap_or_else(|| memory_time.anchor());
+    let warning = supplied.map(|raw| DateWarning {
+        field: "valid_from",
+        value: truncate_for_report(raw),
+        used: at,
+        fallback,
+    });
+    (Some(at), warning)
 }
 
 /// Resolve a raw subject against known fact subjects in (diary, kb):
@@ -444,8 +534,9 @@ pub struct FactWriteCtx<'a> {
     pub memory_id: Uuid,
     pub diary: &'a str,
     pub kb: &'a str,
-    /// The memory's event time, inherited by facts with no date of their own.
-    pub event_time: Option<DateTime<Utc>>,
+    /// The memory's own dates. Facts with no readable date of their own
+    /// inherit from here — never from a fresh clock read.
+    pub memory_time: MemoryTime,
     /// Powers the novelty gate. `None` = gate off, exact path only.
     pub embedder: Option<&'a dyn Embedder>,
     /// Powers full-autonomy adjudication.
@@ -510,7 +601,15 @@ pub async fn write_fact(
         (false, Some(t)) => FactType::parse(t),
         (false, None) => FactType::Assertion,
     };
-    let valid_from = resolve_valid_from(ef, &predicate, w.event_time);
+    let (valid_from, date_warning) = resolve_valid_from(ef, &predicate, w.memory_time);
+    if let Some(warning) = date_warning {
+        // Recorded before any dedup/queue branch: the date was unreadable
+        // whatever happens to the fact itself, and the caller is the only one
+        // who can fix the source.
+        outcome
+            .date_warnings
+            .push(warning.to_json(&subject, &predicate));
+    }
 
     let new_fact = Fact {
         id: Uuid::new_v4(),
@@ -878,45 +977,91 @@ mod tests {
         parse_moment(s).unwrap()
     }
 
+    fn memory_time(event: Option<&str>) -> MemoryTime {
+        MemoryTime {
+            event_time: event.map(moment),
+            created_at: moment("2026-07-01T09:00:00Z"),
+        }
+    }
+
     #[test]
     fn explicit_valid_from_wins() {
         let ef = extracted("lives_in", "Lisbon", Some("2026-03-01"));
-        let got = resolve_valid_from(&ef, "lives_in", Some(moment("2020-01-01"))).unwrap();
-        assert_eq!(got, moment("2026-03-01"));
+        let (got, warning) = resolve_valid_from(&ef, "lives_in", memory_time(Some("2020-01-01")));
+        assert_eq!(got.unwrap(), moment("2026-03-01"));
+        assert!(warning.is_none(), "a readable date is not a warning");
     }
 
     #[test]
     fn date_valued_object_becomes_the_event_time() {
         let ef = extracted("born_on", "1990-04-12", None);
-        let got = resolve_valid_from(&ef, "born_on", None).unwrap();
-        assert_eq!(got, moment("1990-04-12"));
+        let (got, warning) = resolve_valid_from(&ef, "born_on", memory_time(None));
+        assert_eq!(got.unwrap(), moment("1990-04-12"));
+        assert!(warning.is_none());
     }
 
     #[test]
     fn non_date_predicates_ignore_a_date_shaped_object() {
         let ef = extracted("lives_in", "1990-04-12", None);
-        let event = moment("2024-06-01");
-        assert_eq!(
-            resolve_valid_from(&ef, "lives_in", Some(event)).unwrap(),
-            event
-        );
+        let (got, warning) = resolve_valid_from(&ef, "lives_in", memory_time(Some("2024-06-01")));
+        assert_eq!(got.unwrap(), moment("2024-06-01"));
+        assert!(warning.is_none());
     }
 
     #[test]
     fn facts_inherit_the_memory_event_time() {
         let ef = extracted("married_to", "Bo", None);
-        let event = moment("2019-08-17T14:00:00Z");
-        assert_eq!(
-            resolve_valid_from(&ef, "married_to", Some(event)).unwrap(),
-            event
-        );
+        let (got, warning) =
+            resolve_valid_from(&ef, "married_to", memory_time(Some("2019-08-17T14:00:00Z")));
+        assert_eq!(got.unwrap(), moment("2019-08-17T14:00:00Z"));
+        assert!(warning.is_none());
     }
 
     #[test]
-    fn undated_facts_fall_back_to_now() {
+    fn an_unreadable_date_falls_back_to_the_memory_date_never_to_now() {
         let ef = extracted("prefers", "tea", Some("next spring"));
-        let got = resolve_valid_from(&ef, "prefers", None).unwrap();
-        assert!((Utc::now() - got).num_seconds().abs() < 5);
+        let mt = memory_time(Some("2019-08-17T14:00:00Z"));
+        let (got, warning) = resolve_valid_from(&ef, "prefers", mt);
+        assert_eq!(
+            got.unwrap(),
+            moment("2019-08-17T14:00:00Z"),
+            "a date the parser cannot read must not become the newest date in the store"
+        );
+        let warning = warning.expect("the caller has to learn the date was dropped");
+        assert_eq!(warning.value, "next spring");
+        assert_eq!(warning.fallback, "memory_event_time");
+    }
+
+    #[test]
+    fn with_no_event_time_an_unreadable_date_falls_back_to_the_record_time() {
+        let ef = extracted("prefers", "tea", Some("next spring"));
+        let (got, warning) = resolve_valid_from(&ef, "prefers", memory_time(None));
+        assert_eq!(got.unwrap(), moment("2026-07-01T09:00:00Z"));
+        assert_eq!(warning.unwrap().fallback, "memory_created_at");
+    }
+
+    #[test]
+    fn a_fact_with_no_date_at_all_inherits_the_memory_and_warns_about_nothing() {
+        let ef = extracted("prefers", "tea", None);
+        let (got, warning) = resolve_valid_from(&ef, "prefers", memory_time(None));
+        assert_eq!(got.unwrap(), moment("2026-07-01T09:00:00Z"));
+        assert!(warning.is_none(), "no date supplied is not a bad date");
+    }
+
+    #[test]
+    fn a_blank_valid_from_is_an_absent_one() {
+        let ef = extracted("prefers", "tea", Some("   "));
+        let (got, warning) = resolve_valid_from(&ef, "prefers", memory_time(None));
+        assert_eq!(got.unwrap(), moment("2026-07-01T09:00:00Z"));
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_date_never_reaches_the_envelope_unbounded() {
+        let long = "x".repeat(500);
+        let ef = extracted("prefers", "tea", Some(&long));
+        let (_, warning) = resolve_valid_from(&ef, "prefers", memory_time(None));
+        assert!(warning.unwrap().value.chars().count() <= 65);
     }
 
     #[test]

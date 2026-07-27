@@ -58,7 +58,7 @@ Importance: 0–3 trivia, 4–6 useful context, 7–8 decisions/preferences, 9�
 
 ## Facts and contradictions
 
-`remember` extracts `(subject, predicate, object)` facts automatically when an OpenRouter key resolves. Opt out with `--no-extract-facts`; skip the LLM call by supplying the triple yourself via `--facts-json '[{"subject":"...","predicate":"...","object":"..."}]'` (same contradiction detection, zero cost).
+`remember` extracts `(subject, predicate, object)` facts automatically when an OpenRouter key resolves. Opt out with `--no-extract-facts`; skip the LLM call by supplying the triple yourself via `--facts-json '[{"subject":"...","predicate":"...","object":"..."}]'` (same contradiction detection, zero cost). A `valid_from` in the triple must be an absolute `YYYY-MM-DD`/RFC3339 date; anything else is reported in `date_parse_warnings` and the fact is dated from the memory instead.
 
 **Check `fact_extraction` in the response** — `skipped_no_openrouter_key` (nothing captured), `failed_partial_persist` (a fact didn't persist, so no done-marker: backfill will retry that memory), `failed_extraction_marker` (facts landed, marker didn't — a later backfill may re-extract; harmless).
 
