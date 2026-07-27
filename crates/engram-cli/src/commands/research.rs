@@ -5,7 +5,8 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use crate::retrieval::{
-    build_fts_query, hybrid_recall, Filters, HybridParams, RecallMode, RetrievalProfile,
+    build_fts_query, hybrid_recall, render_answer_context, Filters, HybridParams, RecallMode,
+    RetrievalProfile,
 };
 use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
@@ -154,11 +155,7 @@ pub async fn run(
         "success"
     };
     let cited = results.iter().filter(|r| !r.citations.is_empty()).count();
-    let answer_context = results
-        .iter()
-        .map(|r| format!("[{}:{}]\n{}", r.kind, r.id, r.content))
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let answer_context = render_answer_context(&results);
     let results_json = results
         .iter()
         .map(|r| {

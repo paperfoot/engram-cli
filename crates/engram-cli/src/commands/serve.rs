@@ -5,7 +5,8 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::OutputFormat;
 use crate::retrieval::{
-    hybrid_recall, resolve_kb_scope, Filters, HybridParams, RecallMode, RetrievalProfile,
+    hybrid_recall, render_answer_context, resolve_kb_scope, Filters, HybridParams, RecallMode,
+    RetrievalProfile,
 };
 use engram_embed::gemini::{GeminiEmbedder, DEFAULT_DIMS, DEFAULT_MODEL, PROMPT_FORMAT};
 use engram_embed::stub::StubEmbedder;
@@ -380,7 +381,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
         "data": {
             "status": status,
             "query": req.query,
-            "answer_context": results.iter().map(|r| r.content.as_str()).collect::<Vec<_>>().join("\n\n"),
+            "answer_context": render_answer_context(&results),
             "results": results.iter().map(|r| json!({
                 "id": r.id.to_string(),
                 "kind": r.kind,
@@ -506,7 +507,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
         "status": status,
         "data": {
             "status": status,
-            "answer_context": results.iter().map(|r| r.content.as_str()).collect::<Vec<_>>().join("\n\n"),
+            "answer_context": render_answer_context(&results),
             "results": results.iter().map(|r| json!({
                 "id": r.id.to_string(),
                 "kind": r.kind,

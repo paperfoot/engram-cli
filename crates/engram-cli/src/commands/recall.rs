@@ -5,7 +5,8 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_envelope, Metadata};
 use crate::retrieval::{
-    hybrid_recall, resolve_kb_scope, Filters, HybridParams, RecallMode, RetrievalProfile,
+    hybrid_recall, render_answer_context, resolve_kb_scope, Filters, HybridParams, RecallMode,
+    RetrievalProfile,
 };
 use chrono::{DateTime, Utc};
 use engram_core::layers::approx_tokens;
@@ -166,7 +167,9 @@ pub async fn run(
     // half of the contradiction-resolution promise.
     let conflicts = surface_conflicts(ctx, scope.as_deref(), &query)?;
 
-    let answer_context = build_answer_context(&layered);
+    // `layered` is a Vec<&HybridResult>; `.iter()` would hand the renderer
+    // `&&HybridResult`, so copy the references out.
+    let answer_context = render_answer_context(layered.iter().copied());
     let results_json: Vec<_> = layered
         .iter()
         .map(|r| json!({
@@ -414,30 +417,6 @@ fn query_terms(query: &str) -> Vec<String> {
         if seen.insert(lower.clone()) {
             out.push(lower);
         }
-    }
-    out
-}
-
-fn build_answer_context(results: &[&crate::retrieval::HybridResult]) -> String {
-    let mut out = String::new();
-    for (i, r) in results.iter().enumerate() {
-        let citation = r
-            .citations
-            .first()
-            .and_then(|c| {
-                c.source
-                    .clone()
-                    .or_else(|| c.chunk_id.map(|id: uuid::Uuid| id.to_string()))
-            })
-            .unwrap_or_else(|| r.id.to_string());
-        out.push_str(&format!(
-            "[{}] ({}, kb={}) {}\nsource: {}\n\n",
-            i + 1,
-            r.kind,
-            r.kb,
-            r.content.trim(),
-            citation
-        ));
     }
     out
 }
