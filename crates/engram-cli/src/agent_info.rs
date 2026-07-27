@@ -25,7 +25,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "`remember` extracts (subject, predicate, object) facts by default when an OpenRouter key resolves; the envelope always says which via `fact_extraction`. Opt out with --no-extract-facts.",
             "Use `--event-time` whenever the content has a real date (birthday, anniversary, a decision made last March) — `recall --since/--until` filters on it.",
             "For directory ingest, run `engram ingest <dir> --dry-run` first, then ingest with the same --include/--exclude/--max-files scope. Use --all only for an intentional full recursive ingest.",
-            "Default recall profile is cloud_quality: Gemini Embedding 2 + FTS5 BM25 + claims/entities/graph + Cohere rerank when configured."
+            "Default recall profile is cloud_quality: Gemini Embedding 2 + FTS5 BM25 + claims/entities/graph + Cohere rerank when configured.",
+            "A cloud profile with no Gemini key is a config error (exit 2) on every surface — `recall`, `research`, and the daemon's /v1/recall and /v1/research — never a silent fallback to the offline stub. Ask for the stub explicitly with `--profile offline` (or \"profile\": \"offline\" over the API)."
         ],
         "commands": {
             "agent-info | info": "Print this manifest (raw JSON, not enveloped)",

@@ -5,18 +5,13 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_envelope, Metadata};
 use crate::retrieval::{
-    hybrid_recall, render_answer_context, resolve_kb_scope, Filters, HybridParams, RecallMode,
-    RetrievalProfile,
+    hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
+    HybridParams, RecallMode, RetrievalProfile,
 };
 use chrono::{DateTime, Utc};
 use engram_core::layers::approx_tokens;
 use engram_core::temporal::{parse_bound, DayBound};
 use engram_core::types::Layer;
-use engram_embed::gemini::{GeminiEmbedder, DEFAULT_DIMS, DEFAULT_MODEL, PROMPT_FORMAT};
-use engram_embed::stub::StubEmbedder;
-use engram_embed::Embedder;
-use engram_rerank::cohere::CohereReranker;
-use engram_rerank::passthrough::PassthroughReranker;
 use serde_json::json;
 use std::time::Instant;
 
@@ -79,63 +74,18 @@ pub async fn run(
         allow_mixed_embeddings,
     };
 
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
-
-    // A cloud profile (cloud_quality/fast) with no Gemini key used to fall back
-    // to the 64-dim hash stub SILENTLY — producing garbage similarity and, on a
-    // real gemini-indexed KB, misdiagnosing the missing key as an index
-    // mismatch. Fail loudly instead (exit code 2 = config). `--profile offline`
-    // and the bench stub-forcing env var opt into the stub explicitly.
-    if profile_enum != RetrievalProfile::Offline && gemini_key.is_none() && !force_stub {
-        return Err(CliError::Config(format!(
-            "profile `{}` needs a Gemini API key for real retrieval, but none is configured. \
-             Set it with `engram config set keys.gemini <KEY>` (or GEMINI_API_KEY), \
-             or run with `--profile offline` to use the deterministic offline stub.",
-            profile_enum.as_str()
-        )));
-    }
-
-    let use_cloud_embedder =
-        profile_enum != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-
-    // Enforce spend guardrails before any paid embed/rerank call.
-    if use_cloud_embedder {
-        crate::commands::budget::enforce_budget(ctx, scope.as_deref())?;
-    }
-    let use_cohere = profile_enum != RetrievalProfile::Offline
-        && cohere_key.is_some()
-        && !force_stub
-        && !crate::commands::config::rerank_disabled();
-    let cohere_model = engram_rerank::cohere::resolve_model();
-
-    let (outcome, embed_model, embed_dims, prompt_format) = if use_cloud_embedder {
-        let embedder = GeminiEmbedder::new(gemini_key.clone().unwrap());
-        let meta = (
-            embedder.model(),
-            embedder.dimensions(),
-            embedder.prompt_format().to_string(),
-        );
-        let results = if use_cohere {
-            let reranker = CohereReranker::new(cohere_key.clone().unwrap());
-            hybrid_recall(&ctx.store, &embedder, Some(&reranker), params).await?
-        } else {
-            let reranker: Option<&PassthroughReranker> = None;
-            hybrid_recall(&ctx.store, &embedder, reranker, params).await?
-        };
-        (results, meta.0, meta.1, meta.2)
-    } else {
-        let embedder = StubEmbedder::default();
-        let meta = (
-            embedder.model(),
-            embedder.dimensions(),
-            embedder.prompt_format().to_string(),
-        );
-        let reranker: Option<&PassthroughReranker> = None;
-        let results = hybrid_recall(&ctx.store, &embedder, reranker, params).await?;
-        (results, meta.0, meta.1, meta.2)
-    };
+    // Provider choice, the missing-key hard error and the spend guardrail all
+    // live in `resolve_retrieval_backends` now — the three copies of this block
+    // drifted, and research and the daemon kept silently falling back to the
+    // 64-dim stub long after recall stopped.
+    let backends = resolve_retrieval_backends(&ctx.store, profile_enum, scope.as_deref())?;
+    let outcome = hybrid_recall(
+        &ctx.store,
+        backends.embedder.as_ref(),
+        backends.reranker.as_deref(),
+        params,
+    )
+    .await?;
 
     let results = outcome.results;
     let notes = outcome.notes;
@@ -191,23 +141,23 @@ pub async fn run(
         .collect();
 
     let query_tokens_estimated = estimated_tokens(&query);
-    let gemini_query_cost = if use_cloud_embedder {
+    let gemini_query_cost = if backends.cloud_embedder {
         gemini_embed_cost_usd(query_tokens_estimated)
     } else {
         0.0
     };
-    let cohere_search_units = if use_cohere && !results.is_empty() {
+    let cohere_search_units = if backends.use_cohere() && !results.is_empty() {
         1.0
     } else {
         0.0
     };
     let cohere_cost = cohere_rerank_cost_usd(cohere_search_units);
 
-    if use_cloud_embedder {
+    if backends.cloud_embedder {
         ctx.store.record_usage_event(
             "gemini",
             "recall_query_embed",
-            Some(&embed_model),
+            Some(backends.embed_model.as_str()),
             scope.as_deref(),
             if diary == "*" { None } else { Some(&diary) },
             1,
@@ -217,17 +167,17 @@ pub async fn run(
             0.0,
             gemini_query_cost,
             json!({
-                "dimensions": embed_dims,
-                "prompt_format": prompt_format.clone(),
+                "dimensions": backends.embed_dims,
+                "prompt_format": backends.prompt_format.clone(),
                 "estimated": true,
             }),
         )?;
     }
-    if use_cohere && !results.is_empty() {
+    if backends.use_cohere() && !results.is_empty() {
         ctx.store.record_usage_event(
             "cohere",
             "recall_rerank",
-            Some(cohere_model.as_str()),
+            Some(backends.cohere_model.as_str()),
             scope.as_deref(),
             if diary == "*" { None } else { Some(&diary) },
             1,
@@ -262,23 +212,16 @@ pub async fn run(
     }
     meta.add(
         "retriever",
-        if use_cloud_embedder {
+        if backends.cloud_embedder {
             "hybrid_gemini"
         } else {
             "hybrid_stub"
         },
     );
-    meta.add("embed_model", embed_model.clone());
-    meta.add("embed_dims", embed_dims);
-    meta.add("embed_prompt_format", prompt_format.clone());
-    meta.add(
-        "reranker",
-        if use_cohere {
-            format!("cohere/{}", cohere_model)
-        } else {
-            "passthrough".to_string()
-        },
-    );
+    meta.add("embed_model", backends.embed_model.clone());
+    meta.add("embed_dims", backends.embed_dims);
+    meta.add("embed_prompt_format", backends.prompt_format.clone());
+    meta.add("reranker", backends.reranker_label.clone());
     meta.add("rrf_k", rrf_k);
     meta.add("layer", format!("{:?}", layer_enum).to_lowercase());
     meta.add("token_budget", budget);
@@ -309,10 +252,10 @@ pub async fn run(
             "conflicts": conflicts,
             "metadata": {
                 "profile": profile_enum.as_str(),
-                "embed_model": if use_cloud_embedder { DEFAULT_MODEL } else { embed_model.as_str() },
-                "embed_dims": if use_cloud_embedder { DEFAULT_DIMS } else { embed_dims },
-                "prompt_format": if use_cloud_embedder { PROMPT_FORMAT } else { prompt_format.as_str() },
-                "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
+                "embed_model": backends.embed_model,
+                "embed_dims": backends.embed_dims,
+                "prompt_format": backends.prompt_format,
+                "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
                 "kb": scope.label(),
                 "kb_scope": scope.origin.as_str(),

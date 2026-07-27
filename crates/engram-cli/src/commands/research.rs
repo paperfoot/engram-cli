@@ -5,14 +5,9 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use crate::retrieval::{
-    build_fts_query, hybrid_recall, render_answer_context, Filters, HybridParams, RecallMode,
-    RetrievalProfile,
+    build_fts_query, hybrid_recall, render_answer_context, resolve_retrieval_backends, Filters,
+    HybridParams, RecallMode, RetrievalProfile,
 };
-use engram_embed::gemini::GeminiEmbedder;
-use engram_embed::stub::StubEmbedder;
-use engram_embed::Embedder;
-use engram_rerank::cohere::CohereReranker;
-use engram_rerank::passthrough::PassthroughReranker;
 use serde_json::json;
 use std::time::Instant;
 
@@ -61,61 +56,34 @@ pub async fn run(
         allow_mixed_embeddings,
     };
 
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
-    let use_cloud =
-        profile_enum != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
-    let use_cohere = profile_enum != RetrievalProfile::Offline
-        && cohere_key.is_some()
-        && !force_stub
-        && !crate::commands::config::rerank_disabled();
-    let cohere_model = engram_rerank::cohere::resolve_model();
-
-    let (results, embed_model, embed_dims, prompt_format) = if use_cloud {
-        let embedder = GeminiEmbedder::new(gemini_key.clone().unwrap());
-        let meta = (
-            embedder.model(),
-            embedder.dimensions(),
-            embedder.prompt_format().to_string(),
-        );
-        let results = if use_cohere {
-            let reranker = CohereReranker::new(cohere_key.clone().unwrap());
-            hybrid_recall(&ctx.store, &embedder, Some(&reranker), params)
-                .await?
-                .results
-        } else {
-            let reranker: Option<&PassthroughReranker> = None;
-            hybrid_recall(&ctx.store, &embedder, reranker, params)
-                .await?
-                .results
-        };
-        (results, meta.0, meta.1, meta.2)
-    } else {
-        let embedder = StubEmbedder::default();
-        let meta = (
-            embedder.model(),
-            embedder.dimensions(),
-            embedder.prompt_format().to_string(),
-        );
-        let reranker: Option<&PassthroughReranker> = None;
-        let results = hybrid_recall(&ctx.store, &embedder, reranker, params)
-            .await?
-            .results;
-        (results, meta.0, meta.1, meta.2)
-    };
+    // Same rule the CLI recall path applies: a cloud profile with no key is a
+    // config error, never a silent stub, and the spend guardrail gates the paid
+    // call. `research` had neither — it was the original copy of this block.
+    let backends = resolve_retrieval_backends(
+        &ctx.store,
+        profile_enum,
+        if all_kbs { None } else { Some(kb.as_str()) },
+    )?;
+    let results = hybrid_recall(
+        &ctx.store,
+        backends.embedder.as_ref(),
+        backends.reranker.as_deref(),
+        params,
+    )
+    .await?
+    .results;
 
     let query_tokens = estimated_tokens(&query);
-    let gemini_cost = if use_cloud {
+    let gemini_cost = if backends.cloud_embedder {
         gemini_embed_cost_usd(query_tokens)
     } else {
         0.0
     };
-    if use_cloud {
+    if backends.cloud_embedder {
         ctx.store.record_usage_event(
             "gemini",
             "research_query_embed",
-            Some(&embed_model),
+            Some(backends.embed_model.as_str()),
             if all_kbs { None } else { Some(&kb) },
             if diary == "*" { None } else { Some(&diary) },
             1,
@@ -124,10 +92,10 @@ pub async fn run(
             0,
             0.0,
             gemini_cost,
-            json!({ "dimensions": embed_dims, "prompt_format": prompt_format, "estimated": true }),
+            json!({ "dimensions": backends.embed_dims, "prompt_format": backends.prompt_format, "estimated": true }),
         )?;
     }
-    let cohere_units = if use_cohere && !results.is_empty() {
+    let cohere_units = if backends.use_cohere() && !results.is_empty() {
         1.0
     } else {
         0.0
@@ -136,7 +104,7 @@ pub async fn run(
         ctx.store.record_usage_event(
             "cohere",
             "research_rerank",
-            Some(cohere_model.as_str()),
+            Some(backends.cohere_model.as_str()),
             if all_kbs { None } else { Some(&kb) },
             if diary == "*" { None } else { Some(&diary) },
             1,
@@ -210,9 +178,9 @@ pub async fn run(
             },
             "metadata": {
                 "profile": profile_enum.as_str(),
-                "embed_model": embed_model,
-                "embed_dims": embed_dims,
-                "reranker": if use_cohere { format!("cohere/{}", cohere_model) } else { "passthrough".to_string() },
+                "embed_model": backends.embed_model,
+                "embed_dims": backends.embed_dims,
+                "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
             }
         }),

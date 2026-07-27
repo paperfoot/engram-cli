@@ -122,4 +122,4 @@ An unscoped directory ingest is refused by default: `--dry-run --include '...' -
 - **After changing embedding model/dimensions/prompt format, run `engram reindex --kb <name>`** — legacy embeddings are refused by default.
 - `engram forget <id>` requires `--confirm`. `engram update` (without `--check`) mutates the install — only on user request.
 - `engram skill install` refuses to overwrite a SKILL.md you edited by hand; pass `--force` if you mean it.
-- No Gemini key configured → recall silently falls back to a deterministic offline stub (deterministic, but not real retrieval quality). `engram doctor --json` to verify; `--integrity` also flags unregistered KBs.
+- **No Gemini key → exit 2, not quiet garbage.** `recall`, `research` and the daemon all refuse a cloud profile with no key rather than answering from the 64-dim offline stub. Ask for the stub on purpose with `--profile offline`. `engram doctor --json` to verify; `--integrity` also flags unregistered KBs.

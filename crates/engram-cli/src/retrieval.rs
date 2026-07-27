@@ -7,8 +7,11 @@
 use chrono::{DateTime, Utc};
 use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
 use engram_core::types::RetrievalSource;
+use engram_embed::gemini::GeminiEmbedder;
+use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::extract_entities;
+use engram_rerank::cohere::CohereReranker;
 use engram_rerank::{passthrough::PassthroughReranker, RerankCandidate, Reranker};
 use engram_storage::{SourceCitation, SqliteStore, StoredChunkEmbedding};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -96,6 +99,109 @@ impl RetrievalProfile {
             Self::Offline => 50,
         }
     }
+}
+
+/// The embedder and reranker one read actually runs on, plus the metadata
+/// every surface reports about them.
+pub struct RetrievalBackends {
+    pub embedder: Box<dyn Embedder>,
+    pub reranker: Option<Box<dyn Reranker>>,
+    /// True when the PAID Gemini embedder was selected — the flag every
+    /// surface uses to decide whether to record a usage event.
+    pub cloud_embedder: bool,
+    pub embed_model: String,
+    pub embed_dims: usize,
+    pub prompt_format: String,
+    /// `cohere/<model>` or `passthrough`.
+    pub reranker_label: String,
+    /// The resolved Cohere model slug, reported even when reranking is off.
+    pub cohere_model: String,
+}
+
+impl RetrievalBackends {
+    pub fn use_cohere(&self) -> bool {
+        self.reranker.is_some()
+    }
+}
+
+/// Pick the embedder and reranker for one read — for EVERY surface that reads.
+///
+/// A cloud profile (cloud_quality/fast) with no Gemini key used to fall back to
+/// the 64-dim hash stub SILENTLY: garbage similarity, and on a gemini-indexed
+/// KB the missing key was misdiagnosed as an index mismatch. `recall` learned
+/// to fail loudly; `research` and both daemon endpoints kept the old behaviour
+/// for months, because the block was copy-pasted rather than shared. It lives
+/// here now: one rule, four callers.
+///
+/// `--profile offline` and `ENGRAM_BENCH_FORCE_STUB` are the two explicit ways
+/// to ask for the stub, and they also skip the budget check — nothing is
+/// spent. Spend guardrails are enforced BEFORE the first paid call, so an
+/// autonomous agent stops at its cap over the daemon exactly as on the CLI.
+///
+/// Note for future callers: `bench personal` deliberately does NOT use this —
+/// there, `ENGRAM_BENCH_FORCE_STUB` under a cloud profile is an error, because
+/// benchmarking the stub and labelling it "cloud quality" is a lie about a
+/// number. Read `bench.rs` before unifying it.
+pub fn resolve_retrieval_backends(
+    store: &SqliteStore,
+    profile: RetrievalProfile,
+    budget_kb: Option<&str>,
+) -> Result<RetrievalBackends, crate::error::CliError> {
+    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
+    let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
+    let cohere_model = engram_rerank::cohere::resolve_model();
+
+    if profile != RetrievalProfile::Offline && gemini_key.is_none() && !force_stub {
+        return Err(crate::error::CliError::Config(format!(
+            "profile `{}` needs a Gemini API key for real retrieval, but none is configured. \
+             Set it with `engram config set keys.gemini <KEY>` (or GEMINI_API_KEY), or select \
+             the offline profile (`--profile offline` on the CLI, \"profile\": \"offline\" over \
+             the daemon API) to use the deterministic offline stub.",
+            profile.as_str()
+        )));
+    }
+
+    let cloud_embedder =
+        profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
+    // Enforce spend guardrails before any paid embed/rerank call.
+    if cloud_embedder {
+        crate::commands::budget::enforce_budget_for_store(store, budget_kb)?;
+    }
+    let use_cohere = profile != RetrievalProfile::Offline
+        && cohere_key.is_some()
+        && !force_stub
+        && !crate::commands::config::rerank_disabled();
+
+    let embedder: Box<dyn Embedder> = if cloud_embedder {
+        Box::new(GeminiEmbedder::new(
+            gemini_key.expect("cloud_embedder implies a key"),
+        ))
+    } else {
+        Box::new(StubEmbedder::default())
+    };
+    let reranker: Option<Box<dyn Reranker>> = if use_cohere {
+        Some(Box::new(CohereReranker::new(
+            cohere_key.expect("use_cohere implies a key"),
+        )))
+    } else {
+        None
+    };
+
+    Ok(RetrievalBackends {
+        embed_model: embedder.model(),
+        embed_dims: embedder.dimensions(),
+        prompt_format: embedder.prompt_format().to_string(),
+        reranker_label: if use_cohere {
+            format!("cohere/{cohere_model}")
+        } else {
+            "passthrough".to_string()
+        },
+        cohere_model,
+        cloud_embedder,
+        embedder,
+        reranker,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1260,6 +1366,23 @@ mod tests {
         assert!(header(&ctx, 1).contains("source=\"paper.pdf\""));
         assert!(header(&ctx, 2).contains(&format!("source=\"{chunk}\"")));
         assert!(header(&ctx, 3).contains(&format!("source=\"{}\"", Uuid::nil())));
+    }
+
+    // Only the OFFLINE branch is unit-testable here: every other branch depends
+    // on the developer's real key configuration (`resolve_secret` reads
+    // ~/.config/engram/config.toml), so the hard-error and budget paths are
+    // covered by tests/wave0_provider_parity.rs under an isolated HOME.
+    #[test]
+    fn the_offline_profile_never_reaches_for_a_cloud_provider() {
+        let store = SqliteStore::open_in_memory().expect("in-memory store");
+        let b = resolve_retrieval_backends(&store, RetrievalProfile::Offline, None)
+            .expect("offline never errors");
+        assert!(!b.cloud_embedder);
+        assert_eq!(b.embed_model, "stub-64");
+        assert_eq!(b.embed_dims, 64);
+        assert_eq!(b.prompt_format, "stub-v1");
+        assert!(b.reranker.is_none());
+        assert_eq!(b.reranker_label, "passthrough");
     }
 
     #[test]
