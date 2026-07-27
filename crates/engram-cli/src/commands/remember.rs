@@ -18,7 +18,7 @@ use crate::commands::usage::{estimated_tokens, estimated_tokens_for_texts, gemin
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_llm::FactLlm;
-use crate::fact_write::{write_fact, Autonomy, FactWriteCtx, FactWriteOutcome};
+use crate::fact_write::{write_fact, Autonomy, FactWriteCtx, FactWriteOutcome, MemoryTime};
 use crate::output::{print_success, Metadata};
 use chrono::{DateTime, Utc};
 use engram_core::temporal::parse_moment;
@@ -143,6 +143,30 @@ pub fn parse_event_time(raw: &Option<String>) -> Result<Option<DateTime<Utc>>, C
     }
 }
 
+/// Test seam: make the embedding call fail on demand.
+///
+/// Set to any non-empty message and `remember` fails exactly where a network
+/// embed would — after chunking, before any database write. There is no other
+/// way to reproduce a failed embed offline, and "a committed memory with no
+/// chunks" is precisely the state this command must never be able to reach:
+/// dense recall can never return such a memory, and the exact-content dedup
+/// above turns every re-save into a successful-looking no-op, so the content is
+/// lost while the CLI reports success. Same shape as `ENGRAM_FACT_WRITE_FAIL`;
+/// never set in production use.
+pub const EMBED_FAIL_ENV: &str = "ENGRAM_EMBED_FAIL";
+
+fn injected_embed_failure() -> Option<CliError> {
+    let raw = std::env::var(EMBED_FAIL_ENV).ok()?;
+    let message = raw.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(CliError::Transient(format!(
+        "{EMBED_FAIL_ENV} injected an embedding failure ({message}); nothing was stored — \
+         re-run `engram remember` once the embedder is reachable"
+    )))
+}
+
 pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let RememberArgs {
         content,
@@ -231,7 +255,6 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         valid_until: None,
         tags,
     };
-    ctx.store.insert_memory_with_kb(&memory, &kb)?;
 
     // CHUNKING. This used to be a bare `naive_split`: paragraph split, no
     // merge, no size cap, no floor. Fed real content (a pasted WhatsApp thread,
@@ -265,27 +288,36 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let model_name = embedder.model();
     let dims = embedder.dimensions();
     let prompt_format = embedder.prompt_format().to_string();
+    // NOTHING IS WRITTEN UNTIL THE VECTORS ARE IN HAND. `embed_batch` is a
+    // NETWORK call: it can 429, time out, or come back short. Writing the memory
+    // row first (as this did) left a committed memory with no chunks whenever it
+    // did — dense recall can never return such a memory, and the exact-content
+    // dedup above turns every re-save into a successful-looking no-op, so the
+    // content is gone for good with the CLI reporting success. Embed, check the
+    // arity, and only then open one transaction for the row and its chunks.
+    if let Some(injected) = injected_embed_failure() {
+        return Err(injected);
+    }
     let embeddings = embedder
         .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
         .await?;
-
-    for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-        ctx.store.insert_chunk_with_embedding_meta(
-            Uuid::new_v4(),
-            memory.id,
-            &chunk.text,
-            chunk.position,
-            chunk.section.as_deref(),
-            emb,
-            &model_name,
-            dims,
-            &prompt_format,
-            None,
-        )?;
+    if embeddings.len() != chunks.len() {
+        return Err(CliError::Transient(format!(
+            "embedder returned {} embeddings for {} chunks; nothing was stored, so no chunk is \
+             indexed without a vector — retry `engram remember` with the same content",
+            embeddings.len(),
+            chunks.len(),
+        )));
     }
+
+    // The embedding call is paid the moment it returns, whether or not the write
+    // below commits, so the usage row is written FIRST and on its own. A failure
+    // to record it must not fail the command: the money is already spent, and
+    // losing the memory over a bookkeeping row is the worse lie. Same treatment
+    // as the extraction usage row in `extract_into`.
     if have_gemini && !chunk_texts.is_empty() {
         let tokens = estimated_tokens_for_texts(&chunk_texts);
-        ctx.store.record_usage_event(
+        if let Err(e) = ctx.store.record_usage_event(
             "gemini",
             "remember_embed",
             Some(&model_name),
@@ -302,8 +334,31 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 "prompt_format": prompt_format.clone(),
                 "estimated": true,
             }),
-        )?;
+        ) {
+            tracing::warn!("could not record remember embedding usage: {e}");
+        }
     }
+
+    // ONE unit of work: the memory row, the KB registration it implies, and
+    // every chunk land together or not at all.
+    let chunks_stored = ctx.store.with_tx(|store| {
+        store.insert_memory_with_kb(&memory, &kb)?;
+        for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
+            store.insert_chunk_with_embedding_meta(
+                Uuid::new_v4(),
+                memory.id,
+                &chunk.text,
+                chunk.position,
+                chunk.section.as_deref(),
+                emb,
+                &model_name,
+                dims,
+                &prompt_format,
+                None,
+            )?;
+        }
+        Ok(chunks.len())
+    })?;
 
     // Fact processing (extraction and/or caller-supplied triples) runs after
     // the memory is safely persisted so a fact failure never blocks `remember`.
@@ -321,7 +376,17 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         match &llm {
             Some(llm) => {
                 extraction_model = Some(llm.model());
-                match extract_into(ctx, llm, &content, &kb, &diary, &mut extracted).await {
+                match extract_into(
+                    ctx,
+                    llm,
+                    &content,
+                    &kb,
+                    &diary,
+                    event_time.unwrap_or(now),
+                    &mut extracted,
+                )
+                .await
+                {
                     Ok(()) if llm.is_live() => ExtractionStatus::Ran,
                     Ok(()) => ExtractionStatus::RanStub,
                     Err(e) => ExtractionStatus::Failed(e),
@@ -345,7 +410,10 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             memory_id: memory.id,
             diary: &diary,
             kb: &kb,
-            event_time,
+            memory_time: MemoryTime {
+                event_time,
+                created_at: now,
+            },
             embedder: gate_embedder.as_deref(),
             llm: llm.as_ref().map(|l| l.as_chat()),
             autonomy,
@@ -394,13 +462,14 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let conflicts = outcome.conflicts;
     let adjudication_needed = outcome.queued;
     let facts_deduped = outcome.deduped;
+    let date_warnings = outcome.date_warnings;
 
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,
         ..Default::default()
     };
     meta.add("memory_id", memory.id.to_string());
-    meta.add("chunks_stored", chunks.len());
+    meta.add("chunks_stored", chunks_stored);
     if let Some(note) = &truncation_note {
         meta.add("embed_truncation_note", note.clone());
     }
@@ -413,6 +482,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     meta.add("facts_deduped", facts_deduped);
     meta.add("conflicts_detected", conflicts.len());
     meta.add("conflicts_queued", adjudication_needed.len());
+    meta.add("date_parse_warnings", date_warnings.len());
     meta.add("fact_extraction", status.as_str());
     let note = status.note(&kb);
     if let Some(note) = &note {
@@ -422,13 +492,22 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             eprintln!("note: {note}");
         }
     }
+    // Loud, not silent: an unreadable date is a fact dated by inference, and
+    // the agent that supplied it is the only one who can correct the source.
+    if !date_warnings.is_empty() && !ctx.quiet {
+        eprintln!(
+            "note: {} fact date(s) could not be read and were taken from the memory instead — \
+             see data.date_parse_warnings",
+            date_warnings.len()
+        );
+    }
 
     print_success(
         ctx.format,
         json!({
             "id": memory.id,
             "stored": true,
-            "chunks": chunks.len(),
+            "chunks": chunks_stored,
             "embed_truncation_note": truncation_note,
             "kb": kb,
             "event_time": event_time.map(|t| t.to_rfc3339()),
@@ -436,6 +515,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             "fact_extraction_note": note,
             "facts_added": facts_added,
             "facts_deduped": facts_deduped,
+            "date_parse_warnings": date_warnings,
             "conflicts": conflicts,
             "adjudication_needed": adjudication_needed,
         }),
@@ -444,7 +524,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             println!(
                 "Stored memory {} ({} chunks, {} facts, {} conflicts, {} queued for resolution)",
                 memory.id,
-                chunks.len(),
+                chunks_stored,
                 facts_added,
                 conflicts.len(),
                 adjudication_needed.len()
@@ -458,6 +538,11 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
 /// An extraction failure is reported, never fatal — the memory is already
 /// stored and losing facts must not lose the memory.
 ///
+/// `memory_date` anchors the extraction prompt so relative expressions come
+/// back as absolute dates: an extractor that has nothing to resolve "last
+/// March" against emits "last March", and no reader downstream may invent a
+/// date for it.
+///
 /// Deliberately does NOT record the "already extracted" marker: that belongs
 /// after the facts are persisted, in the caller. See the marker-ordering note
 /// in `run`.
@@ -467,6 +552,7 @@ async fn extract_into(
     content: &str,
     kb: &str,
     diary: &str,
+    memory_date: DateTime<Utc>,
     out: &mut Vec<ExtractedFact>,
 ) -> Result<(), String> {
     let model = llm.model();
@@ -488,7 +574,7 @@ async fn extract_into(
             tracing::warn!("could not record fact extraction usage: {e}");
         }
     }
-    match extract_facts(llm.as_chat(), content).await {
+    match extract_facts(llm.as_chat(), content, memory_date).await {
         Ok(more) => {
             out.extend(more);
             Ok(())

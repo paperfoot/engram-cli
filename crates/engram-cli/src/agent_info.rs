@@ -95,7 +95,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                     "facts_added": "integer",
                     "facts_deduped": "integer",
                     "conflicts": "array",
-                    "adjudication_needed": "array — unresolved conflicts with a ready-to-run resolve_command; handle them"
+                    "adjudication_needed": "array — unresolved conflicts with a ready-to-run resolve_command; handle them",
+                    "date_parse_warnings": "array — a supplied valid_from that could not be read as a date. The fact was still stored, dated from the memory (event_time, else when it was recorded), never from the clock. Fix the source: valid_from must be YYYY-MM-DD or RFC3339."
                 }
             },
             "recall": {
@@ -144,7 +145,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                 "flags": { "kb": "string|*; omit to sweep EVERY KB, oldest memory first across the union", "diary": "string|*", "limit": "integer", "dry_run": "boolean" },
                 "cost": "one LLM call per unprocessed memory; exits 2 without an OpenRouter key and respects `engram budget`. Pair an unscoped sweep with --dry-run or --limit.",
                 "idempotency": "memories with existing facts or an extraction marker are skipped; oldest first, so a --limit'ed run resumes where the last stopped",
-                "output_data": { "kb": "string — '*' for an unscoped sweep", "pending": "integer", "already_processed": "integer", "would_process": "integer (dry run)", "memories": "array", "llm_available": "boolean" }
+                "output_data": { "kb": "string — '*' for an unscoped sweep", "pending": "integer", "already_processed": "integer", "would_process": "integer (dry run)", "memories": "array", "llm_available": "boolean", "date_parse_warnings": "array — extractor dates that could not be read; those facts were dated from their own memory, never from the sweep's clock" }
             },
             "kb repair": {
                 "destructive": false,
