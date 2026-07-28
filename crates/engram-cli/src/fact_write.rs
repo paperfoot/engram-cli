@@ -316,6 +316,42 @@ fn write_supersede_rule(canonical: &str) -> &'static str {
     }
 }
 
+/// Which rule set a writer gets.
+///
+/// Ingestion order is evidence only when an agent is asserting a value NOW:
+/// `remember` and `facts backfill` are that agent, and last-writer-wins on a
+/// profile slot is the behaviour they promise. A COMPILED fact is a re-reading
+/// of text that was already in the store, and the order chunks happen to be
+/// compiled in is `ORDER BY position, id` — a UUID tiebreak. Letting that
+/// decide which of two papers holds a slot is not a decision, it is a coin
+/// toss with an audit trail. So a compiled fact gets exactly the rules
+/// `facts triage` applies to a backlog: only an explicit event-time ordering
+/// (or a wide confidence gap) settles a slot; everything else is queued.
+fn classify_mode_for(source_kind: SourceKind) -> ClassifyMode {
+    match source_kind {
+        SourceKind::CompileLlm => ClassifyMode::Triage,
+        _ => ClassifyMode::Write,
+    }
+}
+
+/// Audit tag written into `facts.resolution` when the COMPILER settles a slot.
+///
+/// `resolution` is the only record of WHO retired a value months later:
+/// `caller` for an explicit `facts resolve`, `slot_lww`/`exact_match` for a
+/// write-time assertion, `triage_*` for the backlog sweep. "A paper the
+/// compiler read disagreed with an older paper" is a different claim from
+/// "the user told us so", so it gets its own namespace rather than borrowing
+/// one. Under `ClassifyMode::Triage` only these three rules can supersede;
+/// anything else keeps the classifier's own name.
+fn compile_resolution(rule: &'static str) -> &'static str {
+    match rule {
+        "recency_supersede" => "compile_recency",
+        "recency_stale" => "compile_stale",
+        "confidence_gap" => "compile_confidence",
+        other => other,
+    }
+}
+
 /// The memory a batch of facts came from, as far as time is concerned.
 ///
 /// Bundled rather than passed as two loose fields because they are only ever
@@ -648,7 +684,16 @@ pub async fn write_fact(
         outcome.added += 1;
         for old in &exact {
             apply_write_verdict(
-                ctx, &new_fact, old, diary, kb, "slot", None, autonomy, outcome,
+                ctx,
+                &new_fact,
+                old,
+                diary,
+                kb,
+                "slot",
+                None,
+                autonomy,
+                source_kind,
+                outcome,
             )?;
         }
         return Ok(());
@@ -697,8 +742,9 @@ pub async fn write_fact(
             let mut settled: Vec<(Fact, f32)> = Vec::new();
             if !queue_everything() {
                 cand_facts.retain(|(f, s)| {
-                    let keep = classify_pair(&new_fact, f, Some(*s), ClassifyMode::Write).class
-                        == ConflictClass::Queue;
+                    let keep =
+                        classify_pair(&new_fact, f, Some(*s), classify_mode_for(source_kind)).class
+                            == ConflictClass::Queue;
                     if !keep {
                         settled.push((f.clone(), *s));
                     }
@@ -721,6 +767,7 @@ pub async fn write_fact(
                         "semantic_cosine",
                         Some(*s),
                         autonomy,
+                        source_kind,
                         outcome,
                     )?;
                 }
@@ -816,9 +863,15 @@ fn apply_write_verdict(
     detector: &str,
     score: Option<f32>,
     autonomy: Autonomy,
+    source_kind: SourceKind,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), CliError> {
-    let verdict = classify_pair(new_fact, old, score, ClassifyMode::Write);
+    let verdict = classify_pair(new_fact, old, score, classify_mode_for(source_kind));
+    // The tag says who decided, not just why.
+    let tag = match source_kind {
+        SourceKind::CompileLlm => compile_resolution(verdict.rule),
+        _ => verdict.rule,
+    };
     // `strict` promised never to auto-supersede: it escalates every real
     // disagreement. It does NOT invent conflicts out of coexisting values —
     // a second `knows` is not a decision anyone has to make.
@@ -847,22 +900,14 @@ fn apply_write_verdict(
             outcome.added = outcome.added.saturating_sub(1);
         }
         ConflictClass::SupersedeOld => {
-            ctx.store.supersede_fact_with(
-                old.id,
-                new_fact.id,
-                verdict.rule,
-                new_fact.valid_from,
-            )?;
-            outcome
-                .conflicts
-                .push(conflict_payload(old, new_fact, verdict.rule));
+            ctx.store
+                .supersede_fact_with(old.id, new_fact.id, tag, new_fact.valid_from)?;
+            outcome.conflicts.push(conflict_payload(old, new_fact, tag));
         }
         ConflictClass::SupersedeNew => {
             ctx.store
-                .supersede_fact_with(new_fact.id, old.id, verdict.rule, old.valid_from)?;
-            outcome
-                .conflicts
-                .push(conflict_payload(new_fact, old, verdict.rule));
+                .supersede_fact_with(new_fact.id, old.id, tag, old.valid_from)?;
+            outcome.conflicts.push(conflict_payload(new_fact, old, tag));
         }
         ConflictClass::Queue => {
             queue_conflict(ctx, new_fact, old, diary, kb, detector, score, outcome)?;
@@ -1282,5 +1327,51 @@ mod tests {
                 "{class:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_compiled_fact_is_read_like_a_backlog_not_like_an_assertion() {
+        assert_eq!(
+            classify_mode_for(SourceKind::CompileLlm),
+            ClassifyMode::Triage
+        );
+        for kind in [
+            SourceKind::AgentExtracted,
+            SourceKind::UserStated,
+            SourceKind::UserConfirmed,
+            SourceKind::Import,
+        ] {
+            assert_eq!(classify_mode_for(kind), ClassifyMode::Write, "{kind:?}");
+        }
+        // The consequence: two values a compile cannot order stay a question.
+        // Under the write path's rules the LAST chunk compiled would silently
+        // own the slot — and chunk order is a UUID tiebreak.
+        let old = stored("Carol", "works_at", "Acme", "2026-01-01");
+        let mut new = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
+        new.created_at = old.created_at;
+        assert_eq!(
+            classify_pair(&new, &old, None, classify_mode_for(SourceKind::CompileLlm)).class,
+            ConflictClass::Queue
+        );
+        assert_eq!(
+            classify_pair(
+                &new,
+                &old,
+                None,
+                classify_mode_for(SourceKind::AgentExtracted)
+            )
+            .class,
+            ConflictClass::SupersedeOld
+        );
+    }
+
+    #[test]
+    fn a_compile_supersession_says_the_compiler_did_it() {
+        assert_eq!(compile_resolution("recency_supersede"), "compile_recency");
+        assert_eq!(compile_resolution("recency_stale"), "compile_stale");
+        assert_eq!(compile_resolution("confidence_gap"), "compile_confidence");
+        // Non-supersede rules keep the classifier's own name.
+        assert_eq!(compile_resolution("duplicate"), "duplicate");
+        assert_eq!(compile_resolution("safety_slot"), "safety_slot");
     }
 }

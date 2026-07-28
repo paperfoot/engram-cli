@@ -8,7 +8,10 @@
 use crate::commands::usage::estimated_tokens;
 use crate::context::AppContext;
 use crate::error::CliError;
+use crate::fact_write::{write_fact, Autonomy, FactWriteCtx, FactWriteOutcome, MemoryTime};
 use crate::output::{print_success, Metadata};
+use engram_core::types::SourceKind;
+use engram_graph::facts::ExtractedFact;
 use engram_llm::openrouter::{OpenRouterClient, DEFAULT_EXTRACTION_MODEL, DEFAULT_SYNTHESIS_MODEL};
 use engram_llm::{ChatLlm, ChatMessage};
 use serde::{Deserialize, Serialize};
@@ -40,6 +43,11 @@ pub struct CompileStats {
     pub llm_facts: usize,
     #[serde(default)]
     pub llm_facts_rejected: usize,
+    /// Compiled facts whose contradiction the compiler refused to settle on its
+    /// own (safety slots, two papers with no ordering). Reported because a
+    /// silent queue is a backlog nobody knows to read.
+    #[serde(default)]
+    pub llm_facts_queued: usize,
     pub llm_entities: usize,
     pub llm_relations: usize,
     pub llm_takeaways: usize,
@@ -218,6 +226,7 @@ async fn compile_within_tx(
         llm_claims_rejected: 0,
         llm_facts: 0,
         llm_facts_rejected: 0,
+        llm_facts_queued: 0,
         llm_entities: 0,
         llm_relations: 0,
         llm_takeaways: 0,
@@ -484,6 +493,48 @@ fn flush_usage_events(ctx: &AppContext, kb: &str, events: &[PendingUsage]) {
     }
 }
 
+/// Test seam: a scripted, offline compiler LLM — same shape and precedence as
+/// `ENGRAM_FACT_LLM_STUB` (see [`crate::fact_llm`]).
+///
+/// The compiler was the last LLM surface with no offline seam, so the write
+/// path compiled facts take could only be exercised by paying a provider — and
+/// was therefore never exercised at all. Never set in production use.
+pub const COMPILER_STUB_ENV: &str = "ENGRAM_COMPILER_LLM_STUB";
+
+/// (extraction client, synthesis client, `true` when the calls are paid).
+type CompilerLlms = (Box<dyn ChatLlm>, Box<dyn ChatLlm>, bool);
+
+fn resolve_compiler_llms(options: &CompileOptions) -> Result<CompilerLlms, CliError> {
+    if let Some(script) = std::env::var(COMPILER_STUB_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let build = || {
+            engram_llm::stub::ScriptedChatLlm::parse(&script).map_err(|e| {
+                CliError::Config(format!("{COMPILER_STUB_ENV} is not a valid script: {e}"))
+            })
+        };
+        return Ok((Box::new(build()?), Box::new(build()?), false));
+    }
+    let key = crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
+        .ok_or_else(|| {
+            CliError::Config("OPENROUTER_API_KEY is required for `engram compile --llm`".into())
+        })?;
+    Ok((
+        Box::new(
+            OpenRouterClient::new(key.clone())
+                .with_model(options.extraction_model.clone())
+                .with_max_tokens(4096),
+        ),
+        Box::new(
+            OpenRouterClient::new(key)
+                .with_model(options.synthesis_model.clone())
+                .with_max_tokens(8192),
+        ),
+        true,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_llm_compiler(
     ctx: &AppContext,
@@ -495,18 +546,9 @@ async fn run_llm_compiler(
     options: &CompileOptions,
     usage_events: &mut Vec<PendingUsage>,
 ) -> Result<(), CliError> {
-    let key = crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
-        .ok_or_else(|| {
-            CliError::Config("OPENROUTER_API_KEY is required for `engram compile --llm`".into())
-        })?;
-    // Enforce spend guardrails before the compiler's paid LLM calls.
+    // Spend guardrails bind before a provider is chosen, whichever it is.
     crate::commands::budget::enforce_budget(ctx, Some(kb))?;
-    let extraction_llm = OpenRouterClient::new(key.clone())
-        .with_model(options.extraction_model.clone())
-        .with_max_tokens(4096);
-    let synthesis_llm = OpenRouterClient::new(key)
-        .with_model(options.synthesis_model.clone())
-        .with_max_tokens(8192);
+    let (extraction_llm, synthesis_llm, live) = resolve_compiler_llms(options)?;
     let max_chunks = options.max_llm_chunks.unwrap_or(chunks.len());
     // Bound the corpus the synthesis pass may cite to the chunks actually
     // seen, so we can validate its [chunk:uuid] citations.
@@ -523,13 +565,17 @@ async fn run_llm_compiler(
             ])
             .await
             .map_err(|e| CliError::Transient(format!("compiler extraction failed: {e}")))?;
-        usage_events.push(PendingUsage {
-            operation: "compiler_extract",
-            model: response.model.clone(),
-            fallback_prompt_tokens: estimated_tokens(&prompt),
-            prompt_tokens: response.prompt_tokens,
-            completion_tokens: response.completion_tokens,
-        });
+        // A stub spends nothing and must not write an `openrouter` usage row —
+        // the budget guard would then count it against a real cap.
+        if live {
+            usage_events.push(PendingUsage {
+                operation: "compiler_extract",
+                model: response.model.clone(),
+                fallback_prompt_tokens: estimated_tokens(&prompt),
+                prompt_tokens: response.prompt_tokens,
+                completion_tokens: response.completion_tokens,
+            });
+        }
         let evidence = match parse_llm_evidence(&response.content) {
             Ok(e) => e,
             Err(e) => {
@@ -541,7 +587,7 @@ async fn run_llm_compiler(
             }
         };
         let span_id = span_by_chunk.get(&chunk.chunk_id).copied();
-        insert_llm_evidence(ctx, kb, chunk, span_id, evidence, entity_mentions, stats)?;
+        insert_llm_evidence(ctx, kb, chunk, span_id, evidence, entity_mentions, stats).await?;
         stats.llm_extraction_chunks += 1;
     }
 
@@ -558,13 +604,15 @@ async fn run_llm_compiler(
             ])
             .await
             .map_err(|e| CliError::Transient(format!("compiler synthesis failed: {e}")))?;
-        usage_events.push(PendingUsage {
-            operation: "compiler_synthesize",
-            model: response.model.clone(),
-            fallback_prompt_tokens: estimated_tokens(&overview_prompt),
-            prompt_tokens: response.prompt_tokens,
-            completion_tokens: response.completion_tokens,
-        });
+        if live {
+            usage_events.push(PendingUsage {
+                operation: "compiler_synthesize",
+                model: response.model.clone(),
+                fallback_prompt_tokens: estimated_tokens(&overview_prompt),
+                prompt_tokens: response.prompt_tokens,
+                completion_tokens: response.completion_tokens,
+            });
+        }
         let content = response.content.trim();
         if !content.is_empty() {
             // Validate [chunk:<uuid>] citations: fabricated ones (not in the
@@ -620,7 +668,7 @@ fn validate_chunk_citations(text: &str, known: &HashSet<uuid::Uuid>) -> (String,
     (out, dropped)
 }
 
-fn insert_llm_evidence(
+async fn insert_llm_evidence(
     ctx: &AppContext,
     kb: &str,
     chunk: &engram_storage::ChunkRecord,
@@ -742,90 +790,82 @@ fn insert_llm_evidence(
         )?;
         stats.llm_relations += 1;
     }
-    // KB-scoped facts with contradiction detection: a compiled paper populates
-    // the fact/supersession table so a later paper that disagrees is caught.
-    // Grounded like claims (the fact's object must be supported by the chunk).
-    let diary = &chunk.diary;
-    for fact in evidence.facts {
+    // KB-scoped facts through the SAME write path `remember` uses: predicate
+    // and subject canonicalization, slot policy, dedup into confirmations,
+    // conflict classification, and the conflict queue.
+    //
+    // This block used to insert directly and blind-supersede every active fact
+    // with a different object. That silently retired safety-slot values
+    // (allergy, medication, diagnosis, blood type) which NO path may
+    // auto-supersede, destroyed the second value of every multi-valued
+    // predicate ("Ana knows Bob" is not a correction of "Ana knows Alice"),
+    // and dated every fact from the compile clock — a fabricated "now" that
+    // wins recency supersession against the older true fact and gets rewritten
+    // on every recompile.
+    let facts = evidence.facts;
+    if facts.is_empty() {
+        return Ok(());
+    }
+    // The fact's event time comes from the SOURCE MEMORY (its `--event-time`,
+    // else when the store recorded it), never from a clock read here.
+    let Some((event_time, created_at)) = ctx.store.memory_times(chunk.memory_id)? else {
+        // The chunk's memory went away underneath this compile: there is
+        // nothing left to date its facts by, so write none.
+        tracing::warn!(
+            "compiler: skipped facts for chunk {} — memory {} is no longer live",
+            chunk.chunk_id,
+            chunk.memory_id
+        );
+        return Ok(());
+    };
+    let write_ctx = FactWriteCtx {
+        memory_id: chunk.memory_id,
+        diary: &chunk.diary,
+        kb,
+        memory_time: MemoryTime {
+            event_time,
+            created_at,
+        },
+        // No novelty gate in the compiler: the exact (subject, predicate) path
+        // plus the classifier do the work, and an embedding call per fact
+        // inside the compile transaction is a paid round trip per fact.
+        embedder: None,
+        llm: None,
+        // `assisted`, not `strict`: a compile must still be able to record
+        // that a 2024 paper supersedes a 2015 one. `strict` would queue that
+        // too, which is how a corpus rebuilds the backlog nobody reads.
+        autonomy: Autonomy::default(),
+        source_kind: SourceKind::CompileLlm,
+    };
+    let mut outcome = FactWriteOutcome::default();
+    for fact in facts {
         let subject = fact.subject.trim();
         let predicate = fact.predicate.trim();
         let object = fact.object.trim();
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
             continue;
         }
+        // Grounded like claims: the fact's subject and object must be
+        // supported by the chunk before the write path ever sees it.
         if !claim_grounded_in_chunk(&format!("{subject} {object}"), &chunk.content) {
             stats.llm_facts_rejected += 1;
             continue;
         }
-        let inserted = insert_compiled_fact(
-            ctx,
-            kb,
-            diary,
-            chunk.memory_id,
-            subject,
-            predicate,
-            object,
-            fact.confidence.unwrap_or(0.7).clamp(0.0, 1.0),
-        )?;
-        if inserted {
-            stats.llm_facts += 1;
-        }
+        let ef = ExtractedFact {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            confidence: fact.confidence.unwrap_or(0.7).clamp(0.0, 1.0),
+            fact_type: None,
+            // The compiler extracts no date of its own, so the memory's is the
+            // only honest one (see `MemoryTime`).
+            valid_from: None,
+        };
+        write_fact(ctx, &write_ctx, &ef, &mut outcome).await?;
     }
+    stats.llm_facts += outcome.added;
+    stats.llm_facts_queued += outcome.queued.len();
     Ok(())
-}
-
-/// Insert a compiled fact KB-scoped, superseding any active fact with the same
-/// (subject, predicate) but a different object. Returns false if the identical
-/// fact already existed (dedup). Mirrors the `remember` write path but scoped
-/// to the KB so a corpus's own contradictions are tracked.
-#[allow(clippy::too_many_arguments)]
-fn insert_compiled_fact(
-    ctx: &AppContext,
-    kb: &str,
-    diary: &str,
-    memory_id: uuid::Uuid,
-    subject: &str,
-    predicate: &str,
-    object: &str,
-    confidence: f32,
-) -> Result<bool, CliError> {
-    use engram_graph::facts::normalize;
-    let subject_norm = normalize(subject);
-    let object_norm = normalize(object);
-    if subject_norm.is_empty() || object_norm.is_empty() {
-        return Ok(false);
-    }
-    let existing = ctx
-        .store
-        .get_active_facts_in_kb(&subject_norm, predicate, diary, kb)?;
-    let new_fact = engram_core::types::Fact {
-        id: uuid::Uuid::new_v4(),
-        source_memory_id: memory_id,
-        subject: subject.to_string(),
-        subject_norm: subject_norm.clone(),
-        predicate: predicate.to_string(),
-        object: object.to_string(),
-        object_norm: object_norm.clone(),
-        confidence,
-        created_at: chrono::Utc::now(),
-        superseded_by: None,
-        superseded_at: None,
-        diary: diary.to_string(),
-        fact_type: engram_core::types::FactType::Assertion,
-        valid_from: Some(chrono::Utc::now()),
-        valid_until: None,
-        resolution: None,
-        source_kind: engram_core::types::SourceKind::CompileLlm,
-        confirmations: 0,
-    };
-    for old in &existing {
-        if old.object_norm == object_norm {
-            return Ok(false); // identical fact already present
-        }
-        ctx.store.supersede_fact(old.id, new_fact.id)?;
-    }
-    ctx.store.insert_fact(&new_fact)?;
-    Ok(true)
 }
 
 #[derive(Debug, Default, Deserialize)]
