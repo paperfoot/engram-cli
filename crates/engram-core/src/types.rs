@@ -175,8 +175,11 @@ pub struct Fact {
     /// Event time: when this fact stopped being true (set on supersession).
     #[serde(default)]
     pub valid_until: Option<DateTime<Utc>>,
-    /// How a supersession/conflict involving this fact was decided:
-    /// exact_match | slot_lww | semantic_llm | caller | daemon_sweep.
+    /// How a supersession/conflict involving this fact was decided, namespaced
+    /// by WHO decided: exact_match | slot_lww | semantic_llm | duplicate (the
+    /// write path), caller (an explicit `facts resolve`), triage_* (the
+    /// backlog sweep), compile_* (a compiled fact — `compile_recency`,
+    /// `compile_stale`, `compile_confidence`).
     #[serde(default)]
     pub resolution: Option<String>,
     /// Provenance class of the fact — feeds trust weighting.

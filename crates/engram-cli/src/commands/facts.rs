@@ -18,8 +18,9 @@
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_write::{
-    classify_pair, is_safety_slot, predicate_arity, write_fact, Arity, Autonomy, ClassifyMode,
-    ConflictClass, FactWriteCtx, FactWriteOutcome, MemoryTime, Verdict,
+    classify_pair, is_safety_slot, predicate_arity, write_fact_batch, Arity, Autonomy,
+    ClassifyMode, ConflictClass, FactBatch, FactExtractionMarker, FactWriteCtx, FactWriteOutcome,
+    MemoryTime, Verdict,
 };
 use crate::output::{print_success, Metadata};
 use engram_core::types::{Fact, SourceKind};
@@ -973,38 +974,34 @@ pub async fn backfill(
             autonomy: Autonomy::default(),
             source_kind: SourceKind::AgentExtracted,
         };
-        let mut write_failures = 0usize;
-        for ef in &extracted {
-            if let Err(e) = write_fact(ctx, &write_ctx, ef, &mut outcome).await {
-                tracing::warn!("fact write failed for {:?}: {e}", ef);
-                write_failures += 1;
-            }
-        }
-        // EXTRACTION MARKER ORDERING (same rule as `remember`): the marker is
-        // what makes a memory invisible to every future backfill, so it is
-        // only earned once the facts are actually in the store. Recording it
-        // before the write loop meant a persistence failure retired the memory
-        // from the queue with nothing to show for it.
-        if write_failures > 0 {
+        let batch = FactBatch {
+            facts: &extracted,
+            marker: Some(FactExtractionMarker {
+                model: Some(&model),
+                source: "backfill",
+            }),
+        };
+        // Same rule as `remember`: the facts and the marker that retires this
+        // memory from the queue commit together, so a failed memory keeps
+        // neither and the next sweep retries it whole. A marker written on the
+        // strength of a half-written batch is what made the rest of the batch
+        // invisible to every future backfill.
+        if let Err(failure) = write_fact_batch(ctx, &write_ctx, &batch, &mut outcome).await {
             failed += 1;
             progress(
                 ctx,
                 i + 1,
                 queued,
                 &format!(
-                    "{write_failures} of {} facts failed to persist — left pending",
-                    extracted.len()
+                    "fact {} of {} could not be stored ({}) — nothing stored, still pending",
+                    failure.index + 1,
+                    failure.total,
+                    failure.error
                 ),
                 memory,
             );
             continue;
         }
-        ctx.store.record_fact_extraction(
-            memory.id,
-            Some(&model),
-            extracted.len() as i64,
-            "backfill",
-        )?;
         processed += 1;
         if extracted.is_empty() {
             without_facts += 1;

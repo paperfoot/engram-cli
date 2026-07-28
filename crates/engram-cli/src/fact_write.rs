@@ -42,6 +42,7 @@ use engram_graph::facts::{
 use engram_graph::gate::{novelty_gate, GateDecision};
 use engram_llm::ChatLlm;
 use serde_json::json;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// How much authority this process has over conflict resolution.
@@ -316,6 +317,42 @@ fn write_supersede_rule(canonical: &str) -> &'static str {
     }
 }
 
+/// Which rule set a writer gets.
+///
+/// Ingestion order is evidence only when an agent is asserting a value NOW:
+/// `remember` and `facts backfill` are that agent, and last-writer-wins on a
+/// profile slot is the behaviour they promise. A COMPILED fact is a re-reading
+/// of text that was already in the store, and the order chunks happen to be
+/// compiled in is `ORDER BY position, id` — a UUID tiebreak. Letting that
+/// decide which of two papers holds a slot is not a decision, it is a coin
+/// toss with an audit trail. So a compiled fact gets exactly the rules
+/// `facts triage` applies to a backlog: only an explicit event-time ordering
+/// (or a wide confidence gap) settles a slot; everything else is queued.
+fn classify_mode_for(source_kind: SourceKind) -> ClassifyMode {
+    match source_kind {
+        SourceKind::CompileLlm => ClassifyMode::Triage,
+        _ => ClassifyMode::Write,
+    }
+}
+
+/// Audit tag written into `facts.resolution` when the COMPILER settles a slot.
+///
+/// `resolution` is the only record of WHO retired a value months later:
+/// `caller` for an explicit `facts resolve`, `slot_lww`/`exact_match` for a
+/// write-time assertion, `triage_*` for the backlog sweep. "A paper the
+/// compiler read disagreed with an older paper" is a different claim from
+/// "the user told us so", so it gets its own namespace rather than borrowing
+/// one. Under `ClassifyMode::Triage` only these three rules can supersede;
+/// anything else keeps the classifier's own name.
+fn compile_resolution(rule: &'static str) -> &'static str {
+    match rule {
+        "recency_supersede" => "compile_recency",
+        "recency_stale" => "compile_stale",
+        "confidence_gap" => "compile_confidence",
+        other => other,
+    }
+}
+
 /// The memory a batch of facts came from, as far as time is concerned.
 ///
 /// Bundled rather than passed as two loose fields because they are only ever
@@ -396,6 +433,22 @@ pub struct FactWriteOutcome {
     pub queued: Vec<serde_json::Value>,
     /// Unreadable extractor/caller dates, with the date used instead.
     pub date_warnings: Vec<serde_json::Value>,
+}
+
+impl FactWriteOutcome {
+    /// Fold a COMMITTED batch's numbers into the run total.
+    ///
+    /// Only a committed batch may contribute. A batch that rolled back left
+    /// nothing in the store, so reporting its counts — or its queued conflict
+    /// ids, which reference rows that no longer exist — would describe a store
+    /// that never happened.
+    pub fn merge(&mut self, other: FactWriteOutcome) {
+        self.added += other.added;
+        self.deduped += other.deduped;
+        self.conflicts.extend(other.conflicts);
+        self.queued.extend(other.queued);
+        self.date_warnings.extend(other.date_warnings);
+    }
 }
 
 /// Thresholds for the novelty gate, env-overridable so they can be tuned on
@@ -571,18 +624,234 @@ fn queue_everything() -> bool {
         .unwrap_or(false)
 }
 
+/// The vectors a fact batch will need, computed BEFORE it opens its
+/// transaction.
+///
+/// The write path embeds one fact at a time and every one of those calls is a
+/// network round-trip. Holding SQLite's write lock across them is the defect
+/// the refinement plan (2.4) is removing from `compile`: a long write blocks
+/// every concurrent `remember` for its whole duration, and 5s of busy_timeout
+/// turns that into transient failures for someone else. So the batch pays for
+/// its embeddings up front, in ONE request, with no transaction open.
+///
+/// Keyed on the exact text, so a miss is always safe: the canonical subject a
+/// fact resolves to can change once an earlier fact in the same batch lands,
+/// and that fact simply falls back to a live call.
+#[derive(Default)]
+pub struct FactEmbedCache {
+    by_text: HashMap<String, Vec<f32>>,
+}
+
+impl FactEmbedCache {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Embed every distinct text in one call. An arity mismatch yields an EMPTY
+    /// cache rather than a guess: pairing a fact with another fact's vector is
+    /// worse than paying for a second call.
+    pub async fn warm(embedder: &dyn Embedder, texts: &[String]) -> Result<Self, CliError> {
+        let mut unique: Vec<&str> = Vec::new();
+        for text in texts {
+            let t = text.as_str();
+            if !t.trim().is_empty() && !unique.contains(&t) {
+                unique.push(t);
+            }
+        }
+        if unique.is_empty() {
+            return Ok(Self::default());
+        }
+        let vectors = embedder
+            .embed_batch(&unique, TaskMode::RetrievalDocument)
+            .await?;
+        if vectors.len() != unique.len() {
+            return Ok(Self::default());
+        }
+        Ok(Self {
+            by_text: unique
+                .iter()
+                .map(|t| (*t).to_string())
+                .zip(vectors)
+                .filter(|(_, v)| !v.is_empty())
+                .collect(),
+        })
+    }
+
+    fn get(&self, text: &str) -> Option<Vec<f32>> {
+        self.by_text.get(text).cloned()
+    }
+}
+
+/// The cached vector for `text`, or one live call.
+///
+/// An empty vector is an error, not a value: written to the fact row it becomes
+/// an empty BLOB the novelty gate then skips forever — a fact that can never be
+/// compared against anything.
+async fn embed_fact_text(
+    embedder: &dyn Embedder,
+    cache: &FactEmbedCache,
+    text: &str,
+) -> Result<Vec<f32>, CliError> {
+    if let Some(v) = cache.get(text) {
+        return Ok(v);
+    }
+    let mut got = embedder
+        .embed_batch(&[text], TaskMode::RetrievalDocument)
+        .await?;
+    match got.pop() {
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => Err(CliError::Transient(
+            "the embedder returned no vector for a fact; nothing from this batch was stored — \
+             retry once the embedder is reachable"
+                .into(),
+        )),
+    }
+}
+
+/// The texts this batch will embed, resolved against the store as it is NOW.
+/// Both embed sites in `write_fact` build the same string, so one key per fact
+/// covers the exact path and the semantic path alike.
+fn batch_embed_texts(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    facts: &[ExtractedFact],
+) -> Vec<String> {
+    facts
+        .iter()
+        .map(|ef| {
+            let predicate = canonical_predicate(&ef.predicate);
+            let (subject, _) = canonicalize_subject(ctx, w.diary, w.kb, &ef.subject);
+            fact_text(&subject, &predicate, &ef.object)
+        })
+        .collect()
+}
+
+/// The "already extracted" marker a batch earns by committing.
+pub struct FactExtractionMarker<'a> {
+    pub model: Option<&'a str>,
+    /// `remember` | `backfill` — recorded for provenance.
+    pub source: &'a str,
+}
+
+/// One memory's facts, plus the marker they earn.
+pub struct FactBatch<'a> {
+    pub facts: &'a [ExtractedFact],
+    /// `None` when extraction did not run (`--facts-json`,
+    /// `--no-extract-facts`, no key): the memory must stay in the backfill
+    /// queue in that case, so it earns no marker even on success.
+    pub marker: Option<FactExtractionMarker<'a>>,
+}
+
+/// Which fact aborted a batch, and why.
+pub struct FactBatchError {
+    /// 0-based index into `FactBatch::facts`; equals `total` when the marker
+    /// itself (or the commit) was the write that failed.
+    pub index: usize,
+    pub total: usize,
+    pub error: CliError,
+}
+
+/// Persist one memory's whole fact batch — every fact AND the extraction
+/// marker — as ONE unit of work.
+///
+/// THE FAILURE THIS REMOVES. `fact_extraction_log` is what makes a memory
+/// invisible to every future `facts backfill`, and so is a single fact:
+/// `PENDING_EXTRACTION_PREDICATE` counts a memory as processed once it has ANY
+/// fact OR a marker. Writing facts one at a time therefore had a state where
+/// fact A committed, fact B failed, no marker was written — and the memory left
+/// the backfill queue anyway, on the strength of A. B was lost permanently and
+/// silently. Managing that state means teaching the queue about half-processed
+/// memories; removing it means the batch commits or it never happened.
+///
+/// Everything network-bound is paid for BEFORE the transaction opens (see
+/// [`FactEmbedCache`]). One await can still occur inside it: `--autonomy full`
+/// adjudicates an unsettled candidate with an LLM call. That is opt-in, bounded
+/// by one call per contested fact, and the same defect class the refinement
+/// plan's 2.4 removes from `compile`.
+///
+/// PRECONDITION: no transaction is open on this connection. Both call sites
+/// (`remember`, `facts backfill`) are top-level; a nested call fails at
+/// `BEGIN IMMEDIATE` and reports it rather than corrupting an outer unit.
+/// `compile` is the exception that must NOT use this: it already holds its own
+/// build-then-swap transaction, and calls [`write_fact`] directly.
+pub async fn write_fact_batch(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    batch: &FactBatch<'_>,
+    outcome: &mut FactWriteOutcome,
+) -> Result<(), FactBatchError> {
+    let total = batch.facts.len();
+    let fail = |index: usize, error: CliError| FactBatchError {
+        index,
+        total,
+        error,
+    };
+
+    let cache = match w.embedder {
+        Some(embedder) => {
+            let texts = batch_embed_texts(ctx, w, batch.facts);
+            FactEmbedCache::warm(embedder, &texts)
+                .await
+                .map_err(|e| fail(0, e))?
+        }
+        None => FactEmbedCache::empty(),
+    };
+
+    ctx.store.begin_immediate().map_err(|e| fail(0, e.into()))?;
+    let mut scratch = FactWriteOutcome::default();
+    let mut failed: Option<(usize, CliError)> = None;
+    for (i, ef) in batch.facts.iter().enumerate() {
+        if let Err(e) = write_fact(ctx, w, ef, &cache, &mut scratch).await {
+            tracing::warn!("fact {} of {total} failed to persist: {e}", i + 1);
+            failed = Some((i, e));
+            break;
+        }
+    }
+    if failed.is_none() {
+        if let Some(marker) = &batch.marker {
+            if let Err(e) = ctx.store.record_fact_extraction(
+                w.memory_id,
+                marker.model,
+                total as i64,
+                marker.source,
+            ) {
+                failed = Some((total, CliError::from(e)));
+            }
+        }
+    }
+    match failed {
+        None => match ctx.store.commit() {
+            Ok(()) => {
+                outcome.merge(scratch);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = ctx.store.rollback();
+                Err(fail(total, e.into()))
+            }
+        },
+        Some((index, error)) => {
+            let _ = ctx.store.rollback();
+            Err(fail(index, error))
+        }
+    }
+}
+
 pub async fn write_fact(
     ctx: &AppContext,
     w: &FactWriteCtx<'_>,
     ef: &ExtractedFact,
+    cache: &FactEmbedCache,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), CliError> {
     if let Ok(needle) = std::env::var(WRITE_FAIL_ENV) {
-        if !needle.trim().is_empty()
-            && (ef.subject.contains(needle.trim()) || ef.predicate.contains(needle.trim()))
-        {
+        let needle = needle.trim();
+        if !needle.is_empty() && (ef.subject.contains(needle) || ef.predicate.contains(needle)) {
+            // Never `{ef:?}`: the fact restates the memory it came from, and
+            // this string is rendered into `fact_extraction_note`, which goes
+            // to stdout AND stderr. Only the operator's own needle is echoed.
             return Err(CliError::Storage(engram_storage::StorageError::Migration(
-                format!("{WRITE_FAIL_ENV} injected a persistence failure for {ef:?}"),
+                format!("{WRITE_FAIL_ENV} injected a persistence failure (needle '{needle}')"),
             )));
         }
     }
@@ -644,11 +913,20 @@ pub async fn write_fact(
     if !exact.is_empty() {
         // Same question, different answer — or, for a multi-valued predicate,
         // simply a second answer. The classifier decides per pair.
-        insert_with_embedding(ctx, &new_fact, embedder, kb, diary).await?;
+        insert_with_embedding(ctx, &new_fact, embedder, cache).await?;
         outcome.added += 1;
         for old in &exact {
             apply_write_verdict(
-                ctx, &new_fact, old, diary, kb, "slot", None, autonomy, outcome,
+                ctx,
+                &new_fact,
+                old,
+                diary,
+                kb,
+                "slot",
+                None,
+                autonomy,
+                source_kind,
+                outcome,
             )?;
         }
         return Ok(());
@@ -662,12 +940,7 @@ pub async fn write_fact(
         return Ok(());
     };
     let text = fact_text(&subject, &predicate, &ef.object);
-    let embedding = embedder
-        .embed_batch(&[text.as_str()], TaskMode::RetrievalDocument)
-        .await?
-        .into_iter()
-        .next()
-        .unwrap_or_default();
+    let embedding = embed_fact_text(embedder, cache, &text).await?;
     let existing = ctx
         .store
         .active_fact_embeddings(diary, kb, &embedder.model())?;
@@ -697,8 +970,9 @@ pub async fn write_fact(
             let mut settled: Vec<(Fact, f32)> = Vec::new();
             if !queue_everything() {
                 cand_facts.retain(|(f, s)| {
-                    let keep = classify_pair(&new_fact, f, Some(*s), ClassifyMode::Write).class
-                        == ConflictClass::Queue;
+                    let keep =
+                        classify_pair(&new_fact, f, Some(*s), classify_mode_for(source_kind)).class
+                            == ConflictClass::Queue;
                     if !keep {
                         settled.push((f.clone(), *s));
                     }
@@ -721,6 +995,7 @@ pub async fn write_fact(
                         "semantic_cosine",
                         Some(*s),
                         autonomy,
+                        source_kind,
                         outcome,
                     )?;
                 }
@@ -816,9 +1091,15 @@ fn apply_write_verdict(
     detector: &str,
     score: Option<f32>,
     autonomy: Autonomy,
+    source_kind: SourceKind,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), CliError> {
-    let verdict = classify_pair(new_fact, old, score, ClassifyMode::Write);
+    let verdict = classify_pair(new_fact, old, score, classify_mode_for(source_kind));
+    // The tag says who decided, not just why.
+    let tag = match source_kind {
+        SourceKind::CompileLlm => compile_resolution(verdict.rule),
+        _ => verdict.rule,
+    };
     // `strict` promised never to auto-supersede: it escalates every real
     // disagreement. It does NOT invent conflicts out of coexisting values —
     // a second `knows` is not a decision anyone has to make.
@@ -847,22 +1128,14 @@ fn apply_write_verdict(
             outcome.added = outcome.added.saturating_sub(1);
         }
         ConflictClass::SupersedeOld => {
-            ctx.store.supersede_fact_with(
-                old.id,
-                new_fact.id,
-                verdict.rule,
-                new_fact.valid_from,
-            )?;
-            outcome
-                .conflicts
-                .push(conflict_payload(old, new_fact, verdict.rule));
+            ctx.store
+                .supersede_fact_with(old.id, new_fact.id, tag, new_fact.valid_from)?;
+            outcome.conflicts.push(conflict_payload(old, new_fact, tag));
         }
         ConflictClass::SupersedeNew => {
             ctx.store
-                .supersede_fact_with(new_fact.id, old.id, verdict.rule, old.valid_from)?;
-            outcome
-                .conflicts
-                .push(conflict_payload(new_fact, old, verdict.rule));
+                .supersede_fact_with(new_fact.id, old.id, tag, old.valid_from)?;
+            outcome.conflicts.push(conflict_payload(new_fact, old, tag));
         }
         ConflictClass::Queue => {
             queue_conflict(ctx, new_fact, old, diary, kb, detector, score, outcome)?;
@@ -875,19 +1148,16 @@ async fn insert_with_embedding(
     ctx: &AppContext,
     fact: &Fact,
     embedder: Option<&dyn Embedder>,
-    _kb: &str,
-    _diary: &str,
+    cache: &FactEmbedCache,
 ) -> Result<(), CliError> {
     ctx.store.insert_fact(fact)?;
     if let Some(e) = embedder {
         let text = fact_text(&fact.subject, &fact.predicate, &fact.object);
-        if let Ok(mut v) = e
-            .embed_batch(&[text.as_str()], TaskMode::RetrievalDocument)
-            .await
-        {
-            if let Some(emb) = v.pop() {
-                ctx.store.set_fact_embedding(fact.id, &emb, &e.model())?;
-            }
+        // Unchanged on purpose: the fact IS stored, only the novelty gate
+        // loses one vector. With the pre-warmed cache this makes no call at
+        // all in the common path.
+        if let Ok(emb) = embed_fact_text(e, cache, &text).await {
+            ctx.store.set_fact_embedding(fact.id, &emb, &e.model())?;
         }
     }
     Ok(())
@@ -1282,5 +1552,70 @@ mod tests {
                 "{class:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_compiled_fact_is_read_like_a_backlog_not_like_an_assertion() {
+        assert_eq!(
+            classify_mode_for(SourceKind::CompileLlm),
+            ClassifyMode::Triage
+        );
+        for kind in [
+            SourceKind::AgentExtracted,
+            SourceKind::UserStated,
+            SourceKind::UserConfirmed,
+            SourceKind::Import,
+        ] {
+            assert_eq!(classify_mode_for(kind), ClassifyMode::Write, "{kind:?}");
+        }
+        // The consequence: two values a compile cannot order stay a question.
+        // Under the write path's rules the LAST chunk compiled would silently
+        // own the slot — and chunk order is a UUID tiebreak.
+        let old = stored("Carol", "works_at", "Acme", "2026-01-01");
+        let mut new = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
+        new.created_at = old.created_at;
+        assert_eq!(
+            classify_pair(&new, &old, None, classify_mode_for(SourceKind::CompileLlm)).class,
+            ConflictClass::Queue
+        );
+        assert_eq!(
+            classify_pair(
+                &new,
+                &old,
+                None,
+                classify_mode_for(SourceKind::AgentExtracted)
+            )
+            .class,
+            ConflictClass::SupersedeOld
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_batch_contributes_nothing_to_the_run_total() {
+        let mut total = FactWriteOutcome {
+            added: 2,
+            deduped: 1,
+            ..Default::default()
+        };
+        let committed = FactWriteOutcome {
+            added: 3,
+            deduped: 0,
+            ..Default::default()
+        };
+        total.merge(committed);
+        assert_eq!(total.added, 5);
+        assert_eq!(total.deduped, 1);
+        // A batch that never committed is simply never merged — the numbers it
+        // would have reported describe rows that do not exist.
+    }
+
+    #[test]
+    fn a_compile_supersession_says_the_compiler_did_it() {
+        assert_eq!(compile_resolution("recency_supersede"), "compile_recency");
+        assert_eq!(compile_resolution("recency_stale"), "compile_stale");
+        assert_eq!(compile_resolution("confidence_gap"), "compile_confidence");
+        // Non-supersede rules keep the classifier's own name.
+        assert_eq!(compile_resolution("duplicate"), "duplicate");
+        assert_eq!(compile_resolution("safety_slot"), "safety_slot");
     }
 }

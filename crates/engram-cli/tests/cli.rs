@@ -3364,6 +3364,11 @@ fn forget_does_not_unseal_another_diarys_derived_content() {
 /// merely warned about while the memory was still marked done — and
 /// `facts backfill` treats any marker row as processed, so those facts were
 /// lost permanently and invisibly.
+///
+/// The marker now rides inside the batch's own transaction, so "facts stored,
+/// marker missing" is unreachable and a partial persist cannot happen at all.
+/// This fixture's script yields ONE fact, so it cannot distinguish "all failed"
+/// from "partial" — `tests/wave05_fact_batch.rs` covers the two-fact case.
 #[test]
 fn a_failed_fact_write_leaves_the_memory_pending_for_backfill() {
     let tmp = tempfile::tempdir().expect("tmp dir");
@@ -3385,7 +3390,7 @@ fn a_failed_fact_write_leaves_the_memory_pending_for_backfill() {
     let v = parse_stdout(&out);
     // The memory is stored, the failure is loud, and nothing was persisted.
     assert_eq!(v["data"]["stored"], true);
-    assert_eq!(v["data"]["fact_extraction"], "failed_partial_persist");
+    assert_eq!(v["data"]["fact_extraction"], "failed_persist");
     assert_eq!(v["data"]["facts_added"], 0);
     assert!(v["data"]["fact_extraction_note"]
         .as_str()

@@ -14,17 +14,19 @@
 //! queued for the calling agent under the default `assisted` autonomy —
 //! see `facts resolve`.
 
-use crate::commands::usage::{estimated_tokens, estimated_tokens_for_texts, gemini_embed_cost_usd};
+use crate::commands::usage::estimated_tokens;
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_llm::FactLlm;
-use crate::fact_write::{write_fact, Autonomy, FactWriteCtx, FactWriteOutcome, MemoryTime};
+use crate::fact_write::{
+    write_fact_batch, Autonomy, FactBatch, FactBatchError, FactExtractionMarker, FactWriteCtx,
+    FactWriteOutcome, MemoryTime,
+};
 use crate::output::{print_success, Metadata};
+use crate::retrieval::{resolve_write_embedder, WriteEmbedder};
 use chrono::{DateTime, Utc};
 use engram_core::temporal::parse_moment;
 use engram_core::types::{Memory, MemorySource, SourceKind};
-use engram_embed::gemini::GeminiEmbedder;
-use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::facts::{extract_facts, ExtractedFact};
 use engram_ingest::memory::chunk_memory;
@@ -52,6 +54,8 @@ pub struct RememberArgs {
     pub facts_json: Option<String>,
     /// `--event-time`: when the content actually happened.
     pub event_time: Option<String>,
+    /// `--offline`: embed with the deterministic stub instead of Gemini.
+    pub offline: bool,
 }
 
 /// Why the fact extractor did or did not run, reported in the envelope so an
@@ -69,16 +73,14 @@ enum ExtractionStatus {
     SkippedNoKey,
     /// The LLM call was attempted and failed. The memory is still stored.
     Failed(String),
-    /// The LLM returned facts but at least one could not be persisted. No
-    /// extraction marker was recorded, so the memory is still pending.
+    /// The facts could not be persisted, so NOTHING was — a batch is one unit
+    /// of work. The memory is stored and left unprocessed, so `facts backfill`
+    /// retries it.
     FailedPersist {
-        failed: usize,
+        index: usize,
         total: usize,
         detail: String,
     },
-    /// Every fact persisted, but the "already extracted" marker itself could
-    /// not be written. Harmless apart from a re-extraction later.
-    MarkerNotRecorded(String),
 }
 
 impl ExtractionStatus {
@@ -90,8 +92,9 @@ impl ExtractionStatus {
             ExtractionStatus::CallerSupplied => "skipped_facts_json",
             ExtractionStatus::SkippedNoKey => "skipped_no_openrouter_key",
             ExtractionStatus::Failed(_) => "failed",
-            ExtractionStatus::FailedPersist { .. } => "failed_partial_persist",
-            ExtractionStatus::MarkerNotRecorded(_) => "failed_extraction_marker",
+            // Renamed from `failed_partial_persist`: a partial persist is
+            // exactly what can no longer happen.
+            ExtractionStatus::FailedPersist { .. } => "failed_persist",
         }
     }
 
@@ -113,17 +116,14 @@ impl ExtractionStatus {
                  `engram facts backfill --kb {kb}`"
             )),
             ExtractionStatus::FailedPersist {
-                failed,
+                index,
                 total,
                 detail,
             } => Some(format!(
-                "{failed} of {total} extracted facts could not be stored ({detail}); the memory \
-                 is stored and left UNPROCESSED, so `engram facts backfill --kb {kb}` will \
-                 retry it"
-            )),
-            ExtractionStatus::MarkerNotRecorded(e) => Some(format!(
-                "facts were stored but the extraction marker was not ({e}); \
-                 `engram facts backfill --kb {kb}` may extract this memory again"
+                "fact {} of {total} could not be stored ({detail}); a fact batch is one unit of \
+                 work, so NO fact from this memory was stored — the memory is stored and left \
+                 UNPROCESSED, and `engram facts backfill --kb {kb}` will retry it",
+                index + 1
             )),
             _ => None,
         }
@@ -145,25 +145,26 @@ pub fn parse_event_time(raw: &Option<String>) -> Result<Option<DateTime<Utc>>, C
 
 /// Test seam: make the embedding call fail on demand.
 ///
-/// Set to any non-empty message and `remember` fails exactly where a network
-/// embed would — after chunking, before any database write. There is no other
-/// way to reproduce a failed embed offline, and "a committed memory with no
-/// chunks" is precisely the state this command must never be able to reach:
-/// dense recall can never return such a memory, and the exact-content dedup
-/// above turns every re-save into a successful-looking no-op, so the content is
-/// lost while the CLI reports success. Same shape as `ENGRAM_FACT_WRITE_FAIL`;
-/// never set in production use.
+/// Set to any non-empty message and `remember` (or `edit`) fails exactly where
+/// a network embed would — after chunking, after the existence/budget gates,
+/// before any spend and before any database write. There is no other way to
+/// reproduce a failed embed offline, and "a committed memory with no chunks" is
+/// precisely the state these commands must never be able to reach: dense recall
+/// can never return such a memory, and the exact-content dedup turns every
+/// re-save into a successful-looking no-op, so the content is lost while the
+/// CLI reports success. Same shape as `ENGRAM_FACT_WRITE_FAIL`; never set in
+/// production use.
 pub const EMBED_FAIL_ENV: &str = "ENGRAM_EMBED_FAIL";
 
-fn injected_embed_failure() -> Option<CliError> {
+pub(crate) fn injected_embed_failure(command: &str) -> Option<CliError> {
     let raw = std::env::var(EMBED_FAIL_ENV).ok()?;
     let message = raw.trim();
     if message.is_empty() {
         return None;
     }
     Some(CliError::Transient(format!(
-        "{EMBED_FAIL_ENV} injected an embedding failure ({message}); nothing was stored — \
-         re-run `engram remember` once the embedder is reachable"
+        "{EMBED_FAIL_ENV} injected an embedding failure ({message}); nothing was written — \
+         re-run `engram {command}` once the embedder is reachable"
     )))
 }
 
@@ -180,6 +181,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         autonomy,
         facts_json,
         event_time,
+        offline,
     } = args;
     let autonomy = Autonomy::parse(&autonomy)?;
     crate::commands::validate_diary_for_write(&diary)?;
@@ -200,6 +202,12 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         })?,
         None => Vec::new(),
     };
+    // The embedder is chosen — and a missing key refused — BEFORE anything is
+    // read or written, so a keyless store can never quietly fill with 64-dim
+    // stub vectors that recall will later refuse to search. Deliberately after
+    // the argument checks above, so a bad argument is still exit 3 rather than
+    // being masked by the environment.
+    let write_embedder = resolve_write_embedder("remember", offline)?;
 
     let start = Instant::now();
 
@@ -208,9 +216,41 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // --allow-duplicate if you truly want a second copy.
     if !allow_duplicate {
         if let Some(existing) = ctx.store.find_duplicate_memory(&kb, &diary, &content)? {
+            // The CONTENT is already stored; the caller's triples may not be.
+            // A `remember --facts-json` whose batch failed is retried with the
+            // identical command, and returning here would report success while
+            // dropping those triples a second time — the retry the failure
+            // message promises has to be the retry that works. Extraction is
+            // deliberately NOT run here: this path costs no LLM call, as before.
+            let mut outcome = FactWriteOutcome::default();
+            if !extracted.is_empty() {
+                let (stored_event, stored_created) = ctx
+                    .store
+                    .memory_times(existing)?
+                    .unwrap_or((None, Utc::now()));
+                let dedup_llm = crate::fact_llm::resolve()?;
+                let plan = FactBatchPlan {
+                    memory_id: existing,
+                    kb: &kb,
+                    diary: &diary,
+                    memory_time: MemoryTime {
+                        event_time: event_time.or(stored_event),
+                        created_at: stored_created,
+                    },
+                    autonomy,
+                    llm: dedup_llm.as_ref(),
+                    embedder: write_embedder.embedder.as_ref(),
+                    facts: &extracted,
+                    marker: None,
+                };
+                if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
+                    return Err(facts_json_failure(failure, existing, &kb));
+                }
+            }
             let mut meta = Metadata::default();
             meta.add("deduplicated", true);
             meta.add("existing_id", existing.to_string());
+            meta.add("facts_added", outcome.added);
             print_success(
                 ctx.format,
                 json!({
@@ -218,12 +258,19 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     "stored": false,
                     "deduplicated": true,
                     "kb": kb,
+                    "facts_added": outcome.added,
+                    "facts_deduped": outcome.deduped,
+                    "conflicts": outcome.conflicts,
+                    "adjudication_needed": outcome.queued,
+                    "date_parse_warnings": outcome.date_warnings,
                     "reason": "identical content already stored in this kb/diary; nothing re-embedded",
                 }),
                 meta,
-                |_| {
+                |data| {
                     println!(
-                        "Duplicate of {existing} — nothing stored (use --allow-duplicate to force)"
+                        "Duplicate of {existing} — nothing re-stored ({} facts attached, use \
+                         --allow-duplicate to force a second memory)",
+                        data["facts_added"]
                     )
                 },
             );
@@ -267,15 +314,16 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let chunks = chunk_memory(&content, policy);
     let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
 
-    // Embed every chunk. Gemini if available (env or config file), stub otherwise.
-    let force_stub = crate::commands::config::stub_forced();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let have_gemini = !force_stub && gemini_key.is_some();
-    let embedder: Box<dyn Embedder> = if have_gemini {
-        Box::new(GeminiEmbedder::new(gemini_key.unwrap()))
-    } else {
-        Box::new(StubEmbedder::default())
-    };
+    // Gemini, or the offline stub when `--offline` (or the bench hook) asked
+    // for it. There is no third case: a write with no key and no --offline
+    // never reaches this line — see the resolution above.
+    let WriteEmbedder {
+        embedder,
+        cloud: have_gemini,
+        model: model_name,
+        dims,
+        prompt_format,
+    } = write_embedder;
     // A chunk longer than the provider's window loses its tail with no vector
     // coverage — silently, before this. The cap above makes it unreachable
     // unless someone widened `chunking.max_chars`; if they did, say so.
@@ -285,9 +333,6 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         &chunk_texts,
         "remember",
     );
-    let model_name = embedder.model();
-    let dims = embedder.dimensions();
-    let prompt_format = embedder.prompt_format().to_string();
     // NOTHING IS WRITTEN UNTIL THE VECTORS ARE IN HAND. `embed_batch` is a
     // NETWORK call: it can 429, time out, or come back short. Writing the memory
     // row first (as this did) left a committed memory with no chunks whenever it
@@ -295,12 +340,63 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // dedup above turns every re-save into a successful-looking no-op, so the
     // content is gone for good with the CLI reporting success. Embed, check the
     // arity, and only then open one transaction for the row and its chunks.
-    if let Some(injected) = injected_embed_failure() {
+    if let Some(injected) = injected_embed_failure("remember") {
         return Err(injected);
     }
-    let embeddings = embedder
-        .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-        .await?;
+    let embeddings = match embedder
+        .embed_batch_accounted(&chunk_texts, TaskMode::RetrievalDocument)
+        .await
+    {
+        Ok(v) => v,
+        Err(failure) => {
+            // A Gemini `embed_batch` is SEVERAL billed HTTP requests. If batch
+            // 1 was served and batch 2 failed, batch 1 is on the invoice — so
+            // it goes on the ledger before this command dies, or the budget
+            // guardrail silently loses ground on every failed write.
+            if have_gemini && failure.charged_texts > 0 {
+                crate::commands::usage::record_embed_spend(
+                    &ctx.store,
+                    "remember_embed",
+                    &model_name,
+                    Some(&kb),
+                    Some(&diary),
+                    &chunk_texts[..failure.charged_texts],
+                    failure.charged_requests as i64,
+                    json!({
+                        "dimensions": dims,
+                        "prompt_format": prompt_format.clone(),
+                        "estimated": true,
+                        "partial": true,
+                        "chunks_requested": chunk_texts.len(),
+                    }),
+                );
+            }
+            return Err(failure.error.into());
+        }
+    };
+    // The embedding call is paid the moment it returns, whether or not the write
+    // below commits, so the usage row is written FIRST and on its own. A failure
+    // to record it must not fail the command: the money is already spent, and
+    // losing the memory over a bookkeeping row is the worse lie. Same treatment
+    // as the extraction usage row in `extract_into`. Deliberately BEFORE the
+    // arity check below — a short batch was still served, and still billed.
+    if have_gemini {
+        crate::commands::usage::record_embed_spend(
+            &ctx.store,
+            "remember_embed",
+            &model_name,
+            Some(&kb),
+            Some(&diary),
+            &chunk_texts,
+            1,
+            json!({
+                "dimensions": dims,
+                "prompt_format": prompt_format.clone(),
+                "estimated": true,
+                "partial": false,
+            }),
+        );
+    }
     if embeddings.len() != chunks.len() {
         return Err(CliError::Transient(format!(
             "embedder returned {} embeddings for {} chunks; nothing was stored, so no chunk is \
@@ -308,35 +404,6 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             embeddings.len(),
             chunks.len(),
         )));
-    }
-
-    // The embedding call is paid the moment it returns, whether or not the write
-    // below commits, so the usage row is written FIRST and on its own. A failure
-    // to record it must not fail the command: the money is already spent, and
-    // losing the memory over a bookkeeping row is the worse lie. Same treatment
-    // as the extraction usage row in `extract_into`.
-    if have_gemini && !chunk_texts.is_empty() {
-        let tokens = estimated_tokens_for_texts(&chunk_texts);
-        if let Err(e) = ctx.store.record_usage_event(
-            "gemini",
-            "remember_embed",
-            Some(&model_name),
-            Some(&kb),
-            Some(&diary),
-            1,
-            chunk_texts.len() as i64,
-            tokens,
-            0,
-            0.0,
-            gemini_embed_cost_usd(tokens),
-            json!({
-                "dimensions": dims,
-                "prompt_format": prompt_format.clone(),
-                "estimated": true,
-            }),
-        ) {
-            tracing::warn!("could not record remember embedding usage: {e}");
-        }
     }
 
     // ONE unit of work: the memory row, the KB registration it implies, and
@@ -396,65 +463,42 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         }
     };
 
-    let mut write_failures: Vec<String> = Vec::new();
+    // ONE UNIT OF WORK. `facts backfill` treats a memory as processed once it
+    // has ANY fact OR a marker (PENDING_EXTRACTION_PREDICATE), so a batch that
+    // persisted fact A and failed on fact B retired the memory from the queue
+    // on the strength of A, and B was lost permanently and invisibly. The batch
+    // and its marker now commit together or not at all: on failure the memory
+    // keeps no fact and no marker, so it stays pending and a later backfill
+    // retries it from scratch.
+    let marker = status.extraction_ran().then_some(FactExtractionMarker {
+        model: extraction_model.as_deref(),
+        source: "remember",
+    });
     let mut outcome = FactWriteOutcome::default();
-    if !extracted.is_empty() {
-        // The novelty gate uses the same embedder family as the chunks above.
-        let gate_embedder: Option<Box<dyn Embedder>> = if have_gemini {
-            crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
-                .map(|k| Box::new(GeminiEmbedder::new(k)) as Box<dyn Embedder>)
-        } else {
-            Some(Box::new(StubEmbedder::default()) as Box<dyn Embedder>)
-        };
-        let write_ctx = FactWriteCtx {
+    if !extracted.is_empty() || marker.is_some() {
+        let plan = FactBatchPlan {
             memory_id: memory.id,
-            diary: &diary,
             kb: &kb,
+            diary: &diary,
             memory_time: MemoryTime {
                 event_time,
                 created_at: now,
             },
-            embedder: gate_embedder.as_deref(),
-            llm: llm.as_ref().map(|l| l.as_chat()),
             autonomy,
-            source_kind: SourceKind::AgentExtracted,
+            llm: llm.as_ref(),
+            embedder: embedder.as_ref(),
+            facts: &extracted,
+            marker,
         };
-        for ef in &extracted {
-            if let Err(e) = write_fact(ctx, &write_ctx, ef, &mut outcome).await {
-                tracing::warn!("fact write failed for {:?}: {e}", ef);
-                write_failures.push(e.to_string());
+        if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
+            if facts_json.is_some() {
+                return Err(facts_json_failure(failure, memory.id, &kb));
             }
-        }
-    }
-
-    // EXTRACTION MARKER ORDERING. `facts backfill` treats any row in
-    // fact_extraction_log as "this memory is done" (PENDING_EXTRACTION_
-    // PREDICATE), so the marker is a promise that the facts are in the store.
-    // Writing it right after the LLM returned — before the write loop below —
-    // broke that promise: a persistence failure was only `tracing::warn!`ed,
-    // the memory was still marked processed, and no backfill would ever look
-    // at it again. The facts were lost silently and permanently.
-    //
-    // So: record the marker only once every extracted fact has been persisted.
-    // On any failure record NOTHING (the memory stays pending and a later
-    // `facts backfill` retries it) and say so loudly in the envelope.
-    if status.extraction_ran() {
-        if let Some(detail) = write_failures.first() {
             status = ExtractionStatus::FailedPersist {
-                failed: write_failures.len(),
-                total: extracted.len(),
-                detail: detail.clone(),
+                index: failure.index,
+                total: failure.total,
+                detail: failure.error.to_string(),
             };
-        } else if let Err(e) = ctx.store.record_fact_extraction(
-            memory.id,
-            extraction_model.as_deref(),
-            extracted.len() as i64,
-            "remember",
-        ) {
-            // Marker-only failure: the facts ARE stored, the memory just stays
-            // in the backfill queue. Failing safe means a possible re-extract,
-            // never a silent loss.
-            status = ExtractionStatus::MarkerNotRecorded(e.to_string());
         }
     }
 
@@ -532,6 +576,71 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         },
     );
     Ok(())
+}
+
+/// Everything one memory's fact batch needs. Bundled so the duplicate-content
+/// path and the main path cannot drift apart on embedder choice, autonomy, or
+/// the marker rule.
+struct FactBatchPlan<'a> {
+    memory_id: Uuid,
+    kb: &'a str,
+    diary: &'a str,
+    memory_time: MemoryTime,
+    autonomy: Autonomy,
+    llm: Option<&'a FactLlm>,
+    /// The SAME embedder the chunks were written with. The novelty gate has to
+    /// agree with the index it is gating: `novelty_gate` skips candidates of a
+    /// different width, so a gate on another embedder calls every fact novel.
+    embedder: &'a dyn Embedder,
+    facts: &'a [ExtractedFact],
+    marker: Option<FactExtractionMarker<'a>>,
+}
+
+/// Persist a plan as ONE unit of work.
+async fn persist_facts(
+    ctx: &AppContext,
+    plan: FactBatchPlan<'_>,
+    outcome: &mut FactWriteOutcome,
+) -> Result<(), FactBatchError> {
+    let write_ctx = FactWriteCtx {
+        memory_id: plan.memory_id,
+        diary: plan.diary,
+        kb: plan.kb,
+        memory_time: plan.memory_time,
+        embedder: Some(plan.embedder),
+        llm: plan.llm.map(|l| l.as_chat()),
+        autonomy: plan.autonomy,
+        source_kind: SourceKind::AgentExtracted,
+    };
+    let batch = FactBatch {
+        facts: plan.facts,
+        marker: plan.marker,
+    };
+    write_fact_batch(ctx, &write_ctx, &batch, outcome).await
+}
+
+/// A `--facts-json` batch that rolled back is not a note, it is a failure.
+///
+/// `facts backfill` re-extracts with an LLM; it never replays triples an agent
+/// asserted, so nothing downstream can recover these. The retry that DOES work
+/// is the identical command: the duplicate-content path attaches the batch to
+/// the memory the content already has.
+fn facts_json_failure(failure: FactBatchError, memory_id: Uuid, kb: &str) -> CliError {
+    let message = format!(
+        "--facts-json fact {} of {} could not be stored ({}); a fact batch is one unit of work, \
+         so NO fact from it was stored — memory {memory_id} WAS stored, so re-run the identical \
+         `engram remember … --facts-json …` and the facts are attached to it (if this run also \
+         extracted, run `engram facts backfill --kb {kb}` first: backfill only retries memories \
+         that have no facts yet)",
+        failure.index + 1,
+        failure.total,
+        failure.error
+    );
+    match failure.error.exit_code() {
+        2 => CliError::Config(message),
+        4 => CliError::RateLimited(message),
+        _ => CliError::Transient(message),
+    }
 }
 
 /// Run one extraction call and append the triples.
@@ -625,5 +734,16 @@ mod tests {
             .unwrap();
         assert!(failed.contains("429 rate limited"));
         assert!(failed.contains("facts backfill --kb personal"));
+
+        let rolled_back = ExtractionStatus::FailedPersist {
+            index: 1,
+            total: 3,
+            detail: "storage error: disk I/O error".into(),
+        }
+        .note("personal")
+        .unwrap();
+        assert!(rolled_back.contains("fact 2 of 3"));
+        assert!(rolled_back.contains("NO fact from this memory was stored"));
+        assert!(rolled_back.contains("facts backfill --kb personal"));
     }
 }

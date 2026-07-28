@@ -110,6 +110,15 @@ pub struct StoredChunkEmbedding {
     pub source: Option<String>,
 }
 
+/// A memory's two dates: its `--event-time` (when the content happened, if
+/// known) and when the store recorded it. Always read together — a caller that
+/// takes one without the other reintroduces the fabricated "now" that
+/// `MemoryTime` in the write path exists to prevent.
+pub type MemoryTimes = (
+    Option<chrono::DateTime<chrono::Utc>>,
+    chrono::DateTime<chrono::Utc>,
+);
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkRecord {
     pub chunk_id: Uuid,
@@ -2720,6 +2729,59 @@ impl SqliteStore {
             )
             .optional()
             .map_err(StorageError::from)
+    }
+
+    /// The `(kb, diary)` a LIVE memory belongs to, or `None` when the id names
+    /// no live memory.
+    ///
+    /// `edit` needs all three answers in one query — does this row exist, which
+    /// KB budget governs the edit, and which (kb, diary) the usage row must be
+    /// attributed to — BEFORE it makes a paid embedding call. `kb_for_memory`
+    /// answers neither the last one nor the `deleted = 0` question, so it would
+    /// let an edit of a forgotten memory buy an embedding and then fail.
+    pub fn memory_scope(&self, memory_id: Uuid) -> Result<Option<(String, String)>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT kb, diary FROM memories WHERE id = ?1 AND deleted = 0",
+                params![memory_id.to_string()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    /// A memory's own dates, `(event_time, created_at)`. `None` when the
+    /// memory is gone or soft-deleted.
+    ///
+    /// A fact derived from a chunk is dated by the MEMORY the chunk came from,
+    /// never by the clock of the pass that read it. A fabricated "now" is not a
+    /// missing date: it is the NEWEST date in the store, so it wins recency
+    /// supersession against the older true fact — the same defect the anchored
+    /// extractor dates closed on the `remember` path. Exposed as a single-row
+    /// lookup rather than widened onto `ChunkRecord`, whose row parser is
+    /// shared by five queries and whose JSON shape is public.
+    pub fn memory_times(&self, memory_id: Uuid) -> Result<Option<MemoryTimes>, StorageError> {
+        let row: Option<(Option<String>, String)> = self
+            .conn
+            .query_row(
+                "SELECT event_time, created_at FROM memories WHERE id = ?1 AND deleted = 0",
+                params![memory_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|d| d.with_timezone(&chrono::Utc))
+        };
+        Ok(row.map(|(event_time, created_at)| {
+            (
+                event_time.as_deref().and_then(parse),
+                // Every writer of `created_at` is `Utc::now().to_rfc3339()`;
+                // an unparseable one can only mean hand-edited data.
+                parse(&created_at).unwrap_or_else(chrono::Utc::now),
+            )
+        }))
     }
 
     pub fn clear_derived_for_kb(&self, kb: &str) -> Result<(), StorageError> {
@@ -5869,6 +5931,46 @@ mod tests {
             .list_memories_pending_fact_extraction(Some("personal"), None, None)
             .unwrap();
         assert_eq!(got[0].1.event_time, Some(when));
+    }
+
+    #[test]
+    fn memory_scope_answers_existence_kb_and_diary_and_ignores_deleted_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut m = fact("A note filed under work.");
+        m.diary = "work".into();
+        store.insert_memory_with_kb(&m, "business").unwrap();
+        assert_eq!(
+            store.memory_scope(m.id).unwrap(),
+            Some(("business".to_string(), "work".to_string()))
+        );
+        assert!(store.memory_scope(Uuid::new_v4()).unwrap().is_none());
+        store.soft_delete_memory(m.id).unwrap();
+        assert!(
+            store.memory_scope(m.id).unwrap().is_none(),
+            "a forgotten memory must not be editable, and must not be billable"
+        );
+    }
+
+    #[test]
+    fn memory_times_report_the_event_time_and_vanish_with_the_memory() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let when = chrono::DateTime::parse_from_rfc3339("2015-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut m = fact("Ana lived in London.");
+        m.event_time = Some(when);
+        store.insert_memory_with_kb(&m, "personal").unwrap();
+        let (event, created) = store.memory_times(m.id).unwrap().expect("live memory");
+        assert_eq!(event, Some(when));
+        assert!(created <= Utc::now());
+        // A plain memory has only a record time.
+        let n = fact("No event time here.");
+        store.insert_memory_with_kb(&n, "personal").unwrap();
+        assert_eq!(store.memory_times(n.id).unwrap().unwrap().0, None);
+        // A soft-deleted memory can date nothing.
+        store.soft_delete_memory(m.id).unwrap();
+        assert!(store.memory_times(m.id).unwrap().is_none());
+        assert!(store.memory_times(Uuid::new_v4()).unwrap().is_none());
     }
 
     #[test]
