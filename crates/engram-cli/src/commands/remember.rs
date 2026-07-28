@@ -14,7 +14,7 @@
 //! queued for the calling agent under the default `assisted` autonomy —
 //! see `facts resolve`.
 
-use crate::commands::usage::{estimated_tokens, estimated_tokens_for_texts, gemini_embed_cost_usd};
+use crate::commands::usage::estimated_tokens;
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_llm::FactLlm;
@@ -144,25 +144,26 @@ pub fn parse_event_time(raw: &Option<String>) -> Result<Option<DateTime<Utc>>, C
 
 /// Test seam: make the embedding call fail on demand.
 ///
-/// Set to any non-empty message and `remember` fails exactly where a network
-/// embed would — after chunking, before any database write. There is no other
-/// way to reproduce a failed embed offline, and "a committed memory with no
-/// chunks" is precisely the state this command must never be able to reach:
-/// dense recall can never return such a memory, and the exact-content dedup
-/// above turns every re-save into a successful-looking no-op, so the content is
-/// lost while the CLI reports success. Same shape as `ENGRAM_FACT_WRITE_FAIL`;
-/// never set in production use.
+/// Set to any non-empty message and `remember` (or `edit`) fails exactly where
+/// a network embed would — after chunking, after the existence/budget gates,
+/// before any spend and before any database write. There is no other way to
+/// reproduce a failed embed offline, and "a committed memory with no chunks" is
+/// precisely the state these commands must never be able to reach: dense recall
+/// can never return such a memory, and the exact-content dedup turns every
+/// re-save into a successful-looking no-op, so the content is lost while the
+/// CLI reports success. Same shape as `ENGRAM_FACT_WRITE_FAIL`; never set in
+/// production use.
 pub const EMBED_FAIL_ENV: &str = "ENGRAM_EMBED_FAIL";
 
-fn injected_embed_failure() -> Option<CliError> {
+pub(crate) fn injected_embed_failure(command: &str) -> Option<CliError> {
     let raw = std::env::var(EMBED_FAIL_ENV).ok()?;
     let message = raw.trim();
     if message.is_empty() {
         return None;
     }
     Some(CliError::Transient(format!(
-        "{EMBED_FAIL_ENV} injected an embedding failure ({message}); nothing was stored — \
-         re-run `engram remember` once the embedder is reachable"
+        "{EMBED_FAIL_ENV} injected an embedding failure ({message}); nothing was written — \
+         re-run `engram {command}` once the embedder is reachable"
     )))
 }
 
@@ -332,12 +333,63 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // dedup above turns every re-save into a successful-looking no-op, so the
     // content is gone for good with the CLI reporting success. Embed, check the
     // arity, and only then open one transaction for the row and its chunks.
-    if let Some(injected) = injected_embed_failure() {
+    if let Some(injected) = injected_embed_failure("remember") {
         return Err(injected);
     }
-    let embeddings = embedder
-        .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-        .await?;
+    let embeddings = match embedder
+        .embed_batch_accounted(&chunk_texts, TaskMode::RetrievalDocument)
+        .await
+    {
+        Ok(v) => v,
+        Err(failure) => {
+            // A Gemini `embed_batch` is SEVERAL billed HTTP requests. If batch
+            // 1 was served and batch 2 failed, batch 1 is on the invoice — so
+            // it goes on the ledger before this command dies, or the budget
+            // guardrail silently loses ground on every failed write.
+            if have_gemini && failure.charged_texts > 0 {
+                crate::commands::usage::record_embed_spend(
+                    &ctx.store,
+                    "remember_embed",
+                    &model_name,
+                    Some(&kb),
+                    Some(&diary),
+                    &chunk_texts[..failure.charged_texts],
+                    failure.charged_requests as i64,
+                    json!({
+                        "dimensions": dims,
+                        "prompt_format": prompt_format.clone(),
+                        "estimated": true,
+                        "partial": true,
+                        "chunks_requested": chunk_texts.len(),
+                    }),
+                );
+            }
+            return Err(failure.error.into());
+        }
+    };
+    // The embedding call is paid the moment it returns, whether or not the write
+    // below commits, so the usage row is written FIRST and on its own. A failure
+    // to record it must not fail the command: the money is already spent, and
+    // losing the memory over a bookkeeping row is the worse lie. Same treatment
+    // as the extraction usage row in `extract_into`. Deliberately BEFORE the
+    // arity check below — a short batch was still served, and still billed.
+    if have_gemini {
+        crate::commands::usage::record_embed_spend(
+            &ctx.store,
+            "remember_embed",
+            &model_name,
+            Some(&kb),
+            Some(&diary),
+            &chunk_texts,
+            1,
+            json!({
+                "dimensions": dims,
+                "prompt_format": prompt_format.clone(),
+                "estimated": true,
+                "partial": false,
+            }),
+        );
+    }
     if embeddings.len() != chunks.len() {
         return Err(CliError::Transient(format!(
             "embedder returned {} embeddings for {} chunks; nothing was stored, so no chunk is \
@@ -345,35 +397,6 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             embeddings.len(),
             chunks.len(),
         )));
-    }
-
-    // The embedding call is paid the moment it returns, whether or not the write
-    // below commits, so the usage row is written FIRST and on its own. A failure
-    // to record it must not fail the command: the money is already spent, and
-    // losing the memory over a bookkeeping row is the worse lie. Same treatment
-    // as the extraction usage row in `extract_into`.
-    if have_gemini && !chunk_texts.is_empty() {
-        let tokens = estimated_tokens_for_texts(&chunk_texts);
-        if let Err(e) = ctx.store.record_usage_event(
-            "gemini",
-            "remember_embed",
-            Some(&model_name),
-            Some(&kb),
-            Some(&diary),
-            1,
-            chunk_texts.len() as i64,
-            tokens,
-            0,
-            0.0,
-            gemini_embed_cost_usd(tokens),
-            json!({
-                "dimensions": dims,
-                "prompt_format": prompt_format.clone(),
-                "estimated": true,
-            }),
-        ) {
-            tracing::warn!("could not record remember embedding usage: {e}");
-        }
     }
 
     // ONE unit of work: the memory row, the KB registration it implies, and
@@ -440,7 +463,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // and its marker now commit together or not at all: on failure the memory
     // keeps no fact and no marker, so it stays pending and a later backfill
     // retries it from scratch.
-    let marker = status.extraction_ran().then(|| FactExtractionMarker {
+    let marker = status.extraction_ran().then_some(FactExtractionMarker {
         model: extraction_model.as_deref(),
         source: "remember",
     });

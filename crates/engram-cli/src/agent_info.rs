@@ -53,7 +53,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "usage [--kb <name>] [--since <rfc3339>]": "Summarize recorded Gemini embedding and Cohere rerank usage.",
             "budget show|set|clear": "Configure local usage guardrails. Flags: --kb <name>, --daily-usd <n>, --monthly-usd <n>.",
             "forget <id> --confirm": "Soft-delete a memory by UUID. Destructive — requires --confirm.",
-            "edit <id>": "Update memory content or metadata. Flags: --content <text>, --importance 0-10",
+            "edit <id>": "Update memory content or metadata. Flags: --content <text>, --importance 0-10. An unknown or already-deleted id exits 3 BEFORE any paid embedding call; a --content edit re-chunks and re-embeds and therefore respects `engram budget` (exit 4 at the KB or global cap) and is billed to the memory's own kb/diary in `engram usage`. An --importance-only edit makes no provider call and is never budget-gated.",
             "export [--format json] [--kb <name>]": "Export memories as JSON",
             "import <file>": "Import memories from a JSON export",
             "entities [list|show <name>]": "Browse the entity graph. Alias: list|ls",

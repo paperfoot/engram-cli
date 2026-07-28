@@ -7,7 +7,6 @@
 //! `memories.content`, and keeps an edited memory from being the one write
 //! path that still emits degenerate sub-60-character fragments.
 
-use crate::commands::usage::{estimated_tokens_for_texts, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
@@ -49,8 +48,30 @@ pub async fn run(
     let uuid =
         Uuid::parse_str(&id).map_err(|e| CliError::BadInput(format!("invalid UUID {id}: {e}")))?;
 
+    // EXISTENCE FIRST, and in the same breath the scope. A syntactically valid
+    // but unknown uuid used to reach the embedder: the paid call was made, the
+    // transaction then found no row and rolled back, and the caller was billed
+    // for editing a memory that does not exist. Loading the row up front also
+    // supplies the (kb, diary) that the budget guard and the usage row need —
+    // `edit_embed` used to carry neither, so edit spend was invisible to
+    // `usage --kb` and to every per-KB cap. Exit 3, matching every other
+    // "the id you gave names nothing" surface (`forget`, `people show`,
+    // `facts resolve`) and the importance-only branch below.
+    let Some((kb, diary)) = ctx.store.memory_scope(uuid)? else {
+        return Err(CliError::BadInput(format!(
+            "no memory found for id {id} (already deleted?)"
+        )));
+    };
+
     let mut chunks_replaced = 0usize;
     if let Some(new_content) = content.as_deref() {
+        // Paid calls respect the KB budget guardrail — the same rule
+        // `remember`, `recall`, `research` and both daemon endpoints follow.
+        // Only the content path spends: an importance-only update makes no
+        // provider call, and refusing a free metadata edit on a spend cap
+        // would be a new failure mode with no money behind it.
+        crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
+
         let document_id = ctx.store.document_for_memory(uuid)?;
         // CHUNKING. This was a bare `naive_split`: paragraph split, no merge,
         // no floor, no ceiling. Editing a memory therefore re-created exactly
@@ -79,20 +100,73 @@ pub async fn run(
         // failure can never strand the memory with no chunks (invisible to
         // recall, unrecoverable).
         let chunk_texts: Vec<&str> = new_chunks.iter().map(|c| c.text.as_str()).collect();
-        let (embeddings, model_name, dims, prompt_format): (Vec<Vec<f32>>, String, usize, String) =
-            if have_gemini {
-                let e = GeminiEmbedder::new(gemini_key.unwrap());
-                let v = e
-                    .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-                    .await?;
-                (v, e.model(), e.dimensions(), e.prompt_format().to_string())
-            } else {
-                let e = StubEmbedder::default();
-                let v = e
-                    .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-                    .await?;
-                (v, e.model(), e.dimensions(), e.prompt_format().to_string())
-            };
+        let embedder: Box<dyn Embedder> = if have_gemini {
+            Box::new(GeminiEmbedder::new(
+                gemini_key.expect("have_gemini implies a key"),
+            ))
+        } else {
+            Box::new(StubEmbedder::default())
+        };
+        let model_name = embedder.model();
+        let dims = embedder.dimensions();
+        let prompt_format = embedder.prompt_format().to_string();
+        // Test seam, shared with `remember`: fail exactly where a network embed
+        // would, after chunking and before any spend or any write.
+        if let Some(injected) = crate::commands::remember::injected_embed_failure("edit") {
+            return Err(injected);
+        }
+        let embeddings = match embedder
+            .embed_batch_accounted(&chunk_texts, TaskMode::RetrievalDocument)
+            .await
+        {
+            Ok(v) => v,
+            Err(failure) => {
+                // Whatever the provider already served is on the invoice, even
+                // though this command is about to die.
+                if have_gemini && failure.charged_texts > 0 {
+                    crate::commands::usage::record_embed_spend(
+                        &ctx.store,
+                        "edit_embed",
+                        &model_name,
+                        Some(&kb),
+                        Some(&diary),
+                        &chunk_texts[..failure.charged_texts],
+                        failure.charged_requests as i64,
+                        json!({
+                            "memory_id": uuid.to_string(),
+                            "dimensions": dims,
+                            "prompt_format": prompt_format.clone(),
+                            "estimated": true,
+                            "partial": true,
+                            "chunks_requested": chunk_texts.len(),
+                        }),
+                    );
+                }
+                return Err(failure.error.into());
+            }
+        };
+        // Paid the moment it returned, so recorded BEFORE — and independently
+        // of — the transaction that uses it. Recording it after with `?` turned
+        // a bookkeeping failure into a non-zero exit on an edit that had
+        // already committed, and the caller's natural response is a paid retry.
+        if have_gemini {
+            crate::commands::usage::record_embed_spend(
+                &ctx.store,
+                "edit_embed",
+                &model_name,
+                Some(&kb),
+                Some(&diary),
+                &chunk_texts,
+                1,
+                json!({
+                    "memory_id": uuid.to_string(),
+                    "dimensions": dims,
+                    "prompt_format": prompt_format.clone(),
+                    "estimated": true,
+                    "partial": false,
+                }),
+            );
+        }
         if embeddings.len() != new_chunks.len() {
             return Err(CliError::Transient(format!(
                 "embedder returned {} embeddings for {} chunks; aborting edit",
@@ -102,7 +176,9 @@ pub async fn run(
         }
 
         // Atomic swap: update content, tear down stale chunks/facts/derived
-        // claims, insert the new chunks — all or nothing.
+        // claims, insert the new chunks — all or nothing. The NotFound below is
+        // now only reachable by a `forget` racing this edit, which is a genuine
+        // transient (exit 1), not the caller's typo (exit 3, above).
         chunks_replaced = ctx.store.with_tx(|store| {
             let updated = store.update_memory(uuid, content.as_deref(), importance)?;
             if !updated {
@@ -131,30 +207,8 @@ pub async fn run(
             }
             Ok(replaced)
         })?;
-        if have_gemini && !chunk_texts.is_empty() {
-            let tokens = estimated_tokens_for_texts(&chunk_texts);
-            ctx.store.record_usage_event(
-                "gemini",
-                "edit_embed",
-                Some(&model_name),
-                None,
-                None,
-                1,
-                chunk_texts.len() as i64,
-                tokens,
-                0,
-                0.0,
-                gemini_embed_cost_usd(tokens),
-                json!({
-                    "memory_id": uuid.to_string(),
-                    "dimensions": dims,
-                    "prompt_format": prompt_format,
-                    "estimated": true,
-                }),
-            )?;
-        }
     } else {
-        // Importance-only update: no chunk rebuild needed.
+        // Importance-only update: no chunk rebuild, no provider call, no spend.
         let updated = ctx.store.update_memory(uuid, None, importance)?;
         if !updated {
             return Err(CliError::BadInput(format!(

@@ -2731,6 +2731,25 @@ impl SqliteStore {
             .map_err(StorageError::from)
     }
 
+    /// The `(kb, diary)` a LIVE memory belongs to, or `None` when the id names
+    /// no live memory.
+    ///
+    /// `edit` needs all three answers in one query — does this row exist, which
+    /// KB budget governs the edit, and which (kb, diary) the usage row must be
+    /// attributed to — BEFORE it makes a paid embedding call. `kb_for_memory`
+    /// answers neither the last one nor the `deleted = 0` question, so it would
+    /// let an edit of a forgotten memory buy an embedding and then fail.
+    pub fn memory_scope(&self, memory_id: Uuid) -> Result<Option<(String, String)>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT kb, diary FROM memories WHERE id = ?1 AND deleted = 0",
+                params![memory_id.to_string()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
     /// A memory's own dates, `(event_time, created_at)`. `None` when the
     /// memory is gone or soft-deleted.
     ///
@@ -5912,6 +5931,24 @@ mod tests {
             .list_memories_pending_fact_extraction(Some("personal"), None, None)
             .unwrap();
         assert_eq!(got[0].1.event_time, Some(when));
+    }
+
+    #[test]
+    fn memory_scope_answers_existence_kb_and_diary_and_ignores_deleted_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut m = fact("A note filed under work.");
+        m.diary = "work".into();
+        store.insert_memory_with_kb(&m, "business").unwrap();
+        assert_eq!(
+            store.memory_scope(m.id).unwrap(),
+            Some(("business".to_string(), "work".to_string()))
+        );
+        assert!(store.memory_scope(Uuid::new_v4()).unwrap().is_none());
+        store.soft_delete_memory(m.id).unwrap();
+        assert!(
+            store.memory_scope(m.id).unwrap().is_none(),
+            "a forgotten memory must not be editable, and must not be billable"
+        );
     }
 
     #[test]
