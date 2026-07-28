@@ -369,7 +369,32 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                 "exclude": "string[] optional",
                 "max_files": "integer optional",
                 "all": "boolean optional"
-            }
+            },
+            "recall_request_fields": {
+                "query": "string, required — blank or whitespace is bad_input (HTTP 400, exit_code 3), refused before any provider or budget work",
+                "kb": "string optional; omit to search EVERY KB, '*' is an explicit all-KB search",
+                "all_kbs": "boolean optional",
+                "diary": "string|'*' optional",
+                "mode": "evidence|raw|wiki|explore|agent optional (default evidence)",
+                "profile": "cloud_quality|fast|offline optional (default cloud_quality)",
+                "layer": "identity|critical|topic|deep optional (default topic)",
+                "top_k": "integer optional (default 10)",
+                "rerank_top_n": "integer optional",
+                "graph_hops": "1|2 optional",
+                "allow_mixed_embeddings": "boolean optional",
+                "since": "rfc3339 OR bare YYYY-MM-DD (start of that UTC day) optional",
+                "until": "rfc3339 OR bare YYYY-MM-DD (end of that UTC day) optional"
+            },
+            "research_request_fields": {
+                "query": "string, required — same blank-query rule as /v1/recall",
+                "kb": "string optional ('*' or omitted = every KB)",
+                "diary": "string|'*' optional",
+                "profile": "cloud_quality|fast|offline optional (default cloud_quality)",
+                "top_k": "integer optional (default 12)",
+                "rerank_top_n": "integer optional",
+                "allow_mixed_embeddings": "boolean optional"
+            },
+            "response_metadata": "/v1/recall and /v1/research both report embed_model, embed_dims, prompt_format, reranker and candidates_considered, so a 64-dim stub downgrade is visible without guessing from `profile`. /v1/recall additionally reports layer, token_budget, tokens_used, kb, kb_scope, and temporal_scope when a window was requested; /v1/research takes no time window, so its temporal_scope is always null."
         },
         "retrieval_profiles": {
             "cloud_quality": { "embedder": "gemini-embedding-2", "dims": 1536, "lexical": "FTS5 BM25", "entity_claim_search": true, "graph_expansion": true, "reranker": "cohere/rerank-v4.0-pro", "rerank_top_n": 200 },

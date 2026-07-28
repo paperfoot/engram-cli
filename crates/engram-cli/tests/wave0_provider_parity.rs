@@ -77,7 +77,19 @@ fn free_port() -> u16 {
 
 /// Start `engram serve` against `home` with no bench stub and no keys except
 /// `extra_env`. Returns once /health answers.
+/// `free_port` releases the port before the daemon binds it, so a parallel
+/// test can take it in between. Retry on a fresh port rather than reporting a
+/// lost race as "the daemon never became healthy".
 fn start_daemon(home: &Path, extra_env: &[(&str, &str)]) -> Daemon {
+    for _ in 0..5 {
+        if let Some(daemon) = try_start_daemon(home, extra_env) {
+            return daemon;
+        }
+    }
+    panic!("engram serve never became healthy on any of 5 ports");
+}
+
+fn try_start_daemon(home: &Path, extra_env: &[(&str, &str)]) -> Option<Daemon> {
     let port = free_port();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_engram"));
     cmd.env("HOME", home)
@@ -93,17 +105,21 @@ fn start_daemon(home: &Path, extra_env: &[(&str, &str)]) -> Daemon {
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let daemon = Daemon {
+    let mut daemon = Daemon {
         child: cmd.spawn().expect("engram serve starts"),
         port,
     };
     for _ in 0..200 {
         if let Ok((200, _)) = request(daemon.port, "GET", "/health", None) {
-            return daemon;
+            return Some(daemon);
+        }
+        // A bind failure exits the process; there is nothing to wait for.
+        if matches!(daemon.child.try_wait(), Ok(Some(_))) {
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    panic!("daemon never became healthy on 127.0.0.1:{}", daemon.port);
+    None
 }
 
 /// One HTTP/1.1 round trip against the daemon: (status, parsed body).

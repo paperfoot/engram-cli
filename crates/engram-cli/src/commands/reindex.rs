@@ -52,7 +52,7 @@ pub async fn reindex_store(
     if !all && kb.is_none() {
         return Err(CliError::BadInput("reindex requires kb or all=true".into()));
     }
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let have_gemini = gemini_key.is_some() && !force_stub;
 

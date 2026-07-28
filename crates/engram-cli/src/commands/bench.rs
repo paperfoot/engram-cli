@@ -481,7 +481,7 @@ async fn run_personal(
     use std::time::Instant;
 
     let profile_enum = RetrievalProfile::parse(&profile)?;
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
 
     // A cloud profile with no key must fail loudly rather than silently
@@ -733,11 +733,10 @@ async fn run_mini(ctx: &AppContext) -> Result<(), CliError> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(60.0);
 
-    let mode = if std::env::var("GEMINI_API_KEY").is_ok()
-        && std::env::var("ENGRAM_BENCH_FORCE_STUB").is_err()
+    let mode = if std::env::var("GEMINI_API_KEY").is_ok() && !crate::commands::config::stub_forced()
     {
         "hybrid_gemini"
-    } else if std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok() {
+    } else if crate::commands::config::stub_forced() {
         "hybrid_stub"
     } else {
         "fts_only"
@@ -1842,7 +1841,7 @@ async fn run_longmemeval(
         .and_then(|v| v.parse().ok())
         .unwrap_or(60.0);
 
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let have_gemini = gemini_key.is_some() && !force_stub;

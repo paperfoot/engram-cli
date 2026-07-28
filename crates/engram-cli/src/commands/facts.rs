@@ -912,7 +912,7 @@ pub async fn backfill(
 
     // The novelty gate must use the same embedder family the fact
     // embeddings were written with — same rule as `remember`.
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let gate_embedder: Box<dyn Embedder> = match gemini_key {
         Some(k) if !force_stub => Box::new(GeminiEmbedder::new(k)),

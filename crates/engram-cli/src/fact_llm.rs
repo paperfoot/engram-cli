@@ -67,7 +67,7 @@ pub fn extraction_model() -> String {
 pub fn resolve() -> Result<Option<FactLlm>, CliError> {
     resolve_from(
         std::env::var(STUB_ENV).ok().as_deref(),
-        std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok(),
+        crate::commands::config::stub_forced(),
         || crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter"),
     )
 }

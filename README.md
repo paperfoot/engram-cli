@@ -170,7 +170,7 @@ cd engram-cli
 cargo install --path crates/engram-cli --locked
 ```
 
-One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.1.5`.
+One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.2.0`.
 
 ### Package manager status
 
@@ -182,7 +182,7 @@ cargo install --path crates/engram-cli --locked
 
 Not yet published to crates.io or Homebrew — install from source.
 
-`engram update --check --json` reports the current/latest version, detected install source, release URL, and runnable upgrade command. `engram update --json` runs the package-manager update only when `update.mode=auto` and an update is available. Configure with `update.mode`, `update.channel`, and optional `update.install_source` (or the matching `ENGRAM_UPDATE_*` env vars). The crates.io package name is `engram` because `engram-cli` is already owned by another project on crates.io.
+`engram update --check --json` reports the current/latest version, detected install source, release URL, and runnable upgrade command. `engram update --json` runs the package-manager update only when `update.mode=auto` and an update is available. Configure with `update.mode`, `update.channel`, and optional `update.install_source` (or the matching `ENGRAM_UPDATE_*` env vars). The crates.io package name is `paperfoot-engram` (the binary is still `engram`); `engram` and `engram-cli` are both already owned by other projects on crates.io. That is the name `engram update` checks against, and the Homebrew formula it checks is `paperfoot/tap/engram`.
 
 ### Configure keys
 
@@ -200,7 +200,7 @@ engram config check
 # -> gemini/cohere configured; doctor checks OpenRouter when compiler mode needs it
 ```
 
-Keys are resolved in order: **explicit env var → config TOML → none**. Config file is written with `0600` perms (user-only). `engram config show` and `engram doctor --json` never print full secrets. Without Gemini, recall falls back to a deterministic offline stub — useful for CI, unusable for real quality.
+Keys are resolved in order: **explicit env var → config TOML → none**. Config file is written with `0600` perms (user-only). `engram config show` and `engram doctor --json` never print full secrets. Without Gemini, a cloud profile is refused (exit 2) rather than answered from the 64-dim offline stub, and `remember`/`memory add`/`edit` refuse to WRITE stub vectors for the same reason — a store half stub- and half cloud-embedded serves nothing until a full `engram reindex`. Ask for the stub on purpose: `--profile offline` on a read, `--offline` on a write. Useful for CI, unusable for real quality.
 
 ### Tell your agents about it
 
@@ -409,14 +409,14 @@ Cargo workspace layout:
 
 | Crate | Purpose |
 |---|---|
-| `engram-core` (`engram-core` on crates.io) | Pure types, fusion (RRF), memory layers, temporal validity. Zero I/O. |
-| `engram-storage` (`engram-storage`) | SQLite source of truth + FTS5 + chunk-embedding BLOBs + KB/claim/entity/wiki tables. |
-| `engram-embed` (`engram-embed`) | `Embedder` trait + Gemini Embed 2 (batch + single) + deterministic offline stub. |
-| `engram-rerank` (`engram-rerank`) | `Reranker` trait + Cohere Rerank 4 (default `rerank-v4.0-pro`, env-overridable) + passthrough. |
-| `engram-ingest` (`engram-ingest`) | Mining modes: papers (PDF + section-aware), takeaways, conversations, repos, general, auto. |
-| `engram-graph` (`engram-graph`) | Deterministic entity extraction + SQLite graph expansion. |
-| `engram-bench` (`engram-bench`) | Hallucination-resistance harness: LitQA2 (precision-with-abstention), BEIR-sci (nDCG@10), BioGen CSR + ALCE citation P/R, RAGAS faithfulness, plus LongMemEval / LoCoMo-Plus retrieval+QA and the strict LLM judge. |
-| `engram-cli` (`engram`) | The single `engram` binary and the shared hybrid retrieval pipeline. |
+| `engram-core` (`paperfoot-engram-core` on crates.io) | Pure types, fusion (RRF), memory layers, temporal validity. Zero I/O. |
+| `engram-storage` (`paperfoot-engram-storage`) | SQLite source of truth + FTS5 + chunk-embedding BLOBs + KB/claim/entity/wiki tables. |
+| `engram-embed` (`paperfoot-engram-embed`) | `Embedder` trait + Gemini Embed 2 (batch + single) + deterministic offline stub. |
+| `engram-rerank` (`paperfoot-engram-rerank`) | `Reranker` trait + Cohere Rerank 4 (default `rerank-v4.0-pro`, env-overridable) + passthrough. |
+| `engram-ingest` (`paperfoot-engram-ingest`) | Mining modes: papers (PDF + section-aware), takeaways, conversations, repos, general, auto. |
+| `engram-graph` (`paperfoot-engram-graph`) | Deterministic entity extraction + SQLite graph expansion. |
+| `engram-bench` (`paperfoot-engram-bench`) | Hallucination-resistance harness: LitQA2 (precision-with-abstention), BEIR-sci (nDCG@10), BioGen CSR + ALCE citation P/R, RAGAS faithfulness, plus LongMemEval / LoCoMo-Plus retrieval+QA and the strict LLM judge. |
+| `engram-cli` (`paperfoot-engram`) | The single `engram` binary and the shared hybrid retrieval pipeline. |
 
 ## Framework compliance
 

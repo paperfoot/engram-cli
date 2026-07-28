@@ -222,7 +222,7 @@ async fn apply(
     plans: &[RepairPlan],
     kb: Option<&str>,
 ) -> Result<(String, usize), CliError> {
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let have_gemini = !force_stub && gemini_key.is_some();
 

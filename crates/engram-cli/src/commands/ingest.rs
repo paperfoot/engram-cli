@@ -129,7 +129,7 @@ pub async fn run(
     let mut total_embedded_chars: usize = 0;
 
     // Embedder: env var → config file → stub fallback
-    let force_stub = std::env::var("ENGRAM_BENCH_FORCE_STUB").is_ok();
+    let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let have_gemini = gemini_key.is_some() && !force_stub;
 
