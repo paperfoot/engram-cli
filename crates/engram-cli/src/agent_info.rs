@@ -27,7 +27,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "For directory ingest, run `engram ingest <dir> --dry-run` first, then ingest with the same --include/--exclude/--max-files scope. Use --all only for an intentional full recursive ingest.",
             "Default recall profile is cloud_quality: Gemini Embedding 2 + FTS5 BM25 + claims/entities/graph + Cohere rerank when configured.",
             "A cloud profile with no Gemini key is a config error (exit 2) on every surface — `recall`, `research`, and the daemon's /v1/recall and /v1/research — never a silent fallback to the offline stub. Ask for the stub explicitly with `--profile offline` (or \"profile\": \"offline\" over the API).",
-            "Writes embed too: `remember`, `memory add`, `edit` and `memory update` refuse with the same config error (exit 2) when no Gemini key resolves, instead of silently storing 64-dim stub vectors. Ask for the stub on purpose with --offline — and keep one store on ONE embedder, or recall will refuse the mix until `engram reindex --all`."
+            "Writes embed too: `remember`, `memory add`, `edit`, `memory update` and `reindex` refuse with the same config error (exit 2) when no Gemini key resolves, instead of silently storing 64-dim stub vectors. Ask for the stub on purpose with --offline — and keep one store on ONE embedder, or recall will refuse the mix until `engram reindex --all`. KNOWN GAP: `ingest` and `chunks repair` still embed with the stub silently when keyless; give them a key or the truthy test hook until they gain the same guard."
         ],
         "commands": {
             "agent-info | info": "Print this manifest (raw JSON, not enveloped)",
@@ -45,7 +45,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "ingest <path>": "Mine a file or scoped directory. Flags: --mode papers|takeaways|conversations|repos|general|auto, --diary <name>, --kb <name>, --compile evidence, --dry-run, --include <pattern>, --exclude <pattern>, --max-files <n>, --all. Re-ingesting the same path is idempotent when content is unchanged, and REPLACES the prior version when the file changed (edited PDFs no longer go stale).",
             "compile --kb <name> --all": "Derive cited claims, entities, relations, takeaways, and wiki pages. Add --llm for Gemini 3.1 Flash-Lite extraction + Gemini 3.1 Pro synthesis via OpenRouter.",
             "jobs list|show": "Inspect compile job history.",
-            "reindex --kb <name> | --all": "Re-embed chunks with Gemini Embedding 2 metadata guards.",
+            "reindex --kb <name> | --all [--offline]": "Re-embed chunks with Gemini Embedding 2 metadata guards. Keyless reindex without --offline is a config error (exit 2): it used to replace a cloud index with stub vectors and report success. --offline (API: \"offline\": true) is the explicit stub rebuild, searchable only by --profile offline reads.",
             "wiki --kb <name> [path]": "Inspect generated domain wiki pages.",
             "graph neighbors <entity> --kb <name>": "Inspect SQLite graph neighbors, closest first. Flags: --hops 1|2, --min-weight <n>, --limit <n>, --typed-only (drop weak `co_occurs_with` edges and keep only typed relations — use it when you want the real relationship graph, not co-mention noise).",
             "doctor": "Verify keys, schema, embedding metadata, and daemon port. Use --compiler to require OpenRouter and --integrity to check lifecycle residue.",
@@ -54,7 +54,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "usage [--kb <name>] [--since <rfc3339>]": "Summarize recorded Gemini embedding and Cohere rerank usage.",
             "budget show|set|clear": "Configure local usage guardrails. Flags: --kb <name>, --daily-usd <n>, --monthly-usd <n>.",
             "forget <id> --confirm": "Soft-delete a memory by UUID. Destructive — requires --confirm.",
-            "edit <id>": "Update memory content or metadata. Flags: --content <text>, --importance 0-10, --offline (re-embed with the offline stub). An unknown or already-deleted id exits 3 BEFORE any paid embedding call; a --content edit re-chunks and re-embeds and therefore respects `engram budget` (exit 4 at the KB or global cap) and is billed to the memory's own kb/diary in `engram usage`. An --importance-only edit makes no provider call, is never budget-gated, and needs no key. A --content edit with no Gemini key and no --offline is a config error (exit 2).",
+            "edit <id>": "Update memory content or metadata. Flags: --content <text>, --importance 0-10, --offline (re-embed with the offline stub). An unknown or already-deleted id exits 3 BEFORE any paid embedding call; a cloud --content edit re-chunks and re-embeds and therefore respects `engram budget` (exit 4 at the KB or global cap; an --offline edit spends nothing and is never budget-gated) and is billed to the memory's own kb/diary in `engram usage`. An --importance-only edit makes no provider call, is never budget-gated, and needs no key. A --content edit with no Gemini key and no --offline is a config error (exit 2).",
             "export [--format json] [--kb <name>]": "Export memories as JSON",
             "import <file>": "Import memories from a JSON export",
             "entities [list|show <name>]": "Browse the entity graph. Alias: list|ls",

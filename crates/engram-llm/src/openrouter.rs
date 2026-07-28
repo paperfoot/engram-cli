@@ -180,24 +180,47 @@ enum RetryReason {
 /// stdout via `fact_extraction_note`.
 const MAX_ERROR_BODY_CHARS: usize = 200;
 
-/// Head of an error body, bounded, with the omission stated rather than silent.
-fn error_body_head(body: &str) -> String {
-    let head: String = body.chars().take(MAX_ERROR_BODY_CHARS).collect();
-    if head.len() == body.len() {
+/// The provider's own diagnosis, extracted from the STRUCTURED error field —
+/// never the raw body. OpenRouter (and every OpenAI-shaped provider behind
+/// it) wraps failures as `{"error":{"message":...}}`; that message is the
+/// whole diagnosis ("No auth credentials found", "not a valid model ID"). A
+/// raw-head cap was not enough: a 4xx validation failure can echo the request
+/// back, the request carries the memory being read, and 200 characters of
+/// echo is still an echo. So the error string carries only the parsed message
+/// field (bounded), and an unparseable body is withheld entirely — its full
+/// text goes to `tracing::debug` for operators who opt in with RUST_LOG.
+fn provider_error_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let msg = v
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .or_else(|| v.get("message"))?
+        .as_str()?;
+    let head: String = msg.chars().take(MAX_ERROR_BODY_CHARS).collect();
+    Some(if head.chars().count() == msg.chars().count() {
         head
     } else {
-        format!("{head}… ({} bytes total, rest withheld)", body.len())
-    }
+        format!("{head}… (message truncated)")
+    })
 }
 
-/// The message a non-2xx response renders into, with the body bounded.
-///
-/// The head is deliberately KEPT: `{"error":{"message":"No auth credentials
-/// found"` is the whole diagnosis. It is the TAIL that has to go — a 4xx from a
-/// validation failure can echo the request back, and the request carries the
-/// memory being read.
+/// The message a non-2xx response renders into.
 fn status_error_message(status: reqwest::StatusCode, body: &str) -> String {
-    format!("status {status}: {}", error_body_head(body))
+    match provider_error_message(body) {
+        Some(msg) => format!("status {status}: {msg}"),
+        None => {
+            tracing::debug!(
+                %status,
+                body_bytes = body.len(),
+                "openrouter non-2xx body withheld from the error: {body}"
+            );
+            format!(
+                "status {status}: provider body withheld ({} bytes, not a structured error; \
+                 RUST_LOG=debug logs it)",
+                body.len()
+            )
+        }
+    }
 }
 
 /// The decode failure a caller sees: category, position and size — never the
@@ -342,49 +365,52 @@ mod tests {
     }
 
     #[test]
-    fn a_short_error_body_is_reported_whole() {
-        // The cap must not cost the actionable head: this is the entire
-        // diagnosis for the most common provider failure there is.
+    fn a_structured_provider_message_is_reported_whole() {
+        // The structured message IS the diagnosis for the most common
+        // provider failure there is; losing it would make every auth error
+        // undebuggable.
         let body = r#"{"error":{"message":"No auth credentials found","code":401}}"#;
-        assert_eq!(error_body_head(body), body);
+        let msg = status_error_message(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert!(msg.contains("No auth credentials found"), "{msg}");
     }
 
     #[test]
-    fn a_body_exactly_at_the_cap_is_not_truncated() {
-        // The `head.len() == body.len()` boundary: at the cap nothing is
-        // withheld, so claiming otherwise would be a lie.
-        let body = "x".repeat(MAX_ERROR_BODY_CHARS);
-        let head = error_body_head(&body);
-        assert_eq!(head, body);
-        assert!(!head.contains("bytes total"), "{head}");
-    }
-
-    #[test]
-    fn the_error_body_head_is_capped_and_states_the_omission() {
+    fn an_unstructured_body_is_withheld_entirely() {
+        // A body that is not an OpenAI-shaped error can be ANYTHING —
+        // including an echo of the request, which carries the memory being
+        // read. Nothing of it may reach the error string.
         let body = long_body_ending_in_the_sentinel();
-        let head = error_body_head(&body);
-        assert!(
-            !head.contains(SENTINEL),
-            "an echoed request body reached the error string: {head}"
-        );
-        assert!(head.starts_with(&"f".repeat(MAX_ERROR_BODY_CHARS)));
-        assert!(
-            head.contains(&format!("({} bytes total, rest withheld)", body.len())),
-            "the omission must be stated with its true size: {head}"
-        );
-        let kept = head.split('…').next().expect("a head before the ellipsis");
-        assert_eq!(kept.chars().count(), MAX_ERROR_BODY_CHARS, "{head}");
+        let msg = status_error_message(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert!(!msg.contains(SENTINEL), "{msg}");
+        assert!(msg.contains("withheld"), "{msg}");
+        assert!(msg.contains(&format!("({} bytes", body.len())), "{msg}");
     }
 
     #[test]
-    fn the_cap_counts_characters_and_never_splits_one() {
-        // Pins char-wise truncation against a naive `&body[..200]` rewrite,
-        // which would panic mid-character on any non-ASCII provider message.
-        let body = "é".repeat(1_000);
-        let head = error_body_head(&body);
-        let kept = head.split('…').next().expect("a head before the ellipsis");
-        assert_eq!(kept, "é".repeat(MAX_ERROR_BODY_CHARS));
-        assert!(head.contains("(2000 bytes total, rest withheld)"), "{head}");
+    fn an_echo_outside_the_message_field_is_withheld() {
+        // Providers attach request metadata beside the message; only the
+        // message field itself may travel.
+        let body = format!(
+            r#"{{"error":{{"message":"invalid request","metadata":{{"input":"{SENTINEL}"}}}}}}"#
+        );
+        let msg = status_error_message(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert!(msg.contains("invalid request"), "{msg}");
+        assert!(!msg.contains(SENTINEL), "{msg}");
+    }
+
+    #[test]
+    fn a_long_provider_message_is_truncated_on_a_char_boundary() {
+        // Pins char-wise truncation against a naive byte slice, which would
+        // panic mid-character on a non-ASCII provider message.
+        let long = "é".repeat(1_000);
+        let body = format!(r#"{{"error":{{"message":"{long}"}}}}"#);
+        let msg = status_error_message(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert!(msg.contains(&"é".repeat(MAX_ERROR_BODY_CHARS)), "{msg}");
+        assert!(msg.contains("message truncated"), "{msg}");
+        assert!(
+            !msg.contains(&"é".repeat(MAX_ERROR_BODY_CHARS + 1)),
+            "{msg}"
+        );
     }
 
     #[test]

@@ -719,13 +719,20 @@ CREATE TABLE IF NOT EXISTS usage_budgets (
 CREATE INDEX IF NOT EXISTS idx_usage_budgets_kb ON usage_budgets(kb);
 "#;
 
-/// A memory the fact extractor has never processed: no facts derived from it
-/// and no extraction marker. Written once and shared by the backfill work
-/// queue and its coverage counter so the two can never disagree about what
-/// "pending" means. Requires the memories table to be aliased `m`.
+/// A memory the fact extractor has never processed: no extraction MARKER.
+/// The marker is the one source of truth. The predicate used to also count
+/// "has any fact" as processed, which contradicted the write path's own
+/// semantics: a caller-supplied `--facts-json` batch commits with
+/// `marker: None` precisely BECAUSE the LLM extractor has not seen the memory
+/// yet — and one committed caller fact then hid the memory from every future
+/// backfill, so extraction the caller was promised could never happen. A
+/// memory with facts but no marker is pending on purpose: backfill will run
+/// extraction once, dedup absorbs the re-supplied triples, and the marker
+/// retires it. Written once and shared by the backfill work queue and its
+/// coverage counter so the two can never disagree about what "pending"
+/// means. Requires the memories table to be aliased `m`.
 const PENDING_EXTRACTION_PREDICATE: &str =
-    "NOT EXISTS (SELECT 1 FROM facts f WHERE f.source_memory_id = m.id)
-     AND NOT EXISTS (SELECT 1 FROM fact_extraction_log l WHERE l.memory_id = m.id)";
+    "NOT EXISTS (SELECT 1 FROM fact_extraction_log l WHERE l.memory_id = m.id)";
 
 const SCHEMA_V7: &str = r#"
 -- Which memories the fact extractor has already looked at. Facts alone are
@@ -2791,9 +2798,14 @@ impl SqliteStore {
         Ok(row.map(|(event_time, created_at)| {
             (
                 event_time.as_deref().and_then(parse),
-                // Every writer of `created_at` is `Utc::now().to_rfc3339()`;
-                // an unparseable one can only mean hand-edited data.
-                parse(&created_at).unwrap_or_else(chrono::Utc::now),
+                // Every writer of `created_at` is `Utc::now().to_rfc3339()`,
+                // so an unparseable one means hand-edited or imported data.
+                // Fall back to the EPOCH, never to now: a fabricated "now" is
+                // the newest date in the store and would WIN recency
+                // supersession against older true facts, while the epoch
+                // always loses it — an unreadable date cannot outrank a real
+                // one.
+                parse(&created_at).unwrap_or(chrono::DateTime::UNIX_EPOCH),
             )
         }))
     }
@@ -5871,17 +5883,38 @@ mod tests {
             (3, 3)
         );
 
-        // A memory that produced a fact is processed.
+        // A fact alone does NOT retire a memory: a caller-supplied batch
+        // commits facts with no marker precisely because the extractor has
+        // not seen the memory, and it must stay on the queue until one has.
         let f = engram_core::types::Fact {
             source_memory_id: oldest.id,
             ..test_fact(&store, "Ana", "lives_in", "Lisbon")
         };
         store.insert_fact(&f).unwrap();
-        // A memory that produced NO facts is processed too, once logged.
+        // A memory that produced NO facts is processed once its MARKER lands.
         store
             .record_fact_extraction(middle.id, Some("test-model"), 0, "backfill")
             .unwrap();
 
+        let pending = store
+            .list_memories_pending_fact_extraction(Some("personal"), None, None)
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|(_, m)| m.id).collect::<Vec<_>>(),
+            vec![oldest.id, newest.id],
+            "the marker is the one source of truth; a stray fact hides nothing"
+        );
+        assert_eq!(
+            store
+                .fact_extraction_coverage(Some("personal"), None)
+                .unwrap(),
+            (3, 2)
+        );
+
+        // The marker is what retires it.
+        store
+            .record_fact_extraction(oldest.id, Some("test-model"), 1, "remember")
+            .unwrap();
         let pending = store
             .list_memories_pending_fact_extraction(Some("personal"), None, None)
             .unwrap();

@@ -288,6 +288,11 @@ Examples:
         /// Reindex all KBs.
         #[arg(long)]
         all: bool,
+        /// Re-embed with the deterministic offline stub instead of Gemini.
+        /// Without a key this is required: keyless reindex used to silently
+        /// replace a cloud index with stub vectors.
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Inspect generated wiki pages.

@@ -65,13 +65,6 @@ pub async fn run(
 
     let mut chunks_replaced = 0usize;
     if let Some(new_content) = content.as_deref() {
-        // Paid calls respect the KB budget guardrail — the same rule
-        // `remember`, `recall`, `research` and both daemon endpoints follow.
-        // Only the content path spends: an importance-only update makes no
-        // provider call, and refusing a free metadata edit on a spend cap
-        // would be a new failure mode with no money behind it.
-        crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
-
         let document_id = ctx.store.document_for_memory(uuid)?;
         // CHUNKING. This was a bare `naive_split`: paragraph split, no merge,
         // no floor, no ceiling. Editing a memory therefore re-created exactly
@@ -104,6 +97,13 @@ pub async fn run(
             dims,
             prompt_format,
         } = resolve_write_embedder("edit", offline)?;
+
+        // The KB budget guards PAID calls only, so it is checked after the
+        // embedder is resolved: a cloud re-embed spends, an --offline edit
+        // spends nothing, and a zero spend cap must not block a free write.
+        if have_gemini {
+            crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
+        }
 
         // Embed the NEW content first. The old chunks are only torn down
         // once the replacement vectors are in hand, so a transient embed

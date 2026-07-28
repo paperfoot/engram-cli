@@ -152,8 +152,11 @@ fn an_edit_of_an_unknown_uuid_records_no_usage_event() {
     assert_eq!(dump["data"]["chunks"][0]["content"], ORIGINAL, "{dump}");
 }
 
-/// `edit --content` re-embeds, so it spends — and every other paid surface
-/// stops at the cap. `edit` had no `enforce_budget` call at all.
+/// A CLOUD `edit --content` re-embeds, so it spends — and every other paid
+/// surface stops at the cap. `edit` had no `enforce_budget` call at all.
+/// The cap gates paid calls only, so the cloud shape here carries a key:
+/// under the stub an edit is free and the cap deliberately does not fire
+/// (see wave05_offline_writes::a_zero_spend_cap_does_not_block_a_free_offline_edit).
 #[test]
 fn an_edit_under_a_zero_budget_is_refused_before_paying() {
     let tmp = home();
@@ -165,6 +168,8 @@ fn an_edit_under_a_zero_budget_is_refused_before_paying() {
     );
 
     let assert = engram(tmp.path())
+        .env_remove("ENGRAM_BENCH_FORCE_STUB")
+        .env("GEMINI_API_KEY", "fake-key-the-cap-fires-first")
         .env("ENGRAM_EMBED_FAIL", FAULT)
         .args(["edit", &id, "--content", REWRITE, "--json"])
         .assert()

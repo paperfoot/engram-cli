@@ -199,6 +199,60 @@ fn a_batch_that_yields_no_facts_is_still_marked_processed() {
     assert_eq!(dry["data"]["pending"], 0, "{dry}");
 }
 
+/// Release-gate finding (Codex): pending used to mean "no fact AND no
+/// marker", while a caller-supplied batch commits with `marker: None`
+/// precisely because the extractor never saw the memory. One committed caller
+/// fact then hid the memory from every future backfill, so the extraction the
+/// response promises could never run. Pending is marker-only now: the caller
+/// facts commit, the memory STAYS pending, and the next backfill extracts,
+/// dedups the re-supplied triples, and retires it with a marker.
+#[test]
+fn caller_facts_do_not_hide_a_memory_from_extraction() {
+    let tmp = home();
+    let v = run_json(
+        engram(tmp.path()).env("ENGRAM_FACT_LLM_STUB", TWO_FACT_SCRIPT),
+        &[
+            "remember",
+            MEMORY,
+            "--kb",
+            "personal",
+            "--facts-json",
+            FACTS_JSON,
+        ],
+    );
+    assert_eq!(v["data"]["fact_extraction"], "skipped_facts_json", "{v}");
+    assert_eq!(v["data"]["facts_added"], 2, "{v}");
+
+    // The caller's facts are stored, but no extractor has seen the memory:
+    // it must still be on the backfill queue.
+    let dry = run_json(
+        &mut engram(tmp.path()),
+        &["facts", "backfill", "--kb", "personal", "--dry-run"],
+    );
+    assert_eq!(
+        dry["data"]["pending"], 1,
+        "a caller-supplied batch must not retire the memory from extraction: {dry}"
+    );
+
+    // Backfill extracts (the stub yields the same two triples), dedup absorbs
+    // them, the marker retires the memory.
+    let run = run_json(
+        engram(tmp.path()).env("ENGRAM_FACT_LLM_STUB", TWO_FACT_SCRIPT),
+        &["facts", "backfill", "--kb", "personal"],
+    );
+    assert_eq!(run["data"]["processed"], 1, "{run}");
+    assert_eq!(
+        fact_count(tmp.path()),
+        2,
+        "dedup must absorb re-supplied triples"
+    );
+    let done = run_json(
+        &mut engram(tmp.path()),
+        &["facts", "backfill", "--kb", "personal", "--dry-run"],
+    );
+    assert_eq!(done["data"]["pending"], 0, "{done}");
+}
+
 /// `facts backfill` re-extracts with an LLM; it never replays triples an agent
 /// asserted. A dropped `--facts-json` batch is therefore unrecoverable, and
 /// reporting it as success is the lie this closes.

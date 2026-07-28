@@ -169,7 +169,9 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             }
             JobsCommand::Show { id } => commands::jobs::show(&ctx, id),
         },
-        Command::Reindex { kb, all } => commands::reindex::run(&ctx, kb, all).await,
+        Command::Reindex { kb, all, offline } => {
+            commands::reindex::run(&ctx, kb, all, offline).await
+        }
         Command::Wiki { kb, path } => commands::wiki::run(&ctx, kb, path),
         Command::Graph(sub) => match sub {
             GraphCommand::Neighbors {

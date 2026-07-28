@@ -311,3 +311,96 @@ fn a_configured_key_reaches_the_embedder_instead_of_the_guard() {
         "transient_error"
     );
 }
+
+/// Release-gate finding (Codex): the budget guard fired before the embedder
+/// was resolved, so a ZERO spend cap blocked `remember --offline` — a write
+/// that spends nothing failing with a budget error is a failure mode with no
+/// money behind it. The cap now gates paid calls only.
+#[test]
+fn a_zero_spend_cap_does_not_block_a_free_offline_write() {
+    let tmp = home();
+    run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &["budget", "set", "--kb", "capped", "--daily-usd", "0"],
+    );
+    let v = run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &[
+            "remember",
+            "A free offline note under a zero cap.",
+            "--kb",
+            "capped",
+            "--offline",
+            "--no-extract-facts",
+        ],
+    );
+    assert_eq!(v["data"]["stored"], true, "{v}");
+}
+
+/// Same rule on `edit`: an --offline re-embed spends nothing, so the cap
+/// cannot block it.
+#[test]
+fn a_zero_spend_cap_does_not_block_a_free_offline_edit() {
+    let tmp = home();
+    let v = run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &[
+            "remember",
+            "Seed for the capped offline edit.",
+            "--kb",
+            "capped",
+            "--offline",
+            "--no-extract-facts",
+        ],
+    );
+    let id = v["data"]["id"].as_str().expect("id").to_string();
+    run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &["budget", "set", "--kb", "capped", "--daily-usd", "0"],
+    );
+    let e = run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &[
+            "edit",
+            id.as_str(),
+            "--content",
+            "Rewritten under a zero cap, still free.",
+            "--offline",
+        ],
+    );
+    assert_eq!(e["data"]["updated"], true, "{e}");
+}
+
+/// Release-gate finding (Codex): keyless `reindex` silently REPLACED a cloud
+/// index with 64-dim stub vectors and reported success — the recovery path
+/// the mixed-embedding error names, destroying what it was meant to repair.
+#[test]
+fn keyless_reindex_refuses_instead_of_rewriting_the_index() {
+    let tmp = home();
+    run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &[
+            "remember",
+            "A stub-embedded note the reindex must not silently rewrite.",
+            "--kb",
+            "personal",
+            "--offline",
+            "--no-extract-facts",
+        ],
+    );
+    let assert = cloud_cmd_in(tmp.path())
+        .args(["reindex", "--all", "--json"])
+        .assert()
+        .failure()
+        .code(2);
+    let err = stderr_json(&assert.get_output().stderr);
+    let msg = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("--offline"), "must name the remedy: {msg}");
+
+    // The explicit opt-in works, and says what it wrote.
+    let v = run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &["reindex", "--all", "--offline"],
+    );
+    assert_eq!(v["data"]["model"], "stub-64", "{v}");
+}

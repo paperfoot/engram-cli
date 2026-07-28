@@ -221,6 +221,7 @@ async fn route(
                 &store,
                 req.kb.as_deref(),
                 req.all.unwrap_or(false),
+                req.offline.unwrap_or(false),
             )
             .await?;
             Ok(
@@ -325,6 +326,19 @@ async fn route(
     }
 }
 
+/// Daemon diary semantics, CLI parity: an omitted `diary` means the diary
+/// literally named "default" — exactly what `engram recall` does when no
+/// --diary flag is given — and `"*"` is the explicit way to search every
+/// diary. Mapping omission to ALL diaries let a minimal `/v1/recall` request
+/// return specialist-diary content the equivalent CLI invocation excludes.
+fn daemon_diary(diary: Option<String>) -> Option<String> {
+    match diary.as_deref() {
+        None => Some("default".to_string()),
+        Some("*") => None,
+        Some(_) => diary,
+    }
+}
+
 async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Value, CliError> {
     let req: ResearchRequest = serde_json::from_str(body)?;
     // An empty query is refused BEFORE any provider or budget work, exactly as
@@ -351,7 +365,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
         rrf_k: 60.0,
         rerank_top_n: rerank_candidates,
         filters: Filters {
-            diary: req.diary.clone().filter(|d| d != "*"),
+            diary: daemon_diary(req.diary.clone()),
             kb: kb_filter.clone(),
             since: None,
             until: None,
@@ -378,7 +392,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
             "api_research_query_embed",
             Some(backends.embed_model.as_str()),
             kb_filter.as_deref(),
-            req.diary.as_deref().filter(|d| *d != "*"),
+            daemon_diary(req.diary.clone()).as_deref(),
             1,
             1,
             tokens,
@@ -395,7 +409,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
             "api_research_rerank",
             Some(backends.cohere_model.as_str()),
             kb_filter.as_deref(),
-            req.diary.as_deref().filter(|d| *d != "*"),
+            daemon_diary(req.diary.clone()).as_deref(),
             1,
             rerank_candidates as i64,
             0,
@@ -483,7 +497,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
         rrf_k: 60.0,
         rerank_top_n: rerank_candidates,
         filters: Filters {
-            diary: req_diary.clone().filter(|d| d != "*"),
+            diary: daemon_diary(req_diary.clone()),
             kb: scope.kb.clone(),
             since,
             until,
@@ -521,7 +535,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
             "api_recall_query_embed",
             Some(backends.embed_model.as_str()),
             scope.as_deref(),
-            req_diary.as_deref().filter(|d| *d != "*"),
+            daemon_diary(req_diary.clone()).as_deref(),
             1,
             1,
             tokens,
@@ -538,7 +552,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
             "api_recall_rerank",
             Some(backends.cohere_model.as_str()),
             scope.as_deref(),
-            req_diary.as_deref().filter(|d| *d != "*"),
+            daemon_diary(req_diary.clone()).as_deref(),
             1,
             rerank_candidates as i64,
             0,
@@ -760,6 +774,9 @@ struct CompileRequest {
 struct ReindexRequest {
     kb: Option<String>,
     all: Option<bool>,
+    /// Explicit stub opt-in, mirroring the CLI --offline flag; keyless
+    /// reindex without it is a config error, never a silent stub rebuild.
+    offline: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

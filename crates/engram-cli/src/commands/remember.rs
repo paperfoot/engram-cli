@@ -186,8 +186,6 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let autonomy = Autonomy::parse(&autonomy)?;
     crate::commands::validate_diary_for_write(&diary)?;
     let event_time = parse_event_time(&event_time)?;
-    // Paid calls (embedding, extraction) respect the KB budget guardrail.
-    crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     if content.trim().is_empty() {
         return Err(CliError::BadInput("content cannot be empty".into()));
     }
@@ -208,6 +206,19 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // the argument checks above, so a bad argument is still exit 3 rather than
     // being masked by the environment.
     let write_embedder = resolve_write_embedder("remember", offline)?;
+
+    // The KB budget guards PAID calls: cloud embedding, and LLM extraction /
+    // adjudication (which run whenever an OpenRouter key resolves and
+    // --no-extract-facts was not passed). A fully offline write spends
+    // nothing, so a zero spend cap must not block it — a free operation
+    // failing with a budget error is a new failure mode with no money
+    // behind it.
+    let extraction_may_spend = !no_extract_facts
+        && crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
+            .is_some();
+    if write_embedder.cloud || extraction_may_spend {
+        crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
+    }
 
     let start = Instant::now();
 
@@ -463,13 +474,13 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         }
     };
 
-    // ONE UNIT OF WORK. `facts backfill` treats a memory as processed once it
-    // has ANY fact OR a marker (PENDING_EXTRACTION_PREDICATE), so a batch that
-    // persisted fact A and failed on fact B retired the memory from the queue
-    // on the strength of A, and B was lost permanently and invisibly. The batch
-    // and its marker now commit together or not at all: on failure the memory
-    // keeps no fact and no marker, so it stays pending and a later backfill
-    // retries it from scratch.
+    // ONE UNIT OF WORK. `facts backfill` treats a memory as processed only
+    // once its MARKER exists (PENDING_EXTRACTION_PREDICATE): the batch and
+    // its marker commit together or not at all, so a failed batch leaves the
+    // memory pending and a later backfill retries it from scratch. A
+    // caller-supplied batch deliberately carries no marker — the extractor
+    // has not seen the memory — and stays pending until a backfill runs real
+    // extraction over it; dedup absorbs the re-supplied triples.
     let marker = status.extraction_ran().then_some(FactExtractionMarker {
         model: extraction_model.as_deref(),
         source: "remember",

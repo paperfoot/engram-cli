@@ -62,6 +62,20 @@ fn import_v2(
     let chunks: Vec<ChunkExportRow> = section(body, "chunks")?;
     let facts: Vec<FactExportRow> = section(body, "facts")?;
 
+    // Timestamps are load-bearing: `created_at` seeds fact chronology, and a
+    // fabricated date decides recency supersession. A record whose date the
+    // store cannot read is rejected up front — every legitimate export writer
+    // emits RFC3339, so an unparseable one means the file was edited.
+    for row in &memories {
+        if chrono::DateTime::parse_from_rfc3339(&row.created_at).is_err() {
+            return Err(CliError::BadInput(format!(
+                "memory {} has an unreadable created_at {:?}; fix the export file — engram \
+                 will not invent a date for it",
+                row.id, row.created_at
+            )));
+        }
+    }
+
     // Insert in dependency order (kb → document → memory → chunk → fact)
     // inside one transaction so a malformed file cannot leave a half-restored
     // store. Existing rows are kept (INSERT OR IGNORE), so import is
