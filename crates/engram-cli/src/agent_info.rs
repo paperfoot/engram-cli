@@ -91,7 +91,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                     "chunks": "integer",
                     "kb": "string",
                     "event_time": "rfc3339|null",
-                    "fact_extraction": "ran|ran_stub|disabled|skipped_facts_json|skipped_no_openrouter_key|failed|failed_partial_persist|failed_extraction_marker — ALWAYS check this before assuming facts were captured. `failed_partial_persist`: the LLM returned facts but at least one did not persist, so NO extraction marker was recorded and `facts backfill` will retry the memory. `failed_extraction_marker`: every fact persisted but the done-marker did not, so a later backfill may re-extract it (harmless).",
+                    "fact_extraction": "ran|ran_stub|disabled|skipped_facts_json|skipped_no_openrouter_key|failed|failed_persist — ALWAYS check this before assuming facts were captured. `failed_persist`: the LLM returned facts but the batch could not be stored, and a batch is one unit of work — NO fact was stored, no extraction marker was recorded, and `facts backfill` will retry the whole memory.",
                     "fact_extraction_note": "string|null — present whenever facts were NOT captured, with the fix",
                     "facts_added": "integer",
                     "facts_deduped": "integer",

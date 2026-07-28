@@ -8,7 +8,9 @@
 use crate::commands::usage::estimated_tokens;
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::fact_write::{write_fact, Autonomy, FactWriteCtx, FactWriteOutcome, MemoryTime};
+use crate::fact_write::{
+    write_fact, Autonomy, FactEmbedCache, FactWriteCtx, FactWriteOutcome, MemoryTime,
+};
 use crate::output::{print_success, Metadata};
 use engram_core::types::SourceKind;
 use engram_graph::facts::ExtractedFact;
@@ -838,6 +840,10 @@ async fn insert_llm_evidence(
         source_kind: SourceKind::CompileLlm,
     };
     let mut outcome = FactWriteOutcome::default();
+    // `compile` already holds its own build-then-swap transaction, so it calls
+    // `write_fact` directly rather than `write_fact_batch`. With no embedder
+    // the cache is never consulted.
+    let cache = FactEmbedCache::empty();
     for fact in facts {
         let subject = fact.subject.trim();
         let predicate = fact.predicate.trim();
@@ -861,7 +867,7 @@ async fn insert_llm_evidence(
             // only honest one (see `MemoryTime`).
             valid_from: None,
         };
-        write_fact(ctx, &write_ctx, &ef, &mut outcome).await?;
+        write_fact(ctx, &write_ctx, &ef, &cache, &mut outcome).await?;
     }
     stats.llm_facts += outcome.added;
     stats.llm_facts_queued += outcome.queued.len();
