@@ -8,6 +8,10 @@ use crate::retrieval::{
     hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
     HybridParams, RecallMode, RetrievalProfile,
 };
+use chrono::{DateTime, Utc};
+use engram_core::layers::approx_tokens;
+use engram_core::temporal::{parse_bound, DayBound};
+use engram_core::types::Layer;
 use engram_storage::{paths, SqliteStore};
 use serde::Deserialize;
 use serde_json::json;
@@ -63,7 +67,7 @@ async fn handle_stream(mut stream: TcpStream, token: Option<String>) -> Result<(
     }
     let method = parts[0];
     let (path, query) = split_path_query(parts[1]);
-    if token.is_some() && !authorized(&head, token.as_deref().unwrap()) {
+    if token.is_some() && !authorized(head, token.as_deref().unwrap()) {
         write_json(
             &mut stream,
             401,
@@ -323,6 +327,15 @@ async fn route(
 
 async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Value, CliError> {
     let req: ResearchRequest = serde_json::from_str(body)?;
+    // An empty query is refused BEFORE any provider or budget work, exactly as
+    // `engram research ""` is (exit 3 -> HTTP 400). It used to fall through to
+    // hybrid_recall, which embedded the empty string: a paid Gemini call, a
+    // recorded usage event and a budget decremented for a query that cannot
+    // match anything. With no key it was reported as a config error instead,
+    // which sends the caller to fix their keys over a typo.
+    if req.query.trim().is_empty() {
+        return Err(CliError::BadInput("query cannot be empty".into()));
+    }
     let profile = RetrievalProfile::parse(req.profile.as_deref().unwrap_or("cloud_quality"))?;
     let kb_filter = req.kb.clone().filter(|k| k != "*");
     let rerank_candidates = req
@@ -416,6 +429,13 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
             })).collect::<Vec<_>>(),
             "metadata": {
                 "profile": profile.as_str(),
+                // A caller cannot tell 1536-dim Gemini retrieval from the
+                // 64-dim offline stub out of `profile` alone: `offline` and a
+                // forced stub render the same word. The CLI's `research` has
+                // reported these since Wave 0; the daemon copy did not.
+                "embed_model": backends.embed_model,
+                "embed_dims": backends.embed_dims,
+                "prompt_format": backends.prompt_format,
                 "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
                 "diary_isolation": notes.diary_isolation_json(),
@@ -427,6 +447,15 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
 
 async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value, CliError> {
     let req: RecallRequest = serde_json::from_str(body)?;
+    // An empty query is refused BEFORE any provider or budget work, exactly as
+    // `engram recall ""` is (exit 3 -> HTTP 400). It used to fall through to
+    // hybrid_recall, which embedded the empty string: a paid Gemini call, a
+    // recorded usage event and a budget decremented for a query that cannot
+    // match anything. With no key it was reported as a config error instead,
+    // which sends the caller to fix their keys over a typo.
+    if req.query.trim().is_empty() {
+        return Err(CliError::BadInput("query cannot be empty".into()));
+    }
     // Same scope precedence as `engram recall`: explicit kb > retrieval.default_kb
     // > every KB. An omitted `kb` searches everything rather than the single
     // namespace literally named "default".
@@ -434,6 +463,12 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
     let req_diary = req.diary.clone();
     let profile = RetrievalProfile::parse(req.profile.as_deref().unwrap_or("cloud_quality"))?;
     let mode = RecallMode::parse(req.mode.as_deref().unwrap_or("evidence"))?;
+    // The clap defaults of `engram recall`, so the same request spelled over
+    // HTTP answers the same way (cli.rs: --layer topic, --top-k 10).
+    let layer = parse_layer(req.layer.as_deref().unwrap_or("topic"))?;
+    let since = parse_bound_param(req.since.as_deref(), DayBound::Start)?;
+    let until = parse_bound_param(req.until.as_deref(), DayBound::End)?;
+    let top_k = req.top_k.unwrap_or(10);
     let rerank_candidates = req
         .rerank_top_n
         .unwrap_or_else(|| profile.default_rerank_top_n());
@@ -444,14 +479,14 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
     let backends = resolve_retrieval_backends(&store, profile, scope.as_deref())?;
     let params = HybridParams {
         query: &req.query,
-        top_k: req.top_k.unwrap_or(10),
+        top_k,
         rrf_k: 60.0,
         rerank_top_n: rerank_candidates,
         filters: Filters {
             diary: req_diary.clone().filter(|d| d != "*"),
             kb: scope.kb.clone(),
-            since: None,
-            until: None,
+            since,
+            until,
         },
         mode,
         graph_hops: req.graph_hops.unwrap_or(1),
@@ -465,6 +500,20 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
     )
     .await?;
     let (results, notes) = (outcome.results, outcome.notes);
+    // Same layer contract as `engram recall`: the token budget only trims what
+    // exceeds the caller's own top_k, so a layer can never return FEWER results
+    // than were asked for. Reported so a caller can see which budget applied.
+    let budget = layer.default_token_budget();
+    let mut used_tokens = 0usize;
+    let mut layered = Vec::new();
+    for r in &results {
+        let cost = approx_tokens(&r.content);
+        if layered.len() >= top_k && used_tokens + cost > budget {
+            break;
+        }
+        layered.push(r);
+        used_tokens += cost;
+    }
     if backends.cloud_embedder {
         let tokens = estimated_tokens(&req.query);
         store.record_usage_event(
@@ -509,8 +558,10 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
         "status": status,
         "data": {
             "status": status,
-            "answer_context": render_answer_context(&results),
-            "results": results.iter().map(|r| json!({
+            // `layered` is a Vec<&HybridResult>; `.iter()` would hand the
+            // renderer `&&HybridResult`, so copy the references out.
+            "answer_context": render_answer_context(layered.iter().copied()),
+            "results": layered.iter().map(|r| json!({
                 "id": r.id.to_string(),
                 "kind": r.kind,
                 "score": r.score,
@@ -527,6 +578,9 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
                 "prompt_format": backends.prompt_format,
                 "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
+                "layer": format!("{:?}", layer).to_lowercase(),
+                "token_budget": budget,
+                "tokens_used": used_tokens,
                 "kb": scope.label(),
                 "kb_scope": scope.origin.as_str(),
                 "diary_isolation": notes.diary_isolation_json(),
@@ -647,6 +701,46 @@ fn is_local_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// `recall --layer`, over HTTP.
+///
+/// Duplicated rather than shared out of `commands::recall`: that module belongs
+/// to another lane this wave, and a six-arm match is cheaper than a cross-file
+/// conflict. The error string is byte-identical to `recall.rs` on purpose —
+/// one rule, two entry points — so folding the two together is a pure delete.
+fn parse_layer(s: &str) -> Result<Layer, CliError> {
+    match s.to_ascii_lowercase().as_str() {
+        "identity" | "l0" => Ok(Layer::Identity),
+        "critical" | "l1" => Ok(Layer::Critical),
+        "topic" | "l2" => Ok(Layer::Topic),
+        "deep" | "l3" => Ok(Layer::Deep),
+        other => Err(CliError::BadInput(format!(
+            "unknown layer: {other} (expected identity|critical|topic|deep)"
+        ))),
+    }
+}
+
+/// `recall --since/--until`, over HTTP: RFC3339, or a bare `YYYY-MM-DD` that
+/// means the START of that UTC day for `since` and its END for `until`, so
+/// `since == until == D` selects exactly day D.
+///
+/// Unparseable input is a hard error, never a silent "now" and never a silently
+/// ignored field — the daemon used to accept `since` and drop it on the floor,
+/// so a windowed request was answered from the whole store and the caller was
+/// never told.
+fn parse_bound_param(
+    raw: Option<&str>,
+    bound: DayBound,
+) -> Result<Option<DateTime<Utc>>, CliError> {
+    match raw {
+        None => Ok(None),
+        Some(v) => parse_bound(v, bound).map(Some).ok_or_else(|| {
+            CliError::BadInput(format!(
+                "invalid timestamp {v}: expected RFC3339 (2026-06-01T09:30:00Z) or YYYY-MM-DD"
+            ))
+        }),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct KbCreateRequest {
     name: String,
@@ -690,10 +784,13 @@ struct RecallRequest {
     diary: Option<String>,
     mode: Option<String>,
     profile: Option<String>,
+    layer: Option<String>,
     top_k: Option<usize>,
     rerank_top_n: Option<usize>,
     graph_hops: Option<u8>,
     allow_mixed_embeddings: Option<bool>,
+    since: Option<String>,
+    until: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

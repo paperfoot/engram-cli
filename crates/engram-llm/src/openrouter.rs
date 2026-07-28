@@ -190,6 +190,35 @@ fn error_body_head(body: &str) -> String {
     }
 }
 
+/// The message a non-2xx response renders into, with the body bounded.
+///
+/// The head is deliberately KEPT: `{"error":{"message":"No auth credentials
+/// found"` is the whole diagnosis. It is the TAIL that has to go — a 4xx from a
+/// validation failure can echo the request back, and the request carries the
+/// memory being read.
+fn status_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    format!("status {status}: {}", error_body_head(body))
+}
+
+/// The decode failure a caller sees: category, position and size — never the
+/// body, and never serde's own Display.
+///
+/// On a 200 the body IS the model's answer, and the model was reading someone's
+/// memory. This string travels up through `FactExtractionError::Llm` into
+/// `fact_extraction_note`, which `engram remember` prints on stdout AND stderr.
+/// A `Category::Data` failure renders as `invalid type: string "<the value>"`,
+/// so dropping a "preview" alone would still copy a slice of the answer.
+/// Category, position and size are what a decode failure is actually diagnosed
+/// from — the same rule engram-graph applies to fact JSON.
+fn decode_failure_message(e: &serde_json::Error, body_len: usize) -> String {
+    format!(
+        "decode failed: {} error at line {} column {} ({body_len} bytes of model output withheld)",
+        classify_json_error(e),
+        e.line(),
+        e.column(),
+    )
+}
+
 /// serde_json's own category as a stable word, without its message.
 fn classify_json_error(e: &serde_json::Error) -> &'static str {
     use serde_json::error::Category;
@@ -232,7 +261,7 @@ impl OpenRouterClient {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(RetryReason::Transient(LlmError::Api {
                 provider: "openrouter",
-                message: format!("status {}: {}", status, error_body_head(&body_text)),
+                message: status_error_message(status, &body_text),
             }));
         }
         if !status.is_success() {
@@ -240,7 +269,7 @@ impl OpenRouterClient {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(RetryReason::Permanent(LlmError::Api {
                 provider: "openrouter",
-                message: format!("status {}: {}", status, error_body_head(&body_text)),
+                message: status_error_message(status, &body_text),
             }));
         }
 
@@ -257,28 +286,14 @@ impl OpenRouterClient {
         // would also retry, but it would burn through all 6 attempts and then
         // surface — better than silently swallowing.
         //
-        // Neither the body nor serde's own Display is echoed. On a 200 the body
-        // IS the model's answer, and the model was reading someone's memory:
-        // this error string travels up through `FactExtractionError::Llm` into
-        // `fact_extraction_note`, which `engram remember` prints on stdout and
-        // stderr. A `Category::Data` failure also renders as
-        // `invalid type: string "<the value>"`, so dropping the preview alone
-        // would still copy a slice of the answer. Category, position and size
-        // are what a decode failure is actually diagnosed from — the same rule
-        // engram-graph applies to fact JSON.
+        // Neither the body nor serde's own Display is echoed — see
+        // `decode_failure_message` for why the preview had to go too.
         let parsed: ChatResponseBody = match serde_json::from_str(&body_text) {
             Ok(p) => p,
             Err(e) => {
                 return Err(RetryReason::Transient(LlmError::InvalidResponse {
                     provider: "openrouter",
-                    message: format!(
-                        "decode failed: {} error at line {} column {} ({} bytes of model \
-                         output withheld)",
-                        classify_json_error(&e),
-                        e.line(),
-                        e.column(),
-                        body_text.len()
-                    ),
+                    message: decode_failure_message(&e, body_text.len()),
                 }));
             }
         };
@@ -297,5 +312,139 @@ impl OpenRouterClient {
             completion_tokens: parsed.usage.as_ref().and_then(|u| u.completion_tokens),
             model: parsed.model.clone().unwrap_or_else(|| self.model.clone()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stands in for the memory a provider error could echo back. Deliberately
+    /// different from the sentinel in `engram-cli/tests/wave0_no_raw_leak.rs`,
+    /// so a grep for a leaked string says which layer leaked it.
+    const SENTINEL: &str = "QUOKKA-9E21-DO-NOT-ECHO";
+
+    /// A body that is mostly filler with the sentinel past the cap.
+    fn long_body_ending_in_the_sentinel() -> String {
+        format!("{}{SENTINEL}", "f".repeat(5_000))
+    }
+
+    /// The failure a body produces when decoded as a chat response.
+    ///
+    /// Hand-rolled rather than `expect_err` so the response type does not have
+    /// to derive `Debug` for a test's convenience — a `Debug` on a struct that
+    /// holds model output is exactly the sort of thing that leaks it later.
+    fn decode_error(body: &str) -> serde_json::Error {
+        match serde_json::from_str::<ChatResponseBody>(body) {
+            Ok(_) => panic!("the fixture must not decode: {body}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn a_short_error_body_is_reported_whole() {
+        // The cap must not cost the actionable head: this is the entire
+        // diagnosis for the most common provider failure there is.
+        let body = r#"{"error":{"message":"No auth credentials found","code":401}}"#;
+        assert_eq!(error_body_head(body), body);
+    }
+
+    #[test]
+    fn a_body_exactly_at_the_cap_is_not_truncated() {
+        // The `head.len() == body.len()` boundary: at the cap nothing is
+        // withheld, so claiming otherwise would be a lie.
+        let body = "x".repeat(MAX_ERROR_BODY_CHARS);
+        let head = error_body_head(&body);
+        assert_eq!(head, body);
+        assert!(!head.contains("bytes total"), "{head}");
+    }
+
+    #[test]
+    fn the_error_body_head_is_capped_and_states_the_omission() {
+        let body = long_body_ending_in_the_sentinel();
+        let head = error_body_head(&body);
+        assert!(
+            !head.contains(SENTINEL),
+            "an echoed request body reached the error string: {head}"
+        );
+        assert!(head.starts_with(&"f".repeat(MAX_ERROR_BODY_CHARS)));
+        assert!(
+            head.contains(&format!("({} bytes total, rest withheld)", body.len())),
+            "the omission must be stated with its true size: {head}"
+        );
+        let kept = head.split('…').next().expect("a head before the ellipsis");
+        assert_eq!(kept.chars().count(), MAX_ERROR_BODY_CHARS, "{head}");
+    }
+
+    #[test]
+    fn the_cap_counts_characters_and_never_splits_one() {
+        // Pins char-wise truncation against a naive `&body[..200]` rewrite,
+        // which would panic mid-character on any non-ASCII provider message.
+        let body = "é".repeat(1_000);
+        let head = error_body_head(&body);
+        let kept = head.split('…').next().expect("a head before the ellipsis");
+        assert_eq!(kept, "é".repeat(MAX_ERROR_BODY_CHARS));
+        assert!(head.contains("(2000 bytes total, rest withheld)"), "{head}");
+    }
+
+    #[test]
+    fn a_status_error_names_the_status_without_the_echoed_request() {
+        let msg = status_error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            &long_body_ending_in_the_sentinel(),
+        );
+        assert!(msg.contains("status 400"), "{msg}");
+        assert!(
+            !msg.contains(SENTINEL),
+            "a 4xx that echoed the request leaked the memory it carried: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_decode_failure_names_the_category_without_the_model_answer() {
+        // The exact leak the cap alone does not close: serde's Display for a
+        // `Category::Data` failure quotes the offending VALUE, and on a 200
+        // that value is the model's answer to a question about someone's
+        // memory. Only the category, the position and the size may travel.
+        let body = format!("{{\"choices\":\"{SENTINEL}\"}}");
+        let err = decode_error(&body);
+        assert!(
+            err.to_string().contains(SENTINEL),
+            "the fixture must carry the leak serde would print: {err}"
+        );
+
+        let msg = decode_failure_message(&err, body.len());
+        assert!(msg.contains("schema"), "{msg}");
+        assert!(msg.contains("line 1"), "{msg}");
+        assert!(msg.contains(&format!("{} bytes", body.len())), "{msg}");
+        assert!(
+            !msg.contains(SENTINEL),
+            "serde's own Display carried the model output out: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_body_is_classified_truncated_not_echoed() {
+        // A TLS drop mid-stream is the common case, and it cuts the body in the
+        // middle of the answer — the worst possible place to quote from.
+        let body = format!("{{\"choices\":[{{\"message\":{{\"content\":\"{SENTINEL}");
+        let err = decode_error(&body);
+        let msg = decode_failure_message(&err, body.len());
+        assert!(msg.contains("truncated"), "{msg}");
+        assert!(!msg.contains(SENTINEL), "{msg}");
+    }
+
+    #[test]
+    fn each_json_error_category_has_a_stable_word() {
+        // An operator greps for these words; changing one silently would break
+        // every runbook that mentions it.
+        let cases = [
+            ("{not json}", "syntax"),
+            (r#"{"choices":"a string"}"#, "schema"),
+            (r#"{"choices":["#, "truncated"),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(classify_json_error(&decode_error(body)), expected, "{body}");
+        }
     }
 }

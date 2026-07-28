@@ -19,6 +19,7 @@
 //! - Biomedical NDCG@10: zerank-2 = 0.7217 vs Cohere = 0.6246 (+9.7 pp)
 //! - STEM & Logic NDCG@10: zerank-2 = 0.6521 vs Cohere = 0.5418 (+11.0 pp)
 //! - Average across 7 domains: 0.6714 vs 0.5847 (+8.7 pp)
+//!
 //! Source: https://huggingface.co/zeroentropy/zerank-2 model card
 
 use crate::{RerankCandidate, RerankError, RerankedResult, Reranker};
