@@ -146,8 +146,10 @@ pub async fn run(
         })
         .collect::<Vec<_>>();
 
-    let mut meta = Metadata::default();
-    meta.elapsed_ms = start.elapsed().as_millis() as u64;
+    let mut meta = Metadata {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
     meta.add("status", status);
     meta.add("profile", profile_enum.as_str());
     meta.add("kb", if all_kbs { "*" } else { kb.as_str() });

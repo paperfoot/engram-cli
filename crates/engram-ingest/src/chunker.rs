@@ -410,7 +410,7 @@ fn parse_numbered_heading(line: &str) -> Option<(usize, String)> {
     let trimmed = line.trim();
     let mut chars = trimmed.chars().peekable();
     // First char must be a digit.
-    if !chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+    if !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
         return None;
     }
     let mut depth = 1usize;
@@ -451,7 +451,7 @@ fn parse_numbered_heading(line: &str) -> Option<(usize, String)> {
     }
     let caps_ratio = words
         .iter()
-        .filter(|w| w.chars().next().map_or(false, |c| c.is_ascii_uppercase()))
+        .filter(|w| w.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
         .count() as f32
         / words.len() as f32;
     if caps_ratio < 0.5 {
@@ -539,10 +539,7 @@ fn looks_like_reference(title: &str) -> bool {
         let name = w[0].trim_matches(|c: char| !c.is_ascii_alphanumeric());
         let initials = w[1].trim_matches(|c: char| !c.is_ascii_alphanumeric());
         let name_ok = name.len() >= 2
-            && name
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_ascii_uppercase())
+            && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && name.chars().skip(1).any(|c| c.is_ascii_lowercase());
         let initials_ok =
             (1..=3).contains(&initials.len()) && initials.chars().all(|c| c.is_ascii_uppercase());

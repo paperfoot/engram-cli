@@ -114,9 +114,9 @@ mod tests {
     #[test]
     fn all_gold_present_requires_full_coverage() {
         let retrieved = vec![1, 2, 3, 4, 5];
-        assert!(all_gold_present(&retrieved, &vec![1, 3], 5));
-        assert!(!all_gold_present(&retrieved, &vec![1, 6], 5));
-        assert!(!all_gold_present(&retrieved, &vec![3], 2));
+        assert!(all_gold_present(&retrieved, &[1, 3], 5));
+        assert!(!all_gold_present(&retrieved, &[1, 6], 5));
+        assert!(!all_gold_present(&retrieved, &[3], 2));
         assert!(all_gold_present(&retrieved, &Vec::<i32>::new(), 5));
     }
 
@@ -164,7 +164,7 @@ mod tests {
         //   nDCG = 3.5 / 4.7618595071                                      = 0.7350069851
         let q = qrels(&[("a", 3), ("b", 2), ("c", 1)]);
         let retrieved = ids(&["b", "x", "a"]);
-        assert!((ndcg_at_10(&retrieved, &q) - 0.735_006_99).abs() < 1e-6);
+        assert!((ndcg_at_10(&retrieved, &q) - 0.735_007).abs() < 1e-6);
     }
 
     #[test]

@@ -313,7 +313,7 @@ where
             let vecs = embedder
                 .embed_batch(&texts, TaskMode::RetrievalDocument)
                 .await?;
-            for ((cid, _, _), v) in pending_chunks.iter().zip(vecs.into_iter()) {
+            for ((cid, _, _), v) in pending_chunks.iter().zip(vecs) {
                 chunk_embeddings.insert(*cid, v);
             }
         }
@@ -698,7 +698,7 @@ where
             let vecs = embedder
                 .embed_batch(&texts, TaskMode::RetrievalDocument)
                 .await?;
-            for ((cid, _, _), v) in pending_chunks.iter().zip(vecs.into_iter()) {
+            for ((cid, _, _), v) in pending_chunks.iter().zip(vecs) {
                 chunk_embeddings.insert(*cid, v);
             }
         }
@@ -1219,7 +1219,7 @@ where
             let vecs = embedder
                 .embed_batch(&texts, TaskMode::RetrievalDocument)
                 .await?;
-            for ((cid, _, _), v) in pending_chunks.iter().zip(vecs.into_iter()) {
+            for ((cid, _, _), v) in pending_chunks.iter().zip(vecs) {
                 chunk_embeddings.insert(*cid, v);
             }
         }
@@ -1657,7 +1657,7 @@ where
             let vecs = embedder
                 .embed_batch(&texts, TaskMode::RetrievalDocument)
                 .await?;
-            for ((cid, _), v) in pending_chunks.iter().zip(vecs.into_iter()) {
+            for ((cid, _), v) in pending_chunks.iter().zip(vecs) {
                 chunk_embeddings.insert(*cid, v);
             }
         }
@@ -2062,7 +2062,7 @@ where
         let vecs = embedder
             .embed_batch(&texts, TaskMode::RetrievalDocument)
             .await?;
-        for ((cid, _), v) in pending_chunks.iter().zip(vecs.into_iter()) {
+        for ((cid, _), v) in pending_chunks.iter().zip(vecs) {
             chunk_embeddings.insert(*cid, v);
         }
     }

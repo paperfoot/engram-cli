@@ -163,8 +163,8 @@ pub fn show(ctx: &AppContext, subject: String, diary: String, kb: String) -> Res
         "kb": kb,
         "active_count": active.len(),
         "historic_count": historic.len(),
-        "active":  active.iter().map(|f| fact_to_json(*f)).collect::<Vec<_>>(),
-        "historic": historic.iter().map(|f| fact_to_json(*f)).collect::<Vec<_>>(),
+        "active":  active.iter().map(|f| fact_to_json(f)).collect::<Vec<_>>(),
+        "historic": historic.iter().map(|f| fact_to_json(f)).collect::<Vec<_>>(),
     });
 
     print_success(ctx.format, payload, Metadata::default(), |_| {

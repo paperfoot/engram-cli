@@ -132,12 +132,12 @@ fn dehyphenate(text: &str) -> String {
             let cur = lines[i].trim_end();
             match cur.strip_suffix('-') {
                 Some(p)
-                    if p.chars().last().map_or(false, |c| c.is_ascii_lowercase())
+                    if p.chars().last().is_some_and(|c| c.is_ascii_lowercase())
                         && lines[i + 1]
                             .trim_start()
                             .chars()
                             .next()
-                            .map_or(false, |c| c.is_ascii_lowercase()) =>
+                            .is_some_and(|c| c.is_ascii_lowercase()) =>
                 {
                     Some(p.to_string())
                 }

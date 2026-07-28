@@ -193,8 +193,10 @@ pub async fn run(
         )?;
     }
 
-    let mut meta = Metadata::default();
-    meta.elapsed_ms = start.elapsed().as_millis() as u64;
+    let mut meta = Metadata {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
     meta.add("profile", profile_enum.as_str());
     meta.add("mode", recall_mode.as_str());
     meta.add("kb", scope.label());

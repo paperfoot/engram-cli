@@ -30,8 +30,10 @@ pub async fn run(ctx: &AppContext, kb: Option<String>, all: bool) -> Result<(), 
     let start = Instant::now();
     let stats = reindex_store(&ctx.store, kb.as_deref(), all).await?;
 
-    let mut meta = Metadata::default();
-    meta.elapsed_ms = start.elapsed().as_millis() as u64;
+    let mut meta = Metadata {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
     meta.add("chunks_reindexed", stats.chunks_reindexed);
     meta.add("model", stats.model.clone());
     meta.add("dimensions", stats.dimensions);

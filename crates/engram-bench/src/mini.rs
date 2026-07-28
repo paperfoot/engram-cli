@@ -248,20 +248,22 @@ pub fn run_fts_baseline() -> Result<MiniReport, crate::error::BenchError> {
     }
 
     let n = QUESTIONS.len() as f32;
-    let mut metrics = Metrics::default();
-    metrics.recall = Recall {
-        at_1: r1_total / n,
-        at_5: r5_total / n,
-        at_10: r5_total / n, // collapses for k=10 in this set
-    };
-    metrics.mrr = mrr_total / n;
-    metrics.questions_evaluated = QUESTIONS.len();
     let mean_lat = latencies.iter().sum::<u64>() as f32 / n;
-    metrics.mean_latency_ms = mean_lat;
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
-    metrics.p50_latency_ms = sorted[sorted.len() / 2] as f32;
-    metrics.p95_latency_ms = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32;
+    let metrics = Metrics {
+        recall: Recall {
+            at_1: r1_total / n,
+            at_5: r5_total / n,
+            at_10: r5_total / n, // collapses for k=10 in this set
+        },
+        mrr: mrr_total / n,
+        questions_evaluated: QUESTIONS.len(),
+        mean_latency_ms: mean_lat,
+        p50_latency_ms: sorted[sorted.len() / 2] as f32,
+        p95_latency_ms: sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32,
+        ..Default::default()
+    };
 
     Ok(MiniReport {
         metrics,
@@ -442,20 +444,22 @@ pub async fn run_hybrid_baseline<E: Embedder + ?Sized>(
     }
 
     let n = QUESTIONS.len() as f32;
-    let mut metrics = Metrics::default();
-    metrics.recall = Recall {
-        at_1: r1_total / n,
-        at_5: r5_total / n,
-        at_10: r5_total / n,
-    };
-    metrics.mrr = mrr_total / n;
-    metrics.questions_evaluated = QUESTIONS.len();
     let mean_lat = latencies.iter().sum::<u64>() as f32 / n;
-    metrics.mean_latency_ms = mean_lat;
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
-    metrics.p50_latency_ms = sorted[sorted.len() / 2] as f32;
-    metrics.p95_latency_ms = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32;
+    let metrics = Metrics {
+        recall: Recall {
+            at_1: r1_total / n,
+            at_5: r5_total / n,
+            at_10: r5_total / n,
+        },
+        mrr: mrr_total / n,
+        questions_evaluated: QUESTIONS.len(),
+        mean_latency_ms: mean_lat,
+        p50_latency_ms: sorted[sorted.len() / 2] as f32,
+        p95_latency_ms: sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32,
+        ..Default::default()
+    };
 
     Ok(MiniReport {
         metrics,

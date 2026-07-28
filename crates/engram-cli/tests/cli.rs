@@ -843,7 +843,7 @@ fn documents_jobs_budget_and_scientific_bench_work() {
         .stdout
         .clone();
     let jobs = parse_stdout(&jobs_out);
-    assert!(jobs["data"]["jobs"].as_array().unwrap().len() >= 1);
+    assert!(!jobs["data"]["jobs"].as_array().unwrap().is_empty());
 
     let mut budget_cmd = engram();
     budget_cmd.env("HOME", tmp.path());

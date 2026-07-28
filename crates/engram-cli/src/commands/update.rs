@@ -119,8 +119,10 @@ pub async fn run(ctx: &AppContext, check: bool) -> Result<(), CliError> {
         Vec::new()
     };
 
-    let mut meta = Metadata::default();
-    meta.elapsed_ms = start.elapsed().as_millis() as u64;
+    let mut meta = Metadata {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
     meta.add("current_version", current_version);
     meta.add("latest_version", latest_version.clone());
     meta.add("update_available", update_available);
@@ -394,7 +396,7 @@ fn version_parts(version: &str) -> Vec<u64> {
     version
         .trim()
         .trim_start_matches('v')
-        .split(|c| c == '.' || c == '-' || c == '+')
+        .split(['.', '-', '+'])
         .take_while(|part| part.chars().all(|c| c.is_ascii_digit()))
         .filter_map(|part| part.parse::<u64>().ok())
         .collect()

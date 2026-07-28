@@ -119,6 +119,16 @@ pub type MemoryTimes = (
     chrono::DateTime<chrono::Utc>,
 );
 
+/// One chunk as the brute-force dense scan wants it: `(chunk id, content,
+/// embedding, diary)`. Deliberately a tuple and not `ChunkRecord` — the scan
+/// reads millions of these and pays for every field it does not use.
+pub type ChunkEmbeddingRow = (Uuid, String, Vec<f32>, String);
+
+/// One row of the embedding census: `(model, dimensions, prompt format, chunk
+/// count)`. The dimensions and format are optional because chunks written
+/// before schema v5 recorded neither.
+pub type EmbeddingProfileRow = (String, Option<i64>, Option<String>, i64);
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkRecord {
     pub chunk_id: Uuid,
@@ -1521,6 +1531,9 @@ impl SqliteStore {
 
     /// Insert a chunk together with its embedding. The embedding is stored
     /// as a BLOB of little-endian f32s.
+    // Every argument is one non-defaultable column of `chunks`; a struct here
+    // would only move the same list one call frame further out.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk_with_embedding(
         &self,
         chunk_id: Uuid,
@@ -1545,6 +1558,9 @@ impl SqliteStore {
         )
     }
 
+    // As above, plus the three embedding-provenance columns that make a
+    // mixed-embedding store diagnosable.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk_with_embedding_meta(
         &self,
         chunk_id: Uuid,
@@ -1618,7 +1634,7 @@ impl SqliteStore {
     pub fn iter_chunks_with_embeddings(
         &self,
         diary: Option<&str>,
-    ) -> Result<Vec<(Uuid, String, Vec<f32>, String)>, StorageError> {
+    ) -> Result<Vec<ChunkEmbeddingRow>, StorageError> {
         let sql = match diary {
             Some(_) => {
                 "SELECT c.id, c.content, c.embedding, m.diary
@@ -1647,9 +1663,7 @@ impl SqliteStore {
                 diary,
             ))
         };
-        let rows_iter: Box<
-            dyn Iterator<Item = rusqlite::Result<(Uuid, String, Vec<f32>, String)>>,
-        > = match diary {
+        let rows_iter: Box<dyn Iterator<Item = rusqlite::Result<ChunkEmbeddingRow>>> = match diary {
             Some(d) => {
                 let iter = stmt.query_map(params![d], mapper)?;
                 Box::new(iter.collect::<Vec<_>>().into_iter())
@@ -2964,6 +2978,9 @@ impl SqliteStore {
         Ok(id)
     }
 
+    // One argument per column of `claims`; grouping them would hide which of
+    // the three provenance ids a caller left unset.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_claim(
         &self,
         kb: &str,
@@ -3387,6 +3404,8 @@ impl SqliteStore {
         )
     }
 
+    // One argument per column of `relations`.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_relation(
         &self,
         kb: &str,
@@ -5052,7 +5071,7 @@ impl SqliteStore {
     pub fn embedding_profiles(
         &self,
         kb: Option<&str>,
-    ) -> Result<Vec<(String, Option<i64>, Option<String>, i64)>, StorageError> {
+    ) -> Result<Vec<EmbeddingProfileRow>, StorageError> {
         let sql = if kb.is_some() {
             "SELECT COALESCE(embed_model, 'missing'), embed_dimensions, embed_prompt_format, COUNT(*)
              FROM chunks c JOIN memories m ON m.id = c.memory_id

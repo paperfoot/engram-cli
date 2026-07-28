@@ -30,11 +30,7 @@ impl MabSplit {
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        let normalized = name
-            .trim()
-            .to_ascii_lowercase()
-            .replace('-', "_")
-            .replace(' ', "_");
+        let normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
         match normalized.as_str() {
             "accurate_retrieval" | "ar" => Some(Self::AccurateRetrieval),
             "test_time_learning" | "ttl" => Some(Self::TestTimeLearning),

@@ -8,7 +8,7 @@ use serde_json::json;
 pub const GEMINI_EMBED_USD_PER_MILLION_TOKENS: f64 = 0.15;
 
 pub fn estimated_tokens(text: &str) -> i64 {
-    ((text.len() + 3) / 4) as i64
+    text.len().div_ceil(4) as i64
 }
 
 pub fn estimated_tokens_for_texts(texts: &[&str]) -> i64 {

@@ -276,7 +276,7 @@ pub fn resolve_setting(env: &str, toml_path: &str, default: &str) -> String {
 
 // Silence unused-imports warning for `Write` on non-unix.
 fn _keep_write_import(mut w: impl Write) {
-    let _ = writeln!(w, "");
+    let _ = writeln!(w);
 }
 
 /// True when the user explicitly disabled reranking

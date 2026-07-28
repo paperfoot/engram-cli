@@ -386,7 +386,7 @@ async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
                 embedding,
                 &embedder.model(),
                 embedder.dimensions(),
-                &embedder.prompt_format(),
+                embedder.prompt_format(),
                 Some(document_id),
             )?;
         }

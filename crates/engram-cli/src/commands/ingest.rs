@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use uuid::Uuid;
 
+// Every argument is one `engram ingest` flag, threaded straight from clap.
+// A struct here would be a second, hand-maintained copy of the CLI surface.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     ctx: &AppContext,
     path: PathBuf,
@@ -87,8 +90,10 @@ pub async fn run(
         .collect::<Vec<_>>();
 
     if dry_run {
-        let mut meta = Metadata::default();
-        meta.elapsed_ms = start.elapsed().as_millis() as u64;
+        let mut meta = Metadata {
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
         meta.add("dry_run", true);
         meta.add("matched_files", matched_files.len());
         meta.add("kb", kb.clone());
@@ -307,7 +312,7 @@ pub async fn run(
     }
 
     // Cost summary.
-    let tokens_estimated = (total_embedded_chars + 3) / 4;
+    let tokens_estimated = total_embedded_chars.div_ceil(4);
     let gemini_cost_usd = if have_gemini {
         gemini_embed_cost_usd(tokens_estimated as i64)
     } else {
@@ -345,8 +350,10 @@ pub async fn run(
         }
     };
 
-    let mut meta = Metadata::default();
-    meta.elapsed_ms = start.elapsed().as_millis() as u64;
+    let mut meta = Metadata {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
     meta.add("memories_created", memories_created);
     meta.add("chunks_created", chunks_created);
     meta.add("skipped_existing", skipped_existing);
@@ -526,10 +533,9 @@ fn walk(
                         | "go"
                         | "java"
                         | "pdf"
-                ) {
-                    if file_matches(root, &p, include, exclude) {
-                        out.push(p);
-                    }
+                ) && file_matches(root, &p, include, exclude)
+                {
+                    out.push(p);
                 }
             }
         }

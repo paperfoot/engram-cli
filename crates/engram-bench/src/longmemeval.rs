@@ -303,7 +303,7 @@ where
             let vecs = embedder
                 .embed_batch(&texts, TaskMode::RetrievalDocument)
                 .await?;
-            for (p, v) in pending.into_iter().zip(vecs.into_iter()) {
+            for (p, v) in pending.into_iter().zip(vecs) {
                 cache.blobs.insert(p.key, v.clone());
                 chunk_embeddings.insert(p.chunk_id, v);
                 cache_dirty = true;
@@ -441,20 +441,22 @@ where
     }
 
     let nf = n as f32;
-    let mut metrics = Metrics::default();
-    metrics.recall = Recall {
-        at_1: r1_total / nf,
-        at_5: r5_total / nf,
-        at_10: r10_total / nf,
-    };
-    metrics.mrr = mrr_total / nf;
-    metrics.questions_evaluated = n;
     let mean_lat = latencies.iter().sum::<u64>() as f32 / nf;
-    metrics.mean_latency_ms = mean_lat;
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
-    metrics.p50_latency_ms = sorted[sorted.len() / 2] as f32;
-    metrics.p95_latency_ms = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32;
+    let metrics = Metrics {
+        recall: Recall {
+            at_1: r1_total / nf,
+            at_5: r5_total / nf,
+            at_10: r10_total / nf,
+        },
+        mrr: mrr_total / nf,
+        questions_evaluated: n,
+        mean_latency_ms: mean_lat,
+        p50_latency_ms: sorted[sorted.len() / 2] as f32,
+        p95_latency_ms: sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)] as f32,
+        ..Default::default()
+    };
 
     Ok(LongMemEvalReport {
         metrics,
@@ -475,7 +477,7 @@ mod tests {
         let p = default_oracle_path();
         if p.exists() {
             let ds = LongMemEvalDataset::load_from_file(&p).unwrap();
-            assert!(ds.questions.len() > 0);
+            assert!(!ds.questions.is_empty());
             assert!(!ds.questions[0].haystack_session_ids.is_empty());
         }
     }

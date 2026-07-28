@@ -83,10 +83,8 @@ pub async fn judge_answer<J: ChatLlm + ?Sized>(
             true
         } else if last_line_verdict.contains("INCORRECT") {
             false
-        } else if upper.contains("CORRECT") && !upper.contains("INCORRECT") {
-            true
         } else {
-            false
+            upper.contains("CORRECT") && !upper.contains("INCORRECT")
         };
     Ok(JudgeVerdict {
         correct,
