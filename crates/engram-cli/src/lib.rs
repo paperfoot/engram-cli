@@ -34,6 +34,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             allow_duplicate,
             autonomy,
             facts_json,
+            offline,
         } => {
             commands::remember::run(
                 &ctx,
@@ -49,6 +50,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                     autonomy,
                     facts_json,
                     event_time,
+                    offline,
                 },
             )
             .await
@@ -197,6 +199,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 autonomy,
                 facts_json,
                 allow_duplicate,
+                offline,
             } => {
                 commands::remember::run(
                     &ctx,
@@ -212,6 +215,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                         autonomy,
                         facts_json,
                         event_time,
+                        offline,
                     },
                 )
                 .await
@@ -249,7 +253,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 id,
                 content,
                 importance,
-            } => commands::edit::run(&ctx, id, content, importance).await,
+                offline,
+            } => commands::edit::run(&ctx, id, content, importance, offline).await,
             MemoryCommand::Delete { id, confirm } => commands::forget::run(&ctx, id, confirm),
             MemoryCommand::List { diary, limit } => commands::memory::list(&ctx, diary, limit),
         },
@@ -269,7 +274,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             id,
             content,
             importance,
-        } => commands::edit::run(&ctx, id, content, importance).await,
+            offline,
+        } => commands::edit::run(&ctx, id, content, importance, offline).await,
         Command::Entities(sub) => match sub {
             EntitiesCommand::List {
                 limit,

@@ -142,43 +142,40 @@ impl RetrievalBackends {
 /// there, `ENGRAM_BENCH_FORCE_STUB` under a cloud profile is an error, because
 /// benchmarking the stub and labelling it "cloud quality" is a lie about a
 /// number. Read `bench.rs` before unifying it.
+///
+/// Writes go through [`resolve_write_embedder`], one function down: same
+/// key/stub decision, different remedy sentence and no reranker.
 pub fn resolve_retrieval_backends(
     store: &SqliteStore,
     profile: RetrievalProfile,
     budget_kb: Option<&str>,
 ) -> Result<RetrievalBackends, crate::error::CliError> {
-    let force_stub = crate::commands::config::stub_forced();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let cohere_key = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere");
     let cohere_model = engram_rerank::cohere::resolve_model();
 
-    if profile != RetrievalProfile::Offline && gemini_key.is_none() && !force_stub {
-        return Err(crate::error::CliError::Config(format!(
+    let choice = select_embedder(profile == RetrievalProfile::Offline).ok_or_else(|| {
+        crate::error::CliError::Config(format!(
             "profile `{}` needs a Gemini API key for real retrieval, but none is configured. \
              Set it with `engram config set keys.gemini <KEY>` (or GEMINI_API_KEY), or select \
              the offline profile (`--profile offline` on the CLI, \"profile\": \"offline\" over \
              the daemon API) to use the deterministic offline stub.",
             profile.as_str()
-        )));
-    }
-
-    let cloud_embedder =
-        profile != RetrievalProfile::Offline && gemini_key.is_some() && !force_stub;
+        ))
+    })?;
+    let cloud_embedder = matches!(choice, EmbedderChoice::Cloud(_));
     // Enforce spend guardrails before any paid embed/rerank call.
     if cloud_embedder {
         crate::commands::budget::enforce_budget_for_store(store, budget_kb)?;
     }
-    let use_cohere = profile != RetrievalProfile::Offline
-        && cohere_key.is_some()
-        && !force_stub
-        && !crate::commands::config::rerank_disabled();
+    // Past the guard above, `cloud_embedder` is exactly the old
+    // `profile != Offline && !force_stub` conjunction — a stub read never buys a
+    // paid reranker.
+    let use_cohere =
+        cloud_embedder && cohere_key.is_some() && !crate::commands::config::rerank_disabled();
 
-    let embedder: Box<dyn Embedder> = if cloud_embedder {
-        Box::new(GeminiEmbedder::new(
-            gemini_key.expect("cloud_embedder implies a key"),
-        ))
-    } else {
-        Box::new(StubEmbedder::default())
+    let embedder: Box<dyn Embedder> = match choice {
+        EmbedderChoice::Cloud(key) => Box::new(GeminiEmbedder::new(key)),
+        EmbedderChoice::Stub => Box::new(StubEmbedder::default()),
     };
     let reranker: Option<Box<dyn Reranker>> = if use_cohere {
         Some(Box::new(CohereReranker::new(
@@ -201,6 +198,85 @@ pub fn resolve_retrieval_backends(
         cloud_embedder,
         embedder,
         reranker,
+    })
+}
+
+/// Which embedder a command may use, or `None` when no key resolves and the
+/// caller never asked for the stub — the ONE condition both sides turn into a
+/// loud config error, each in its own words (a read says `--profile offline`,
+/// a write says `--offline`).
+///
+/// `ENGRAM_BENCH_FORCE_STUB` (truthy — see `config::stub_forced`) is the
+/// test-harness opt-in and behaves exactly like an explicit one on both sides.
+enum EmbedderChoice {
+    Cloud(String),
+    Stub,
+}
+
+fn select_embedder(offline_opt_in: bool) -> Option<EmbedderChoice> {
+    if offline_opt_in || crate::commands::config::stub_forced() {
+        return Some(EmbedderChoice::Stub);
+    }
+    crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
+        .map(EmbedderChoice::Cloud)
+}
+
+/// The embedder a WRITE uses, plus the metadata it records with every chunk.
+///
+/// Writes need no reranker and no `RetrievalProfile`, so they get their own
+/// small shape — but NOT their own policy: both sides go through
+/// [`select_embedder`].
+pub struct WriteEmbedder {
+    pub embedder: Box<dyn Embedder>,
+    /// True when the PAID Gemini embedder was selected — the flag every caller
+    /// uses to decide whether to record a usage event.
+    pub cloud: bool,
+    pub model: String,
+    pub dims: usize,
+    pub prompt_format: String,
+}
+
+/// Pick the embedder for one WRITE (`remember`, `memory add`, `edit`,
+/// `memory update`).
+///
+/// WHY THIS EXISTS. Every read surface hard-errors when a cloud profile has no
+/// Gemini key, but the write paths silently fell back to the 64-dim hash stub.
+/// A keyless user therefore built a store that ordinary recall then REFUSED to
+/// serve — "embedding metadata mismatch", which reads as a corrupt index rather
+/// than a missing key — and configuring the key later left half the store stub-
+/// embedded and half cloud-embedded, a mix nothing but a full `engram reindex`
+/// repairs. Worse than unsearchable: `novelty_gate` skips candidate vectors of a
+/// different width, so fact dedup silently stops working too. The stub itself is
+/// fine; choosing it BY ACCIDENT is not. So writes take the read side's rule:
+/// the stub is available, but only when asked for.
+///
+/// Budget enforcement deliberately stays with the caller: `remember` gates every
+/// write on its KB budget (paid or not) before it does anything, which is not
+/// the read side's rule, and `edit` gates only its `--content` branch.
+pub fn resolve_write_embedder(
+    command: &str,
+    offline: bool,
+) -> Result<WriteEmbedder, crate::error::CliError> {
+    let choice = select_embedder(offline).ok_or_else(|| {
+        crate::error::CliError::Config(format!(
+            "`engram {command}` needs a Gemini API key to embed what it stores, but none is \
+             configured. Set it with `engram config set keys.gemini <KEY>` (or GEMINI_API_KEY), \
+             or pass --offline to embed with the deterministic offline stub. Storing stub vectors \
+             unasked is worse than failing: recall refuses to mix embedding metadata, so those \
+             memories come back as an \"embedding metadata mismatch\" until `engram reindex --all` \
+             re-embeds the whole store."
+        ))
+    })?;
+    let (embedder, cloud): (Box<dyn Embedder>, bool) = match choice {
+        EmbedderChoice::Cloud(key) => (Box::new(GeminiEmbedder::new(key)), true),
+        EmbedderChoice::Stub => (Box::new(StubEmbedder::default()), false),
+    };
+    Ok(WriteEmbedder {
+        model: embedder.model(),
+        dims: embedder.dimensions(),
+        prompt_format: embedder.prompt_format().to_string(),
+        cloud,
+        embedder,
     })
 }
 
@@ -1393,6 +1469,15 @@ mod tests {
         assert_eq!(b.prompt_format, "stub-v1");
         assert!(b.reranker.is_none());
         assert_eq!(b.reranker_label, "passthrough");
+    }
+
+    #[test]
+    fn an_offline_write_never_reaches_for_a_cloud_provider() {
+        let w = resolve_write_embedder("remember", true).expect("offline never errors");
+        assert!(!w.cloud);
+        assert_eq!(w.model, "stub-64");
+        assert_eq!(w.dims, 64);
+        assert_eq!(w.prompt_format, "stub-v1");
     }
 
     #[test]

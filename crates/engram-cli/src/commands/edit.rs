@@ -10,9 +10,8 @@
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
-use engram_embed::gemini::GeminiEmbedder;
-use engram_embed::stub::StubEmbedder;
-use engram_embed::{Embedder, TaskMode};
+use crate::retrieval::{resolve_write_embedder, WriteEmbedder};
+use engram_embed::TaskMode;
 use engram_ingest::memory::chunk_memory;
 use serde_json::json;
 use uuid::Uuid;
@@ -22,6 +21,7 @@ pub async fn run(
     id: String,
     content: Option<String>,
     importance: Option<u8>,
+    offline: bool,
 ) -> Result<(), CliError> {
     if content.is_none() && importance.is_none() {
         return Err(CliError::BadInput(
@@ -91,25 +91,25 @@ pub async fn run(
             ));
         }
 
-        let force_stub = crate::commands::config::stub_forced();
-        let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-        let have_gemini = !force_stub && gemini_key.is_some();
+        // Same rule as `remember`: no key and no `--offline` is a loud config
+        // error, never a silent 64-dim stub written into a cloud-embedded
+        // store. This sits INSIDE the --content branch on purpose — an
+        // `--importance`-only edit re-embeds nothing and needs no key at all —
+        // and after the empty-content guards, so a bad argument is still exit 3
+        // rather than being masked by the environment.
+        let WriteEmbedder {
+            embedder,
+            cloud: have_gemini,
+            model: model_name,
+            dims,
+            prompt_format,
+        } = resolve_write_embedder("edit", offline)?;
 
         // Embed the NEW content first. The old chunks are only torn down
         // once the replacement vectors are in hand, so a transient embed
         // failure can never strand the memory with no chunks (invisible to
         // recall, unrecoverable).
         let chunk_texts: Vec<&str> = new_chunks.iter().map(|c| c.text.as_str()).collect();
-        let embedder: Box<dyn Embedder> = if have_gemini {
-            Box::new(GeminiEmbedder::new(
-                gemini_key.expect("have_gemini implies a key"),
-            ))
-        } else {
-            Box::new(StubEmbedder::default())
-        };
-        let model_name = embedder.model();
-        let dims = embedder.dimensions();
-        let prompt_format = embedder.prompt_format().to_string();
         // Test seam, shared with `remember`: fail exactly where a network embed
         // would, after chunking and before any spend or any write.
         if let Some(injected) = crate::commands::remember::injected_embed_failure("edit") {

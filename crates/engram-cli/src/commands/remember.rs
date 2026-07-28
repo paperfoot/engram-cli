@@ -23,11 +23,10 @@ use crate::fact_write::{
     FactWriteOutcome, MemoryTime,
 };
 use crate::output::{print_success, Metadata};
+use crate::retrieval::{resolve_write_embedder, WriteEmbedder};
 use chrono::{DateTime, Utc};
 use engram_core::temporal::parse_moment;
 use engram_core::types::{Memory, MemorySource, SourceKind};
-use engram_embed::gemini::GeminiEmbedder;
-use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::facts::{extract_facts, ExtractedFact};
 use engram_ingest::memory::chunk_memory;
@@ -55,6 +54,8 @@ pub struct RememberArgs {
     pub facts_json: Option<String>,
     /// `--event-time`: when the content actually happened.
     pub event_time: Option<String>,
+    /// `--offline`: embed with the deterministic stub instead of Gemini.
+    pub offline: bool,
 }
 
 /// Why the fact extractor did or did not run, reported in the envelope so an
@@ -180,6 +181,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         autonomy,
         facts_json,
         event_time,
+        offline,
     } = args;
     let autonomy = Autonomy::parse(&autonomy)?;
     crate::commands::validate_diary_for_write(&diary)?;
@@ -200,6 +202,12 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         })?,
         None => Vec::new(),
     };
+    // The embedder is chosen — and a missing key refused — BEFORE anything is
+    // read or written, so a keyless store can never quietly fill with 64-dim
+    // stub vectors that recall will later refuse to search. Deliberately after
+    // the argument checks above, so a bad argument is still exit 3 rather than
+    // being masked by the environment.
+    let write_embedder = resolve_write_embedder("remember", offline)?;
 
     let start = Instant::now();
 
@@ -231,6 +239,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     },
                     autonomy,
                     llm: dedup_llm.as_ref(),
+                    embedder: write_embedder.embedder.as_ref(),
                     facts: &extracted,
                     marker: None,
                 };
@@ -305,15 +314,16 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let chunks = chunk_memory(&content, policy);
     let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
 
-    // Embed every chunk. Gemini if available (env or config file), stub otherwise.
-    let force_stub = crate::commands::config::stub_forced();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let have_gemini = !force_stub && gemini_key.is_some();
-    let embedder: Box<dyn Embedder> = if have_gemini {
-        Box::new(GeminiEmbedder::new(gemini_key.unwrap()))
-    } else {
-        Box::new(StubEmbedder::default())
-    };
+    // Gemini, or the offline stub when `--offline` (or the bench hook) asked
+    // for it. There is no third case: a write with no key and no --offline
+    // never reaches this line — see the resolution above.
+    let WriteEmbedder {
+        embedder,
+        cloud: have_gemini,
+        model: model_name,
+        dims,
+        prompt_format,
+    } = write_embedder;
     // A chunk longer than the provider's window loses its tail with no vector
     // coverage — silently, before this. The cap above makes it unreachable
     // unless someone widened `chunking.max_chars`; if they did, say so.
@@ -323,9 +333,6 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         &chunk_texts,
         "remember",
     );
-    let model_name = embedder.model();
-    let dims = embedder.dimensions();
-    let prompt_format = embedder.prompt_format().to_string();
     // NOTHING IS WRITTEN UNTIL THE VECTORS ARE IN HAND. `embed_batch` is a
     // NETWORK call: it can 429, time out, or come back short. Writing the memory
     // row first (as this did) left a committed memory with no chunks whenever it
@@ -479,6 +486,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             },
             autonomy,
             llm: llm.as_ref(),
+            embedder: embedder.as_ref(),
             facts: &extracted,
             marker,
         };
@@ -580,6 +588,10 @@ struct FactBatchPlan<'a> {
     memory_time: MemoryTime,
     autonomy: Autonomy,
     llm: Option<&'a FactLlm>,
+    /// The SAME embedder the chunks were written with. The novelty gate has to
+    /// agree with the index it is gating: `novelty_gate` skips candidates of a
+    /// different width, so a gate on another embedder calls every fact novel.
+    embedder: &'a dyn Embedder,
     facts: &'a [ExtractedFact],
     marker: Option<FactExtractionMarker<'a>>,
 }
@@ -590,21 +602,12 @@ async fn persist_facts(
     plan: FactBatchPlan<'_>,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), FactBatchError> {
-    // The novelty gate must use the same embedder family the chunks were
-    // written with, or every fact looks novel against a store embedded by
-    // someone else.
-    let force_stub = crate::commands::config::stub_forced();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let gate_embedder: Box<dyn Embedder> = match gemini_key {
-        Some(k) if !force_stub => Box::new(GeminiEmbedder::new(k)),
-        _ => Box::new(StubEmbedder::default()),
-    };
     let write_ctx = FactWriteCtx {
         memory_id: plan.memory_id,
         diary: plan.diary,
         kb: plan.kb,
         memory_time: plan.memory_time,
-        embedder: Some(gate_embedder.as_ref()),
+        embedder: Some(plan.embedder),
         llm: plan.llm.map(|l| l.as_chat()),
         autonomy: plan.autonomy,
         source_kind: SourceKind::AgentExtracted,

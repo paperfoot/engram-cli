@@ -90,6 +90,15 @@ pub enum Command {
         /// contradiction detection.
         #[arg(long)]
         facts_json: Option<String>,
+
+        /// Embed with the deterministic offline stub instead of Gemini.
+        /// Without this flag a write with no Gemini key is a config error
+        /// (exit 2), never a silent 64-dim stub — a store holding both kinds
+        /// of vector is what makes `recall` fail with "embedding metadata
+        /// mismatch" later. Affects EMBEDDINGS only: fact extraction reports
+        /// its own outcome in `fact_extraction`.
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Retrieve relevant memories via hybrid search (dense + lexical + rerank).
@@ -363,6 +372,12 @@ Examples:
         /// New importance (0..=10).
         #[arg(long)]
         importance: Option<u8>,
+        /// Re-embed the new content with the deterministic offline stub
+        /// instead of Gemini. Without it, a `--content` edit with no Gemini key
+        /// is a config error (exit 2). An `--importance`-only edit never
+        /// embeds and needs no key.
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Browse extracted entities.
@@ -609,6 +624,11 @@ pub enum MemoryCommand {
         /// Store even if identical content already exists in this kb/diary.
         #[arg(long)]
         allow_duplicate: bool,
+        /// Embed with the deterministic offline stub instead of Gemini.
+        /// Without it, a write with no Gemini key is a config error (exit 2).
+        /// Same flag as `remember --offline`.
+        #[arg(long)]
+        offline: bool,
     },
     /// Search durable memories.
     #[command(visible_alias = "find")]
@@ -645,6 +665,10 @@ pub enum MemoryCommand {
         content: Option<String>,
         #[arg(long)]
         importance: Option<u8>,
+        /// Re-embed with the deterministic offline stub instead of Gemini.
+        /// Same flag as `edit --offline`.
+        #[arg(long)]
+        offline: bool,
     },
     /// Delete a memory by UUID.
     Delete {
