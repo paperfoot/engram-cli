@@ -529,6 +529,10 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         meta.add("embed_truncation_note", note.clone());
     }
     meta.add("embedder", model_name.clone());
+    if let Some(note) = embedder.degradation_note() {
+        meta.add("embedder_degraded", note.clone());
+        eprintln!("warning: {note}");
+    }
     meta.add("embed_dimensions", dims);
     meta.add("embed_prompt_format", prompt_format.clone());
     meta.add("kb", kb.clone());

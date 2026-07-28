@@ -448,6 +448,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
                 // forced stub render the same word. The CLI's `research` has
                 // reported these since Wave 0; the daemon copy did not.
                 "embed_model": backends.embed_model,
+                "embedder_degraded": backends.embedder.degradation_note(),
                 "embed_dims": backends.embed_dims,
                 "prompt_format": backends.prompt_format,
                 "reranker": backends.reranker_label,
@@ -588,6 +589,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
             "metadata": {
                 "profile": profile.as_str(),
                 "embed_model": backends.embed_model,
+                "embedder_degraded": backends.embedder.degradation_note(),
                 "embed_dims": backends.embed_dims,
                 "prompt_format": backends.prompt_format,
                 "reranker": backends.reranker_label,

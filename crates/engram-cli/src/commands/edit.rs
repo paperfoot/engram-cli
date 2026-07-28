@@ -64,6 +64,7 @@ pub async fn run(
     };
 
     let mut chunks_replaced = 0usize;
+    let mut degraded_note: Option<String> = None;
     if let Some(new_content) = content.as_deref() {
         let document_id = ctx.store.document_for_memory(uuid)?;
         // CHUNKING. This was a bare `naive_split`: paragraph split, no merge,
@@ -207,6 +208,7 @@ pub async fn run(
             }
             Ok(replaced)
         })?;
+        degraded_note = embedder.degradation_note();
     } else {
         // Importance-only update: no chunk rebuild, no provider call, no spend.
         let updated = ctx.store.update_memory(uuid, None, importance)?;
@@ -217,6 +219,11 @@ pub async fn run(
         }
     }
 
+    let mut meta = Metadata::default();
+    if let Some(note) = degraded_note {
+        meta.add("embedder_degraded", note.clone());
+        eprintln!("warning: {note}");
+    }
     print_success(
         ctx.format,
         json!({
@@ -224,7 +231,7 @@ pub async fn run(
             "updated": true,
             "chunks_replaced": chunks_replaced,
         }),
-        Metadata::default(),
+        meta,
         |data| println!("{}", data),
     );
     Ok(())

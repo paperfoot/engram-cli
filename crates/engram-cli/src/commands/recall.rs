@@ -198,6 +198,13 @@ pub async fn run(
         ..Default::default()
     };
     meta.add("profile", profile_enum.as_str());
+    // A silent failover must not stay silent: if a fallback key served this
+    // command, say so in metadata AND on stderr so both agents and humans see
+    // the primary needs fixing while everything still works.
+    if let Some(note) = backends.embedder.degradation_note() {
+        meta.add("embedder_degraded", note.clone());
+        eprintln!("warning: {note}");
+    }
     meta.add("mode", recall_mode.as_str());
     meta.add("kb", scope.label());
     meta.add("kb_scope", scope.origin.as_str());

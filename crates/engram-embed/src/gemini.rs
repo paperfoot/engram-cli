@@ -74,6 +74,24 @@ impl GeminiEmbedder {
         &self.keys[i]
     }
 
+    /// Masked form for logs and notes: enough to recognize, never enough to use.
+    fn mask(key: &str) -> String {
+        if key.chars().count() < 12 {
+            "***".to_string()
+        } else {
+            let head: String = key.chars().take(6).collect();
+            let tail: String = key
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            format!("{head}...{tail}")
+        }
+    }
+
     /// Retire the active key and move to the next fallback, if one exists.
     /// Returns false when there is nothing left to rotate to.
     fn rotate_key(&self, why: &str) -> bool {
@@ -264,6 +282,20 @@ impl Embedder for GeminiEmbedder {
 
     fn prompt_format(&self) -> &'static str {
         PROMPT_FORMAT
+    }
+
+    fn degradation_note(&self) -> Option<String> {
+        let i = self.active.load(std::sync::atomic::Ordering::Relaxed);
+        (i > 0).then(|| {
+            let served = Self::mask(&self.keys[i.min(self.keys.len() - 1)]);
+            format!(
+                "gemini primary key is NOT serving — this command ran on fallback key {} of {} \
+                 ({served}). Top up or replace the primary, then verify the chain with \
+                 `engram config check`.",
+                i + 1,
+                self.keys.len()
+            )
+        })
     }
 
     fn max_input_chars(&self) -> Option<usize> {
@@ -625,6 +657,26 @@ mod tests {
         ]);
         assert_eq!(e.keys, vec!["primary", "second", "third"]);
         assert_eq!(e.active_key(), "primary");
+    }
+
+    #[test]
+    fn a_healthy_embedder_reports_no_degradation_and_a_rotated_one_masks_the_key() {
+        let e = GeminiEmbedder::new("primary-key-aaaaaaaa").with_fallback_keys(vec![
+            "AQ.REDACTED-REVOKED-KEY".to_string(),
+        ]);
+        assert!(e.degradation_note().is_none(), "healthy = silent");
+        e.rotate_key("test");
+        let note = e.degradation_note().expect("rotated = loud");
+        assert!(note.contains("fallback key 2 of 2"), "{note}");
+        assert!(note.contains("AQ.RED...-KEY"), "recognizable: {note}");
+        assert!(
+            !note.contains("REDACTED-REVOKED-KEY"),
+            "the full key must never appear in a note that reaches stdout: {note}"
+        );
+        assert!(
+            note.contains("config check"),
+            "must name the remedy: {note}"
+        );
     }
 
     #[test]

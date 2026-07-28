@@ -19,6 +19,9 @@ pub struct ReindexStats {
     pub model: String,
     pub dimensions: usize,
     pub prompt_format: String,
+    /// Set when a fallback key served the rebuild — the primary needs fixing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
 }
 
 pub async fn run(
@@ -80,12 +83,14 @@ pub async fn reindex_store(
 
     let chunks = store.list_chunks_for_reindex(if all { None } else { kb })?;
     let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+    let mut degraded_note: Option<String> = None;
     let (embeddings, model, dims, prompt_format) = if have_gemini {
         let embedder = GeminiEmbedder::new(gemini_key.unwrap())
             .with_fallback_keys(crate::commands::config::gemini_fallback_keys());
         let embeddings = embedder
             .embed_batch(&texts, TaskMode::RetrievalDocument)
             .await?;
+        degraded_note = engram_embed::Embedder::degradation_note(&embedder);
         (
             embeddings,
             embedder.model(),
@@ -151,5 +156,6 @@ pub async fn reindex_store(
         model,
         dimensions: dims,
         prompt_format,
+        degraded: degraded_note,
     })
 }

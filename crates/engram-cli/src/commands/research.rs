@@ -152,6 +152,10 @@ pub async fn run(
     };
     meta.add("status", status);
     meta.add("profile", profile_enum.as_str());
+    if let Some(note) = backends.embedder.degradation_note() {
+        meta.add("embedder_degraded", note.clone());
+        eprintln!("warning: {note}");
+    }
     meta.add("kb", if all_kbs { "*" } else { kb.as_str() });
     meta.add("results", results_json.len());
     meta.add("cited_results", cited);

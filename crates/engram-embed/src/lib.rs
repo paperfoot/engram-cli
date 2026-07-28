@@ -78,6 +78,15 @@ pub trait Embedder: Send + Sync {
         None
     }
 
+    /// A human-readable warning when this embedder is running degraded —
+    /// e.g. the primary API key stopped serving and a fallback answered.
+    /// `None` means healthy. Callers surface this in command output so a
+    /// silent failover never stays silent: a fallback keeps you running,
+    /// and this line is what tells you to go fix the primary.
+    fn degradation_note(&self) -> Option<String> {
+        None
+    }
+
     async fn embed_one(&self, text: &str, mode: TaskMode) -> Result<Vec<f32>, EmbedError>;
 
     /// Embed a batch. Errors here discard the partial-spend accounting; a

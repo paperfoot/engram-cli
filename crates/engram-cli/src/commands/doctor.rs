@@ -53,6 +53,12 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
                 "gemini": if gemini { "present" } else { "missing" },
                 "cohere": if cohere { "present" } else { "missing" },
                 "openrouter": if openrouter { "present" } else { "missing" },
+                // Presence is not health: a key can sit at zero prepaid
+                // credits and still look "present". The live per-key probe
+                // (one tiny embed per key, including fallbacks) lives in
+                // `config check`, which doctor points at rather than dialling
+                // the network itself — doctor must stay useful offline.
+                "note": "presence only; run `engram config check` for a live per-key probe (ok | quota_or_credits_depleted | invalid_or_revoked), including fallback keys",
             },
             "db": {
                 "path": ctx.store.path().to_string_lossy(),
