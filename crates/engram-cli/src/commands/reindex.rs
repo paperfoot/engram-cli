@@ -81,7 +81,8 @@ pub async fn reindex_store(
     let chunks = store.list_chunks_for_reindex(if all { None } else { kb })?;
     let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
     let (embeddings, model, dims, prompt_format) = if have_gemini {
-        let embedder = GeminiEmbedder::new(gemini_key.unwrap());
+        let embedder = GeminiEmbedder::new(gemini_key.unwrap())
+            .with_fallback_keys(crate::commands::config::gemini_fallback_keys());
         let embeddings = embedder
             .embed_batch(&texts, TaskMode::RetrievalDocument)
             .await?;

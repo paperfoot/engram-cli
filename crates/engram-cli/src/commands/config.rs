@@ -70,6 +70,10 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
             "cache_path": paths::cache_dir().to_string_lossy(),
             "keys": {
                 "gemini": gemini_source,
+                "gemini_fallbacks": gemini_fallback_keys()
+                    .iter()
+                    .map(|k| mask_key(k))
+                    .collect::<Vec<_>>(),
                 "cohere": cohere_source,
                 "openrouter": openrouter_source,
             },
@@ -202,10 +206,32 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
     let cohere = has_key("COHERE_API_KEY", &file_cfg, "keys.cohere");
     let openrouter = has_key("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
 
+    // LIVE per-key probe. "Configured" is not "working": a key can be
+    // syntactically present while its AI Studio project sits at zero prepaid
+    // credits, and the free models-list endpoint answers 200 for such a key —
+    // only a real embed call tells the truth. One 5-character embed per key,
+    // a fraction of a thousandth of a cent, so `config check` can say which
+    // key in the chain will actually serve.
+    let mut gemini_keys: Vec<(String, String)> = Vec::new();
+    if let Some(primary) = resolve_secret("GEMINI_API_KEY", "keys.gemini") {
+        gemini_keys.push(("primary".to_string(), primary));
+    }
+    for (i, k) in gemini_fallback_keys().into_iter().enumerate() {
+        gemini_keys.push((format!("fallback_{}", i + 1), k));
+    }
+    let mut probes = serde_json::Map::new();
+    for (label, key) in &gemini_keys {
+        probes.insert(
+            format!("{label} ({})", mask_key(key)),
+            json!(probe_gemini_key(key).await),
+        );
+    }
+
     print_success(
         ctx.format,
         json!({
             "gemini": if gemini { "configured" } else { "missing" },
+            "gemini_keys_probed": probes,
             "cohere": if cohere { "configured (optional)" } else { "missing (optional)" },
             "openrouter": if openrouter { "configured (compiler)" } else { "missing (compiler optional)" },
             "ok": gemini,
@@ -221,6 +247,35 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
     Ok(())
 }
 
+/// One cheap embedContent against a single key. Statuses are deliberately a
+/// closed vocabulary an agent can branch on.
+async fn probe_gemini_key(key: &str) -> &'static str {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return "probe_error",
+    };
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={key}",
+        engram_embed::gemini::DEFAULT_MODEL
+    );
+    let body = json!({
+        "content": {"parts": [{"text": "probe"}]},
+        "outputDimensionality": 8,
+    });
+    match client.post(&url).json(&body).send().await {
+        Err(_) => "unreachable",
+        Ok(resp) => match resp.status().as_u16() {
+            200 => "ok",
+            429 => "quota_or_credits_depleted",
+            400 | 401 | 403 => "invalid_or_revoked",
+            _ => "probe_error",
+        },
+    }
+}
+
 fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
     if std::env::var(env).is_ok() {
         return true;
@@ -233,6 +288,34 @@ fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
         }
     }
     cur.as_str().map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+/// Split a fallback-key list: comma- or whitespace-separated, trimmed,
+/// empties dropped, order preserved, duplicates removed. Pure so it can be
+/// unit-tested without touching env or the config file.
+pub fn parse_key_list(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split([',', ' ', '\n', '\t']) {
+        let k = part.trim();
+        if !k.is_empty() && !out.iter().any(|s| s == k) {
+            out.push(k.to_string());
+        }
+    }
+    out
+}
+
+/// Gemini fallback keys, in priority order, with the primary excluded so a
+/// key listed in both places is not tried twice. Sources, same precedence as
+/// every other secret: GEMINI_API_KEY_FALLBACKS env, else `keys.gemini_fallbacks`
+/// in the config file — comma-separated in either place.
+pub fn gemini_fallback_keys() -> Vec<String> {
+    let raw =
+        resolve_secret("GEMINI_API_KEY_FALLBACKS", "keys.gemini_fallbacks").unwrap_or_default();
+    let primary = resolve_secret("GEMINI_API_KEY", "keys.gemini");
+    parse_key_list(&raw)
+        .into_iter()
+        .filter(|k| primary.as_deref() != Some(k.as_str()))
+        .collect()
 }
 
 /// Resolve a secret in the canonical order: env var → config file → None.
@@ -303,4 +386,19 @@ pub fn stub_forced() -> bool {
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_list;
+
+    #[test]
+    fn key_lists_split_on_commas_and_whitespace_and_dedup() {
+        assert_eq!(
+            parse_key_list("a, b,,  c\na  "),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert!(parse_key_list("").is_empty());
+        assert!(parse_key_list("  , ,\t").is_empty());
+    }
 }

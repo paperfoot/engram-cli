@@ -139,7 +139,8 @@ pub async fn run(
         crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     }
     let (model_name, dims, prompt_format) = if have_gemini {
-        let e = GeminiEmbedder::new(gemini_key.clone().unwrap());
+        let e = GeminiEmbedder::new(gemini_key.clone().unwrap())
+            .with_fallback_keys(crate::commands::config::gemini_fallback_keys());
         (e.model(), e.dimensions(), e.prompt_format().to_string())
     } else {
         let e = StubEmbedder::default();
@@ -255,7 +256,8 @@ pub async fn run(
         let embeddings: Vec<Vec<f32>> = if chunk_texts.is_empty() {
             Vec::new()
         } else if have_gemini {
-            let e = GeminiEmbedder::new(gemini_key.clone().unwrap());
+            let e = GeminiEmbedder::new(gemini_key.clone().unwrap())
+                .with_fallback_keys(crate::commands::config::gemini_fallback_keys());
             e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
                 .await?
         } else {

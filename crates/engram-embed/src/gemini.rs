@@ -27,7 +27,12 @@ const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models"
 
 pub struct GeminiEmbedder {
     client: reqwest::Client,
-    api_key: String,
+    /// Primary key first, then fallbacks. `active` points at the key all
+    /// requests currently use; a quota or auth refusal advances it. The
+    /// pointer only moves forward: a depleted key stays retired for the rest
+    /// of the process, and the next run starts fresh from the primary.
+    keys: Vec<String>,
+    active: std::sync::atomic::AtomicUsize,
     model: String,
     dimensions: usize,
 }
@@ -42,10 +47,49 @@ impl GeminiEmbedder {
                 .pool_idle_timeout(std::time::Duration::from_secs(60))
                 .build()
                 .expect("failed to build reqwest client"),
-            api_key: api_key.into(),
+            keys: vec![api_key.into()],
+            active: std::sync::atomic::AtomicUsize::new(0),
             model: DEFAULT_MODEL.to_string(),
             dimensions: DEFAULT_DIMS,
         }
+    }
+
+    /// Append fallback keys, skipping empties and duplicates of keys already
+    /// held. Order is priority order.
+    pub fn with_fallback_keys<I: IntoIterator<Item = String>>(mut self, extra: I) -> Self {
+        for k in extra {
+            let k = k.trim().to_string();
+            if !k.is_empty() && !self.keys.contains(&k) {
+                self.keys.push(k);
+            }
+        }
+        self
+    }
+
+    fn active_key(&self) -> &str {
+        let i = self
+            .active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(self.keys.len() - 1);
+        &self.keys[i]
+    }
+
+    /// Retire the active key and move to the next fallback, if one exists.
+    /// Returns false when there is nothing left to rotate to.
+    fn rotate_key(&self, why: &str) -> bool {
+        let i = self.active.load(std::sync::atomic::Ordering::Relaxed);
+        if i + 1 >= self.keys.len() {
+            return false;
+        }
+        self.active
+            .store(i + 1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "gemini key {} of {} refused ({why}); rotating to fallback key {}",
+            i + 1,
+            self.keys.len(),
+            i + 2
+        );
+        true
     }
 
     pub fn from_env() -> Result<Self, EmbedError> {
@@ -237,17 +281,20 @@ impl Embedder for GeminiEmbedder {
             output_dimensionality: Some(self.dimensions),
         };
 
-        let url = format!(
-            "{}/{}:embedContent?key={}",
-            ENDPOINT, self.model, self.api_key
-        );
-
         // Full-lifecycle retry: send + 429 + 5xx + body read + JSON parse.
+        // The URL is rebuilt every attempt because a quota refusal rotates
+        // `active` to the next fallback key.
         // Long benchmark runs (1500+ queries) hit transient drops; without
         // retry the whole bench dies on the first one.
         let delays_secs: [u64; 6] = [2, 4, 8, 16, 32, 64];
         let mut attempt: u32 = 0;
         loop {
+            let url = format!(
+                "{}/{}:embedContent?key={}",
+                ENDPOINT,
+                self.model,
+                self.active_key()
+            );
             // 1. send
             let send_result = self.client.post(&url).json(&req).send().await;
             let resp = match send_result {
@@ -274,7 +321,27 @@ impl Embedder for GeminiEmbedder {
 
             // 2. status
             let status = resp.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                // A fallback key is tried BEFORE any backoff: a depleted or
+                // revoked key never recovers inside this call, so sleeping on
+                // it (~3 min of ladder) would only delay the key that works.
+                // Per-minute rate limits also clear instantly on a different
+                // key. Only when no keys remain does the ladder make sense.
+                if self.rotate_key(status.as_str()) {
+                    continue;
+                }
+                if status == reqwest::StatusCode::FORBIDDEN {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(EmbedError::Api {
+                        provider: "gemini",
+                        message: format!(
+                            "status 403: {}",
+                            body.chars().take(200).collect::<String>()
+                        ),
+                    });
+                }
                 if (attempt as usize) < delays_secs.len() {
                     let wait = delays_secs[attempt as usize];
                     attempt += 1;
@@ -386,10 +453,6 @@ impl Embedder for GeminiEmbedder {
         }
         let truncated = self.prepare_inputs(texts, mode);
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-        let url = format!(
-            "{}/{}:batchEmbedContents?key={}",
-            ENDPOINT, self.model, self.api_key
-        );
 
         // What the provider has already SERVED, and will therefore bill, by the
         // time this call gives up. A batch counts the moment a 2xx lands —
@@ -422,6 +485,13 @@ impl Embedder for GeminiEmbedder {
             let mut attempt: u32 = 0;
             let delays_secs: [u64; 6] = [4, 8, 16, 32, 60, 60];
             let parsed: BatchEmbedResponse = loop {
+                // Rebuilt per attempt: a quota refusal rotates to a fallback key.
+                let url = format!(
+                    "{}/{}:batchEmbedContents?key={}",
+                    ENDPOINT,
+                    self.model,
+                    self.active_key()
+                );
                 let send_result = self.client.post(&url).json(&body).send().await;
                 let resp = match send_result {
                     Ok(r) => r,
@@ -450,7 +520,30 @@ impl Embedder for GeminiEmbedder {
                     }
                 };
                 let status = resp.status();
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    // Rotate to a fallback key before burning the backoff
+                    // ladder on a key that cannot recover (depleted credits,
+                    // revoked key). A 429/403 is never billed, so the charged
+                    // counters are untouched by the switch.
+                    if self.rotate_key(status.as_str()) {
+                        continue;
+                    }
+                    if status == reqwest::StatusCode::FORBIDDEN {
+                        let body = resp.text().await.unwrap_or_default();
+                        return Err(BatchEmbedFailure {
+                            error: EmbedError::Api {
+                                provider: "gemini",
+                                message: format!(
+                                    "status 403: {}",
+                                    body.chars().take(200).collect::<String>()
+                                ),
+                            },
+                            charged_texts,
+                            charged_requests,
+                        });
+                    }
                     if (attempt as usize) < delays_secs.len() {
                         let wait = delays_secs[attempt as usize];
                         attempt += 1;
@@ -521,6 +614,30 @@ impl Embedder for GeminiEmbedder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_keys_dedup_and_keep_priority_order() {
+        let e = GeminiEmbedder::new("primary").with_fallback_keys(vec![
+            "primary".to_string(),
+            "  ".to_string(),
+            "second".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ]);
+        assert_eq!(e.keys, vec!["primary", "second", "third"]);
+        assert_eq!(e.active_key(), "primary");
+    }
+
+    #[test]
+    fn rotation_advances_once_per_key_and_stops_at_the_end() {
+        let e = GeminiEmbedder::new("a").with_fallback_keys(vec!["b".to_string()]);
+        assert!(e.rotate_key("test"));
+        assert_eq!(e.active_key(), "b");
+        assert!(!e.rotate_key("test"), "nothing beyond the last key");
+        assert_eq!(e.active_key(), "b");
+        let single = GeminiEmbedder::new("only");
+        assert!(!single.rotate_key("test"));
+    }
+
     use super::*;
 
     fn texts_of(count: usize, len: usize) -> Vec<String> {

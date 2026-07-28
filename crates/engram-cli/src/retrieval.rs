@@ -174,7 +174,10 @@ pub fn resolve_retrieval_backends(
         cloud_embedder && cohere_key.is_some() && !crate::commands::config::rerank_disabled();
 
     let embedder: Box<dyn Embedder> = match choice {
-        EmbedderChoice::Cloud(key) => Box::new(GeminiEmbedder::new(key)),
+        EmbedderChoice::Cloud(key) => Box::new(
+            GeminiEmbedder::new(key)
+                .with_fallback_keys(crate::commands::config::gemini_fallback_keys()),
+        ),
         EmbedderChoice::Stub => Box::new(StubEmbedder::default()),
     };
     let reranker: Option<Box<dyn Reranker>> = if use_cohere {
@@ -268,7 +271,13 @@ pub fn resolve_write_embedder(
         ))
     })?;
     let (embedder, cloud): (Box<dyn Embedder>, bool) = match choice {
-        EmbedderChoice::Cloud(key) => (Box::new(GeminiEmbedder::new(key)), true),
+        EmbedderChoice::Cloud(key) => (
+            Box::new(
+                GeminiEmbedder::new(key)
+                    .with_fallback_keys(crate::commands::config::gemini_fallback_keys()),
+            ),
+            true,
+        ),
         EmbedderChoice::Stub => (Box::new(StubEmbedder::default()), false),
     };
     Ok(WriteEmbedder {

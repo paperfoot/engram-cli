@@ -915,7 +915,10 @@ pub async fn backfill(
     let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let gate_embedder: Box<dyn Embedder> = match gemini_key {
-        Some(k) if !force_stub => Box::new(GeminiEmbedder::new(k)),
+        Some(k) if !force_stub => Box::new(
+            GeminiEmbedder::new(k)
+                .with_fallback_keys(crate::commands::config::gemini_fallback_keys()),
+        ),
         _ => Box::new(StubEmbedder::default()),
     };
 
