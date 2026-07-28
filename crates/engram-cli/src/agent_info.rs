@@ -26,7 +26,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "Use `--event-time` whenever the content has a real date (birthday, anniversary, a decision made last March) — `recall --since/--until` filters on it.",
             "For directory ingest, run `engram ingest <dir> --dry-run` first, then ingest with the same --include/--exclude/--max-files scope. Use --all only for an intentional full recursive ingest.",
             "Default recall profile is cloud_quality: Gemini Embedding 2 + FTS5 BM25 + claims/entities/graph + Cohere rerank when configured.",
-            "A cloud profile with no Gemini key is a config error (exit 2) on every surface — `recall`, `research`, and the daemon's /v1/recall and /v1/research — never a silent fallback to the offline stub. Ask for the stub explicitly with `--profile offline` (or \"profile\": \"offline\" over the API)."
+            "A cloud profile with no Gemini key is a config error (exit 2) on every surface — `recall`, `research`, and the daemon's /v1/recall and /v1/research — never a silent fallback to the offline stub. Ask for the stub explicitly with `--profile offline` (or \"profile\": \"offline\" over the API).",
+            "Writes embed too: `remember`, `memory add`, `edit` and `memory update` refuse with the same config error (exit 2) when no Gemini key resolves, instead of silently storing 64-dim stub vectors. Ask for the stub on purpose with --offline — and keep one store on ONE embedder, or recall will refuse the mix until `engram reindex --all`."
         ],
         "commands": {
             "agent-info | info": "Print this manifest (raw JSON, not enveloped)",
@@ -34,8 +35,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "kb list | kb show <name> | kb delete <name> --confirm": "Manage domain KBs.",
             "kb repair [--dry-run]": "Register KBs that hold memories but are missing from `kb list` — the residue of stores written by builds that predated write-time registration. Idempotent and additive; never touches memories. `doctor --integrity` reports the same fault as `unregistered_kbs`.",
             "documents list|show|delete": "Inspect or remove ingested source documents. Flags: --kb <name>, --all-kbs, --limit <n>, --confirm",
-            "remember <content>": "Store a new memory. Flags: --importance 0-10, --tag <tag> (repeatable), --diary <name>, --kb <name>, --event-time <RFC3339|YYYY-MM-DD>, --no-extract-facts, --facts-json '<json array>', --autonomy full|assisted|strict, --allow-duplicate. Identical content in the same kb/diary is deduplicated (no second embedding) unless --allow-duplicate. Fact extraction runs BY DEFAULT whenever an OpenRouter key resolves — pass --no-extract-facts for bulk/low-value writes, or --facts-json when you already know the (subject, predicate, object) triple (same contradiction detection, zero LLM cost). Set --event-time for anything with a real date: `recall --since/--until` filters on it and the extracted facts inherit it. Under the default --autonomy assisted, uncertain contradictions come back in `adjudication_needed` for YOU to resolve (you have the conversation context): run the included resolve_command. Safety slots (allergic_to, takes_medication, diagnosed_with) are never auto-superseded.",
-            "memory add|search|update|delete|list": "Simple aliases for agent memory workflows. Prefer these when an agent wants CRUD semantics. `memory add` takes the same flags as `remember` (including --event-time, --no-extract-facts, --facts-json, --autonomy).",
+            "remember <content>": "Store a new memory. Flags: --importance 0-10, --tag <tag> (repeatable), --diary <name>, --kb <name>, --event-time <RFC3339|YYYY-MM-DD>, --no-extract-facts, --facts-json '<json array>', --autonomy full|assisted|strict, --allow-duplicate, --offline. Identical content in the same kb/diary is deduplicated (no second embedding) unless --allow-duplicate. Fact extraction runs BY DEFAULT whenever an OpenRouter key resolves — pass --no-extract-facts for bulk/low-value writes, or --facts-json when you already know the (subject, predicate, object) triple (same contradiction detection, zero LLM cost). Set --event-time for anything with a real date: `recall --since/--until` filters on it and the extracted facts inherit it. Under the default --autonomy assisted, uncertain contradictions come back in `adjudication_needed` for YOU to resolve (you have the conversation context): run the included resolve_command. Safety slots (allergic_to, takes_medication, diagnosed_with) are never auto-superseded. Without a Gemini key and without --offline the write is a config error (exit 2): a store that mixes stub and cloud vectors is unsearchable until `engram reindex`.",
+            "memory add|search|update|delete|list": "Simple aliases for agent memory workflows. Prefer these when an agent wants CRUD semantics. `memory add` takes the same flags as `remember` (including --event-time, --no-extract-facts, --facts-json, --autonomy). `memory add` / `memory update` take --offline exactly as `remember` / `edit` do.",
             "recall <query>": "Retrieve via cloud-quality hybrid search. Searches EVERY KB unless narrowed. Flags: --kb <name> (narrow to one; '*' means all), --all-kbs (force all, ignoring --kb and retrieval.default_kb), --diary <name>|'*', --mode evidence|raw|wiki|explore|agent, --profile cloud_quality|fast|offline, --top-k <n>, --layer identity|critical|topic|deep, --rerank-top-n <n>, --graph-hops 1|2, --allow-mixed-embeddings, --since, --until (RFC3339 or bare YYYY-MM-DD — --since D is the START of that UTC day, --until D the END, so `--since D --until D` selects all of day D). `metadata.kb_scope` reports how the scope was chosen (flag|config|all_kbs) and `metadata.kb` the effective KB ('*' for all) — check it before concluding a memory does not exist. A diary-scoped recall reports anything the isolation guard withheld in `metadata.diary_isolation`. A temporal window restricts results to raw memory chunks: derived sources (claims, wiki pages, entities, relations) carry no event time of their own, so they are withheld and listed in `metadata.temporal_scope` (absent when no window is set). Output includes a `conflicts` array with two statuses: `superseded` (a fact was updated — cite the current value or surface the change) and `contested` (an UNRESOLVED contradiction: both values are listed — do not pick one silently; resolve it via the included resolve_command or surface both to the user).",
             "facts list|show <subject>|conflicts|resolve|backfill": "Browse the fact store and contradiction record. `facts list` spans EVERY KB by default (omit --kb, or pass '*') and labels each fact with its own `kb`; the response carries `kb_scope` (flag|config|all_kbs) — a KB-scoped listing that comes back empty is a scope result, not proof extraction produced nothing. `facts conflicts` lists resolved supersessions; `facts conflicts --open` lists CONTESTED pairs awaiting your decision; `facts resolve <id> --action supersede-old|keep-both|reject-new [--note]` records your verdict and applies the supersession (never a deletion).",
             "facts backfill [--kb <name>]": "Extract facts from memories stored before extraction was on. Flags: --kb <name>|'*' (omit to sweep EVERY KB, oldest memory first across the union), --diary <name>, --limit <n>, --dry-run. Idempotent — memories that already have facts or an extraction marker are skipped, so a --limit'ed run resumes where the last one stopped. One LLM call per memory, so pair an unscoped sweep with --dry-run or --limit; exits 2 without an OpenRouter key.",
@@ -53,7 +54,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "usage [--kb <name>] [--since <rfc3339>]": "Summarize recorded Gemini embedding and Cohere rerank usage.",
             "budget show|set|clear": "Configure local usage guardrails. Flags: --kb <name>, --daily-usd <n>, --monthly-usd <n>.",
             "forget <id> --confirm": "Soft-delete a memory by UUID. Destructive — requires --confirm.",
-            "edit <id>": "Update memory content or metadata. Flags: --content <text>, --importance 0-10. An unknown or already-deleted id exits 3 BEFORE any paid embedding call; a --content edit re-chunks and re-embeds and therefore respects `engram budget` (exit 4 at the KB or global cap) and is billed to the memory's own kb/diary in `engram usage`. An --importance-only edit makes no provider call and is never budget-gated.",
+            "edit <id>": "Update memory content or metadata. Flags: --content <text>, --importance 0-10, --offline (re-embed with the offline stub). An unknown or already-deleted id exits 3 BEFORE any paid embedding call; a --content edit re-chunks and re-embeds and therefore respects `engram budget` (exit 4 at the KB or global cap) and is billed to the memory's own kb/diary in `engram usage`. An --importance-only edit makes no provider call, is never budget-gated, and needs no key. A --content edit with no Gemini key and no --offline is a config error (exit 2).",
             "export [--format json] [--kb <name>]": "Export memories as JSON",
             "import <file>": "Import memories from a JSON export",
             "entities [list|show <name>]": "Browse the entity graph. Alias: list|ls",
@@ -83,7 +84,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                     "extract_facts": "boolean; deprecated — extraction is the default. Still forces extraction alongside --facts-json",
                     "facts_json": "json string; supply the triples yourself and skip the extraction LLM call",
                     "autonomy": "full|assisted|strict",
-                    "allow_duplicate": "boolean"
+                    "allow_duplicate": "boolean",
+                    "offline": "boolean; embed with the deterministic 64-dim stub instead of Gemini. Without it, no Gemini key = config error (exit 2). Embeddings only — fact extraction has its own status field."
                 },
                 "output_data": {
                     "id": "uuid",
@@ -99,6 +101,21 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                     "adjudication_needed": "array — unresolved conflicts with a ready-to-run resolve_command; handle them",
                     "date_parse_warnings": "array — a supplied valid_from that could not be read as a date. The fact was still stored, dated from the memory (event_time, else when it was recorded), never from the clock. Fix the source: valid_from must be YYYY-MM-DD or RFC3339."
                 }
+            },
+            "edit": {
+                "destructive": false,
+                "args": { "id": "uuid" },
+                "flags": {
+                    "content": "string; re-chunks and RE-EMBEDS the memory",
+                    "importance": "0..10; never embeds",
+                    "offline": "boolean; re-embed with the deterministic offline stub"
+                },
+                "output_data": {
+                    "id": "uuid",
+                    "updated": "boolean",
+                    "chunks_replaced": "integer"
+                },
+                "agent_rule": "An unknown or already-deleted id exits 3 BEFORE any paid call. A --content edit re-embeds: use the embedder the store was written with, or recall will refuse the mixed index until `engram reindex`."
             },
             "recall": {
                 "destructive": false,
@@ -254,7 +271,7 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
             "ENGRAM_UPDATE_CRATE": "crates.io package used by cargo updates. Default paperfoot-engram.",
             "ENGRAM_UPDATE_HOMEBREW_FORMULA": "Homebrew formula used by brew updates. Default paperfoot/tap/engram.",
             "ENGRAM_DEFAULT_KB": "Pin reads to one KB when no --kb is given. Unset (the default) means recall spans every KB. Same as config `retrieval.default_kb`.",
-            "ENGRAM_EMBEDDER": "NOT IMPLEMENTED — nothing reads this. To read with the offline stub, pass --profile offline (or \"profile\": \"offline\" over the API); a cloud profile without GEMINI_API_KEY is exit 2. The sole override is the test hook ENGRAM_BENCH_FORCE_STUB with a truthy value (1/true); 0, false or empty leaves cloud semantics intact.",
+            "ENGRAM_EMBEDDER": "NOT IMPLEMENTED — nothing reads this. To READ with the offline stub pass --profile offline (or \"profile\": \"offline\" over the API); to WRITE with it pass --offline to remember/memory add/edit/memory update. A cloud read or any write with no GEMINI_API_KEY is exit 2. The sole override is the test hook ENGRAM_BENCH_FORCE_STUB with a truthy value (1/true); 0, false or empty leaves cloud semantics intact on both sides.",
             "ENGRAM_COHERE_RERANK_MODEL": "Override the Cohere rerank model slug (default rerank-v4.0-pro; e.g. rerank-v4.0-fast).",
             "ENGRAM_RERANK_PROVIDER": "Production values: cohere (default when COHERE_API_KEY is set) or none (disable reranking explicitly, e.g. Cohere billing failure — retrieval then returns hybrid-fused order). zerank2 is recognized by `bench` only, never by recall/research/serve.",
             "ENGRAM_LME_SPLIT": "LongMemEval split: s|oracle (default: s)"
@@ -287,7 +304,8 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                 "Set --event-time for anything dated — birthdays, anniversaries, when a decision was made. Without it the memory is only findable by content, never by time.",
                 "Check `fact_extraction` in the response. `skipped_no_openrouter_key` means no facts were captured: either configure the key or run `engram facts backfill` later. A `failed*` status also leaves work for backfill.",
                 "Never write with `--diary '*'` — it is a read-side wildcard and every write path rejects it with exit 3.",
-                "Handle `adjudication_needed` rather than ignoring it — you have the conversation context the resolver lacks."
+                "Handle `adjudication_needed` rather than ignoring it — you have the conversation context the resolver lacks.",
+                "If a write exits 2 saying no Gemini key is configured, do not reach for --offline just to make it pass: a store holding both stub and cloud vectors is what makes `recall` refuse later. Configure the key, or use --offline deliberately for a store you keep offline."
             ],
             "people": [
                 "Use `people list` / `people show` for who-do-I-know questions; they read the person-typed entity graph, not raw text.",
