@@ -25,7 +25,7 @@ impl Default for LayerBudget {
 /// Approximate token count using a 4-chars-per-token heuristic.
 /// Replaced with a tokenizer when one is wired up.
 pub fn approx_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Trim a payload to fit within a token budget. Greedy: keeps highest-ranked
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn budget_is_respected() {
-        let items = vec!["aaaa", "bbbb", "cccc", "dddd"]; // 1 token each
+        let items = ["aaaa", "bbbb", "cccc", "dddd"]; // 1 token each
         let kept = fit_to_budget(items.iter().copied(), 2);
         assert_eq!(kept.len(), 2);
     }
