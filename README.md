@@ -333,8 +333,8 @@ engram ingest . --kb ageing-biology --mode papers --include '*.pdf' --max-files 
 engram recall "personalized pagerank for multi-hop retrieval" --kb ageing-biology --top-k 3 --json
 
 # Optional LLM compiler pass:
-# extraction defaults to google/gemini-3.1-flash-lite-preview,
-# synthesis defaults to google/gemini-3.1-pro-preview.
+# extraction defaults to google/gemini-3.5-flash-lite,
+# synthesis defaults to google/gemini-3.6-flash.
 engram compile --kb ageing-biology --all --llm --max-llm-chunks 25
 
 # Agentic research pass: returns a query plan, evidence leads, and citation readiness.

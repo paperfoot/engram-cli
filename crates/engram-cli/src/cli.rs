@@ -438,11 +438,12 @@ Examples:
         #[arg(long)]
         limit: Option<usize>,
 
-        /// Answerer model (OpenRouter slug, default anthropic/claude-opus-4.8).
-        #[arg(long, default_value = "anthropic/claude-opus-4.8")]
+        /// Answerer model (OpenRouter slug, default anthropic/claude-opus-5).
+        #[arg(long, default_value = "anthropic/claude-opus-5")]
         answerer: String,
 
         /// Judge model (OpenRouter slug, default google/gemini-3.1-pro-preview).
+        /// Kept pinned: changing the GRADER invalidates comparison with recorded runs.
         #[arg(long, default_value = "google/gemini-3.1-pro-preview")]
         judge: String,
 
