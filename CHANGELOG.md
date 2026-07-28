@@ -16,8 +16,6 @@
   "now" on facts attached to a vanished memory.
 - "fact 4 of 3" messages are gone: a marker/commit failure says what it is.
 - Doc surfaces (agent-info, --help, README) caught up with the 3.5/3.6 model defaults.
-
-
 - Compiler defaults move a generation forward: extraction `google/gemini-3.5-flash-lite`,
   synthesis `google/gemini-3.6-flash` (newer than the old pro and cheaper on output; the
   synthesis completion budget doubles to 16384 because 3.6-flash spends thinking tokens
