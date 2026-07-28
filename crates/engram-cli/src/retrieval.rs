@@ -174,10 +174,7 @@ pub fn resolve_retrieval_backends(
         cloud_embedder && cohere_key.is_some() && !crate::commands::config::rerank_disabled();
 
     let embedder: Box<dyn Embedder> = match choice {
-        EmbedderChoice::Cloud(key) => Box::new(
-            GeminiEmbedder::new(key)
-                .with_fallback_keys(crate::commands::config::gemini_fallback_keys()),
-        ),
+        EmbedderChoice::Cloud(key) => Box::new(cloud_gemini(key)),
         EmbedderChoice::Stub => Box::new(StubEmbedder::default()),
     };
     let reranker: Option<Box<dyn Reranker>> = if use_cohere {
@@ -256,6 +253,14 @@ pub struct WriteEmbedder {
 /// Budget enforcement deliberately stays with the caller: `remember` gates every
 /// write on its KB budget (paid or not) before it does anything, which is not
 /// the read side's rule, and `edit` gates only its `--content` branch.
+/// THE one constructor for a cloud Gemini embedder. Every call site must go
+/// through here so the fallback-key chain can never be forgotten again —
+/// `chunks repair` shipped without failover precisely because the wiring was
+/// sprinkled per site.
+pub fn cloud_gemini(key: String) -> GeminiEmbedder {
+    GeminiEmbedder::new(key).with_fallback_keys(crate::commands::config::gemini_fallback_keys())
+}
+
 pub fn resolve_write_embedder(
     command: &str,
     offline: bool,
@@ -271,13 +276,7 @@ pub fn resolve_write_embedder(
         ))
     })?;
     let (embedder, cloud): (Box<dyn Embedder>, bool) = match choice {
-        EmbedderChoice::Cloud(key) => (
-            Box::new(
-                GeminiEmbedder::new(key)
-                    .with_fallback_keys(crate::commands::config::gemini_fallback_keys()),
-            ),
-            true,
-        ),
+        EmbedderChoice::Cloud(key) => (Box::new(cloud_gemini(key)), true),
         EmbedderChoice::Stub => (Box::new(StubEmbedder::default()), false),
     };
     Ok(WriteEmbedder {

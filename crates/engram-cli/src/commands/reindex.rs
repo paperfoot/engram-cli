@@ -4,7 +4,6 @@ use crate::commands::usage::{estimated_tokens_for_texts, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
-use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_storage::SqliteStore;
@@ -85,8 +84,7 @@ pub async fn reindex_store(
     let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
     let mut degraded_note: Option<String> = None;
     let (embeddings, model, dims, prompt_format) = if have_gemini {
-        let embedder = GeminiEmbedder::new(gemini_key.unwrap())
-            .with_fallback_keys(crate::commands::config::gemini_fallback_keys());
+        let embedder = crate::retrieval::cloud_gemini(gemini_key.unwrap());
         let embeddings = embedder
             .embed_batch(&texts, TaskMode::RetrievalDocument)
             .await?;

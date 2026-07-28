@@ -5403,9 +5403,12 @@ fn parse_fact_from_offset(
         object,
         object_norm,
         confidence,
+        // Epoch, never now: a fabricated "now" is the newest date in the
+        // store and would WIN recency supersession; the epoch always loses.
+        // Same rule as memory_times.
         created_at: DateTime::parse_from_rfc3339(&created_at_str)
             .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
+            .unwrap_or(DateTime::UNIX_EPOCH),
         superseded_by: superseded_by_str
             .as_deref()
             .and_then(|s| Uuid::parse_str(s).ok()),

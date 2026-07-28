@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased (0.3.1)
+## 0.3.1 — 2026-07-28
+- Failover hardening from the post-release code review (15 findings, all fixed):
+  rotation now also fires on 400/401 key-invalid refusals (a deleted primary used to
+  defeat the whole failover feature); the degradation note diagnoses a 429 as
+  possibly-transient instead of telling you to replace a healthy key; rotation is a
+  compare-and-swap from the observed key so concurrent refusals can never skip an
+  untried fallback; `chunks repair` gains the failover chain via one shared
+  `cloud_gemini` factory; `ingest` builds one embedder for the whole run and, like
+  `facts backfill`, now surfaces `embedder_degraded`; the daemon omits the field
+  when healthy instead of serializing null; `config check`'s `ok` is true only when
+  a key in the chain actually serves, and probes run concurrently on one client.
+- Date hygiene: unreadable stored fact dates fall back to the epoch (never "now");
+  v2 import validates fact dates; the remember dedup path can no longer stamp
+  "now" on facts attached to a vanished memory.
+- "fact 4 of 3" messages are gone: a marker/commit failure says what it is.
+- Doc surfaces (agent-info, --help, README) caught up with the 3.5/3.6 model defaults.
+
 
 - Compiler defaults move a generation forward: extraction `google/gemini-3.5-flash-lite`,
   synthesis `google/gemini-3.6-flash` (newer than the old pro and cheaper on output; the

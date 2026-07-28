@@ -241,10 +241,10 @@ Examples:
         /// Add LLM-assisted extraction and synthesis on top of deterministic compilation.
         #[arg(long)]
         llm: bool,
-        /// OpenRouter model for extraction. Defaults to Gemini 3.1 Flash-Lite Preview.
+        /// OpenRouter model for extraction. Defaults to Gemini 3.5 Flash-Lite.
         #[arg(long)]
         extraction_model: Option<String>,
-        /// OpenRouter model for synthesis/wiki overview. Defaults to Gemini 3.1 Pro Preview.
+        /// OpenRouter model for synthesis/wiki overview. Defaults to Gemini 3.6 Flash.
         #[arg(long)]
         synthesis_model: Option<String>,
         /// Limit LLM extraction chunks to control cost. Deterministic compile still scans all chunks.

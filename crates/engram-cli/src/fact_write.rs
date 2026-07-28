@@ -751,6 +751,24 @@ pub struct FactBatchError {
     pub error: CliError,
 }
 
+impl FactBatchError {
+    /// What failed, in words that survive the marker case: `index == total`
+    /// is the marker/commit write, and rendering it as `fact 4 of 3` shipped
+    /// impossible arithmetic to users and agents.
+    pub fn what_failed(&self) -> String {
+        Self::render_what_failed(self.index, self.total)
+    }
+
+    /// Same phrasing for callers that carry (index, total) without the error.
+    pub fn render_what_failed(index: usize, total: usize) -> String {
+        if index >= total {
+            format!("the batch could not be committed after all {total} fact(s) were prepared")
+        } else {
+            format!("fact {} of {total} could not be stored", index + 1)
+        }
+    }
+}
+
 /// Persist one memory's whole fact batch — every fact AND the extraction
 /// marker — as ONE unit of work.
 ///

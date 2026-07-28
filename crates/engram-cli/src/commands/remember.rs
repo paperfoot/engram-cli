@@ -120,10 +120,10 @@ impl ExtractionStatus {
                 total,
                 detail,
             } => Some(format!(
-                "fact {} of {total} could not be stored ({detail}); a fact batch is one unit of \
-                 work, so NO fact from this memory was stored — the memory is stored and left \
-                 UNPROCESSED, and `engram facts backfill --kb {kb}` will retry it",
-                index + 1
+                "{} ({detail}); a fact batch is one unit of work, so NO fact from this memory \
+                 was stored — the memory is stored and left UNPROCESSED, and `engram facts \
+                 backfill --kb {kb}` will retry it",
+                FactBatchError::render_what_failed(*index, *total)
             )),
             _ => None,
         }
@@ -235,10 +235,14 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             // deliberately NOT run here: this path costs no LLM call, as before.
             let mut outcome = FactWriteOutcome::default();
             if !extracted.is_empty() {
+                // Epoch, never now, when the existing memory vanished under
+                // us (concurrent forget): a fabricated "now" would date these
+                // facts newest-in-store and win recency supersession — the
+                // same rule memory_times itself applies to unreadable dates.
                 let (stored_event, stored_created) = ctx
                     .store
                     .memory_times(existing)?
-                    .unwrap_or((None, Utc::now()));
+                    .unwrap_or((None, chrono::DateTime::UNIX_EPOCH));
                 let dedup_llm = crate::fact_llm::resolve()?;
                 let plan = FactBatchPlan {
                     memory_id: existing,
@@ -642,13 +646,12 @@ async fn persist_facts(
 /// the memory the content already has.
 fn facts_json_failure(failure: FactBatchError, memory_id: Uuid, kb: &str) -> CliError {
     let message = format!(
-        "--facts-json fact {} of {} could not be stored ({}); a fact batch is one unit of work, \
-         so NO fact from it was stored — memory {memory_id} WAS stored, so re-run the identical \
-         `engram remember … --facts-json …` and the facts are attached to it (if this run also \
-         extracted, run `engram facts backfill --kb {kb}` first: backfill only retries memories \
-         that have no facts yet)",
-        failure.index + 1,
-        failure.total,
+        "--facts-json: {} ({}); a fact batch is one unit of work, so NO fact from it was \
+         stored — memory {memory_id} WAS stored, so re-run the identical `engram remember … \
+         --facts-json …` and the facts are attached to it (if this run also extracted, run \
+         `engram facts backfill --kb {kb}` first: backfill only retries memories that have no \
+         facts yet)",
+        failure.what_failed(),
         failure.error
     );
     match failure.error.exit_code() {

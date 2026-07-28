@@ -6,7 +6,6 @@ use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use chrono::Utc;
 use engram_core::types::{Memory, MemorySource};
-use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_ingest::{
@@ -138,13 +137,20 @@ pub async fn run(
     if have_gemini {
         crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     }
-    let (model_name, dims, prompt_format) = if have_gemini {
-        let e = GeminiEmbedder::new(gemini_key.clone().unwrap())
-            .with_fallback_keys(crate::commands::config::gemini_fallback_keys());
-        (e.model(), e.dimensions(), e.prompt_format().to_string())
-    } else {
-        let e = StubEmbedder::default();
-        (e.model(), e.dimensions(), e.prompt_format().to_string())
+    // ONE embedder for the whole run, built before the loop. Per-file
+    // construction re-read the config from disk for every file AND discarded
+    // the key-rotation state, so a dead primary bought one doomed request per
+    // file before each fresh failover.
+    let gemini_embedder =
+        have_gemini.then(|| crate::retrieval::cloud_gemini(gemini_key.clone().unwrap()));
+    let stub_embedder = StubEmbedder::default();
+    let (model_name, dims, prompt_format) = match &gemini_embedder {
+        Some(e) => (e.model(), e.dimensions(), e.prompt_format().to_string()),
+        None => (
+            stub_embedder.model(),
+            stub_embedder.dimensions(),
+            stub_embedder.prompt_format().to_string(),
+        ),
     };
 
     for file in files {
@@ -255,14 +261,12 @@ pub async fn run(
         let embed_chars: usize = chunk_texts.iter().map(|t| t.len()).sum();
         let embeddings: Vec<Vec<f32>> = if chunk_texts.is_empty() {
             Vec::new()
-        } else if have_gemini {
-            let e = GeminiEmbedder::new(gemini_key.clone().unwrap())
-                .with_fallback_keys(crate::commands::config::gemini_fallback_keys());
+        } else if let Some(e) = &gemini_embedder {
             e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
                 .await?
         } else {
-            let e = StubEmbedder::default();
-            e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
+            stub_embedder
+                .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
                 .await?
         };
         if embeddings.len() != chunks.len() {
@@ -371,6 +375,14 @@ pub async fn run(
         meta.add("compiled_entities", stats.entities);
         meta.add("compiled_relations", stats.relations);
         meta.add("compiled_wiki_pages", stats.wiki_pages);
+    }
+    // The highest-volume embed surface must not be the one silent failover.
+    if let Some(note) = gemini_embedder
+        .as_ref()
+        .and_then(engram_embed::Embedder::degradation_note)
+    {
+        meta.add("embedder_degraded", note.clone());
+        eprintln!("warning: {note}");
     }
     meta.add("embed_chars", total_embedded_chars);
     meta.add("embed_tokens_estimated", tokens_estimated);

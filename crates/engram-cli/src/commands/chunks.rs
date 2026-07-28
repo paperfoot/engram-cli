@@ -23,7 +23,6 @@ use crate::commands::usage::{estimated_tokens_for_texts, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
-use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_ingest::chunker::{enforce_max_chunk_chars, enforce_min_chunk_chars, PendingChunk};
@@ -232,7 +231,7 @@ async fn apply(
         .collect();
 
     let embedder: Box<dyn Embedder> = if have_gemini {
-        Box::new(GeminiEmbedder::new(gemini_key.unwrap()))
+        Box::new(crate::retrieval::cloud_gemini(gemini_key.unwrap()))
     } else {
         Box::new(StubEmbedder::default())
     };

@@ -24,7 +24,6 @@ use crate::fact_write::{
 };
 use crate::output::{print_success, Metadata};
 use engram_core::types::{Fact, SourceKind};
-use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::Embedder;
 use engram_graph::facts::{canonical_predicate, extract_facts, normalize};
@@ -915,10 +914,7 @@ pub async fn backfill(
     let force_stub = crate::commands::config::stub_forced();
     let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
     let gate_embedder: Box<dyn Embedder> = match gemini_key {
-        Some(k) if !force_stub => Box::new(
-            GeminiEmbedder::new(k)
-                .with_fallback_keys(crate::commands::config::gemini_fallback_keys()),
-        ),
+        Some(k) if !force_stub => Box::new(crate::retrieval::cloud_gemini(k)),
         _ => Box::new(StubEmbedder::default()),
     };
 
@@ -996,9 +992,8 @@ pub async fn backfill(
                 i + 1,
                 queued,
                 &format!(
-                    "fact {} of {} could not be stored ({}) — nothing stored, still pending",
-                    failure.index + 1,
-                    failure.total,
+                    "{} ({}) — nothing stored, still pending",
+                    failure.what_failed(),
                     failure.error
                 ),
                 memory,
@@ -1031,6 +1026,10 @@ pub async fn backfill(
     meta.add("conflicts_queued", outcome.queued.len());
     meta.add("date_parse_warnings", outcome.date_warnings.len());
     meta.add("extraction_model", model.clone());
+    if let Some(note) = gate_embedder.degradation_note() {
+        meta.add("embedder_degraded", note.clone());
+        eprintln!("warning: {note}");
+    }
     print_success(
         ctx.format,
         json!({

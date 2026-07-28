@@ -424,7 +424,7 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
     } else {
         "success"
     };
-    Ok(json!({
+    let mut resp = json!({
         "version": "1",
         "status": status,
         "data": {
@@ -448,7 +448,6 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
                 // forced stub render the same word. The CLI's `research` has
                 // reported these since Wave 0; the daemon copy did not.
                 "embed_model": backends.embed_model,
-                "embedder_degraded": backends.embedder.degradation_note(),
                 "embed_dims": backends.embed_dims,
                 "prompt_format": backends.prompt_format,
                 "reranker": backends.reranker_label,
@@ -457,7 +456,14 @@ async fn research_api(store: SqliteStore, body: &str) -> Result<serde_json::Valu
                 "temporal_scope": notes.temporal_scope_json()
             }
         }
-    }))
+    });
+    // Presence IS the signal: skill.md tells agents the field appears only in
+    // affected responses, so a healthy daemon must OMIT it — `json!` would
+    // render a None as `null` and make every presence check fire.
+    if let Some(note) = backends.embedder.degradation_note() {
+        resp["data"]["metadata"]["embedder_degraded"] = serde_json::json!(note);
+    }
+    Ok(resp)
 }
 
 async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value, CliError> {
@@ -568,7 +574,7 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
     } else {
         "success"
     };
-    Ok(json!({
+    let mut resp = json!({
         "version": "1",
         "status": status,
         "data": {
@@ -589,7 +595,6 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
             "metadata": {
                 "profile": profile.as_str(),
                 "embed_model": backends.embed_model,
-                "embedder_degraded": backends.embedder.degradation_note(),
                 "embed_dims": backends.embed_dims,
                 "prompt_format": backends.prompt_format,
                 "reranker": backends.reranker_label,
@@ -603,7 +608,14 @@ async fn recall_api(store: SqliteStore, body: &str) -> Result<serde_json::Value,
                 "temporal_scope": notes.temporal_scope_json()
             }
         }
-    }))
+    });
+    // Presence IS the signal: skill.md tells agents the field appears only in
+    // affected responses, so a healthy daemon must OMIT it — `json!` would
+    // render a None as `null` and make every presence check fire.
+    if let Some(note) = backends.embedder.degradation_note() {
+        resp["data"]["metadata"]["embedder_degraded"] = serde_json::json!(note);
+    }
+    Ok(resp)
 }
 
 async fn ingest_api(body: &str) -> Result<serde_json::Value, CliError> {

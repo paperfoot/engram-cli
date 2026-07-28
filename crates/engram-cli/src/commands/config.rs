@@ -12,7 +12,9 @@ use serde_json::json;
 use std::io::Write;
 
 fn mask_key(key: &str) -> String {
-    if key.len() < 12 {
+    // Threshold 16, matching GeminiEmbedder::mask: at 12, head-6 + tail-4
+    // left only 2 characters hidden.
+    if key.len() < 16 {
         "***".to_string()
     } else {
         let head: String = key.chars().take(6).collect();
@@ -219,12 +221,31 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
     for (i, k) in gemini_fallback_keys().into_iter().enumerate() {
         gemini_keys.push((format!("fallback_{}", i + 1), k));
     }
+    // Concurrent probes on ONE shared client: serial fresh-client probes made
+    // an offline machine wait up to 20s PER KEY in the chain.
+    let probe_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .ok();
     let mut probes = serde_json::Map::new();
-    for (label, key) in &gemini_keys {
-        probes.insert(
-            format!("{label} ({})", mask_key(key)),
-            json!(probe_gemini_key(key).await),
-        );
+    let mut any_key_serves = gemini_keys.is_empty();
+    let mut join = tokio::task::JoinSet::new();
+    for (i, (_, key)) in gemini_keys.iter().enumerate() {
+        let client = probe_client.clone();
+        let key = key.clone();
+        join.spawn(async move { (i, probe_gemini_key(client.as_ref(), &key).await) });
+    }
+    let mut probe_results: Vec<&'static str> = vec!["probe_error"; gemini_keys.len()];
+    while let Some(res) = join.join_next().await {
+        if let Ok((i, status)) = res {
+            probe_results[i] = status;
+        }
+    }
+    for ((label, key), status) in gemini_keys.iter().zip(probe_results) {
+        if status == "ok" {
+            any_key_serves = true;
+        }
+        probes.insert(format!("{label} ({})", mask_key(key)), json!(status));
     }
 
     print_success(
@@ -234,7 +255,10 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
             "gemini_keys_probed": probes,
             "cohere": if cohere { "configured (optional)" } else { "missing (optional)" },
             "openrouter": if openrouter { "configured (compiler)" } else { "missing (compiler optional)" },
-            "ok": gemini,
+            // Configured is not working: "ok" is true only when a key in
+            // the chain actually SERVED the live probe. An agent branching on
+            // this contract must not proceed on a depleted chain.
+            "ok": gemini && any_key_serves,
             "summary": if gemini {
                 if cohere { "hybrid_gemini + cohere" } else { "hybrid_gemini (no rerank)" }
             } else {
@@ -249,13 +273,9 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
 
 /// One cheap embedContent against a single key. Statuses are deliberately a
 /// closed vocabulary an agent can branch on.
-async fn probe_gemini_key(key: &str) -> &'static str {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return "probe_error",
+async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'static str {
+    let Some(client) = client else {
+        return "probe_error";
     };
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={key}",

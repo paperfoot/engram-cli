@@ -33,6 +33,10 @@ pub struct GeminiEmbedder {
     /// of the process, and the next run starts fresh from the primary.
     keys: Vec<String>,
     active: std::sync::atomic::AtomicUsize,
+    /// Why the last rotation happened (http status word) — read by
+    /// degradation_note so the warning diagnoses the right condition instead
+    /// of telling the user to replace a merely rate-limited key.
+    rotation_reason: std::sync::Mutex<Option<String>>,
     model: String,
     dimensions: usize,
 }
@@ -49,6 +53,7 @@ impl GeminiEmbedder {
                 .expect("failed to build reqwest client"),
             keys: vec![api_key.into()],
             active: std::sync::atomic::AtomicUsize::new(0),
+            rotation_reason: std::sync::Mutex::new(None),
             model: DEFAULT_MODEL.to_string(),
             dimensions: DEFAULT_DIMS,
         }
@@ -66,17 +71,23 @@ impl GeminiEmbedder {
         self
     }
 
-    fn active_key(&self) -> &str {
-        let i = self
-            .active
+    /// Snapshot of the active key index — callers hold this across a request
+    /// so a refusal can rotate FROM the key that actually failed.
+    fn active_index(&self) -> usize {
+        self.active
             .load(std::sync::atomic::Ordering::Relaxed)
-            .min(self.keys.len() - 1);
-        &self.keys[i]
+            .min(self.keys.len() - 1)
+    }
+
+    #[cfg(test)]
+    fn active_key(&self) -> &str {
+        &self.keys[self.active_index()]
     }
 
     /// Masked form for logs and notes: enough to recognize, never enough to use.
     fn mask(key: &str) -> String {
-        if key.chars().count() < 12 {
+        // Threshold 16: at 12, head-6 + tail-4 left only 2 characters hidden.
+        if key.chars().count() < 16 {
             "***".to_string()
         } else {
             let head: String = key.chars().take(6).collect();
@@ -92,22 +103,54 @@ impl GeminiEmbedder {
         }
     }
 
-    /// Retire the active key and move to the next fallback, if one exists.
-    /// Returns false when there is nothing left to rotate to.
-    fn rotate_key(&self, why: &str) -> bool {
-        let i = self.active.load(std::sync::atomic::Ordering::Relaxed);
-        if i + 1 >= self.keys.len() {
+    /// Retire the key the CALLER just saw fail and advance to the next
+    /// fallback. Returns true when there is a key to retry with (either this
+    /// call advanced the pointer, or a concurrent caller already rotated past
+    /// the failed key). Compare-and-swap FROM THE OBSERVED INDEX: two
+    /// concurrent refusals of key N advance the pointer once, and a fallback
+    /// that was never tried can never be skipped.
+    fn rotate_from(&self, observed: usize, why: &str) -> bool {
+        if observed + 1 >= self.keys.len() {
+            // The failed key was the last one. Another task may still have
+            // rotated TO it from an earlier key; either way there is nothing
+            // beyond it to try.
             return false;
         }
-        self.active
-            .store(i + 1, std::sync::atomic::Ordering::Relaxed);
-        tracing::warn!(
-            "gemini key {} of {} refused ({why}); rotating to fallback key {}",
-            i + 1,
-            self.keys.len(),
-            i + 2
-        );
-        true
+        let rotated = self
+            .active
+            .compare_exchange(
+                observed,
+                observed + 1,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok();
+        if rotated {
+            *self
+                .rotation_reason
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
+            tracing::warn!(
+                "gemini key {} of {} refused ({why}); rotating to fallback key {}",
+                observed + 1,
+                self.keys.len(),
+                observed + 2
+            );
+        }
+        // A lost CAS means another task already moved past the failed key:
+        // the retry should proceed on whatever is active now.
+        rotated || self.active.load(std::sync::atomic::Ordering::Relaxed) > observed
+    }
+
+    /// True when this non-2xx body is Google saying the KEY is bad — the one
+    /// 400/401 class where trying the next key is correct. Any other 400 is a
+    /// real request error: rotating on it would burn every key in the chain
+    /// masking a bug.
+    fn body_says_key_invalid(body: &str) -> bool {
+        body.contains("API_KEY_INVALID")
+            || body.contains("API key not valid")
+            || body.contains("API key expired")
+            || body.contains("CREDENTIALS_MISSING")
     }
 
     pub fn from_env() -> Result<Self, EmbedError> {
@@ -288,10 +331,29 @@ impl Embedder for GeminiEmbedder {
         let i = self.active.load(std::sync::atomic::Ordering::Relaxed);
         (i > 0).then(|| {
             let served = Self::mask(&self.keys[i.min(self.keys.len() - 1)]);
+            // Diagnose what actually happened. A 429 can be a transient
+            // per-minute rate limit, so "replace the primary" would send the
+            // operator to fix a healthy key; only a 400/401/403 refusal
+            // means the key itself is dead.
+            let diagnosis = match self
+                .rotation_reason
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref()
+            {
+                Some("429") => {
+                    "the primary key was rate-limited or out of quota (429) — possibly \
+                     transient; verify with `engram config check` before replacing it"
+                }
+                Some("400") | Some("401") | Some("403") => {
+                    "the primary key was refused as invalid or revoked — replace it, \
+                     then verify the chain with `engram config check`"
+                }
+                _ => "the primary key stopped serving — verify with `engram config check`",
+            };
             format!(
-                "gemini primary key is NOT serving — this command ran on fallback key {} of {} \
-                 ({served}). Top up or replace the primary, then verify the chain with \
-                 `engram config check`.",
+                "gemini failover: this command ran on fallback key {} of {} ({served}); \
+                 {diagnosis}.",
                 i + 1,
                 self.keys.len()
             )
@@ -321,11 +383,10 @@ impl Embedder for GeminiEmbedder {
         let delays_secs: [u64; 6] = [2, 4, 8, 16, 32, 64];
         let mut attempt: u32 = 0;
         loop {
+            let key_idx = self.active_index();
             let url = format!(
                 "{}/{}:embedContent?key={}",
-                ENDPOINT,
-                self.model,
-                self.active_key()
+                ENDPOINT, self.model, self.keys[key_idx]
             );
             // 1. send
             let send_result = self.client.post(&url).json(&req).send().await;
@@ -361,7 +422,7 @@ impl Embedder for GeminiEmbedder {
                 // it (~3 min of ladder) would only delay the key that works.
                 // Per-minute rate limits also clear instantly on a different
                 // key. Only when no keys remain does the ladder make sense.
-                if self.rotate_key(status.as_str()) {
+                if self.rotate_from(key_idx, status.as_str()) {
                     continue;
                 }
                 if status == reqwest::StatusCode::FORBIDDEN {
@@ -408,8 +469,22 @@ impl Embedder for GeminiEmbedder {
                 });
             }
             if !status.is_success() {
-                // 4xx (non-429) — real client error, never retry.
                 let body = resp.text().await.unwrap_or_default();
+                // 400/401 with Google's key-invalid markers is a DEAD KEY,
+                // not a bad request — the exact condition `config check`
+                // labels invalid_or_revoked. Without this arm an invalid
+                // primary defeated the whole failover feature: rotation
+                // fired on 429/403 but a deleted/regenerated key answers
+                // 400 API_KEY_INVALID and hard-failed every surface while
+                // a healthy fallback sat configured.
+                if (status == reqwest::StatusCode::BAD_REQUEST
+                    || status == reqwest::StatusCode::UNAUTHORIZED)
+                    && Self::body_says_key_invalid(&body)
+                    && self.rotate_from(key_idx, status.as_str())
+                {
+                    continue;
+                }
+                // Any other 4xx — real client error, never retry.
                 return Err(EmbedError::Api {
                     provider: "gemini",
                     message: format!("status {}: {}", status, body),
@@ -518,11 +593,10 @@ impl Embedder for GeminiEmbedder {
             let delays_secs: [u64; 6] = [4, 8, 16, 32, 60, 60];
             let parsed: BatchEmbedResponse = loop {
                 // Rebuilt per attempt: a quota refusal rotates to a fallback key.
+                let key_idx = self.active_index();
                 let url = format!(
                     "{}/{}:batchEmbedContents?key={}",
-                    ENDPOINT,
-                    self.model,
-                    self.active_key()
+                    ENDPOINT, self.model, self.keys[key_idx]
                 );
                 let send_result = self.client.post(&url).json(&body).send().await;
                 let resp = match send_result {
@@ -559,7 +633,7 @@ impl Embedder for GeminiEmbedder {
                     // ladder on a key that cannot recover (depleted credits,
                     // revoked key). A 429/403 is never billed, so the charged
                     // counters are untouched by the switch.
-                    if self.rotate_key(status.as_str()) {
+                    if self.rotate_from(key_idx, status.as_str()) {
                         continue;
                     }
                     if status == reqwest::StatusCode::FORBIDDEN {
@@ -591,6 +665,17 @@ impl Embedder for GeminiEmbedder {
                 }
                 if !status.is_success() {
                     let body_text = resp.text().await.unwrap_or_default();
+                    // Same dead-key arm as embed_one: a deleted or
+                    // regenerated key answers 400 API_KEY_INVALID and must
+                    // fail over, not fail the batch. Never billed, so the
+                    // charged counters are untouched.
+                    if (status == reqwest::StatusCode::BAD_REQUEST
+                        || status == reqwest::StatusCode::UNAUTHORIZED)
+                        && Self::body_says_key_invalid(&body_text)
+                        && self.rotate_from(key_idx, status.as_str())
+                    {
+                        continue;
+                    }
                     return Err(BatchEmbedFailure {
                         error: EmbedError::Api {
                             provider: "gemini",
@@ -660,12 +745,70 @@ mod tests {
     }
 
     #[test]
+    fn only_key_invalid_bodies_qualify_a_400_for_rotation() {
+        assert!(GeminiEmbedder::body_says_key_invalid(
+            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#
+        ));
+        assert!(GeminiEmbedder::body_says_key_invalid(
+            "API key not valid. Please pass a valid API key."
+        ));
+        // A genuinely malformed request must NOT rotate — it would burn every
+        // key in the chain masking a real bug.
+        assert!(!GeminiEmbedder::body_says_key_invalid(
+            r#"{"error":{"code":400,"message":"Unable to submit request because it has an empty text parameter"}}"#
+        ));
+    }
+
+    #[test]
+    fn the_note_diagnoses_a_rate_limit_differently_from_a_dead_key() {
+        let e = GeminiEmbedder::new("primary-key-aaaaaaaa")
+            .with_fallback_keys(vec!["fallback-key-bbbbbbbbbb".to_string()]);
+        e.rotate_from(0, "429");
+        let note = e.degradation_note().expect("rotated");
+        assert!(note.contains("rate-limited"), "{note}");
+        assert!(
+            !note.contains("replace it,"),
+            "a 429 must not say the key is dead: {note}"
+        );
+
+        let e2 = GeminiEmbedder::new("primary-key-aaaaaaaa")
+            .with_fallback_keys(vec!["fallback-key-bbbbbbbbbb".to_string()]);
+        e2.rotate_from(0, "400");
+        let note2 = e2.degradation_note().expect("rotated");
+        assert!(note2.contains("invalid or revoked"), "{note2}");
+    }
+
+    #[test]
+    fn concurrent_rotations_from_the_same_key_advance_once() {
+        // The race: both callers used key 0 and both saw it fail. The first
+        // rotate advances 0 -> 1; the second, CASing from the SAME observed
+        // index, loses the exchange but still reports "retry is possible" —
+        // and crucially does NOT advance again, so the untried fallback "b"
+        // can never be skipped.
+        let e = GeminiEmbedder::new("a").with_fallback_keys(vec!["b".to_string(), "c".to_string()]);
+        assert!(e.rotate_from(0, "429"));
+        assert!(
+            e.rotate_from(0, "429"),
+            "lost race still means a retry key exists"
+        );
+        assert_eq!(
+            e.active_key(),
+            "b",
+            "fallback b must not be skipped untried"
+        );
+        // A genuine failure OF b advances to c; c is the end of the chain.
+        assert!(e.rotate_from(1, "429"));
+        assert_eq!(e.active_key(), "c");
+        assert!(!e.rotate_from(2, "429"), "nothing beyond the last key");
+    }
+
+    #[test]
     fn a_healthy_embedder_reports_no_degradation_and_a_rotated_one_masks_the_key() {
         let e = GeminiEmbedder::new("primary-key-aaaaaaaa").with_fallback_keys(vec![
             "AQ.REDACTED-REVOKED-KEY".to_string(),
         ]);
         assert!(e.degradation_note().is_none(), "healthy = silent");
-        e.rotate_key("test");
+        e.rotate_from(0, "test");
         let note = e.degradation_note().expect("rotated = loud");
         assert!(note.contains("fallback key 2 of 2"), "{note}");
         assert!(note.contains("AQ.RED...-KEY"), "recognizable: {note}");
@@ -682,12 +825,12 @@ mod tests {
     #[test]
     fn rotation_advances_once_per_key_and_stops_at_the_end() {
         let e = GeminiEmbedder::new("a").with_fallback_keys(vec!["b".to_string()]);
-        assert!(e.rotate_key("test"));
+        assert!(e.rotate_from(0, "test"));
         assert_eq!(e.active_key(), "b");
-        assert!(!e.rotate_key("test"), "nothing beyond the last key");
+        assert!(!e.rotate_from(1, "test"), "nothing beyond the last key");
         assert_eq!(e.active_key(), "b");
         let single = GeminiEmbedder::new("only");
-        assert!(!single.rotate_key("test"));
+        assert!(!single.rotate_from(0, "test"));
     }
 
     use super::*;

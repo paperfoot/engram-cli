@@ -452,7 +452,7 @@ ingest.require_scope true`, `ingest.include`, `ingest.exclude`, and
 | `engram research <query>` | Evidence-first research retrieval. Returns query plan, evidence leads, answer context, and citation-readiness checks |
 | `engram ingest <path>` | Mine one file, or a scoped directory. `--mode papers\|takeaways\|conversations\|repos\|general\|auto`, `--compile evidence`, `--dry-run`, `--include`, `--exclude`, `--max-files`, `--all` |
 | `engram documents list/show/delete` | Inspect or remove ingested source documents |
-| `engram compile --kb <name> --all` | Derive claims, source spans, entities, relations, takeaways, and wiki pages. Add `--llm` for Gemini 3.1 Flash-Lite extraction + Gemini 3.1 Pro synthesis via OpenRouter |
+| `engram compile --kb <name> --all` | Derive claims, source spans, entities, relations, takeaways, and wiki pages. Add `--llm` for Gemini 3.5 Flash-Lite extraction + Gemini 3.6 Flash synthesis via OpenRouter |
 | `engram jobs list/show` | Inspect compile job history |
 | `engram reindex --kb <name> \| --all` | Re-embed chunks with current embedding metadata |
 | `engram wiki --kb <name> [path]` | Browse generated wiki pages |
@@ -512,7 +512,7 @@ Research direction for contributors: [`program.md`](program.md). Design rational
 - `engram bench personal`: an offline, deterministic personal-memory suite (no keys, no network, no writes to the live store)
 - `engram kb repair` to register KBs that hold memories but are missing from `kb list`
 - Document/job/budget UX plus local daemon endpoints for KBs, recall, research, compile, reindex, documents, entities, jobs, usage, and budgets
-- Optional LLM compiler pass: Gemini 3.1 Flash-Lite Preview extraction + Gemini 3.1 Pro Preview synthesis via OpenRouter
+- Optional LLM compiler pass: Gemini 3.5 Flash-Lite extraction + Gemini 3.6 Flash synthesis via OpenRouter
 - Hallucination-resistance harness (loaders + scorers + unit tests): LitQA2 precision-with-abstention, BEIR-sci nDCG@10, BioGen CSR, ALCE citation P/R, repaired RAGAS faithfulness
 - LongMemEval + LoCoMo-Plus retrieval/QA harness with strict evaluation
 - `scientific-mini` evidence compiler benchmark

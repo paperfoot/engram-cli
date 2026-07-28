@@ -75,6 +75,26 @@ fn import_v2(
             )));
         }
     }
+    // Fact dates are just as load-bearing: created_at seeds recency
+    // supersession and valid_from is the event time. Reject unreadable ones
+    // up front — the row parser's epoch fallback keeps an already-stored
+    // corrupt date harmless, but an import must not add more.
+    for row in &facts {
+        if chrono::DateTime::parse_from_rfc3339(&row.created_at).is_err() {
+            return Err(CliError::BadInput(format!(
+                "fact {} has an unreadable created_at {:?}; fix the export file",
+                row.id, row.created_at
+            )));
+        }
+        if let Some(v) = row.valid_from.as_deref() {
+            if chrono::DateTime::parse_from_rfc3339(v).is_err() {
+                return Err(CliError::BadInput(format!(
+                    "fact {} has an unreadable valid_from {v:?}; fix the export file",
+                    row.id
+                )));
+            }
+        }
+    }
 
     // Insert in dependency order (kb → document → memory → chunk → fact)
     // inside one transaction so a malformed file cannot leave a half-restored
