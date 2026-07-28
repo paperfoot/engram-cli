@@ -170,7 +170,7 @@ cd engram-cli
 cargo install --path crates/engram-cli --locked
 ```
 
-One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.2.0`.
+One binary at `~/.cargo/bin/engram`. No runtime, no Python, no Docker, no services. `engram --version` should print `engram 0.3.0`.
 
 ### Package manager status
 
