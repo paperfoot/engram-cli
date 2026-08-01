@@ -16,6 +16,7 @@ pub mod jsonschema;
 pub mod model;
 pub mod registry;
 pub mod runtime;
+pub mod skill;
 
 pub use model::*;
 pub use runtime::RuntimeContext;

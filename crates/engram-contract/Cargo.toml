@@ -10,6 +10,13 @@ description = "engram — the agent contract as data: one schema, three generato
 [lib]
 name = "engram_contract"
 
+# Dev-time generator. A separate binary and not a build script: a build script
+# that writes into a sibling crate's assets breaks `cargo package` and races
+# `include_str!` against its own output.
+[[bin]]
+name = "engram-contract-gen"
+path = "src/bin/gen.rs"
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
