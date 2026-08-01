@@ -8,6 +8,7 @@ pub mod error;
 pub mod fact_llm;
 pub mod fact_write;
 pub mod output;
+pub mod respond;
 pub mod retrieval;
 
 use crate::cli::{
