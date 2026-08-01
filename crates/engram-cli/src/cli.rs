@@ -107,8 +107,10 @@ pub enum Command {
         /// Search query.
         query: String,
 
-        /// Number of results.
-        #[arg(long, default_value_t = 10)]
+        /// Number of results. `--limit` is accepted as an alias: agents reach
+        /// for the enumerating word, and a rejected flag on the most-called
+        /// command is a worse teacher than an alias.
+        #[arg(long, default_value_t = 10, visible_alias = "limit")]
         top_k: usize,
 
         /// Memory layer to target (identity|critical|topic|deep).
@@ -265,8 +267,8 @@ Examples:
         /// Specialist agent diary namespace, or "*" for all.
         #[arg(long, default_value = "default")]
         diary: String,
-        /// Number of evidence leads.
-        #[arg(long, default_value_t = 12)]
+        /// Number of evidence leads. `--limit` is accepted as an alias.
+        #[arg(long, default_value_t = 12, visible_alias = "limit")]
         top_k: usize,
         /// Retrieval profile: cloud_quality|fast|offline.
         #[arg(long, default_value = "cloud_quality")]
@@ -640,7 +642,8 @@ pub enum MemoryCommand {
     #[command(visible_alias = "find")]
     Search {
         query: String,
-        #[arg(long, default_value_t = 10)]
+        /// Number of results. `--limit` is accepted as an alias.
+        #[arg(long, default_value_t = 10, visible_alias = "limit")]
         top_k: usize,
         #[arg(long, default_value = "agent")]
         mode: String,

@@ -10,6 +10,7 @@ members = [
     "crates/engram-graph",
     "crates/engram-bench",
     "crates/engram-cli",
+    "crates/engram-contract",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ engram-llm     = { package = "paperfoot-engram-llm", version = "0.3.1", path = "
 engram-ingest  = { package = "paperfoot-engram-ingest", version = "0.3.1", path = "crates/engram-ingest" }
 engram-graph   = { package = "paperfoot-engram-graph", version = "0.3.1", path = "crates/engram-graph" }
 engram-bench   = { package = "paperfoot-engram-bench", version = "0.3.1", path = "crates/engram-bench" }
+engram-contract = { package = "paperfoot-engram-contract", version = "0.3.1", path = "crates/engram-contract" }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

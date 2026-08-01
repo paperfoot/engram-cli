@@ -446,8 +446,79 @@ pub fn run() -> Result<(), CliError> {
         "framework": "https://github.com/paperfoot/agent-cli-framework"
     });
 
+    let manifest = merge_contract(manifest);
+
     // Raw JSON — NOT wrapped in envelope. Framework principle #1.
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{}", serde_json::to_string_pretty(&manifest).unwrap());
     Ok(())
+}
+
+/// Splice in everything `engram-contract` owns.
+///
+/// This manifest is being migrated command by command, not in one rewrite:
+/// 453 lines of hand-tuned agent-facing prose move into `registry.rs`, and a
+/// transcription that quietly drops a sentence is a regression no key-level
+/// test can see. So each command lands with the contract test that pins it,
+/// and the hand-written entry for anything not yet transcribed stays exactly
+/// as it shipped. `recall` is first because it is the command agents call
+/// most and the one whose documented defaults have drifted before.
+fn merge_contract(mut manifest: serde_json::Value) -> serde_json::Value {
+    let rt = runtime();
+    let generated = engram_contract::agent_info::render(&rt);
+
+    if let (Some(root), Some(add)) = (manifest.as_object_mut(), generated.as_object()) {
+        for (k, v) in add {
+            root.insert(k.clone(), v.clone());
+        }
+    }
+
+    for path in engram_contract::contract().commands.iter().map(|c| c.path) {
+        if let Some(fragment) = engram_contract::agent_info::render_command(path) {
+            if let Some(schemas) = manifest
+                .get_mut("command_schemas")
+                .and_then(|s| s.as_object_mut())
+            {
+                schemas.insert(path.to_string(), fragment);
+            }
+        }
+    }
+    manifest
+}
+
+/// The only place `engram-contract` meets this machine. Uses the NON-creating
+/// peek getters, exactly as the inline manifest does: the discovery surface
+/// must not be the call that creates a store.
+fn runtime() -> engram_contract::RuntimeContext<'static> {
+    fn leak(s: String) -> &'static str {
+        // Four allocations, once per process, and no lifetime gymnastics at
+        // the call site. `agent-info` is a one-shot command.
+        Box::leak(s.into_boxed_str())
+    }
+    engram_contract::RuntimeContext {
+        version: env!("CARGO_PKG_VERSION"),
+        config_path: leak(
+            engram_storage::paths::config_path_peek()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        data_path: leak(
+            engram_storage::paths::db_path_peek()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        vector_path: leak(
+            engram_storage::paths::vector_dir_peek()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        cache_path: leak(
+            engram_storage::paths::cache_dir_peek()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        answer_context_format: crate::retrieval::ANSWER_CONTEXT_FORMAT,
+        extraction_model: engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL,
+        synthesis_model: engram_llm::openrouter::DEFAULT_SYNTHESIS_MODEL,
+    }
 }

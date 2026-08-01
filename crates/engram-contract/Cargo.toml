@@ -1,0 +1,16 @@
+[package]
+name = "paperfoot-engram-contract"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "engram — the agent contract as data: one schema, three generators"
+
+[lib]
+name = "engram_contract"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
