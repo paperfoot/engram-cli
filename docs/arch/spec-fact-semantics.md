@@ -1,11 +1,19 @@
 # spec — fact-semantics lane (engram v0.4)
 
 Implements **move 2** (bi-temporal interval facts) and the **replay half of move 3** (decision
-replay on re-derivation) from `docs/arch/redesign-brief.md`. Reads `docs/arch/interfaces.md` as
-the cross-lane contract; every divergence request is listed in §6 rather than invented here.
+replay on re-derivation) from `docs/arch/redesign-brief.md`. Reads `docs/arch/interfaces.md`
+**v2 + the v2.1 addendum** as the cross-lane contract — rulings R1–R15 and D1–D28 override
+everything below; every remaining divergence request is listed in §6 rather than invented here.
+
+**Status: unblocked, wave-3 ready.** OQ-1 (where the semantic-key primitives live) is resolved by
+**D15**, which LANDED as `engram_core::keys` at commit `a35f7e8`, so nothing in this lane waits on
+a ruling. Wave-3 readiness was pending one revision pass — coherence-report-v2.md §6's eleven R7
+conformance edits plus its V2–V7 — and that pass is applied throughout this document.
 
 Owned files (exclusive): `crates/engram-graph/src/**`, `crates/engram-cli/src/fact_write.rs`,
 `crates/engram-cli/src/fact_llm.rs`, and new tests matching `crates/engram-cli/tests/wave3_fact_*.rs`.
+Edits this lane needs in files it does not own go through the lead's patch channel (§8
+`cross_lane_patches`), never as lane commits [R15].
 
 ---
 
@@ -29,10 +37,14 @@ Owned files (exclusive): `crates/engram-graph/src/**`, `crates/engram-cli/src/fa
    disagreement on a set-valued relation, (c) disagreement on an immutable attribute.
    Different medications never form a pair at all — the storm dies at pair construction, not at
    classification.
-4. **`suggested_action` replacement** — the suggestion vocabulary shrinks to
-   `keep-both` | `requires_context`. `supersede-old` is never *suggested* again (it remains an
-   accepted `facts resolve --action` value, forever, per constraint 3). Kills
-   `fact_write.rs:1209-1213`.
+4. **`suggested_action` replacement** — the suggestion vocabulary stays
+   `keep-both | supersede-old | requires_context`. `supersede-old` is never suggested on a SAFETY
+   pair, and never as a laundering of classifier uncertainty; it survives only where the
+   classifier reached `SupersedeOld` and `--autonomy strict` is the sole reason the pair queued
+   (R7). It also remains an accepted `facts resolve --action` value, forever, per constraint 3.
+   Kills `fact_write.rs:1209-1213` — the hard-coded `detector == "slot"` suggestion still dies;
+   the replacement is `suggested_action()` (§2.3.1), which may return `supersede-old` in that one
+   narrow case.
 5. **Decision replay** — decisions are keyed by SEMANTIC identity
    (`subject_norm`, `relation`, `object_pair_hash`), recorded as journal events, and replayed
    before any conflict is opened. A re-derivation after `edit`, `facts backfill` or `compile`
@@ -42,9 +54,11 @@ Owned files (exclusive): `crates/engram-graph/src/**`, `crates/engram-cli/src/fa
 
 ### 1.2 Non-goals (explicitly other lanes' or later waves')
 
-- The `events` table, `append_event`, the v9→v10 migration body, `Handle`, and the `Arity` enum's
-  home in `engram-core` — **storage-journal**. This spec states exactly what it needs from them
-  (§6) and supplies the pure functions the migration calls.
+- The `events` table, `append_event`, the v9→v10 migration body, `Handle`, `engram_core::keys`,
+  and the **files** `engram-core/src/relations.rs` and `engram-core/src/interval.rs` —
+  **storage-journal**, and all of them have LANDED. This lane owns what those two modules MEAN
+  (§2.1, §2.2), states what it needs from the rest in §6, and supplies the pure functions the
+  migration calls.
 - `facts.rs` command surface (`list`, `conflicts`, `triage`, `resolve`), `recall`'s conflicts
   array, envelope totals/cursors — **read-surfaces**. This lane keeps their imports compiling
   and hands them shared helpers instead of duplicated rules.
@@ -63,31 +77,44 @@ Owned files (exclusive): `crates/engram-graph/src/**`, `crates/engram-cli/src/fa
 
 ## 2. Data model and API changes
 
-### 2.1 New: `crates/engram-graph/src/relations.rs`
+### 2.1 LANDED: `crates/engram-core/src/relations.rs` — consume it, do not rebuild it
 
 The registry. Pure, no I/O, versioned so a conflict row can record which registry classified it.
+**It lives in `engram_core::relations`** [R1], and it has already LANDED there (storage-journal,
+`dbdb757`): `engram-core` cannot depend on `engram-graph`, and the v9→v10 migration keys ~14.5k
+decision rows through `member_identity`, so the migration must be able to reach it. This lane
+therefore **creates no registry file**. `engram_graph::relations` is a **re-export shim only**
+(`pub use engram_core::relations::*;`), and this lane's job here is to verify the landed module
+against the table below, not to rewrite it.
+
+What this lane still owns is the registry's **content**: the classification table, the
+member-identity algorithm and their two version constants are fact-semantics' to define and to
+change. A content change is a one-line `cross_lane_patches` request against `engram-core` (§8),
+never a second registry — two registries is CM-1/CM-3, the failure this wave exists to close.
 
 ```rust
+// engram_core::relations — LANDED. Reproduced here because this lane owns what these
+// values MEAN; the file itself is storage-journal's.
+
 /// Bump when any classification below changes. Recorded on queue rows so a
 /// backlog can be re-keyed after a registry change instead of re-litigated.
 pub const REGISTRY_VERSION: &str = "relations@1";
 
 /// How many values one (subject, relation) may hold at once, and whether a
-/// wrong answer here is a medical incident.
-///
-/// Mirrors `engram_core::Arity` (interfaces.md §3) exactly; re-exported so
-/// callers never see two spellings of the same idea.
-pub use engram_core::types::Arity;   // { SetValued { safety: bool }, SingleValued { safety: bool } }
+/// wrong answer here is a medical incident. interfaces.md §3's enum, at its
+/// only home — `engram_core::relations`, NOT `engram_core::types` (CM-12).
+pub enum Arity { SetValued { safety: bool }, SingleValued { safety: bool } }
 
 /// The OLD two-variant enum, which `fact_write.rs:78-85` calls `Arity` and
 /// `commands/facts.rs:21` imports under that name. It cannot keep the name —
-/// `Arity` now means the interfaces.md enum — so it is renamed here and
-/// `fact_write.rs` re-exports it under BOTH spellings:
-/// `pub use engram_graph::relations::LegacyArity as Arity;` plus
-/// `pub use engram_graph::relations::LegacyArity;`. That one alias is what
-/// keeps `commands/facts.rs:436-439`'s `Arity::Single | Arity::Multi` match
-/// arms compiling untouched; the new enum is NOT re-exported from
-/// `fact_write.rs`, so no read-surfaces file sees two meanings of one name.
+/// `Arity` now means the interfaces.md enum — so it is renamed to `LegacyArity`
+/// and **nothing re-exports it as `Arity`** [R3]. The call sites are renamed
+/// instead: `commands/facts.rs:436-439` matches `LegacyArity::Single |
+/// LegacyArity::Multi` and imports the name from `engram_core::relations`
+/// (read-surfaces §3.4.1 already does exactly this and drops the
+/// `fact_write::Arity` import at `facts.rs:20-24`). An alias would survive as a
+/// public trap with no in-repo consumer — a `pub use` whose only function is to
+/// make the next reader of `Arity` wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyArity { Single, Multi }
 
@@ -177,7 +204,8 @@ Registry contents (v1). Anything not listed is `SetValued { safety: false }`, `M
 `has_age` deserves a note in the code: it is single-valued and mutable, and its value is a
 function of `birthday` plus today. It stays a slot; deriving it is reasoning-layer work.
 
-**Member identity** (interfaces.md §3, `member_identity`) also lives here:
+**Member identity** (interfaces.md §3, `member_identity`) lives in the same landed module, and
+for the same reason — the migration keys ~14.5k decision rows through it:
 
 ```rust
 /// Bump when the heuristic changes; stored on queue rows so a re-key is possible.
@@ -212,9 +240,17 @@ v1 algorithm, in order, on the already-normalized (lowercased, trimmed) object:
 `type 2 diabetes` is safe: nothing at the END is noise. `hypertension stage 2` → `hypertension`.
 `metformin xr` stays distinct from `metformin` — deliberately (rule: err toward distinctness).
 
-### 2.2 New: `crates/engram-graph/src/interval.rs`
+### 2.2 LANDED: `crates/engram-core/src/interval.rs` — consume it, do not rebuild it
+
+Same split as §2.1 and for the same reason [R1]: the interval algebra lives in
+`engram_core::interval`, storage-journal landed the file (`dbdb757`), and
+`engram_graph::interval` is a **re-export shim only**. The migration closes intervals with the
+same `close_at` clamp the classifier uses, so one implementation is not a preference. This lane
+owns the SEMANTICS below — which authorities may close what, and where the gate sits — and asks
+for any change to the landed file through §8.
 
 ```rust
+// engram_core::interval — LANDED. Semantics owned here.
 /// A fact's validity window. `until: None` means the interval is still open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Interval { pub from: DateTime<Utc>, pub until: Option<DateTime<Utc>> }
@@ -300,12 +336,26 @@ So:
 
 `classify_pair` and everything around it move here from `fact_write.rs:73-354` so read-surfaces,
 daemon-jobs and reasoning-layer can use them without depending on `engram-cli`. `fact_write.rs`
-re-exports every moved name, so `commands/facts.rs:20-24` keeps compiling untouched.
+re-exports every moved name **except `Arity`** — the legacy enum keeps its legacy name at every
+call site [R3], so `commands/facts.rs:20-24` is edited by read-surfaces to import `LegacyArity`
+rather than kept compiling by an alias.
 
 ```rust
 // ---- unchanged public shapes (re-exported from fact_write.rs) ----
 pub enum ConflictClass { Coexist, Duplicate, SupersedeOld, SupersedeNew, Settled, Queue }
-pub struct Verdict { pub class: ConflictClass, pub rule: &'static str }
+pub struct Verdict {
+    pub class: ConflictClass,
+    pub rule: &'static str,
+    /// The class this verdict held BEFORE it was escalated to `Queue` — set by
+    /// `safety_gate` (§2.3.1 step 9) and by the planner's strict-autonomy step
+    /// (§2.3.3 step 9.5), `None` otherwise. R7's honest `supersede-old` case is
+    /// not computable without it: step 9.5 turns a `closes` entry into a `queue`
+    /// entry and would otherwise discard the pre-escalation class, leaving
+    /// `suggested_action` unable to tell "queued because strict" from "queued
+    /// because comparable". Because `safety_gate` sets it too, arm (1) and arm
+    /// (3) of the suggestion table can never both match [D18].
+    pub escalated_from: Option<ConflictClass>,
+}
 pub enum ClassifyMode { Write, Triage }
 impl Verdict { pub fn is_auto_resolvable(&self) -> bool; }
 ```
@@ -342,7 +392,8 @@ pub fn classify_views(new: &FactView<'_>, old: &FactView<'_>, score: Option<f32>
 /// (commands/facts.rs:581-593 replaces its inline copy with this).
 pub fn safety_gate(v: Verdict, new: &FactView<'_>, old: &FactView<'_>) -> Verdict;
 
-/// What the CALLER should be told to do. Never `supersede-old`.
+/// What the CALLER should be told to do. Never `supersede-old` on a safety
+/// pair, and never when the classifier could not order the values (R7).
 pub fn suggested_action(v: &Verdict, new: &FactView<'_>, old: &FactView<'_>) -> &'static str;
 
 /// The actions `facts resolve` will accept for this pair, for the envelope's
@@ -419,7 +470,9 @@ NEW did not exist in v0.3.1.
    - otherwise → `Queue("comparable_values")`.
 9. **Safety gate** (`safety_gate`), applied to the result of 4–8: if either side is safety and
    the class is `SupersedeOld`, `SupersedeNew` **or `Duplicate`**, downgrade to
-   `Queue("safety_slot")`.
+   `Queue("safety_slot")`. Behaviour is unchanged by R7; the gate additionally **sets
+   `escalated_from`** to the pre-downgrade class, which arm (1) of `suggested_action` then never
+   reads — safety wins first, unconditionally, so a safety escalation can never reach arm (3).
    The rule name stays `"safety_slot"` on purpose — `commands/facts.rs:701` reads
    `kept_by_reason["safety_slot"]` to populate `safety_slots_kept`, and a rename would silently
    report zero. `Coexist` and `Settled` pass through untouched.
@@ -438,15 +491,25 @@ NEW did not exist in v0.3.1.
      arithmetic; the difference is that the absorbed observation is never inserted rather than
      inserted and immediately retired (`WritePlan.insert == None`, §2.3.3).
 
-`suggested_action`:
+`suggested_action`, four arms, **in this order** (R7):
 
 ```
-either side safety                                  -> "requires_context"
-rule in { same_source_contradiction, comparable_values,
-          paraphrase_slot, immutable_attribute_disagreement }
+(1) either side safety                              -> "requires_context"
+(2) rule in { same_source_contradiction, comparable_values,
+              paraphrase_slot, immutable_attribute_disagreement }
                                                     -> "requires_context"
-otherwise                                           -> "keep-both"
+(3) v.escalated_from == Some(SupersedeOld)
+    AND neither side safety
+    AND the relation is single-valued               -> "supersede-old"
+(4) otherwise                                       -> "keep-both"
 ```
+
+Arm (3) is R7's honest case and the only surviving `supersede-old` suggestion: the classifier DID
+order the two values, and the pair is in the queue solely because `--autonomy strict` refused to
+act on that ordering (§2.3.3 step 9.5). Telling the caller what the classifier concluded is not
+laundering uncertainty — there is no uncertainty to launder. Arm (1) runs first, so no safety pair
+can reach it; arm (2) runs before it, so no pair that queued because the values were *not*
+orderable can reach it either.
 
 `allowed_actions` is `["keep-both", "supersede-old", "reject-new"]` for every pair — a caller
 decision authorizes a safety close (that is what `CloseAuthority::Caller` means), so the
@@ -455,20 +518,45 @@ read-surfaces ships it (§6.4).
 
 #### 2.3.2 Decision keys and replay
 
+The key **primitives** are `engram_core::keys` [D15, LANDED at commit `a35f7e8`] — not this
+crate, and **not blake3, which R9 rejected**. `engram-storage` cannot depend on `engram-graph` and
+the v9→v10 migration must key ~14.5k decision rows, so the hash and the encoding live where the
+migration and the classifier can both reach them. One encoding, one namespace, no ownership change
+to the typed API:
+
 ```rust
+// engram_core::keys — LANDED. uuid5; no new dependency (uuid already carries v5, Cargo.toml:81).
+pub const SEMANTIC_KEY_NAMESPACE: Uuid;   // 6d1b9d3a-4f0e-5a7c-9b21-8f1c0d6e4a55
 pub const SEMANTIC_KEY_VERSION: &str = "semantic_key@1";
+pub const CONTENT_HASH_NAMESPACE: Uuid;   // 2f7c5e88-1a34-5c62-8d90-3b4e7a1f6c02
+/// hex(uuid5(SEMANTIC_KEY_NAMESPACE, min(a,b) ++ 0x1f ++ max(a,b))) over the two
+/// facts' `object_norm`s — NOT their member identities: the migration has only
+/// `object_norm`, and the migration and the classifier must agree or 14.5k
+/// migrated decisions stop replaying.
+pub fn object_pair_hash(a_norm: &str, b_norm: &str) -> String;
+pub fn semantic_key_encode(subject_norm: &str, relation: &str, pair_hash: &str) -> String;
+pub fn semantic_key_decode(s: &str) -> Option<(String, String, String)>;
+pub fn content_hash(content: &str) -> String;
+```
+
+The typed key keeps its home in this lane and **delegates**:
+
+```rust
+// engram_graph::semantics — this lane.
+pub use engram_core::keys::SEMANTIC_KEY_VERSION;
 
 /// interfaces.md §3, verbatim.
 pub struct SemanticKey { pub subject_norm: String, pub relation: String, pub object_pair_hash: String }
 
 impl SemanticKey {
-    /// object_pair_hash = hex(blake3(min(a,b) || 0x1f || max(a,b))) over the
-    /// two object_norms, so the key is the same whichever fact arrives first.
+    /// `keys::object_pair_hash(&new.fact.object_norm, &old.fact.object_norm)`,
+    /// which is order-independent, so the key is the same whichever fact arrives first.
     pub fn for_pair(new: &FactView<'_>, old: &FactView<'_>) -> SemanticKey;
     /// Stable single-column encoding for the queue row and the event payload:
-    /// "<subject_norm>\u{1f}<relation>\u{1f}<object_pair_hash>".
+    /// "<subject_norm>\u{1f}<relation>\u{1f}<object_pair_hash>" — the delegated
+    /// `keys::semantic_key_encode`, never a second spelling of it.
     pub fn encode(&self) -> String;
-    pub fn decode(s: &str) -> Option<SemanticKey>;
+    pub fn decode(s: &str) -> Option<SemanticKey>;   // keys::semantic_key_decode
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,10 +749,14 @@ refuses. So `plan_write` applies them as step 9.5, after `safety_gate`:
 - `observation.autonomy == Strict` → every `closes` entry whose authority is `SuccessorInterval`
   or `Heuristic` becomes a `queue` entry instead. `ExplicitEnd` and replayed caller decisions are
   NOT escalated: `strict` promised never to auto-supersede, not to disbelieve the text or
-  re-ask a question the caller already answered.
+  re-ask a question the caller already answered. The resulting `PlannedConflict.verdict` carries
+  `escalated_from: Some(SupersedeOld | SupersedeNew)` — the class the classifier actually reached
+  — which is what lets arm (3) of `suggested_action` (§2.3.1) answer `supersede-old` honestly
+  instead of pretending the classifier was undecided [R7, D18].
 - `observation.queue_everything` → every `closes` entry becomes a `queue` entry, and `confirm`
   stays (a confirmation is not a decision). This is a test seam, and it keeps its exact
-  present-day reach.
+  present-day reach. These escalations carry `escalated_from: None`, because
+  `ENGRAM_FACT_QUEUE_ALL` is a test seam and must not change the advice a caller is given.
 
 Both are read once by the applier and passed in on the `Observation`, so the planner stays pure.
 
@@ -707,20 +799,29 @@ fn queue_conflict(ctx: &AppContext, p: &PlannedConflict, ...) -> Result<(), CliE
 ```
 
 - `suggested` comes from `suggested_action`, never from `detector == "slot"` (kills `:1209-1213`);
+  the value is whatever the four-arm table of §2.3.1 returns, including `supersede-old` in R7's
+  one honest case;
 - the row carries `decision_key`, `member_key` and `registry_version`;
 - the payload gains `resolve: { program: "engram", args: [...], allowed_actions: [...] }` and
   `resolve_command` becomes ONE runnable command with no `|` (interfaces.md §4):
   `engram facts resolve <id> --action keep-both`;
 - `note` explains coexistence honestly: "both values stay active until resolved" is only true for
   values that are genuinely both open, which after this change they always are.
-- **a key collision is reported, not swallowed.** `insert_fact_conflict` is `INSERT OR IGNORE`
-  (`sqlite.rs:4240`) and returns `Ok(false)` when nothing was inserted. With `idx_fcq_open_key`
-  in place, a second distinct pair carrying an already-open semantic key hits that branch — and
-  today `queue_conflict` simply pushes nothing onto `outcome.queued`, so the caller gets an
-  exit-0 success with the question missing. Instead: on `Ok(false)`, look up the open row for
-  `(kb, decision_key)` and push a `queued` entry naming THAT `conflict_id`, with
-  `"deduplicated": true`. The agent is told which question is already waiting rather than being
-  told nothing happened.
+- **a key collision is reported, not swallowed, and the two collisions are told apart.**
+  `insert_fact_conflict` no longer returns `Result<bool>`: per R10/D16 it returns
+  `InsertOutcome { Inserted, DuplicatePair { existing }, DuplicateKey { existing } }`, and the
+  applier matches on it. `Ok(false)` used to mean "nothing was inserted" for two unrelated
+  reasons, and the recovery built on it (look up the open row for `(kb, decision_key)`) is what
+  CM-7 showed to be wrong for the `DuplicatePair` case — it can name a conflict id for a
+  DIFFERENT pair, or nothing at all when the existing row predates the key backfill. So:
+  - `Inserted` → push the new `conflict_id` onto `outcome.queued`, as today;
+  - `DuplicateKey { existing }` → push a `queued` entry naming `existing`, with
+    `"deduplicated": true`. This is the only path that produces `deduplicated`, and it is honest
+    because storage matched the semantic key, not a guess made by the applier;
+  - `DuplicatePair { existing }` → the same pair is already queued; push `existing` with no
+    `deduplicated` flag. Nothing is looked up and nothing is inferred.
+  What this preserves is the property the old text was reaching for: the caller is never handed an
+  exit-0 success with the question silently missing.
 
 `apply_write_verdict` (`:1103-1163`) is replaced by `apply_plan`. `write_supersede_rule`
 (`:311-318`), `classify_mode_for` (`:320-336`) and `compile_resolution` (`:338-354`) move to
@@ -820,13 +921,15 @@ every existing listing; it is not `resolved`, because nobody resolved it.
 
 | File | Change | Anchors |
 |---|---|---|
-| `crates/engram-graph/src/relations.rs` | **NEW** ~420 lines. `RelationSpec`, registry, `relation_spec`, `relation_arity`, `canonical_relation`, `cessation_of`, `member_identity`, `predicate_arity` + `LegacyArity` (legacy projection), `is_safety_slot`, `REGISTRY_VERSION`, `MEMBER_IDENTITY_VERSION`, unit tests. | absorbs `fact_write.rs:89-151` |
-| `crates/engram-graph/src/interval.rs` | **NEW** ~280 lines. `Interval`, `is_open_fact`, `CloseReason`, `CloseAuthority`, `CloseVerdict`, `may_close`, `close_at`, unit tests. | new |
+| `crates/engram-core/src/relations.rs` | **LANDED** (storage-journal, `dbdb757`). This lane VERIFIES the registry content against §2.1's table and does not rewrite the file; content changes go through §8. | `engram_core::relations` [R1] |
+| `crates/engram-core/src/interval.rs` | **LANDED** (storage-journal, `dbdb757`). Same rule: verify `may_close` / `close_at` against §2.2, do not rewrite. | `engram_core::interval` [R1] |
+| `crates/engram-graph/src/relations.rs` | **NEW, shim only** (~5 lines): `pub use engram_core::relations::*;` so `engram_graph::relations` keeps resolving. No registry content, no second heuristic. | [R1] |
+| `crates/engram-graph/src/interval.rs` | **NEW, shim only** (~5 lines): `pub use engram_core::interval::*;`. | [R1] |
 | `crates/engram-graph/src/semantics.rs` | **NEW** ~700 lines. `ConflictClass`, `Verdict`, `ClassifyMode`, `FactView`, `classify_pair`, `classify_views`, `safety_gate`, `suggested_action`, `allowed_actions`, `write_supersede_rule`, `classify_mode_for`, `compile_resolution`, `SemanticKey`, `DecisionVerdict`, `DecisionAuthority`, `DecisionRecord`, `DecisionLedger`, `replay`, `Observation`, `WritePlan`, `plan_write`, unit tests. | moves `fact_write.rs:73-354`, rewrites `:228-309` |
 | `crates/engram-graph/src/facts.rs` | EDIT. `ExtractedFact` +`valid_until` +`state` +`Default`; prompt gains `valid_until`/`state`/coexistence rules + a cessation example; adjudication prompt gains the set-valued line; `slot_policy` deprecated shim; `date_valued_predicate` re-expressed. | `:30-59`, `:61-74`, `:225-266`, `:270-280` |
-| `crates/engram-graph/src/lib.rs` | EDIT. `pub mod interval; pub mod relations; pub mod semantics;` + re-export `relation_spec`, `member_identity`, `classify_pair`, `SemanticKey`. | `:11-22` |
-| `crates/engram-graph/Cargo.toml` | EDIT. add `blake3.workspace = true` (see §6.1). | |
-| `crates/engram-cli/src/fact_write.rs` | EDIT, net −350 lines. Delete the classifier and arity tables; re-export the moved names — including `LegacyArity as Arity` and `is_safety_slot` — so `commands/facts.rs:20-24` is untouched; rewrite `write_fact` around `plan_write` + `apply_plan`; new `resolve_valid_until`; `queue_conflict` takes a `PlannedConflict`; `--autonomy full` supersession is safety-gated; module header rewritten to describe intervals rather than slots. | `:1-30`, `:73-354`, `:858-1097`, `:1099-1163`, `:1197-1239` |
+| `crates/engram-graph/src/lib.rs` | EDIT. `pub mod interval; pub mod relations; pub mod semantics;` (the first two are the re-export shims) + re-export `relation_spec`, `member_identity`, `classify_pair`, `SemanticKey`. | `:11-22` |
+| `crates/engram-graph/Cargo.toml` | **no change.** blake3 is rejected [R9]; the key primitives are `engram_core::keys`, and `engram-graph` already depends on `engram-core` (§2.3.2, D15). | |
+| `crates/engram-cli/src/fact_write.rs` | EDIT, net −350 lines. Delete the classifier and arity tables; re-export the moved names — `is_safety_slot` included, `LegacyArity` under its own name and **no `as Arity` alias** [R3], so `commands/facts.rs:20-24` is edited by read-surfaces rather than propped up; rewrite `write_fact` around `plan_write` + `apply_plan`; new `resolve_valid_until`; `queue_conflict` takes a `PlannedConflict`; `--autonomy full` supersession is safety-gated; module header rewritten to describe intervals rather than slots. | `:1-30`, `:73-354`, `:858-1097`, `:1099-1163`, `:1197-1239` |
 | `crates/engram-cli/src/fact_llm.rs` | EDIT (small). The stub-script docs mention the two new `ExtractedFact` fields so a test author knows the seam covers cessation. No behaviour change. | `:1-25` |
 | `crates/engram-cli/tests/wave3_fact_intervals.rs` | **NEW** — see §5.E. | |
 | `crates/engram-cli/tests/wave3_fact_polypharmacy.rs` | **NEW** | |
@@ -878,10 +981,14 @@ snapshot is not reusable for a second before/after comparison. Take a fresh one 
 Never automate this, never put it in a test, never point a binary at the real path.
 
 **Phase 1 — migration v9→v10 (storage-journal lane, calling this lane's pure functions).**
-Ordered, idempotent, backup first. The backup filename is `db.sqlite.pre-v10-backup`, exactly as
-interfaces.md §2 spells it; the brief's constraint 4 asks for a *timestamped* backup, and the two
-documents disagree. This lane does not own the migration and does not get to pick — §6.8 asks the
-lead to pin one spelling, and until then the implementer follows interfaces.md.
+Ordered, idempotent, backup first. The backup is
+`VACUUM INTO '<data_dir>/db.sqlite.pre-v10-backup.<YYYYMMDDHHMMSS>'` (UTC), taken before the
+migration transaction opens, only when the stored version is < 10, and never for
+`open_in_memory()` — interfaces.md §2.1 step 1 **[R5a]**, which settled this: the un-timestamped
+filename in interfaces v1 and constraint 4's "repo precedent" were both wrong, and there is no
+existing backup mechanism in the tree to be consistent with. `VACUUM INTO` rather than a file
+copy, so the WAL trio cannot be torn. Storage-journal owns the code and follows the same ruling;
+this annex no longer asks the lead to pin anything.
 
 The steps are ordered, and the order matters more than it looks — step 1 creates a UNIQUE index
 over a column step 5 populates:
@@ -984,9 +1091,12 @@ has not signed.
   all three actions and their meanings; `supersede-old` now closes an interval with
   `CloseAuthority::Caller`, which is what it already did (it set `valid_until`, `sqlite.rs:4105-4133`).
 - **JSON fields**: `arity` keeps emitting `"single"|"multi"` from the legacy projection;
-  `suggested_action` keeps its name and type, and gains one new value (`requires_context`) while
-  losing one it emitted (`supersede-old`) — a value change, not a schema change, and the point of
-  the lane. `resolve_command` stays, now pipe-free. `conflicts[]`, `adjudication_needed[]`,
+  `suggested_action` keeps its name and type, and gains one new value (`requires_context`);
+  `supersede-old` is **retained but narrowed** — it can no longer appear on a safety pair, and
+  off a safety pair only in R7's strict-escalation case. The vocabulary is generated by
+  contract-codegen from `engram_contract::vocabulary("suggested_action")` (R7), so there is one
+  list, not one per surface. A value change, not a schema change, and the point of the lane.
+  `resolve_command` stays, now pipe-free. `conflicts[]`, `adjudication_needed[]`,
   `resolved_by_rule`, `remaining_by_reason`, `safety_slots_kept` keep their shapes and keys.
 - **Rule names**: existing names are preserved wherever the meaning is unchanged, including
   `safety_slot` for the gate output, because another lane reads it as a map key.
@@ -1023,6 +1133,10 @@ Two structural defences:
    `rg -n 'cargo_bin' crates/engram-cli/tests/wave3_fact_*.rs` must show one hit per file.
 
 ### A. `relations.rs` unit tests
+Tests A and B run against the **landed** `engram_core::{relations, interval}` modules (§2.1, §2.2).
+Where an assertion below is missing from the landed test module, it is added there through §8, not
+duplicated behind the `engram_graph` shim — a second copy of these tables is a second registry
+wearing a test's clothes.
 1. `safety_relations_are_sets_not_slots` — `takes_medication`, `allergic_to`, `diagnosed_with`
    → `SetValued { safety: true }`. The single assertion that kills the storm.
 2. `blood_type_is_a_single_safety_value`; `birthday`/`died_on`/`nationality` →
@@ -1058,8 +1172,14 @@ Two structural defences:
 16. `no_verdict_ever_closes_a_safety_interval` — property test: for the cross product of safety
     relations × object pairs × time orderings × source kinds × both `ClassifyMode`s, assert the
     class is never `SupersedeOld`/`SupersedeNew`.
-17. `suggested_action_is_never_supersede_old` — property test over every `Verdict` the classifier
-    can emit.
+17. `suggested_action_is_never_supersede_old_on_a_safety_pair` — property test over every
+    `Verdict` the classifier can emit, at unchanged strength but scoped to safety pairs, which is
+    what R7 actually forbids.
+17b. `a_strict_escalated_slot_update_still_suggests_supersede_old` — the positive test, and the
+    only one that proves R7's honest case fires: a non-safety single-valued pair whose verdict
+    carries `escalated_from: Some(SupersedeOld)` under `--autonomy strict` suggests
+    `supersede-old`. Without it the blanket rule can be reintroduced silently and every other
+    test in this file stays green.
 18. `disjoint_intervals_coexist` — London 2015–2020 vs Lisbon 2024–open → `Coexist`.
 19. `overlapping_single_valued_intervals_close_the_older_one` — and the close instant equals the
     successor's `valid_from`.
@@ -1129,10 +1249,13 @@ Each uses `ENGRAM_FACT_LLM_STUB` with a scripted JSON array, so no key and no ne
     `cli.rs::strict_autonomy_queues_even_plain_slot_updates` (the `Autonomy::Strict` escalation
     the planner absorbs, §2.3.3), `cli.rs:1959`/`:4474` (the `facts resolve` action surface).
 
-41. **Regressions that MUST change, and whose diff is the deliverable.** Two shipped tests
+41. **Regressions that MUST change — and that this lane does NOT edit.** Two shipped tests
     encode the polypharmacy defect as a guarantee, so "leave them green" and "fix the storm" are
-    the same sentence read two ways. Both assert that two DIFFERENT allergies on one person
-    produce exactly one queued `safety_slot` conflict:
+    the same sentence read two ways. Both live in files R15 gives to the **lead**
+    (`crates/engram-cli/tests/cli.rs`, `tests/wave0_*.rs`, `tests/wave05_*.rs`), so both rewrites
+    are **patch-channel items, not lane commits** — they are written out verbatim as CLP-1 and
+    CLP-2 in §8 and the lead applies them at wave integration. Both assert that two DIFFERENT
+    allergies on one person produce exactly one queued `safety_slot` conflict:
     - `cli.rs:1791 safety_slot_queues_conflict_and_recall_reports_contested` — `Ana allergic_to
       penicillin` then `Ana allergic_to amoxicillin` → `adjudication_needed.len() == 1`. Under
       this spec that is `safety_set_coexist`: zero conflicts, two open intervals. The test is
@@ -1143,8 +1266,12 @@ Each uses `ENGRAM_FACT_LLM_STUB` with a scripted JSON array, so no key and no ne
       claim worth keeping is `historic_count == 0` (a compile never retires a safety fact),
       which stays green; the queued count becomes 0 and the rule assertion moves to a
       dose-change fixture.
-    Both rewrites go in their own commit, ahead of the behaviour change, with a message that
-    says the assertion WAS the bug. Nothing else in `wave05_compiled_facts.rs` moves.
+    Both rewrites land through the lead's patch channel in one commit, ahead of the behaviour
+    change, with a message that says the assertion WAS the bug. Nothing else in
+    `wave05_compiled_facts.rs` moves. If the patch has not landed when the behaviour change does,
+    this lane reports two red tests rather than editing files it does not own — a lane that
+    rewrites another lane's assertions to keep its own build green is how a guarantee gets
+    deleted quietly.
 
 42. **Tests that depend on other lanes, and what they assert until those lanes land.**
     Marked `#[ignore]` with the blocking lane named in the attribute, so the gate is honest
@@ -1174,14 +1301,14 @@ Everything below is a request to the integration lead for `docs/arch/interfaces.
 is implemented divergently in the meantime; where a signature is missing this lane codes against
 the shape written here and reports it.
 
-### 6.1 `blake3` as a workspace dependency
-interfaces.md §3 pins `object_pair_hash = hex(blake3(...))`. `blake3` is not in
-`Cargo.toml`'s `[workspace.dependencies]`. **Request**: add `blake3 = "1"` and
-`blake3.workspace = true` to `crates/engram-graph/Cargo.toml`.
-*Alternative if a new dependency is unwanted*: `uuid` is already vendored with the `v5` feature,
-so `Uuid::new_v5(&DECISION_NS, bytes).simple()` is a deterministic, dependency-free hash of the
-same pair encoding. This lane will use blake3 as specified unless the lead says otherwise; the
-choice must be made once, because it is baked into 14.5k migrated decision keys.
+### 6.1 The key hash — CLOSED, no dependency
+**Settled by R9 and D15; nothing is requested here.** `blake3` is rejected and must NOT be added
+to `[workspace.dependencies]` or to `crates/engram-graph/Cargo.toml`. `object_pair_hash` is
+`hex(uuid5(SEMANTIC_KEY_NAMESPACE, min(a,b) ++ 0x1f ++ max(a,b)))` over the two `object_norm`s,
+and it lives with the rest of the primitives in **`engram_core::keys`**, which LANDED at commit
+`a35f7e8`. `uuid` already carries the `v5` feature (`Cargo.toml:81`), so the encoding costs no new
+dependency. The choice had to be made once because it is baked into ~14.5k migrated decision keys;
+it was, and this lane consumes it rather than re-deciding it.
 
 ### 6.2 Storage methods this lane calls
 ```rust
@@ -1220,26 +1347,35 @@ impl SqliteStore {
     pub fn lookup_decision(&self, kb: &str, key_encoded: &str)
         -> Result<Option<DecisionRow>, StorageError>;
 
-    /// Queue insert gains the semantic key and provenance of the classification.
+    /// Queue insert gains the semantic key and provenance of the classification,
+    /// and returns `InsertOutcome` — NOT `Result<bool>` [R10, D16]: the applier
+    /// must tell "this exact pair is already queued" from "another pair already
+    /// holds this semantic key", and a bool cannot (CM-7).
     pub fn insert_fact_conflict(&self, id: Uuid, new_fact_id: Uuid, old_fact_id: Uuid,
                                 diary: &str, kb: &str, detector: &str, score: Option<f32>,
                                 suggested: &str, decision_key: &str, member_key: &str,
-                                registry_version: &str) -> Result<bool, StorageError>;
+                                registry_version: &str) -> Result<InsertOutcome, StorageError>;
 }
+
+// engram_storage, per interfaces §3.5 — the applier matches on this (§2.4).
+pub enum InsertOutcome { Inserted, DuplicatePair { existing: Uuid }, DuplicateKey { existing: Uuid } }
 ```
 `insert_fact_conflict` (sqlite.rs:4229-4258) has exactly one caller
-(`fact_write.rs:1214`), so widening it in place costs no other lane an edit.
+(`fact_write.rs:1214`), so widening it in place costs no other lane an edit. Storage-journal §2.6
+implements it and its `cross_lane_patches` CLP-6 carries the wave-2 stopgap at that call site, so
+the workspace stays green in whichever order the two lanes land.
 
 ### 6.3 `engram-core` additions
-- `pub enum Arity { SetValued { safety: bool }, SingleValued { safety: bool } }` — already in
-  interfaces.md §3; this lane needs it to land in `engram-core` (wave 2) so `relations.rs` can
-  re-export rather than define a rival.
+- `pub enum Arity { SetValued { safety: bool }, SingleValued { safety: bool } }` — **LANDED** in
+  `engram_core::relations` (not `engram_core::types`, CM-12). `engram_graph::relations` re-exports
+  it and defines no rival.
 - `Fact` gains `close_reason: Option<String>`, `close_authority: Option<String>`,
   `closed_by: Option<Uuid>` (`#[serde(default)]`, additive). This lane only reads them.
-- **Addition request**: `Mutability` and `Temporality` are NOT in interfaces.md. They are
-  additive axes this lane needs (birthday vs lives_in behave differently under identical arity)
-  and they live in `engram-graph::relations`, not in the pinned `Arity` enum, so nothing pinned
-  diverges. Requesting they be recorded in §3 as fact-semantics-owned.
+- `Mutability` and `Temporality` are additive axes this lane needs (birthday vs lives_in behave
+  differently under identical arity) and they **LANDED in `engram_core::relations`** alongside
+  `Arity` [R1] — not in `engram-graph`, and not inside the pinned `Arity` enum, so nothing pinned
+  diverges. **Request**: record them in interfaces §3 as fact-semantics-owned *content* in a
+  storage-journal-owned *file*, which is the same split as the rest of the registry (§2.1).
 
 ### 6.4 Read-surfaces (`commands/facts.rs`, `commands/recall.rs`)
 1. Replace the inline safety defence at `facts.rs:581-593` with
@@ -1255,6 +1391,12 @@ impl SqliteStore {
    from `queue_conflict`.
 5. Optional, recommended: a `--action close-old --as-of <date>` variant so a caller can close an
    interval at a stated date rather than at the successor's start.
+6. Read-surfaces' **read-side R7 guard** (`suggested_action_for(row_suggested, safety)` plus
+   `metadata.suggested_action_overridden`) survives this revision unchanged. It exists for the 951
+   pre-wave-3 queue rows, whose stored `suggested_action` was written by the old classifier, and
+   the `_overridden` flag is what stops the guard from masking a write-side regression. Nothing in
+   §2.3.1 duplicates it: this lane fixes what is written, that guard fixes what was already
+   written.
 
 ### 6.5 Daemon-jobs (`commands/compile.rs`)
 `ExtractedFact` gains two `#[serde(default)]` fields, so the single struct literal at
@@ -1316,10 +1458,10 @@ says so in its report. A stub that silently returns `Ok(None)` from `binding_dec
 classifier that has forgotten every decision the user ever made, and it would pass every test in
 §5.D because those use a fixture closure.
 
-Interfaces.md §2 spells the migration backup `db.sqlite.pre-v10-backup`; the brief's constraint 4
-requires a *timestamped* backup and cites `db.sqlite.pre-v8-backup` as precedent (which is not
-timestamped either). **Request**: pin one spelling in interfaces.md so this lane's Phase 3
-verification script and storage-journal's migration agree on the filename.
+The migration backup filename is **pinned and no longer a request**:
+`db.sqlite.pre-v10-backup.<YYYYMMDDHHMMSS>` (UTC) via `VACUUM INTO`, interfaces.md §2.1 step 1
+**[R5a]**. §4.1 Phase 1 and the Phase 3 verification script use that spelling, and so does
+storage-journal's migration, so the two documents that used to disagree now do not.
 
 ### 6.9 Open interface question — decision scope
 `SemanticKey` (interfaces.md §3) carries no `kb`. A decision made in one KB would replay into
@@ -1367,13 +1509,15 @@ re-answering per diary.
    `is_open_fact()` semantics. Known sites outside this lane: `sqlite.rs:3974-4030`,
    `:4150-4173`, `:4542-4760`, `commands/people.rs`, `retrieval.rs`. **This is the highest-risk
    cross-lane item in the spec** and needs an explicit sweep in wave 3 integration.
-6. **The safety gate is enforced in `engram-graph`, not structurally in storage.**
-   `engram-storage` cannot depend on `engram-graph` (the dependency runs the other way), so
-   `close_fact_interval` cannot consult the registry. The gate is therefore a discipline
-   (one funnel: `may_close`) plus an audit (`close_authority` column plus test 37 plus the Phase 3
-   SQL assertion), not a type-level impossibility. If the lead wants it structural, the registry
-   must move into `engram-core` — a larger change that this lane can absorb in wave 3 if decided
-   before it starts.
+6. **The safety gate is a discipline, not a type-level impossibility — but the option to make it
+   structural is now open.** The classifier that applies the gate lives in `engram-graph`, which
+   `engram-storage` cannot depend on, so `close_fact_interval` does not consult it. The gate is
+   therefore one funnel (`may_close`) plus an audit (`close_authority` column, test 37, the Phase
+   3 SQL assertion). What changed under R1 is the cost of the structural version: the registry and
+   `may_close` now live in `engram_core::{relations, interval}`, which `engram-storage` DOES
+   depend on, so a storage-side refusal is a small change rather than a module move. Not taken in
+   this wave — `close_fact_interval` would need the relation spec threaded to every call site —
+   and recorded here as the cheap follow-up it has become.
 7. **`--autonomy full` becomes weaker on safety relations**, by design: the LLM is a `Heuristic`
    authority and can no longer supersede an allergy. Agents using `--autonomy full` will see more
    queued pairs than before on medical content and fewer everywhere else. Worth a CHANGELOG line
@@ -1382,18 +1526,17 @@ re-answering per diary.
    repo keying behaviour off that projection changes behaviour. Inside the repo the only consumer
    is the `arity` JSON field at `commands/facts.rs:436-439`, which is descriptive.
 
-9. **Withdrawing `supersede-old` from `suggested_action` everywhere is broader than the brief
-   asks.** The brief's move 2 kills `suggested_action: "supersede-old"` on SAFETY pairs
-   (`fact_write.rs:1209-1213`); interfaces.md §3 likewise constrains only the safety
-   member-attribute case. §1.4 of this spec goes further and removes the value from the
-   suggestion vocabulary for every pair, safety or not. The argument for going further: an
-   ordinary slot disagreement that reached the queue reached it precisely because the classifier
-   could NOT order the two values, so suggesting a supersession there is the classifier laundering
-   its own uncertainty as advice. The argument against: agents that auto-run
-   `suggested_action` on routine slot queues will now do nothing where they used to converge, and
-   the queue grows. **Open question for the lead**: narrow the change to safety pairs (brief-exact,
-   smaller blast radius), or keep the blanket rule? The spec currently implements the blanket rule.
-   Either way `supersede-old` remains an accepted `--action` value forever.
+9. **How far `supersede-old` is withdrawn from `suggested_action` — RULED (R7).** The scope is
+   **narrowed to safety pairs plus the classifier-uncertainty rules**
+   (`same_source_contradiction`, `comparable_values`, `paraphrase_slot`,
+   `immutable_attribute_disagreement`); the blanket removal this spec's earlier draft implemented
+   is **overruled**. Where the classifier did order the values and only `--autonomy strict` put
+   the pair in the queue, `supersede-old` is honest advice and is emitted (§2.3.1 arm 3). The
+   argument that reached this ruling: suggesting a supersession the classifier could not justify
+   is laundering uncertainty as advice, but suppressing one it *did* justify is throwing away the
+   answer and growing the queue for nothing. `supersede-old` remains an accepted `--action` value
+   forever. Recorded as closed rather than deleted, because an open question that has been
+   answered is how an implementer re-litigates it.
 
 10. **The deprecated `slot_policy` shim (§2.5) does not round-trip.** It is defined by arity, so
     it necessarily changes two ways: safety SETS (`takes_medication`, `allergic_to`,
@@ -1426,3 +1569,30 @@ re-answering per diary.
     That weakens the argument for auto-closing at all and strengthens the "queue in v1, revisit
     after the drain is measured" option already listed in risk 1. Folded into that open question
     rather than decided here.
+
+---
+
+## 8. cross_lane_patches
+
+Edits this lane needs in files it does not own. Each is written to be applied verbatim by the
+integration lead at wave integration [R15]; none is a design question. Constraint 7 stands: this
+lane never edits outside its owned set, however small the diff and however red the build.
+
+| # | File (owner) | Patch |
+|---|---|---|
+| CLP-1 | `crates/engram-cli/tests/cli.rs:1791` (**lead**) | rewrite `safety_slot_queues_conflict_and_recall_reports_contested`: `Ana allergic_to penicillin` + `Ana allergic_to amoxicillin` now assert **coexistence** — `adjudication_needed.len() == 0`, two facts with `valid_until: null` — because two different allergies are `safety_set_coexist`, not a conflict. Add the sibling test that keeps the half still true: a DOSE change on one medication queues exactly one conflict and `recall` reports the subject contested. The old assertion WAS the polypharmacy bug (§5.41) |
+| CLP-2 | `crates/engram-cli/tests/wave05_compiled_facts.rs:170` (**lead**) | rewrite `a_compiled_fact_never_retires_a_safety_slot`: keep `historic_count == 0` (a compile never retires a safety fact — the claim worth keeping, and it stays green); `llm_facts_queued` becomes `0`; the `triage.rule == "safety_slot"` assertion moves to a dose-change fixture. Nothing else in the file moves |
+
+Both patches land in one commit **ahead of** this lane's behaviour change, with a message that
+says the assertion was the bug. If they have not landed when the behaviour change does, this lane
+reports two red tests rather than editing lead-owned files.
+
+Inbound, for reference — patches other lanes have already written against **this** lane's files,
+which this lane absorbs rather than duplicates: storage-journal's CLP-6 (`fact_write.rs:1214`,
+`insert_fact_conflict` gains the three key columns and returns `InsertOutcome`, §2.4/§6.2) and
+CLP-7 (`fact_write.rs:901` and `:1368`, the two `Fact { … }` literals gain `closed_by`,
+`close_reason`, `close_authority`).
+
+Explicitly **not** requested, stated so nobody adds it: no `blake3` anywhere (§6.1, R9), and no
+`pub use … LegacyArity as Arity` in any file (§2.1, R3) — read-surfaces renames its own imports
+in its own lane, which is why the alias has no consumer to keep alive.
