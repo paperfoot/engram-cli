@@ -1177,6 +1177,7 @@ dependencies = [
  "figment",
  "owo-colors",
  "paperfoot-engram-bench",
+ "paperfoot-engram-contract",
  "paperfoot-engram-core",
  "paperfoot-engram-embed",
  "paperfoot-engram-graph",
@@ -1217,6 +1218,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "paperfoot-engram-contract"
+version = "0.3.1"
+dependencies = [
+ "serde",
+ "serde_json",
  "uuid",
 ]
 

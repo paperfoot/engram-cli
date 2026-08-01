@@ -1,7 +1,6 @@
 //! engram — agent-native memory CLI.
 
-use clap::Parser;
-use engram_cli::{cli::Cli, dispatch};
+use engram_cli::dispatch;
 use std::process::ExitCode;
 
 #[tokio::main]
@@ -12,7 +11,9 @@ async fn main() -> ExitCode {
         .compact()
         .init();
 
-    let cli = Cli::parse();
+    // Not `Cli::parse()`: that exits 2 on a typo, which our own exit table
+    // reads as "your setup is broken". See cli::parse_or_exit.
+    let cli = engram_cli::cli::parse_or_exit();
     match dispatch(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

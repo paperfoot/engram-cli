@@ -107,8 +107,10 @@ pub enum Command {
         /// Search query.
         query: String,
 
-        /// Number of results.
-        #[arg(long, default_value_t = 10)]
+        /// Number of results. `--limit` is accepted as an alias: agents reach
+        /// for the enumerating word, and a rejected flag on the most-called
+        /// command is a worse teacher than an alias.
+        #[arg(long, default_value_t = 10, visible_alias = "limit")]
         top_k: usize,
 
         /// Memory layer to target (identity|critical|topic|deep).
@@ -269,8 +271,8 @@ Examples:
         /// Specialist agent diary namespace, or "*" for all.
         #[arg(long, default_value = "default")]
         diary: String,
-        /// Number of evidence leads.
-        #[arg(long, default_value_t = 12)]
+        /// Number of evidence leads. `--limit` is accepted as an alias.
+        #[arg(long, default_value_t = 12, visible_alias = "limit")]
         top_k: usize,
         /// Retrieval profile: cloud_quality|fast|offline.
         #[arg(long, default_value = "cloud_quality")]
@@ -660,7 +662,8 @@ pub enum MemoryCommand {
     #[command(visible_alias = "find")]
     Search {
         query: String,
-        #[arg(long, default_value_t = 10)]
+        /// Number of results. `--limit` is accepted as an alias.
+        #[arg(long, default_value_t = 10, visible_alias = "limit")]
         top_k: usize,
         #[arg(long, default_value = "agent")]
         mode: String,
@@ -997,4 +1000,265 @@ pub enum SkillCommand {
     },
     /// Remove the installed skill files.
     Uninstall,
+}
+
+// --- argv parsing, through the envelope -------------------------------------
+//
+// `Cli::parse()` prints clap's prose to stderr and exits 2. Two exits collide
+// there: our own table says 2 means "config error, fix your setup, do not
+// retry", so a typo'd flag sent every agent to `config check`. A bad argument
+// is bad INPUT — exit 3 — and it must arrive in the same JSON envelope as
+// every other failure, because an agent that cannot parse the error cannot
+// act on it. `--help` and `--version` stay on stdout at exit 0: they are
+// successes. Nothing here opens a store, which preserves the landed guarantee
+// that discovery and misuse never migrate a database.
+
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::CommandFactory;
+
+/// What argv parsing produced when it did not produce a `Cli`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseOutcome {
+    /// clap rendered help or version; print `text` to STDOUT, exit 0.
+    Rendered { text: String },
+    /// Anything else: emit the error envelope, exit 3.
+    Invalid { message: String, suggestion: String },
+}
+
+/// Classify one `clap::Error` without owning a `Cli` — the seam every other
+/// clap parser in the workspace uses, `engramd`'s `Args` most of all, so the
+/// daemon and the CLI cannot drift on the same typo.
+pub fn classify(e: &clap::Error) -> ParseOutcome {
+    match e.kind() {
+        // These three are successes wearing an error type. Losing
+        // DisplayHelpOnMissingArgumentOrSubcommand here would make bare
+        // `engram` exit 3 with an envelope instead of printing help.
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayVersion
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => ParseOutcome::Rendered {
+            text: e.render().to_string(),
+        },
+        kind => ParseOutcome::Invalid {
+            message: first_line(&e.render().to_string()),
+            suggestion: suggest(kind, e),
+        },
+    }
+}
+
+/// Testable half of `parse_or_exit`: same behaviour, injectable argv, no
+/// process boundary.
+pub fn parse_from<I, T>(argv: I) -> Result<Cli, ParseOutcome>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    Cli::try_parse_from(argv).map_err(|e| classify(&e))
+}
+
+/// Terminal half, exposed so the daemon's parser is one line and not a
+/// re-derivation: render help to stdout and exit 0, or emit the error
+/// envelope and exit 3.
+pub fn emit_parse_failure(e: clap::Error) -> ! {
+    exit_with(classify(&e))
+}
+
+/// Parse argv, or print a JSON error envelope and exit 3.
+pub fn parse_or_exit() -> Cli {
+    match parse_from(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(outcome) => exit_with(outcome),
+    }
+}
+
+fn exit_with(outcome: ParseOutcome) -> ! {
+    use std::io::Write;
+    match outcome {
+        ParseOutcome::Rendered { text } => {
+            let mut out = std::io::stdout().lock();
+            let _ = write!(out, "{text}");
+            std::process::exit(0)
+        }
+        ParseOutcome::Invalid {
+            message,
+            suggestion,
+        } => {
+            let code = engram_core::ErrorCode::BadInput;
+            let mut err = std::io::stderr().lock();
+            if crate::error::stderr_is_tty() {
+                let _ = writeln!(err, "error: {message}");
+                let _ = writeln!(err, "  hint: {suggestion}");
+            } else {
+                let payload = serde_json::json!({
+                    "version": "1",
+                    "status": "error",
+                    "error": {
+                        "code": code.as_str(),
+                        "message": message,
+                        "suggestion": suggestion,
+                        "exit_code": code.exit_code(),
+                    }
+                });
+                let _ = writeln!(err, "{payload}");
+            }
+            std::process::exit(code.exit_code())
+        }
+    }
+}
+
+/// A suggestion built from the failing context, not boilerplate. An agent that
+/// mistypes a subcommand gets the name it meant; one that guesses a flag gets
+/// told where the real list is.
+fn suggest(kind: ErrorKind, e: &clap::Error) -> String {
+    match kind {
+        ErrorKind::InvalidSubcommand => {
+            let typed = context_string(e, ContextKind::InvalidSubcommand);
+            match typed.as_deref().and_then(nearest_subcommand) {
+                Some(near) => format!(
+                    "did you mean `engram {near}`? run `engram agent-info` for the full command list"
+                ),
+                None => "run `engram agent-info` for the full command list".to_string(),
+            }
+        }
+        ErrorKind::UnknownArgument => {
+            "`engram <command> --help` lists the flags this command accepts; `engram agent-info --schema '<command>'` gives their exact types"
+                .to_string()
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+            match context_string(e, ContextKind::ValidValue) {
+                Some(v) => format!("valid values are listed in `engram <command> --help` (one of them is `{v}`)"),
+                None => "run `engram <command> --help` for the accepted values".to_string(),
+            }
+        }
+        _ => {
+            "run `engram <command> --help`, or `engram agent-info --schema '<command>'` for this command's exact argument shape"
+                .to_string()
+        }
+    }
+}
+
+fn context_string(e: &clap::Error, kind: ContextKind) -> Option<String> {
+    match e.get(kind) {
+        Some(ContextValue::String(s)) => Some(s.clone()),
+        Some(ContextValue::Strings(v)) => v.first().cloned(),
+        _ => None,
+    }
+}
+
+/// Nearest top-level subcommand by Jaro-Winkler, aliases included. The cutoff
+/// is deliberately high: a wrong guess reads as authority and sends an agent
+/// down a worse path than no guess at all.
+fn nearest_subcommand(typed: &str) -> Option<String> {
+    let cmd = Cli::command();
+    let mut best: Option<(f64, String)> = None;
+    for sub in cmd.get_subcommands() {
+        for name in std::iter::once(sub.get_name()).chain(sub.get_all_aliases()) {
+            let score = strsim::jaro_winkler(typed, name);
+            if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                best = Some((score, name.to_string()));
+            }
+        }
+    }
+    best.filter(|(s, _)| *s >= 0.8).map(|(_, n)| n)
+}
+
+/// clap renders a paragraph; the envelope carries a sentence. Keep the first
+/// line and drop the `error: ` prefix — the usage block is help, not message.
+fn first_line(rendered: &str) -> String {
+    rendered
+        .lines()
+        .next()
+        .unwrap_or(rendered)
+        .trim()
+        .strip_prefix("error: ")
+        .unwrap_or_else(|| rendered.lines().next().unwrap_or(rendered).trim())
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_and_version_are_successes() {
+        for argv in [
+            vec!["engram", "--help"],
+            vec!["engram", "--version"],
+            vec!["engram", "remember", "--help"],
+        ] {
+            match parse_from(argv.clone()) {
+                Err(ParseOutcome::Rendered { text }) => assert!(!text.is_empty()),
+                other => panic!("{argv:?} should render, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bare_engram_still_prints_help() {
+        // The regression that would turn `engram` with no arguments into an
+        // exit-3 envelope.
+        assert!(matches!(
+            parse_from(vec!["engram"]),
+            Err(ParseOutcome::Rendered { .. })
+        ));
+    }
+
+    #[test]
+    fn a_missing_argument_is_invalid_not_rendered() {
+        match parse_from(vec!["engram", "recall"]) {
+            Err(ParseOutcome::Invalid { suggestion, .. }) => {
+                assert!(suggestion.contains("engram"))
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_good_command_parses() {
+        assert!(parse_from(vec!["engram", "recall", "q"]).is_ok());
+    }
+
+    #[test]
+    fn a_mistyped_subcommand_names_the_one_it_meant() {
+        match parse_from(vec!["engram", "recal", "q"]) {
+            Err(ParseOutcome::Invalid { suggestion, .. }) => {
+                assert!(suggestion.contains("recall"), "{suggestion}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_nonsense_subcommand_does_not_invent_a_neighbour() {
+        match parse_from(vec!["engram", "zzzzzzzz"]) {
+            Err(ParseOutcome::Invalid { suggestion, .. }) => {
+                assert!(suggestion.contains("agent-info"), "{suggestion}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_flag_points_at_the_flag_list() {
+        match parse_from(vec!["engram", "recall", "q", "--nonsense"]) {
+            Err(ParseOutcome::Invalid {
+                message,
+                suggestion,
+            }) => {
+                assert!(message.contains("nonsense"), "{message}");
+                assert!(suggestion.contains("--help"), "{suggestion}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_message_is_one_line_without_the_error_prefix() {
+        match parse_from(vec!["engram", "recall", "q", "--nonsense"]) {
+            Err(ParseOutcome::Invalid { message, .. }) => {
+                assert!(!message.contains('\n'));
+                assert!(!message.starts_with("error:"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
 }

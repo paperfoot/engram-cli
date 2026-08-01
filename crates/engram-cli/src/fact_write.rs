@@ -868,8 +868,14 @@ pub async fn write_fact(
             // Never `{ef:?}`: the fact restates the memory it came from, and
             // this string is rendered into `fact_extraction_note`, which goes
             // to stdout AND stderr. Only the operator's own needle is echoed.
-            return Err(CliError::Storage(engram_storage::StorageError::Migration(
-                format!("{WRITE_FAIL_ENV} injected a persistence failure (needle '{needle}')"),
+            // `Io`, not `Migration`: R11 classifies a migration failure as a
+            // CONFIG error (exit 2, "fix your setup"), and this seam fabricates
+            // a failed write, which is transient (exit 1, "retry the identical
+            // command") — the advice the batch's own error message gives.
+            return Err(CliError::Storage(engram_storage::StorageError::Io(
+                std::io::Error::other(format!(
+                    "{WRITE_FAIL_ENV} injected a persistence failure (needle '{needle}')"
+                )),
             )));
         }
     }

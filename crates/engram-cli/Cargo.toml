@@ -28,6 +28,7 @@ engram-llm.workspace = true
 engram-ingest.workspace = true
 engram-graph.workspace = true
 engram-bench.workspace = true
+engram-contract.workspace = true
 tempfile = "3"
 
 clap.workspace = true
