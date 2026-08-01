@@ -5,6 +5,7 @@ pub mod backup;
 pub mod decisions;
 pub mod error;
 pub mod fts;
+pub mod handles;
 pub mod journal;
 pub mod migrate_v10;
 pub mod paths;
@@ -15,6 +16,7 @@ pub mod write_path;
 
 pub use decisions::{DecisionRow, InsertOutcome};
 pub use error::StorageError;
+pub use handles::Resolved;
 pub use journal::{EventDraft, EventRow};
 pub use migrate_v10::MigrationV10Report;
 pub use sqlite::{
