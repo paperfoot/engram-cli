@@ -18,10 +18,16 @@ use crate::error::CliError;
 
 pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let format = output::OutputFormat::detect(cli.json);
+    // The discovery surface answers BEFORE any store is opened: constructing
+    // AppContext runs migrations, and "run agent-info to check the setup"
+    // must never be the call that migrates (or creates) a database.
+    if matches!(cli.command, Command::AgentInfo) {
+        return agent_info::run();
+    }
     let ctx = context::AppContext::new(format, cli.quiet)?;
 
     match cli.command {
-        Command::AgentInfo => agent_info::run(&ctx),
+        Command::AgentInfo => agent_info::run(),
         Command::Remember {
             content,
             importance,

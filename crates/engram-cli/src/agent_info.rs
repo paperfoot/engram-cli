@@ -4,12 +4,15 @@
 //! directly (NOT wrapped in the standard success envelope). Agents parse
 //! this once to discover every command.
 
-use crate::context::AppContext;
 use crate::error::CliError;
 use serde_json::json;
 use std::io::Write;
 
-pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
+/// Takes no context on purpose: the discovery surface must answer without
+/// opening, creating, or migrating any store — `dispatch` returns before
+/// `AppContext::new`, and the path fields below use the non-creating peek
+/// getters.
+pub fn run() -> Result<(), CliError> {
     let manifest = json!({
         "name": "engram",
         "version": env!("CARGO_PKG_VERSION"),
@@ -327,10 +330,10 @@ pub fn run(_ctx: &AppContext) -> Result<(), CliError> {
                 "After a successful update, restart the agent process and run `engram skill install` if local agent skill files are used."
             ]
         },
-        "config_path": engram_storage::paths::config_path().to_string_lossy(),
-        "data_path": engram_storage::paths::db_path().to_string_lossy(),
-        "vector_path": engram_storage::paths::vector_dir().to_string_lossy(),
-        "cache_path": engram_storage::paths::cache_dir().to_string_lossy(),
+        "config_path": engram_storage::paths::config_path_peek().to_string_lossy(),
+        "data_path": engram_storage::paths::db_path_peek().to_string_lossy(),
+        "vector_path": engram_storage::paths::vector_dir_peek().to_string_lossy(),
+        "cache_path": engram_storage::paths::cache_dir_peek().to_string_lossy(),
         "providers": {
             "embeddings": ["gemini-embedding-2 (cloud, 1536 dims)", "stub (offline, deterministic)"],
             "rerankers": ["cohere/rerank-v4.0-pro (cloud)", "passthrough (none)"],
