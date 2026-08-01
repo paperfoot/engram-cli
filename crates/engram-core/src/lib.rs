@@ -4,7 +4,9 @@
 //! optimize via autoresearch loops.
 
 pub mod error;
+pub mod events;
 pub mod fusion;
+pub mod handle;
 pub mod layers;
 pub mod names;
 pub mod temporal;
