@@ -702,7 +702,7 @@ mod tests {
             .is_empty());
         assert!(store.list_facts(None, false, 50).unwrap().is_empty());
         assert!(store
-            .list_facts_scoped(None, Some("personal"), false, 50)
+            .list_facts_scoped(None, Some("personal"), false, 50, 0)
             .unwrap()
             .is_empty());
         assert!(store

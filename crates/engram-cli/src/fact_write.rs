@@ -540,7 +540,7 @@ pub fn canonicalize_subject(
     }
     // Fuzzy: token-sorted Jaro-Winkler against known subjects catches
     // "Robert Smith" vs "Smith, Robert" and small spelling drift.
-    if let Ok(subjects) = ctx.store.distinct_fact_subjects(diary, kb) {
+    if let Ok(subjects) = ctx.store.distinct_fact_subjects(Some(diary), Some(kb)) {
         let target = token_sort(&raw_norm);
         let mut best: Option<(f64, String, String)> = None;
         for (display, norm) in subjects {

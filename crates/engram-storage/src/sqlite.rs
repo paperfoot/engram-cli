@@ -1984,6 +1984,25 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Every chunk of one memory, in position order. `list_chunks_by_memory`
+    /// spans a whole KB and filters deleted memories out; this answers "what
+    /// text does THIS memory consist of", which a provenance surface needs
+    /// even for a memory that was later retracted.
+    pub fn chunks_for_memory(&self, memory_id: Uuid) -> Result<Vec<ChunkRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.memory_id, c.content, c.position, c.section, m.diary, m.kb,
+                    c.document_id, COALESCE(d.source_path, json_extract(m.source_json, '$.path'))
+             FROM chunks c
+             JOIN memories m ON m.id = c.memory_id
+             LEFT JOIN documents d ON d.id = c.document_id
+             WHERE c.memory_id = ?1
+             ORDER BY c.position ASC, c.id ASC",
+        )?;
+        let rows = stmt.query_map(params![memory_id.to_string()], parse_chunk_record_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
     /// Fetch chunk content by id.
     pub fn get_chunk_content(&self, chunk_id: Uuid) -> Result<Option<String>, StorageError> {
         let r = self
@@ -4335,6 +4354,7 @@ impl SqliteStore {
     pub fn facts_matching_terms(
         &self,
         kb: Option<&str>,
+        diary: Option<&str>,
         terms: &[String],
         limit: usize,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
@@ -4346,6 +4366,12 @@ impl SqliteStore {
         if let Some(k) = kb {
             binds.push(Box::new(k.to_string()));
             sql.push_str(&format!("kb = ?{} AND ", binds.len()));
+        }
+        // Without this, `recall` surfaces another diary's facts alongside its
+        // own — the cross-diary leak the diary namespace exists to prevent.
+        if let Some(d) = diary {
+            binds.push(Box::new(d.to_string()));
+            sql.push_str(&format!("diary = ?{} AND ", binds.len()));
         }
         let mut clauses = Vec::new();
         for term in terms {
@@ -4518,14 +4544,19 @@ impl SqliteStore {
 
     /// Distinct (display, norm) subjects of active facts in (diary, kb).
     /// Small by construction; used by fuzzy subject canonicalization.
+    /// `None` spans every diary / every KB, matching
+    /// `list_facts_by_subject_scoped`. The (display, norm) PAIR is kept rather
+    /// than narrowed to the norm: fuzzy subject canonicalization compares
+    /// against what a person actually typed.
     pub fn distinct_fact_subjects(
         &self,
-        diary: &str,
-        kb: &str,
+        diary: Option<&str>,
+        kb: Option<&str>,
     ) -> Result<Vec<(String, String)>, StorageError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT subject, subject_norm FROM facts
-             WHERE diary = ?1 AND kb = ?2 AND {OPEN_INTERVAL_PREDICATE}
+             WHERE (?1 IS NULL OR diary = ?1) AND (?2 IS NULL OR kb = ?2)
+                   AND {OPEN_INTERVAL_PREDICATE}
              GROUP BY subject_norm"
         ))?;
         let rows = stmt.query_map(params![diary, kb], |r| {
@@ -4770,6 +4801,7 @@ impl SqliteStore {
         kb: Option<&str>,
         subject: Option<&str>,
         limit: usize,
+        offset: usize,
     ) -> Result<
         Vec<(
             FactConflictRow,
@@ -4790,7 +4822,7 @@ impl SqliteStore {
                    AND (?1 IS NULL OR q.diary = ?1)
                    AND (?2 IS NULL OR q.kb = ?2)
                    AND (?3 IS NULL OR nf.subject_norm LIKE ?3 OR of.subject_norm LIKE ?3)
-             ORDER BY q.created_at DESC, q.id LIMIT ?4",
+             ORDER BY q.created_at DESC, q.id LIMIT ?4 OFFSET ?5",
             conflict = conflict_columns("q."),
             new_fact = fact_columns("nf."),
             old_fact = fact_columns("of.")
@@ -4799,12 +4831,16 @@ impl SqliteStore {
         // casting that straight to i64 wraps to -1, which SQLite happens to
         // read as "no limit". Saturating is the same behaviour on purpose.
         let capped = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = stmt.query_map(params![diary, kb, subject_like, capped], |r| {
-            let row = parse_conflict_row(r)?;
-            let new_fact = parse_fact_from_offset(r, CONFLICT_COLUMN_COUNT)?;
-            let old_fact = parse_fact_from_offset(r, CONFLICT_COLUMN_COUNT + FACT_COLUMN_COUNT)?;
-            Ok((row, new_fact, old_fact))
-        })?;
+        let rows = stmt.query_map(
+            params![diary, kb, subject_like, capped, offset as i64],
+            |r| {
+                let row = parse_conflict_row(r)?;
+                let new_fact = parse_fact_from_offset(r, CONFLICT_COLUMN_COUNT)?;
+                let old_fact =
+                    parse_fact_from_offset(r, CONFLICT_COLUMN_COUNT + FACT_COLUMN_COUNT)?;
+                Ok((row, new_fact, old_fact))
+            },
+        )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     }
@@ -4947,6 +4983,7 @@ impl SqliteStore {
     pub fn open_conflicts_matching_terms(
         &self,
         kb: Option<&str>,
+        diary: Option<&str>,
         terms: &[String],
         limit: usize,
     ) -> Result<
@@ -4972,6 +5009,11 @@ impl SqliteStore {
         if let Some(k) = kb {
             binds.push(Box::new(k.to_string()));
             sql.push_str(&format!("q.kb = ?{} AND ", binds.len()));
+        }
+        // Same leak, on the contradictions half of the same response.
+        if let Some(d) = diary {
+            binds.push(Box::new(d.to_string()));
+            sql.push_str(&format!("q.diary = ?{} AND ", binds.len()));
         }
         let mut clauses = Vec::new();
         for term in terms {
@@ -5069,24 +5111,34 @@ impl SqliteStore {
         include_superseded: bool,
         limit: usize,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
+        self.list_facts_scoped(diary, None, include_superseded, limit, 0)
+    }
+
+    fn list_facts_unscoped(
+        &self,
+        diary: Option<&str>,
+        include_superseded: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
                 "SELECT {facts}
-                 FROM facts WHERE diary = ?1 ORDER BY created_at DESC LIMIT ?2"
+                 FROM facts WHERE diary = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
             }
             (Some(_), false) => {
                 "SELECT {facts}
                  FROM facts WHERE diary = ?1 AND {open}
-                 ORDER BY created_at DESC LIMIT ?2"
+                 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
             }
             (None, true) => {
                 "SELECT {facts}
-                 FROM facts ORDER BY created_at DESC LIMIT ?1"
+                 FROM facts ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
             }
             (None, false) => {
                 "SELECT {facts}
                  FROM facts WHERE {open}
-                 ORDER BY created_at DESC LIMIT ?1"
+                 ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
             }
         };
         let sql = sql
@@ -5095,10 +5147,10 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
-                .query_map(params![d, limit as i64], parse_fact_row)?
+                .query_map(params![d, limit as i64, offset as i64], parse_fact_row)?
                 .collect::<Result<Vec<_>, _>>()?,
             None => stmt
-                .query_map(params![limit as i64], parse_fact_row)?
+                .query_map(params![limit as i64, offset as i64], parse_fact_row)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(rows)
@@ -5110,29 +5162,31 @@ impl SqliteStore {
         kb: Option<&str>,
         include_superseded: bool,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
         if kb.is_none() {
-            return self.list_facts(diary, include_superseded, limit);
+            return self.list_facts_unscoped(diary, include_superseded, limit, offset);
         }
         let k = kb.unwrap();
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
                 "SELECT {facts}
-                 FROM facts WHERE kb = ?1 AND diary = ?2 ORDER BY created_at DESC LIMIT ?3"
+                 FROM facts WHERE kb = ?1 AND diary = ?2
+                 ORDER BY created_at DESC LIMIT ?3 OFFSET ?4"
             }
             (Some(_), false) => {
                 "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND diary = ?2 AND {open}
-                 ORDER BY created_at DESC LIMIT ?3"
+                 ORDER BY created_at DESC LIMIT ?3 OFFSET ?4"
             }
             (None, true) => {
                 "SELECT {facts}
-                 FROM facts WHERE kb = ?1 ORDER BY created_at DESC LIMIT ?2"
+                 FROM facts WHERE kb = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
             }
             (None, false) => {
                 "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND {open}
-                 ORDER BY created_at DESC LIMIT ?2"
+                 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
             }
         };
         let sql = sql
@@ -5141,10 +5195,10 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
-                .query_map(params![k, d, limit as i64], parse_fact_row)?
+                .query_map(params![k, d, limit as i64, offset as i64], parse_fact_row)?
                 .collect::<Result<Vec<_>, _>>()?,
             None => stmt
-                .query_map(params![k, limit as i64], parse_fact_row)?
+                .query_map(params![k, limit as i64, offset as i64], parse_fact_row)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(rows)
@@ -5203,19 +5257,24 @@ impl SqliteStore {
     /// Returns the OLD fact alongside the new one that replaced it.
     pub fn list_recent_conflicts(
         &self,
+        diary: Option<&str>,
+        kb: Option<&str>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<(engram_core::types::Fact, engram_core::types::Fact)>, StorageError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {old_fact}, {new_fact}
              FROM facts old
              JOIN facts new ON new.id = old.superseded_by
              WHERE old.superseded_by IS NOT NULL
+                   AND (?1 IS NULL OR old.diary = ?1)
+                   AND (?2 IS NULL OR old.kb = ?2)
              ORDER BY old.superseded_at DESC
-             LIMIT ?1",
+             LIMIT ?3 OFFSET ?4",
             old_fact = fact_columns("old."),
             new_fact = fact_columns("new.")
         ))?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
+        let rows = stmt.query_map(params![diary, kb, limit as i64, offset as i64], |r| {
             let old = parse_fact_from_offset(r, 0)?;
             let new = parse_fact_from_offset(r, FACT_COLUMN_COUNT)?;
             Ok((old, new))
@@ -6157,11 +6216,11 @@ mod tests {
         // Term matching surfaces the contested pair from EITHER side: a query
         // about the old value must reveal that the value is contested.
         let hits = store
-            .open_conflicts_matching_terms(Some("default"), &["penicillin".into()], 10)
+            .open_conflicts_matching_terms(Some("default"), None, &["penicillin".into()], 10)
             .unwrap();
         assert_eq!(hits.len(), 1);
         let hits = store
-            .open_conflicts_matching_terms(Some("default"), &["amoxicillin".into()], 10)
+            .open_conflicts_matching_terms(Some("default"), None, &["amoxicillin".into()], 10)
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1.id, new_f.id);
@@ -6236,7 +6295,7 @@ mod tests {
         );
 
         let joined = store
-            .list_open_fact_conflicts_with_facts(None, None, None, 10)
+            .list_open_fact_conflicts_with_facts(None, None, None, 10, 0)
             .unwrap();
         assert_eq!(joined.len(), 2);
         for (row, nf, of) in &joined {
@@ -6257,7 +6316,7 @@ mod tests {
 
         // Subject filter narrows to one person's backlog.
         let ana_only = store
-            .list_open_fact_conflicts_with_facts(None, None, Some("ana"), 10)
+            .list_open_fact_conflicts_with_facts(None, None, Some("ana"), 10, 0)
             .unwrap();
         assert_eq!(ana_only.len(), 1);
         assert_eq!(ana_only[0].0.id, ana);
@@ -6287,7 +6346,7 @@ mod tests {
         assert_eq!(store.count_open_fact_conflicts(None, None).unwrap(), 2);
         assert_eq!(
             store
-                .list_open_fact_conflicts_with_facts(None, None, None, 10)
+                .list_open_fact_conflicts_with_facts(None, None, None, 10, 0)
                 .unwrap()
                 .len(),
             1,

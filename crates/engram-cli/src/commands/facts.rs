@@ -78,7 +78,7 @@ pub fn list(
                 Some(diary.as_str())
             };
             ctx.store
-                .list_facts_scoped(diary_filter, kb_filter, all, limit)?
+                .list_facts_scoped(diary_filter, kb_filter, all, limit, 0)?
         }
     };
 
@@ -209,7 +209,9 @@ pub fn conflicts(
     if open || subject.is_some() {
         return open_conflicts(ctx, limit, diary, kb, subject);
     }
-    let pairs = ctx.store.list_recent_conflicts(limit)?;
+    let pairs = ctx
+        .store
+        .list_recent_conflicts(diary.as_deref(), kb.as_deref(), limit, 0)?;
     let open_count = ctx
         .store
         .count_open_fact_conflicts(diary.as_deref(), kb.as_deref())?;
@@ -279,6 +281,7 @@ fn open_conflicts(
         kb.as_deref(),
         subject.as_deref(),
         limit,
+        0,
     )?;
     let total_open = ctx
         .store
@@ -558,6 +561,7 @@ pub fn triage(
         kb_filter,
         subject.as_deref(),
         limit.unwrap_or(usize::MAX),
+        0,
     )?;
 
     let mut resolved_by_rule: HashMap<&'static str, usize> = HashMap::new();
