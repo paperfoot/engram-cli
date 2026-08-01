@@ -902,7 +902,11 @@ fn forget_with_bad_uuid_is_bad_input() {
 
 #[test]
 fn bench_mini_fts_deterministic() {
-    let out = engram()
+    // Isolated home: bench seeds and writes a corpus, and two bench tests
+    // sharing the sandbox under a loaded machine overlap past busy_timeout
+    // ("database is locked" flakes that only appear when the host is busy).
+    let (_tmp, mut cmd) = with_isolated_home();
+    let out = cmd
         .args(["bench", "mini-fts", "--json"])
         .assert()
         .success()
@@ -918,9 +922,13 @@ fn bench_mini_fts_deterministic() {
 
 #[test]
 fn bench_mini_stub_is_stable_across_runs() {
+    // Same isolation rationale as bench_mini_fts_deterministic.
+    let (_tmp, _) = with_isolated_home();
     let mut r1s: Vec<f64> = Vec::new();
     for _ in 0..3 {
-        let out = engram()
+        let mut cmd = engram();
+        point_at_home(&mut cmd, _tmp.path());
+        let out = cmd
             .args(["bench", "mini", "--json"])
             .assert()
             .success()
@@ -1078,7 +1086,9 @@ fn json_envelope_has_version_and_status() {
 #[test]
 fn auto_json_when_piped() {
     // Not passing --json but piping stdout should still produce JSON envelope.
-    let out = engram()
+    // Isolated home: same bench-write contention rationale as above.
+    let (_tmp, mut cmd) = with_isolated_home();
+    let out = cmd
         .args(["bench", "mini-fts"])
         .assert()
         .success()
