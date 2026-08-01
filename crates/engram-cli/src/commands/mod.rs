@@ -1,5 +1,6 @@
 use crate::error::CliError;
 
+pub mod admin;
 pub mod bench;
 pub mod budget;
 pub mod chunks;

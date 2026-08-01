@@ -148,6 +148,7 @@ impl SqliteStore {
                         reason,
                         authority,
                         sets_superseded_by,
+                        sets_superseded_by.then(|| clamped.to_rfc3339()).as_deref(),
                         false,
                     ),
                 )

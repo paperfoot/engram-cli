@@ -471,6 +471,7 @@ pub mod payload {
         reason: &str,
         authority: &str,
         sets_superseded_by: bool,
+        superseded_at: Option<&str>,
         genesis: bool,
     ) -> Value {
         let mut m = Map::new();
@@ -480,6 +481,10 @@ pub mod payload {
         m.insert("reason".into(), json!(reason));
         m.insert("authority".into(), json!(authority));
         m.insert("sets_superseded_by".into(), json!(sets_superseded_by));
+        // Transaction time, carried separately from event time: they are the
+        // same on a live close and DIFFERENT on a migrated v9 row, and a
+        // replay that assumes one is the other rewrites history.
+        m.insert("superseded_at".into(), json!(superseded_at));
         if genesis {
             m.insert("genesis".into(), json!(true));
         }

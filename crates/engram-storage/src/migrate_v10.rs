@@ -144,6 +144,7 @@ struct FactSeed {
     created_at: String,
     valid_until: Option<String>,
     superseded_by: Option<String>,
+    superseded_at: Option<String>,
     close_reason: Option<String>,
     close_authority: Option<String>,
 }
@@ -250,7 +251,7 @@ impl SqliteStore {
 
     fn fact_seeds(&self) -> Result<Vec<FactSeed>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kb, diary, created_at, valid_until, superseded_by,
+            "SELECT id, kb, diary, created_at, valid_until, superseded_by, superseded_at,
                     close_reason, close_authority
                FROM facts ORDER BY created_at, id",
         )?;
@@ -262,8 +263,9 @@ impl SqliteStore {
                 created_at: r.get(3)?,
                 valid_until: r.get(4)?,
                 superseded_by: r.get(5)?,
-                close_reason: r.get(6)?,
-                close_authority: r.get(7)?,
+                superseded_at: r.get(6)?,
+                close_reason: r.get(7)?,
+                close_authority: r.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -457,6 +459,7 @@ impl SqliteStore {
                     seed.close_reason.as_deref().unwrap_or("superseded"),
                     seed.close_authority.as_deref().unwrap_or("heuristic"),
                     seed.superseded_by.is_some(),
+                    seed.superseded_at.as_deref(),
                     true,
                 ),
             )

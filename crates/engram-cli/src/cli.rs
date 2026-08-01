@@ -226,6 +226,10 @@ Examples:
     #[command(subcommand)]
     Documents(DocumentsCommand),
 
+    /// Store maintenance that is not part of ordinary use.
+    #[command(subcommand)]
+    Admin(AdminCommand),
+
     /// Manage knowledge bases/domains.
     #[command(subcommand)]
     Kb(KbCommand),
@@ -536,6 +540,22 @@ pub enum ConfigCommand {
     Set { key: String, value: String },
     /// Validate configured API keys.
     Check,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Drop and replay the fact and adjudication projections from the event journal.
+    Rebuild {
+        /// Limit the rebuild to one knowledge base.
+        #[arg(long)]
+        kb: Option<String>,
+        /// Rehearse: replay into a transaction that is rolled back, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Required for a real rebuild — it drops projections before replaying them.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

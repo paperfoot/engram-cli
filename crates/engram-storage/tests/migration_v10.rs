@@ -512,3 +512,162 @@ fn migrating_twice_changes_nothing() {
         "a re-run must append zero events and zero rows"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Invariant 3: `admin rebuild` reproduces the fact and adjudication
+// projections from the journal alone. Proved against the migrated fixture,
+// because a store whose journal is entirely synthesized is the hardest input
+// the property has.
+// ---------------------------------------------------------------------------
+
+/// A digest of everything the rebuild claims to own, EXCLUDING the columns it
+/// honestly says it does not (`embedding`, `embed_model`).
+fn projection_digest(db: &PathBuf) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).expect("open");
+    let mut out = Vec::new();
+    for sql in [
+        "SELECT id || '|' || subject_norm || '|' || predicate || '|' || object_norm
+              || '|' || COALESCE(valid_from,'') || '|' || COALESCE(valid_until,'')
+              || '|' || COALESCE(close_reason,'') || '|' || COALESCE(close_authority,'')
+              || '|' || COALESCE(closed_by,'') || '|' || COALESCE(superseded_by,'')
+              || '|' || COALESCE(superseded_at,'') || '|' || kb || '|' || diary
+              || '|' || fact_type || '|' || confirmations
+           FROM facts ORDER BY id",
+        "SELECT id || '|' || new_fact_id || '|' || old_fact_id || '|' || status
+              || '|' || kb || '|' || diary || '|' || detector
+              || '|' || COALESCE(suggested,'') || '|' || COALESCE(decision_key,'')
+              || '|' || COALESCE(member_key,'') || '|' || COALESCE(registry_version,'')
+           FROM fact_conflict_queue q
+          WHERE EXISTS (SELECT 1 FROM facts f WHERE f.id = q.new_fact_id)
+            AND EXISTS (SELECT 1 FROM facts f WHERE f.id = q.old_fact_id)
+          ORDER BY id",
+        "SELECT id || '|' || kb || '|' || decision_key || '|' || verdict
+              || '|' || authority || '|' || subject_norm || '|' || relation
+              || '|' || pair_hash || '|' || COALESCE(conflict_id,'')
+           FROM fact_decisions ORDER BY id",
+        "SELECT content_hash || '|' || extractor_id || '|' || memory_id || '|' || fact_count
+           FROM derivations ORDER BY content_hash, extractor_id",
+        "SELECT memory_id FROM fact_extraction_log ORDER BY memory_id",
+    ] {
+        let mut stmt = conn.prepare(sql).expect(sql);
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        out.extend(rows);
+        out.push("--".to_string());
+    }
+    out
+}
+
+#[test]
+fn rebuild_reproduces_the_projection_from_the_journal_alone() {
+    let (_tmp, db) = restore_v9();
+    let store = migrate(&db);
+    let before = projection_digest(&db);
+    let report = store.rebuild_projections(None, false).unwrap();
+    assert!(report.events_replayed > 0);
+    assert_eq!(
+        projection_digest(&db),
+        before,
+        "the projection must come back identical, or the journal is not the source of truth"
+    );
+    // The orphaned queue rows are the ONE place a rebuild is knowingly not
+    // identical, and it says so rather than aborting or silently dropping them.
+    assert_eq!(report.conflicts_skipped_orphan, 2);
+    assert!(report
+        .skipped
+        .iter()
+        .any(|s| s.table == "memories" && !s.reason.is_empty()));
+    assert!(report.skipped.iter().any(|s| s.table == "chunks"));
+    assert!(report.skipped.iter().any(|s| s.table == "claims"));
+    assert!(report.skipped.iter().any(|s| s.table == "entities"));
+}
+
+#[test]
+fn a_dry_run_writes_nothing() {
+    let (_tmp, db) = restore_v9();
+    let store = migrate(&db);
+    let before = projection_digest(&db);
+    let events_before = count(&db, "SELECT COUNT(*) FROM events");
+    let report = store.rebuild_projections(None, true).unwrap();
+    assert!(report.dry_run);
+    assert_eq!(projection_digest(&db), before);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM events"),
+        events_before,
+        "a rebuild that appends is a rebuild that grows its own input"
+    );
+}
+
+#[test]
+fn rebuild_kb_touches_only_that_kb() {
+    let (_tmp, db) = restore_v9();
+    let store = migrate(&db);
+    let work_before: Vec<String> = {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM facts WHERE kb='work' ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(!work_before.is_empty());
+    let report = store.rebuild_projections(Some("personal"), false).unwrap();
+    assert_eq!(report.kb.as_deref(), Some("personal"));
+    let work_after: Vec<String> = {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM facts WHERE kb='work' ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(work_after, work_before, "another KB must be untouched");
+    // …including its questions, which the FK cascade would have taken if the
+    // facts had been deleted before the queue.
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM fact_conflict_queue WHERE kb='work'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn rebuilding_a_deleted_kb_is_refused_rather_than_resurrecting_it() {
+    let (_tmp, db) = restore_v9();
+    let store = migrate(&db);
+    let err = store.rebuild_projections(Some("gone"), false).unwrap_err();
+    assert!(
+        err.to_string().contains("resurrect"),
+        "the refusal must say why: {err}"
+    );
+}
+
+#[test]
+fn an_unknown_event_kind_is_an_error_not_a_silent_skip() {
+    let (_tmp, db) = restore_v9();
+    let store = migrate(&db);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO events(id, ts, actor, kind, payload)
+             VALUES ('22222222-2222-4222-8222-222222222222',
+                     '2026-01-01T00:00:00+00:00', 'cli:default', 'memory.exploded', '{}')",
+            [],
+        )
+        .unwrap();
+    }
+    let err = store.rebuild_projections(None, false).unwrap_err();
+    assert!(
+        matches!(err, engram_storage::StorageError::MalformedRow(_)),
+        "a skipped event is a projection that silently diverges from its journal: {err:?}"
+    );
+}

@@ -9,6 +9,7 @@ pub mod handles;
 pub mod journal;
 pub mod migrate_v10;
 pub mod paths;
+pub mod rebuild;
 pub mod sqlite;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -19,6 +20,7 @@ pub use error::StorageError;
 pub use handles::Resolved;
 pub use journal::{EventDraft, EventRow};
 pub use migrate_v10::MigrationV10Report;
+pub use rebuild::RebuildReport;
 pub use sqlite::{
     ChunkExportRow, ChunkRecord, ClaimRecord, DocumentExportRow, DocumentRecord, EntityRecord,
     FactExportRow, KbExportRow, KnowledgeBase, MemoryExportRow, RelationRecord, SourceCitation,
