@@ -8,6 +8,11 @@
 //! points at `facts backfill` — because a silently dormant fact layer is how
 //! a store ends up with zero facts after a year of use.
 //!
+//! The two doors stay apart all the way to the row: a `--facts-json` triple is
+//! stored as `user_stated`, extractor output as `agent_extracted`, and a run
+//! that does both writes two batches rather than averaging their provenance.
+//! Until this split, nothing in production could produce `user_stated` at all.
+//!
 //! Every fact then runs the write-path v2 pipeline in `fact_write`: predicate
 //! and subject canonicalization, exact-match dedup/supersession, slot
 //! policies, and the embedding novelty gate. Uncertain contradictions are
@@ -193,13 +198,18 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         return Err(CliError::BadInput("importance must be 0..=10".into()));
     }
     // Caller-supplied triples are validated before anything is written, so a
-    // typo in --facts-json cannot leave a memory stored but factless.
-    let mut extracted: Vec<ExtractedFact> = match &facts_json {
+    // typo in --facts-json cannot leave a memory stored but factless. They are
+    // kept in their OWN vector from here on: a triple an agent asserted and a
+    // triple an extractor guessed are different claims, and merging them into
+    // one batch is what made `SourceKind::UserStated` unreachable in
+    // production — and the classifier's `correction_by_user` rule dead code.
+    let caller_facts: Vec<ExtractedFact> = match &facts_json {
         Some(raw) => serde_json::from_str::<Vec<ExtractedFact>>(raw).map_err(|e| {
             CliError::BadInput(format!("--facts-json is not a valid fact array: {e}"))
         })?,
         None => Vec::new(),
     };
+    let mut extracted: Vec<ExtractedFact> = Vec::new();
     // The embedder is chosen — and a missing key refused — BEFORE anything is
     // read or written, so a keyless store can never quietly fill with 64-dim
     // stub vectors that recall will later refuse to search. Deliberately after
@@ -234,7 +244,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             // message promises has to be the retry that works. Extraction is
             // deliberately NOT run here: this path costs no LLM call, as before.
             let mut outcome = FactWriteOutcome::default();
-            if !extracted.is_empty() {
+            let mut caller_batch_committed = false;
+            if !caller_facts.is_empty() {
                 // Epoch, never now, when the existing memory vanished under
                 // us (concurrent forget): a fabricated "now" would date these
                 // facts newest-in-store and win recency supersession — the
@@ -255,17 +266,23 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     autonomy,
                     llm: dedup_llm.as_ref(),
                     embedder: write_embedder.embedder.as_ref(),
-                    facts: &extracted,
+                    facts: &caller_facts,
                     marker: None,
+                    // The caller asserted these, on the retry path exactly as
+                    // on the first run: dedup must not downgrade provenance.
+                    source_kind: SourceKind::UserStated,
                 };
                 if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
                     return Err(facts_json_failure(failure, existing, &kb));
                 }
+                caller_batch_committed = true;
             }
+            let facts_source_kind = facts_source_kind(caller_batch_committed, false);
             let mut meta = Metadata::default();
             meta.add("deduplicated", true);
             meta.add("existing_id", existing.to_string());
             meta.add("facts_added", outcome.added);
+            meta.add("facts_source_kind", facts_source_kind);
             print_success(
                 ctx.format,
                 json!({
@@ -274,6 +291,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     "deduplicated": true,
                     "kb": kb,
                     "facts_added": outcome.added,
+                    "facts_source_kind": facts_source_kind,
                     "facts_deduped": outcome.deduped,
                     "conflicts": outcome.conflicts,
                     "adjudication_needed": outcome.queued,
@@ -490,6 +508,36 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         source: "remember",
     });
     let mut outcome = FactWriteOutcome::default();
+    let mut caller_batch_committed = false;
+    let mut extraction_batch_committed = false;
+    // The caller's own triples go first, as their own unit of work, stamped
+    // `user_stated`. Ordering is deliberate: an extracted triple that
+    // contradicts one the caller asserted now meets a `user_stated` incumbent
+    // instead of racing it inside a single batch, which is the direction the
+    // adjudication rules already assume (the caller's assertion is the
+    // stronger claim). No marker — the extractor has not seen this memory, so
+    // `facts backfill` must still find it pending.
+    if !caller_facts.is_empty() {
+        let plan = FactBatchPlan {
+            memory_id: memory.id,
+            kb: &kb,
+            diary: &diary,
+            memory_time: MemoryTime {
+                event_time,
+                created_at: now,
+            },
+            autonomy,
+            llm: llm.as_ref(),
+            embedder: embedder.as_ref(),
+            facts: &caller_facts,
+            marker: None,
+            source_kind: SourceKind::UserStated,
+        };
+        if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
+            return Err(facts_json_failure(failure, memory.id, &kb));
+        }
+        caller_batch_committed = true;
+    }
     if !extracted.is_empty() || marker.is_some() {
         let plan = FactBatchPlan {
             memory_id: memory.id,
@@ -504,18 +552,25 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             embedder: embedder.as_ref(),
             facts: &extracted,
             marker,
+            source_kind: SourceKind::AgentExtracted,
         };
         if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
-            if facts_json.is_some() {
-                return Err(facts_json_failure(failure, memory.id, &kb));
-            }
+            // Keyed on the BATCH, never on the flag. The old guard asked
+            // `facts_json.is_some()` because there was only ever one batch;
+            // with two, that question hard-errors an EXTRACTION failure on a
+            // mixed run and reports it as if the caller's triples — already
+            // committed above — had been lost. An extraction failure is soft
+            // and reported; a caller-batch failure is fatal, above.
             status = ExtractionStatus::FailedPersist {
                 index: failure.index,
                 total: failure.total,
                 detail: failure.error.to_string(),
             };
+        } else {
+            extraction_batch_committed = !extracted.is_empty();
         }
     }
+    let facts_source_kind = facts_source_kind(caller_batch_committed, extraction_batch_committed);
 
     let facts_added = outcome.added;
     let conflicts = outcome.conflicts;
@@ -547,6 +602,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     meta.add("conflicts_queued", adjudication_needed.len());
     meta.add("date_parse_warnings", date_warnings.len());
     meta.add("fact_extraction", status.as_str());
+    meta.add("facts_source_kind", facts_source_kind);
     let note = status.note(&kb);
     if let Some(note) = &note {
         meta.add("fact_extraction_note", note.clone());
@@ -576,6 +632,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             "event_time": event_time.map(|t| t.to_rfc3339()),
             "fact_extraction": status.as_str(),
             "fact_extraction_note": note,
+            "facts_source_kind": facts_source_kind,
             "facts_added": facts_added,
             "facts_deduped": facts_deduped,
             "date_parse_warnings": date_warnings,
@@ -613,6 +670,24 @@ struct FactBatchPlan<'a> {
     embedder: &'a dyn Embedder,
     facts: &'a [ExtractedFact],
     marker: Option<FactExtractionMarker<'a>>,
+    /// Who claims these triples. `UserStated` for `--facts-json`,
+    /// `AgentExtracted` for what the extractor produced — the whole point of
+    /// splitting one run into two batches.
+    source_kind: SourceKind,
+}
+
+/// What provenance actually landed on this memory's facts.
+///
+/// `None` when no fact batch committed, so the field never claims a provenance
+/// for a memory that has no facts. A run whose extraction batch failed reports
+/// `user_stated`, not `mixed`: the envelope describes what is in the store.
+fn facts_source_kind(caller_committed: bool, extracted_committed: bool) -> Option<&'static str> {
+    match (caller_committed, extracted_committed) {
+        (true, true) => Some("mixed"),
+        (true, false) => Some(SourceKind::UserStated.as_str()),
+        (false, true) => Some(SourceKind::AgentExtracted.as_str()),
+        (false, false) => None,
+    }
 }
 
 /// Persist a plan as ONE unit of work.
@@ -629,7 +704,7 @@ async fn persist_facts(
         embedder: Some(plan.embedder),
         llm: plan.llm.map(|l| l.as_chat()),
         autonomy: plan.autonomy,
-        source_kind: SourceKind::AgentExtracted,
+        source_kind: plan.source_kind,
     };
     let batch = FactBatch {
         facts: plan.facts,

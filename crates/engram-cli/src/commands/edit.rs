@@ -45,8 +45,12 @@ pub async fn run(
             ));
         }
     }
-    let uuid =
-        Uuid::parse_str(&id).map_err(|e| CliError::BadInput(format!("invalid UUID {id}: {e}")))?;
+    // ANY handle kind, not just a bare uuid: `mem:<uuid>` is the form every new
+    // surface prints, and a wrong kind now gets a sentence naming what it is
+    // rather than "invalid UUID". `memory update` routes here too, so the
+    // command named in the message is `edit` — the alias's own name would not
+    // be runnable from `forget`'s side of the dispatch.
+    let uuid = crate::commands::memory::parse_memory_id(&id, "edit")?;
 
     // EXISTENCE FIRST, and in the same breath the scope. A syntactically valid
     // but unknown uuid used to reach the embedder: the paid call was made, the
@@ -227,7 +231,9 @@ pub async fn run(
     print_success(
         ctx.format,
         json!({
-            "id": id,
+            // The canonical uuid, never the caller's raw spelling: `data.id`
+            // has always been a bare uuid and scripts feed it straight back in.
+            "id": uuid.to_string(),
             "updated": true,
             "chunks_replaced": chunks_replaced,
         }),

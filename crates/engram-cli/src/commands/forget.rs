@@ -4,7 +4,6 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
 use serde_json::json;
-use uuid::Uuid;
 
 pub fn run(ctx: &AppContext, id: String, confirm: bool) -> Result<(), CliError> {
     if !confirm {
@@ -12,11 +11,14 @@ pub fn run(ctx: &AppContext, id: String, confirm: bool) -> Result<(), CliError> 
             "destructive operation — pass --confirm to actually delete".into(),
         ));
     }
-    let uuid =
-        Uuid::parse_str(&id).map_err(|e| CliError::BadInput(format!("invalid UUID {id}: {e}")))?;
-    // `soft_delete_memory` now reports which fact intervals it closed as well
-    // as whether it retracted anything. The published `deleted` boolean keeps
-    // its exact old meaning here; write-surfaces owns surfacing the rest.
+    // Same resolution as `edit`, from the same helper: `forget mem:<uuid>` and
+    // `memory delete mem:<uuid>` are what an agent copies out of a write
+    // response, and rejecting them as malformed uuids was the sharpest edge of
+    // the untyped id.
+    let uuid = crate::commands::memory::parse_memory_id(&id, "forget")?;
+    // `soft_delete_memory` reports which fact intervals it closed as well as
+    // whether it retracted anything. The published `deleted` boolean keeps its
+    // exact old meaning; write-surfaces surfaces the rest in wave 3.
     let deleted = ctx
         .store
         .soft_delete_memory(uuid)?
@@ -24,7 +26,9 @@ pub fn run(ctx: &AppContext, id: String, confirm: bool) -> Result<(), CliError> 
         .unwrap_or(false);
     print_success(
         ctx.format,
-        json!({ "id": id, "deleted": deleted }),
+        // The canonical uuid, never the caller's raw spelling: `data.id` has
+        // always been a bare uuid and scripts feed it straight back in.
+        json!({ "id": uuid.to_string(), "deleted": deleted }),
         Metadata::default(),
         |data| println!("{}", data),
     );
