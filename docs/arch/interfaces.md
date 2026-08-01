@@ -322,3 +322,29 @@ trait adapter in graph (CM-6/CW-3) · R9 Uuid::new_v5, blake3 rejected (CD-8) ·
 (CM-7) · R11 ErrorCode + StorageError mapping (CM-10) · R12 respond.rs in wave 2 (CM-9) ·
 R13 UserStated source kind (IN-26) · R14 ENGRAM_STORE everywhere, --store deferred to wave 4
 (CM-13/CC-1/CD-5/CD-6) · R15 patch channel + ownership additions (CC-5/IN-29/IN-30).
+
+## v2.1 addendum — rulings on coherence-report-v2 §7 (binding)
+
+**D1–D28 are ADOPTED as written in coherence-report-v2.md §7**, with these clarifications:
+
+- **D15 + D20: LANDED** (commit a35f7e8) — `engram_core::keys` with the pinned namespaces;
+  `ErrorCode` wire spellings are `config_error`/`transient_error` (v0.3's exact values), serde
+  matches `as_str`, `retryable()` and `ALL` included. The daemon's HTTP table uses these
+  spellings (D20's table with `"config_error" => 400`).
+- **D6 → option 2**: the rebuild dispatcher's rule is `memory.revised` deletes the
+  `fact_extraction_log` marker for its `memory_id`. No new EventKind.
+- **D2**: the three read-surfaces metadata fields (`scope.diary_applicable`, `command_alias`,
+  `suggested_action_overridden`) are BLESSED; contract-codegen documents them.
+- **D3 (Fact.kb)**: adopted, but LANDS in storage-journal's offset re-pinning pass (wave 2), not
+  before — adding the field mid-flight breaks every constructor for no gain. `#[serde(default)]`,
+  `""` on pre-v10 rows.
+- **D24**: ruled ALL-IN, wave 5, one lead patch: `EventKind` gains
+  `LessonRecorded|LessonConfirmed|LessonRetracted` (ALL widens 15→18) together with their payload
+  schemas and `admin rebuild` arms; `HandleKind` gains `Lesson` and `Wiki` in the same commit.
+  Until that commit both enums are CLOSED.
+- **V10**: `crates/engram-core/src/error.rs` owner is contract-codegen from wave 2 (the landed
+  baseline is lead work; extend, don't fork).
+- **R7 conformance**: spec-fact-semantics.md must apply coherence-report-v2 §6's eleven edits
+  verbatim plus V2–V7 before wave 3 implementation begins.
+- Wave-2 GO conditions from §8 are hereby satisfied for storage-journal, contract-codegen, and
+  write-surfaces' W1/W6 subset.
