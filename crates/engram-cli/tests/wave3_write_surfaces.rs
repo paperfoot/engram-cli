@@ -264,6 +264,207 @@ fn an_unknown_prefix_is_reported_as_an_unknown_kind() {
     assert!(msg.contains("mem, chunk, fact"), "{msg}");
 }
 
+// ---------------------------------------------------------------------------
+// W6 — a caller-asserted triple is not an extractor's guess
+// ---------------------------------------------------------------------------
+
+/// Caller triples: one subject the scripted extractor never mentions.
+const CALLER_FACTS: &str = r#"[
+  {"subject":"Ana","predicate":"lives_in","object":"Lisbon","confidence":1.0}
+]"#;
+
+/// A scripted extractor that always answers with a DIFFERENT subject, so a
+/// mixed run has one triple from each door and no adjudication between them.
+const EXTRACTOR_SCRIPT: &str = r#"{
+  "*": [
+    {"subject":"Bruno","predicate":"works_at","object":"Acme","confidence":1.0,"fact_type":"profile_slot"}
+  ]
+}"#;
+
+/// Every fact in the store, as `(subject, source_kind)`.
+fn facts(store: &std::path::Path) -> Vec<(String, String)> {
+    let v = run_json(
+        &mut engram(store),
+        &["facts", "list", "--kb", "*", "--diary", "*"],
+    );
+    v["data"]["facts"]
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .map(|f| {
+            (
+                f["subject"].as_str().unwrap_or_default().to_string(),
+                f["source_kind"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn facts_json_is_stamped_user_stated() {
+    let dir = store();
+    let v = run_json(
+        &mut engram(dir.path()),
+        &[
+            "remember",
+            "Ana moved to Lisbon.",
+            "--offline",
+            "--facts-json",
+            CALLER_FACTS,
+        ],
+    );
+    assert_eq!(v["data"]["facts_added"], 1);
+    assert_eq!(v["data"]["facts_source_kind"], "user_stated");
+    // The caller did the extraction, so no LLM ran — unchanged from v0.3.
+    assert_eq!(v["data"]["fact_extraction"], "skipped_facts_json");
+
+    let rows = facts(dir.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0], ("Ana".to_string(), "user_stated".to_string()));
+}
+
+#[test]
+fn extraction_stays_agent_extracted() {
+    let dir = store();
+    let mut cmd = engram(dir.path());
+    cmd.env("ENGRAM_FACT_LLM_STUB", EXTRACTOR_SCRIPT);
+    let v = run_json(&mut cmd, &["remember", "Bruno joined Acme.", "--offline"]);
+    assert_eq!(v["data"]["facts_added"], 1);
+    assert_eq!(v["data"]["facts_source_kind"], "agent_extracted");
+
+    let rows = facts(dir.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        ("Bruno".to_string(), "agent_extracted".to_string())
+    );
+}
+
+#[test]
+fn a_mixed_run_keeps_both_provenances() {
+    let dir = store();
+    let mut cmd = engram(dir.path());
+    cmd.env("ENGRAM_FACT_LLM_STUB", EXTRACTOR_SCRIPT);
+    // `--extract-facts` alongside `--facts-json` is the ONLY way both doors
+    // open on one write; without it the caller's triples suppress extraction.
+    let v = run_json(
+        &mut cmd,
+        &[
+            "remember",
+            "Ana moved to Lisbon and Bruno joined Acme.",
+            "--offline",
+            "--facts-json",
+            CALLER_FACTS,
+            "--extract-facts",
+        ],
+    );
+    assert_eq!(v["data"]["facts_added"], 2);
+    assert_eq!(v["data"]["facts_source_kind"], "mixed");
+
+    let mut rows = facts(dir.path());
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("Ana".to_string(), "user_stated".to_string()),
+            ("Bruno".to_string(), "agent_extracted".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn a_failing_extraction_batch_leaves_the_caller_batch_committed() {
+    // The landmine of the two-batch split: the old guard keyed on the FLAG, so
+    // an extraction failure on a `--facts-json` run hard-errored and reported
+    // the caller's triples as lost when they were already in the store.
+    let dir = store();
+    let mut cmd = engram(dir.path());
+    cmd.env("ENGRAM_FACT_LLM_STUB", EXTRACTOR_SCRIPT);
+    cmd.env("ENGRAM_FACT_WRITE_FAIL", "Bruno");
+    let v = run_json(
+        &mut cmd,
+        &[
+            "remember",
+            "Ana moved to Lisbon and Bruno joined Acme.",
+            "--offline",
+            "--facts-json",
+            CALLER_FACTS,
+            "--extract-facts",
+        ],
+    );
+    assert_eq!(v["data"]["fact_extraction"], "failed_persist");
+    assert_eq!(v["data"]["facts_source_kind"], "user_stated");
+
+    let rows = facts(dir.path());
+    assert_eq!(
+        rows,
+        vec![("Ana".to_string(), "user_stated".to_string())],
+        "the caller's committed batch survives an extraction failure"
+    );
+}
+
+#[test]
+fn a_failing_caller_batch_still_hard_errors() {
+    let dir = store();
+    let mut cmd = engram(dir.path());
+    cmd.env("ENGRAM_FACT_WRITE_FAIL", "Ana");
+    let out = cmd
+        .args([
+            "remember",
+            "Ana moved to Lisbon.",
+            "--offline",
+            "--facts-json",
+            CALLER_FACTS,
+        ])
+        .arg("--json")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let msg = parse_error(&out.stderr)["error"]["message"]
+        .as_str()
+        .expect("message")
+        .to_string();
+    assert!(msg.contains("--facts-json:"), "{msg}");
+    assert!(
+        facts(dir.path()).is_empty(),
+        "a failed batch stores nothing"
+    );
+}
+
+#[test]
+fn the_duplicate_content_path_stamps_the_same_source_kind() {
+    let dir = store();
+    let content = "Ana moved to Lisbon.";
+    run_json(
+        &mut engram(dir.path()),
+        &[
+            "remember",
+            content,
+            "--offline",
+            "--facts-json",
+            CALLER_FACTS,
+        ],
+    );
+    // The identical command again: the content dedups, the caller's triples are
+    // re-offered against the existing memory, and provenance does not drift.
+    let v = run_json(
+        &mut engram(dir.path()),
+        &[
+            "remember",
+            content,
+            "--offline",
+            "--facts-json",
+            CALLER_FACTS,
+        ],
+    );
+    assert_eq!(v["data"]["deduplicated"], true);
+    assert_eq!(v["data"]["facts_source_kind"], "user_stated");
+
+    let rows = facts(dir.path());
+    assert_eq!(rows, vec![("Ana".to_string(), "user_stated".to_string())]);
+}
+
 #[test]
 fn the_store_under_test_is_the_temp_dir() {
     // The guard that catches a leaked path before it reaches a real store.
