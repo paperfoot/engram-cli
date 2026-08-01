@@ -104,6 +104,11 @@ pub fn storage_error_code(e: &engram_storage::StorageError) -> ErrorCode {
         S::NotFound(_) => ErrorCode::NotFound,
         S::Migration(_) => ErrorCode::Config,
         S::Serde(_) => ErrorCode::MalformedJson,
+        // Storage's dedicated variants, landed with the v10 work (CLP-4):
+        // the string-sniffing `is_busy` fallback below stays for raw Sqlite
+        // errors that arrive unclassified.
+        S::Busy(_) => ErrorCode::SqliteBusy,
+        S::MalformedRow(_) => ErrorCode::MalformedJson,
         S::Io(_) => ErrorCode::Transient,
         S::Sqlite(_) if is_busy(e) => ErrorCode::SqliteBusy,
         S::Sqlite(_) => ErrorCode::Transient,
