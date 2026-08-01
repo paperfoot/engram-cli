@@ -14,7 +14,7 @@ pub mod relations;
 pub mod temporal;
 pub mod types;
 
-pub use error::CoreError;
+pub use error::{CoreError, ErrorCode};
 pub use events::EventKind;
 pub use handle::{Handle, HandleKind};
 pub use interval::{CloseAuthority, CloseReason, Interval};
