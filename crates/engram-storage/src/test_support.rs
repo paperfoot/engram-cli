@@ -52,6 +52,14 @@ pub fn store_guard() -> (TempDir, StoreGuard) {
     )
 }
 
+/// A SECOND store inside an existing guard's TempDir. `store_guard` holds a
+/// non-reentrant lock, so a test that needs two stores (export/import) must
+/// take the guard once and open the second store through this — calling
+/// `temp_store` twice on one thread deadlocks.
+pub fn extra_store(tmp: &TempDir, name: &str) -> SqliteStore {
+    SqliteStore::open(tmp.path().join(format!("{name}.sqlite"))).expect("open extra store")
+}
+
 /// An opened file store inside a fresh guard. A FILE store, not `:memory:`:
 /// `VACUUM INTO` needs a directory and the "never back up an in-memory store"
 /// rule is only testable against both.
