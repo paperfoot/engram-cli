@@ -101,12 +101,12 @@ mod tests {
     use super::*;
 
     // Env vars are process-global, so these tests serialize on a lock rather
-    // than racing each other (cargo runs tests threaded). A panic inside one
-    // test must not poison the rest into false failures.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    // than racing each other (cargo runs tests threaded). The lock lives in
+    // `test_support` because the store helpers set `ENGRAM_STORE` as well, and
+    // two locks over one variable is the same as no lock at all. It is
+    // poison-tolerant: one panicking test must not turn every later test red
+    // for the wrong reason.
+    use crate::test_support::env_lock as env_guard;
 
     #[test]
     fn override_roots_everything_under_one_dir() {

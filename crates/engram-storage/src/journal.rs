@@ -26,6 +26,15 @@ use uuid::Uuid;
 pub const EXTRACTOR_FACT_LLM: &str = "fact_llm@1";
 pub const EXTRACTOR_COMPILE: &str = "compile_llm@1";
 
+/// The `"cli:<diary>"` actor of interfaces §2's grammar. Storage derives it
+/// from the row's own diary rather than taking it as a parameter: adding an
+/// actor argument to `insert_fact` would touch every caller in three other
+/// lanes for a value none of them has. A daemon that needs to stamp
+/// `"daemon"` or `"job:<uuid>"` calls the event-appending methods directly.
+pub fn cli_actor(diary: &str) -> String {
+    format!("cli:{diary}")
+}
+
 /// Actor string for events the v9→v10 migration synthesizes.
 pub const ACTOR_MIGRATION_V10: &str = "migration:v10";
 /// Actor string for events synthesized while importing a v2 export.

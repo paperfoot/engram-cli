@@ -14,6 +14,13 @@ use tempfile::TempDir;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// The ONE process-global env lock for this crate's tests. `paths::tests`
+/// mutates `ENGRAM_STORE` too, and two locks over one process-global variable
+/// is the same as no lock at all.
+pub fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Holds the env lock and restores `ENGRAM_STORE` on drop.
 pub struct StoreGuard {
     _lock: MutexGuard<'static, ()>,
@@ -32,7 +39,7 @@ impl Drop for StoreGuard {
 /// A TempDir with `ENGRAM_STORE` pointed at it. Keep BOTH values alive: the
 /// TempDir deletes itself when dropped, the guard un-sets the env var.
 pub fn store_guard() -> (TempDir, StoreGuard) {
-    let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let lock = env_lock();
     let tmp = TempDir::new().expect("tempdir");
     let previous = std::env::var_os("ENGRAM_STORE");
     std::env::set_var("ENGRAM_STORE", tmp.path());

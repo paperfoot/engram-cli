@@ -1,6 +1,8 @@
 //! SQLite source of truth + FTS5 lexical index.
 
 use crate::error::StorageError;
+use crate::write_path::{close_authority_for, RetractOutcome};
+use engram_core::interval::{CloseAuthority, CloseReason};
 use engram_core::types::Memory;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -67,7 +69,15 @@ pub struct DocumentDuplicateRecord {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RepairReport {
     pub dry_run: bool,
+    /// How many facts of deleted memories were FOUND. It keeps its published
+    /// name and its type, and it is now always a count of rows repair left
+    /// alone: nothing hard-deletes them any more.
     pub facts_from_deleted_memories_removed: i64,
+    /// How many of those intervals `repair` actually closed. The rename the
+    /// honest report wanted is forbidden by the published-key rule, so the new
+    /// number ships beside the old one instead of replacing it.
+    #[serde(default)]
+    pub facts_from_deleted_memories_closed: i64,
     pub derived_kbs_cleared: Vec<String>,
     pub duplicate_source_documents: Vec<DocumentDuplicateRecord>,
 }
@@ -1572,6 +1582,13 @@ impl SqliteStore {
 
     pub fn insert_memory_with_kb(&self, m: &Memory, kb: &str) -> Result<(), StorageError> {
         self.ensure_kb(kb, None)?;
+        // The row and its event are one transaction (invariant 1). `with_tx`
+        // joins an already-open one rather than nesting, so a caller that
+        // wraps a whole write in its own transaction still gets exactly one.
+        self.with_tx(|s| s.insert_memory_row(m, kb))
+    }
+
+    fn insert_memory_row(&self, m: &Memory, kb: &str) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT INTO memories(id, content, created_at, event_time, importance,
                 emotional_weight, access_count, last_accessed, stability, source_json,
@@ -1594,6 +1611,22 @@ impl SqliteStore {
                 serde_json::to_string(&m.tags)?,
                 kb,
             ],
+        )?;
+        self.append_event(
+            &crate::journal::EventDraft::new(
+                engram_core::events::EventKind::MemoryWritten,
+                crate::journal::cli_actor(&m.diary),
+                crate::journal::payload::memory_written(
+                    &engram_core::keys::content_hash(&m.content),
+                    m.importance as i64,
+                    &m.tags,
+                    m.event_time.map(|t| t.to_rfc3339()).as_deref(),
+                    "remember",
+                    false,
+                ),
+            )
+            .scope(Some(kb), Some(&m.diary))
+            .subject(m.id),
         )?;
         Ok(())
     }
@@ -1963,25 +1996,61 @@ impl SqliteStore {
         Ok(r)
     }
 
-    /// Mark a memory as deleted (soft delete).
+    /// Mark a memory as deleted (soft delete), CLOSING the intervals it
+    /// derived instead of deleting them.
+    ///
+    /// This is the headline defect of v0.3: `forget` hard-deleted the memory's
+    /// facts, and the FK cascade on `fact_conflict_queue` then erased every
+    /// open and resolved adjudication row that touched them. A retraction is
+    /// information — "this stopped being a source" — not an erasure, and the
+    /// questions a person already answered about those facts must survive it.
+    /// Facts therefore remain visible in history listings as closed intervals;
+    /// that is a deliberate value change on a published surface.
     ///
     /// `deleted_at` is stamped so the diary-isolation gate can tell whether a
     /// later compile has actually purged this memory from the KB's derived
     /// layer — see `MEMORY_CONSTRAINS_DERIVED`.
-    pub fn soft_delete_memory(&self, memory_id: Uuid) -> Result<bool, StorageError> {
+    pub fn soft_delete_memory(
+        &self,
+        memory_id: Uuid,
+    ) -> Result<Option<RetractOutcome>, StorageError> {
         self.with_tx(|s| {
-            let n = s.conn.execute(
+            let Some((kb, diary, already_deleted)) = s.memory_scope_including_deleted(memory_id)?
+            else {
+                return Ok(None);
+            };
+            if already_deleted {
+                return Ok(Some(RetractOutcome::default()));
+            }
+            s.conn.execute(
                 "UPDATE memories SET deleted = 1, deleted_at = ?2 WHERE id = ?1 AND deleted = 0",
                 params![memory_id.to_string(), chrono::Utc::now().to_rfc3339()],
             )?;
-            if n > 0 {
-                s.conn.execute(
-                    "DELETE FROM facts WHERE source_memory_id = ?1",
-                    params![memory_id.to_string()],
-                )?;
-                s.delete_derived_for_memory_chunks(memory_id)?;
-            }
-            Ok(n > 0)
+            // AFTER the soft delete, in the same transaction — which is why
+            // `close_facts_for_memory` must not filter on `deleted = 0`.
+            let closed = s.close_facts_for_memory(
+                memory_id,
+                chrono::Utc::now(),
+                CloseReason::RetractedSource,
+                &CloseAuthority::Caller {
+                    actor: crate::journal::cli_actor(&diary),
+                },
+                &crate::journal::cli_actor(&diary),
+            )?;
+            s.delete_derived_for_memory_chunks(memory_id)?;
+            s.append_event(
+                &crate::journal::EventDraft::new(
+                    engram_core::events::EventKind::MemoryRetracted,
+                    crate::journal::cli_actor(&diary),
+                    crate::journal::payload::memory_retracted(memory_id, Some("forget")),
+                )
+                .scope(Some(&kb), Some(&diary))
+                .subject(memory_id),
+            )?;
+            Ok(Some(RetractOutcome {
+                retracted: true,
+                closed,
+            }))
         })
     }
 
@@ -2010,44 +2079,109 @@ impl SqliteStore {
     }
 
     /// Update memory content / importance.
+    ///
+    /// A content change appends `memory.revised`, an importance-only change
+    /// `memory.meta_changed`. The distinction is load-bearing rather than
+    /// tidy: `memory.revised` is what tells a rebuild that the memory's
+    /// extraction marker must be cleared, so a pending re-extraction survives
+    /// `admin rebuild` instead of being silently un-pended (D6, option 2).
     pub fn update_memory(
         &self,
         memory_id: Uuid,
         content: Option<&str>,
         importance: Option<u8>,
     ) -> Result<bool, StorageError> {
-        let changed = match (content, importance) {
-            (Some(c), Some(i)) => self.conn.execute(
-                "UPDATE memories SET content = ?1, importance = ?2 WHERE id = ?3 AND deleted = 0",
-                params![c, i, memory_id.to_string()],
-            )?,
-            (Some(c), None) => self.conn.execute(
-                "UPDATE memories SET content = ?1 WHERE id = ?2 AND deleted = 0",
-                params![c, memory_id.to_string()],
-            )?,
-            (None, Some(i)) => self.conn.execute(
-                "UPDATE memories SET importance = ?1 WHERE id = ?2 AND deleted = 0",
-                params![i, memory_id.to_string()],
-            )?,
-            (None, None) => 0,
-        };
-        Ok(changed > 0)
+        if content.is_none() && importance.is_none() {
+            return Ok(false);
+        }
+        self.with_tx(|s| {
+            let previous: Option<(String, String)> = s
+                .conn
+                .query_row(
+                    "SELECT content, diary FROM memories WHERE id = ?1 AND deleted = 0",
+                    params![memory_id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((previous_content, diary)) = previous else {
+                return Ok(false);
+            };
+            let changed = match (content, importance) {
+                (Some(c), Some(i)) => s.conn.execute(
+                    "UPDATE memories SET content = ?1, importance = ?2 WHERE id = ?3 AND deleted = 0",
+                    params![c, i, memory_id.to_string()],
+                )?,
+                (Some(c), None) => s.conn.execute(
+                    "UPDATE memories SET content = ?1 WHERE id = ?2 AND deleted = 0",
+                    params![c, memory_id.to_string()],
+                )?,
+                (None, Some(i)) => s.conn.execute(
+                    "UPDATE memories SET importance = ?1 WHERE id = ?2 AND deleted = 0",
+                    params![i, memory_id.to_string()],
+                )?,
+                (None, None) => 0,
+            };
+            if changed == 0 {
+                return Ok(false);
+            }
+            let kb = s.kb_for_memory(memory_id)?;
+            let (kind, payload) = match content {
+                Some(c) => (
+                    engram_core::events::EventKind::MemoryRevised,
+                    crate::journal::payload::memory_revised(
+                        memory_id,
+                        &engram_core::keys::content_hash(c),
+                        &engram_core::keys::content_hash(&previous_content),
+                    ),
+                ),
+                None => (
+                    engram_core::events::EventKind::MemoryMetaChanged,
+                    crate::journal::payload::memory_meta_changed(
+                        memory_id,
+                        importance.map(|i| i as i64),
+                    ),
+                ),
+            };
+            s.append_event(
+                &crate::journal::EventDraft::new(kind, crate::journal::cli_actor(&diary), payload)
+                    .scope(kb.as_deref(), Some(&diary))
+                    .subject(memory_id),
+            )?;
+            Ok(true)
+        })
     }
 
-    /// Drop everything the fact layer derived from one memory's content —
-    /// the facts themselves and the "already extracted" marker. `edit` calls
-    /// this when content changes, so rewritten content is eligible for
-    /// extraction again instead of being permanently marked as processed.
+    /// Retire everything the fact layer derived from one memory's content and
+    /// re-open it for extraction. Despite the name it NO LONGER DELETES: it
+    /// closes each open interval with `retracted_source` and clears the
+    /// "already extracted" marker, so rewritten content is eligible for
+    /// extraction again without the FK cascade taking the adjudication ledger
+    /// with it. Returns how many intervals it closed.
+    ///
+    /// New callers use `close_facts_for_memory` + `clear_extraction_marker`
+    /// separately: `edit` needs to close facts WITHOUT clearing the marker in
+    /// some paths, and welding the two together is what made an honest
+    /// "re-extraction: replayed" impossible to report. No `#[deprecated]`
+    /// attribute — the warning would fail `clippy -D warnings` in the lane
+    /// that still calls this.
     pub fn delete_facts_for_memory(&self, memory_id: Uuid) -> Result<usize, StorageError> {
-        let id = memory_id.to_string();
-        let n = self
-            .conn
-            .execute("DELETE FROM facts WHERE source_memory_id = ?1", params![id])?;
-        self.conn.execute(
-            "DELETE FROM fact_extraction_log WHERE memory_id = ?1",
-            params![id],
-        )?;
-        Ok(n)
+        self.with_tx(|s| {
+            let diary = s
+                .memory_scope_including_deleted(memory_id)?
+                .map(|(_, d, _)| d)
+                .unwrap_or_else(|| "default".to_string());
+            let closed = s.close_facts_for_memory(
+                memory_id,
+                chrono::Utc::now(),
+                CloseReason::RetractedSource,
+                &CloseAuthority::Caller {
+                    actor: crate::journal::cli_actor(&diary),
+                },
+                &crate::journal::cli_actor(&diary),
+            )?;
+            s.clear_extraction_marker(memory_id)?;
+            Ok(closed.len())
+        })
     }
 
     /// KB of each of `ids`, as a lookup map.
@@ -2199,7 +2333,7 @@ impl SqliteStore {
     /// Hard-delete a memory and all its chunks (used by ingest rollback
     /// when embedding fails mid-batch and we want to clean up the orphan).
     pub fn hard_delete_memory(&self, memory_id: Uuid) -> Result<(), StorageError> {
-        self.delete_facts_for_memory(memory_id)?;
+        self.purge_facts_for_memory(memory_id)?;
         // Chunks are removed by ON DELETE CASCADE on the foreign key.
         self.conn.execute(
             "DELETE FROM memories WHERE id = ?1",
@@ -2654,16 +2788,15 @@ impl SqliteStore {
             return Ok(false);
         }
         self.with_tx(|s| {
+            // Route the retraction through `soft_delete_memory` so each memory
+            // gets its `memory.retracted` event and its facts are closed rather
+            // than deleted. The bare `UPDATE memories SET deleted = 1` this
+            // replaces was the fourth hard-delete path, and the only one that
+            // retracted memories with no journal record whatsoever.
             let memory_ids = s.memory_ids_for_document(id)?;
             for memory_id in &memory_ids {
-                s.delete_facts_for_memory(*memory_id)?;
+                s.soft_delete_memory(*memory_id)?;
             }
-            s.conn.execute(
-                "UPDATE memories SET deleted = 1, deleted_at = ?2
-                 WHERE id IN (SELECT memory_id FROM chunks WHERE document_id = ?1)
-                   AND deleted = 0",
-                params![id_s, chrono::Utc::now().to_rfc3339()],
-            )?;
             s.conn.execute(
                 "DELETE FROM claims
                  WHERE id IN (SELECT claim_id FROM claim_evidence WHERE document_id = ?1)",
@@ -2991,12 +3124,37 @@ impl SqliteStore {
             .iter()
             .map(|r| r.kb.clone())
             .collect::<Vec<_>>();
+        let mut facts_from_deleted_memories_closed = 0usize;
         if !dry_run {
-            self.conn.execute(
-                "DELETE FROM facts
-                 WHERE source_memory_id IN (SELECT id FROM memories WHERE deleted = 1)",
-                [],
-            )?;
+            // Facts of a deleted memory are CLOSED, not deleted. Shipping the
+            // soft-delete rewrite without this one means the next
+            // `engram repair` quietly undoes it — and takes the adjudication
+            // rows with it through the queue's FK cascade.
+            let stale: Vec<Uuid> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT f.id FROM facts f
+                       JOIN memories m ON m.id = f.source_memory_id
+                      WHERE m.deleted = 1
+                        AND f.valid_until IS NULL AND f.superseded_by IS NULL",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .filter_map(|v| Uuid::parse_str(v).ok())
+                    .collect()
+            };
+            for id in stale {
+                if self.close_fact_interval(
+                    id,
+                    chrono::Utc::now(),
+                    CloseReason::RetractedSource.as_str(),
+                    CloseAuthority::ExplicitEnd.as_str(),
+                    None,
+                    None,
+                )? {
+                    facts_from_deleted_memories_closed += 1;
+                }
+            }
             for kb in &derived_kbs_cleared {
                 self.clear_derived_for_kb(kb)?;
             }
@@ -3004,6 +3162,7 @@ impl SqliteStore {
         Ok(RepairReport {
             dry_run,
             facts_from_deleted_memories_removed,
+            facts_from_deleted_memories_closed: facts_from_deleted_memories_closed as i64,
             derived_kbs_cleared,
             duplicate_source_documents: report.duplicate_source_documents,
         })
@@ -4048,9 +4207,14 @@ impl SqliteStore {
     // lowercase.
     // ========================================================================
 
-    /// Insert a new fact. Caller is responsible for first checking whether
-    /// it conflicts with an existing active fact and superseding the old one.
+    /// Insert a new fact and append its `fact.observed`, in one transaction.
+    /// Caller is responsible for first checking whether it conflicts with an
+    /// existing active fact and superseding the old one.
     pub fn insert_fact(&self, f: &engram_core::types::Fact) -> Result<(), StorageError> {
+        self.with_tx(|s| s.insert_fact_row(f))
+    }
+
+    fn insert_fact_row(&self, f: &engram_core::types::Fact) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT INTO facts(id, source_memory_id, subject, subject_norm,
                 predicate, object, object_norm, confidence, created_at,
@@ -4086,6 +4250,24 @@ impl SqliteStore {
                 f.close_authority,
                 f.kb,
             ],
+        )?;
+        // The stored kb is read BACK rather than assumed: when the caller
+        // leaves it empty the column falls back to the source memory's KB, and
+        // the event has to carry what was actually written or a replay re-runs
+        // the fallback against a memory that may have moved since.
+        let stored_kb: String = self.conn.query_row(
+            "SELECT kb FROM facts WHERE id = ?1",
+            params![f.id.to_string()],
+            |r| r.get(0),
+        )?;
+        self.append_event(
+            &crate::journal::EventDraft::new(
+                engram_core::events::EventKind::FactObserved,
+                crate::journal::cli_actor(&f.diary),
+                crate::journal::payload::fact_observed(f, false),
+            )
+            .scope(Some(&stored_kb), Some(&f.diary))
+            .subject(f.id),
         )?;
         Ok(())
     }
@@ -4212,6 +4394,13 @@ impl SqliteStore {
     /// event-time close of the old fact's validity window. `valid_until`
     /// should be the new fact's `valid_from` when known so the bi-temporal
     /// history reads "true until the replacement became true".
+    ///
+    /// Re-expressed over [`SqliteStore::close_fact_interval`] so every close
+    /// lands in the journal, with the authority DERIVED from the `resolution`
+    /// tag the caller already passes. Stamping `heuristic` unconditionally —
+    /// which is what the signature invited — makes the safety audit report the
+    /// exact opposite of the truth for `facts resolve`, whose whole point is
+    /// that a person decided.
     pub fn supersede_fact_with(
         &self,
         old_id: Uuid,
@@ -4219,25 +4408,16 @@ impl SqliteStore {
         resolution: &str,
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool, StorageError> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let until = valid_until
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_else(|| now.clone());
-        let n = self.conn.execute(
-            &format!(
-                "UPDATE facts SET superseded_by = ?1, superseded_at = ?2,
-                        resolution = ?3, valid_until = COALESCE(valid_until, ?4)
-                 WHERE id = ?5 AND {OPEN_INTERVAL_PREDICATE}"
-            ),
-            params![
-                new_id.to_string(),
-                now,
-                resolution,
-                until,
-                old_id.to_string()
-            ],
-        )?;
-        Ok(n > 0)
+        let at = valid_until.unwrap_or_else(chrono::Utc::now);
+        let authority = close_authority_for(resolution);
+        self.close_fact_interval(
+            old_id,
+            at,
+            engram_core::interval::CloseReason::Superseded.as_str(),
+            authority,
+            Some(new_id),
+            Some(resolution),
+        )
     }
 
     /// Store the embedding of a fact's "{subject} {predicate} {object}" string.
@@ -4285,11 +4465,34 @@ impl SqliteStore {
     /// A re-asserted duplicate bumps the existing fact's confirmation count
     /// instead of inserting a second row. Confirmations feed trust weighting.
     pub fn increment_fact_confirmations(&self, id: Uuid) -> Result<(), StorageError> {
-        self.conn.execute(
-            "UPDATE facts SET confirmations = confirmations + 1 WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        Ok(())
+        self.with_tx(|s| {
+            let n = s.conn.execute(
+                "UPDATE facts SET confirmations = confirmations + 1 WHERE id = ?1",
+                params![id.to_string()],
+            )?;
+            if n == 0 {
+                return Ok(());
+            }
+            let scope: Option<(String, String)> = s
+                .conn
+                .query_row(
+                    "SELECT kb, diary FROM facts WHERE id = ?1",
+                    params![id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (kb, diary) = scope.unwrap_or_else(|| ("default".into(), "default".into()));
+            s.append_event(
+                &crate::journal::EventDraft::new(
+                    engram_core::events::EventKind::FactConfirmed,
+                    crate::journal::cli_actor(&diary),
+                    crate::journal::payload::fact_confirmed(id),
+                )
+                .scope(Some(&kb), Some(&diary))
+                .subject(id),
+            )?;
+            Ok(())
+        })
     }
 
     /// Resolve a name against the compile-time entity alias table: returns
@@ -5435,6 +5638,11 @@ fn parse_wiki_page_row(r: &rusqlite::Row) -> rusqlite::Result<WikiPageRecord> {
 
 /// Parse a row of the standard 12-column fact projection into a Fact.
 fn parse_fact_row(r: &rusqlite::Row) -> rusqlite::Result<engram_core::types::Fact> {
+    parse_fact_from_offset(r, 0)
+}
+
+/// Same parser, reachable from `write_path` — one column order, one reader.
+pub(crate) fn parse_fact_row_pub(r: &rusqlite::Row) -> rusqlite::Result<engram_core::types::Fact> {
     parse_fact_from_offset(r, 0)
 }
 

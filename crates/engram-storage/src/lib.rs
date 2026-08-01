@@ -10,6 +10,7 @@ pub mod paths;
 pub mod sqlite;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod write_path;
 
 pub use error::StorageError;
 pub use journal::{EventDraft, EventRow};
@@ -19,3 +20,4 @@ pub use sqlite::{
     FactExportRow, KbExportRow, KnowledgeBase, MemoryExportRow, RelationRecord, SourceCitation,
     SqliteStore, StoredChunkEmbedding, WikiPageRecord,
 };
+pub use write_path::{DerivationRow, RetractOutcome};
