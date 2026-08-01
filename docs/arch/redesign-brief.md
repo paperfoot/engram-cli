@@ -20,10 +20,10 @@ Stage 5 (reasoning layer): `engram state <subject>` — compiled current-state o
 
 ## Hard constraints — violating any of these fails the lane
 
-1. **NEVER touch the live store.** The user's real memory lives at `~/Library/Application Support/bio.199-biotechnologies.engram/`. Every test and every manual binary run MUST use an isolated HOME (`TempDir` + `.env("HOME", …)`; see the `cmd_in(&tmp)` pattern in crates/engram-cli/tests/cli.rs). A test that opens the real store is an automatic reject — this exact bug once migrated the live store and bricked the installed binary.
+1. **NEVER touch the live store.** The user's real memory lives at `~/Library/Application Support/bio.199-biotechnologies.engram/`. Every test and every manual binary run MUST set `ENGRAM_STORE` to a TempDir (the override is landed in `paths.rs` and roots db/vectors/config/cache). Legacy tests isolate via HOME+XDG (`point_at_home`); do not write new ones that way. A test that opens the real store is an automatic reject — this exact bug once migrated the live store and bricked the installed binary.
 2. **Do not install the binary** (`cargo install`, brew) and do not run migrations against any store outside a temp dir.
 3. **Backward compatibility:** the existing CLI surface keeps working. Bare UUIDs stay accepted everywhere a handle is accepted. Existing JSON fields keep their names and types; new fields are additive. Exit-code taxonomy (0/1/2/3/4) is preserved and corrected, never reinterpreted.
-4. **Migration v9→v10** must: write a timestamped backup file next to db.sqlite first (repo precedent: db.sqlite.pre-v8-backup), synthesize genesis events for existing rows, be idempotent, and leave `bench personal` results unchanged.
+4. **Migration v9→v10** must: back up FIRST via `VACUUM INTO 'db.sqlite.pre-v10-backup.<YYYYMMDDHHMMSS>'` outside the migration transaction (there is NO existing backup mechanism in the tree — the v8 "precedent" was a manual file, not code), synthesize genesis events for existing rows, be idempotent, and leave `bench personal` results unchanged. Binding detail: interfaces.md §2.1.
 5. **Quality gates:** `cargo build --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check`, `cargo test --workspace` green in your worktree before you commit. `engram bench personal --json` (offline, deterministic, never touches the live store) must not regress.
 6. **Style:** match the repo's voice — narrative WHY-comments (read edit.rs or fact_write.rs headers for the register), no restating-the-code comments. Rust 2021, workspace deps.
 7. **Commit discipline:** commit in your worktree with messages that say why (bug class, user impact), one commit per coherent change. Never push. Never touch files owned by another lane (ownership table below).
@@ -41,7 +41,9 @@ Stage 5 (reasoning layer): `engram state <subject>` — compiled current-state o
 | daemon-jobs | crates/engram-cli/src/commands/{serve,jobs,compile}.rs, crates/engram-cli/src/{lib,context,main}.rs, tests/daemon_*.rs |
 | reasoning-layer | crates/engram-cli/src/commands/state.rs NEW, reflection job spec, tests/state_*.rs |
 
-Cross-lane needs go through `docs/arch/interfaces.md` (the shared contract — trait signatures, event schema, handle grammar, error codes, envelope fields). If the interface is missing something you need, note it in your spec/report; do not invent a divergent one.
+Cross-lane needs go through `docs/arch/interfaces.md` (the shared contract — trait signatures, event schema, handle grammar, error codes, envelope fields; now v2 with lead rulings R1–R15 and ownership corrections in its §7, which override this table where they conflict). If the interface is missing something you need, note it in your spec/report; do not invent a divergent one. One-line changes you need in another lane's file go in a `cross_lane_patches` section of your report — the lead applies them at wave integration; never edit outside your lane.
+
+Already landed on arch/v0.4 (do not re-spec): `Handle`/`EventKind` in engram-core; `ENGRAM_STORE` + peek getters in paths.rs; agent-info answering before any store opens; dispatch-level `elapsed_ms`; de-flaked bench tests.
 
 ## Sequencing
 

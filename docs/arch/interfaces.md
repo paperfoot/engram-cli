@@ -1,8 +1,35 @@
-# interfaces.md — the shared contract for arch/v0.4
+# interfaces.md v2 — the shared contract for arch/v0.4
 
-Cross-lane ground truth. Lanes code against THIS; if your spec needs something not here, flag it in your report — do not invent a divergent shape. Additions land here via the integration lead, never by editing from a lane.
+Cross-lane ground truth, revised after coherence-report.md (67 findings; every ⚠ there is ruled
+here — rulings carry the CM/CD/CW/CC/IN number they settle). Lanes code against THIS. If your
+spec needs something not here, flag it in your report; do not invent a divergent shape.
+Additions land only via the integration lead.
 
-## 1. Handles
+Ruling shorthand used below: **[Rn]** = lead ruling n, referenced from the changelog at the end.
+
+## 0. Module homes and re-exports [CM-1, CM-3, CM-12, IN-5]
+
+Fully-qualified homes. Anything shared lives in `engram-core`; `engram-graph` may re-export,
+never redefine.
+
+| Item | Home |
+|---|---|
+| `Handle`, `HandleKind`, `HandleParseError` | `engram_core::handle` (LANDED) |
+| `EventKind` | `engram_core::events` (LANDED) |
+| Relation registry (`RelationSpec`, `Arity`, `relation_spec`, `relation_arity`, `canonical_relation`, `cessation_of`, `is_safety_slot`, `member_identity`, `LegacyArity`, `predicate_arity`, versions) | `engram_core::relations` (NEW — storage-journal implements to fact-semantics' registry v1 table below; fact-semantics owns the CONTENT, storage-journal must not edit the table without a lane request) |
+| Interval algebra (`Interval`, `is_open_fact`, `CloseReason`, `CloseAuthority`, `CloseVerdict`, `may_close`, `close_at`) | `engram_core::interval` (NEW — same split: storage-journal lands the file, fact-semantics owns semantics) |
+| `ErrorCode` | `engram_core::error` (extend the existing module) |
+| `SemanticKey`, `DecisionVerdict`, `DecisionAuthority`, `DecisionRecord`, `DecisionLedger`, classifier, planner | `engram_graph` (fact-semantics) |
+| `EventDraft`, `EventRow`, `Resolved`, `DecisionRow`, `InsertOutcome` | `engram_storage` |
+
+`engram-core/src/lib.rs` re-exports at crate root: `Handle`, `HandleKind`, `EventKind`, `Arity`,
+`LegacyArity`, `RelationSpec`, `Interval`, `CloseReason`, `CloseAuthority`, `ErrorCode`.
+
+**[R1]** One registry, one member heuristic, in `engram-core`, because the v9→v10 migration keys
+14.5k decision rows via `SemanticKey` → `member_identity`, and `engram-core` cannot depend on
+`engram-graph`. `engram_graph::relations` is a re-export module only.
+
+## 1. Handles [unchanged, LANDED]
 
 ```
 handle := kind ":" uuid | uuid            # bare uuid = legacy input, always accepted
@@ -10,137 +37,288 @@ kind   := mem | chunk | fact | conflict | entity | doc | job | event
 ```
 
 ```rust
-// engram-core
-pub enum HandleKind { Memory, Chunk, Fact, Conflict, Entity, Document, Job, Event }
-pub struct Handle { pub kind: Option<HandleKind>, pub id: Uuid }
-impl Handle { pub fn parse(s: &str) -> Result<Handle, HandleParseError>; pub fn render(kind: HandleKind, id: Uuid) -> String; }
-```
-
-Resolution lives in storage:
-
-```rust
+// engram_storage
 pub struct Resolved { pub kind: HandleKind, pub id: Uuid, pub memory_id: Option<Uuid> }
 impl SqliteStore { pub fn resolve_handle(&self, h: &Handle) -> Result<Option<Resolved>, StorageError>; }
 ```
 
-Rules: a mutator that needs a memory id accepts ANY handle; if it resolves to a chunk, use `memory_id`; if it resolves to a different kind, return `wrong_id_kind` naming the actual kind and the correct handle. A bare uuid is looked up across kinds (memories first, then chunks, facts, conflicts, entities, documents). Unknown → `not_found`, exit 3 — on every mutator including `forget`.
+A mutator that needs a memory id accepts ANY handle: chunk → follow `memory_id`; other kind →
+`wrong_id_kind` naming the actual kind and correct handle; unknown uuid → `not_found`, exit 3 —
+on every mutator including `forget`. Every serialized result row carries `id` (legacy, unchanged)
+plus `memory_id` and `handle` where applicable. Additive only.
 
-Output rule: every serialized result row carries `id` (legacy, unchanged meaning) AND, where applicable, `memory_id` plus `handle` (kind-prefixed). Additive only.
-
-## 2. The journal
+## 2. The journal [IN-6, IN-12, IN-15..18]
 
 ```sql
 CREATE TABLE events (
-    seq        INTEGER PRIMARY KEY AUTOINCREMENT,   -- total order
-    id         TEXT NOT NULL UNIQUE,                -- uuid
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         TEXT NOT NULL UNIQUE,
     ts         TEXT NOT NULL,                       -- rfc3339, transaction time
     actor      TEXT NOT NULL,                       -- "cli:<diary>" | "daemon" | "job:<uuid>"
     kind       TEXT NOT NULL,
-    subject_id TEXT,                                -- primary entity uuid
+    subject_id TEXT,
     kb         TEXT,
     diary      TEXT,
-    payload    TEXT NOT NULL                        -- canonical JSON, schema per kind below
+    payload    TEXT NOT NULL                        -- canonical JSON; readers ignore unknown fields
 );
 CREATE INDEX idx_events_subject ON events(subject_id, seq);
 CREATE INDEX idx_events_kind    ON events(kind, seq);
 ```
 
-Event kinds v1 (payload fields in parentheses; all payloads also allowed extra fields — readers ignore unknowns):
-
-- `memory.written` (content, content_hash, importance, tags, event_time, source)
-- `memory.revised` (memory_id, content, content_hash, prev_content_hash)
-- `memory.retracted` (memory_id, reason?)            — replaces hard behavior of forget
-- `memory.meta_changed` (memory_id, importance?)
-- `derivation.ran` (memory_id, content_hash, deriver, model?, output_fact_ids, fact_count) — deriver is "fact_extract@<version>"; replaces fact_extraction_log semantics
-- `fact.observed` (fact_id, subject, subject_norm, relation, object, object_norm, valid_from, valid_until?, confidence, source_memory_id, content_hash)
-- `fact.interval_closed` (fact_id, valid_until, closed_by_fact?, reason: "superseded"|"stopped"|"corrected"|"retracted_source")
-- `fact.confirmed` (fact_id)
-- `conflict.opened` (conflict_id, new_fact_id, old_fact_id, detector, rule, score?)
-- `decision.recorded` (decision_id, semantic_key, verdict, conflict_id?, note?, actor)
-- `decision.replayed` (decision_id, applied_to_conflict?, new_fact_id, old_fact_id)
-- `compile.ran` (kb, job_id?, stats)
-- `job.submitted` / `job.completed` / `job.failed` (job_id, kind, params/stats/error)
-
-Invariants:
-1. Every projection mutation happens in the SAME transaction as its event append. No projection write without an event; no event without its projection effect.
-2. Nothing is ever deleted from `events`.
-3. `engram admin rebuild [--kb K]` drops and replays projections from the journal and must reproduce byte-identical projection state (property-tested).
-4. Export v3 = journal slice + current schema version. Import v3 = replay. v2 import stays supported (synthesizes genesis events).
-
 ```rust
-// engram-storage
-pub struct EventDraft { pub kind: EventKind, pub subject_id: Option<Uuid>, pub kb: Option<String>, pub diary: Option<String>, pub actor: String, pub payload: serde_json::Value }
+// engram_storage
+pub struct EventDraft { pub kind: EventKind, pub subject_id: Option<Uuid>, pub kb: Option<String>,
+                        pub diary: Option<String>, pub actor: String, pub payload: serde_json::Value }
+pub struct EventRow  { pub seq: i64, pub id: Uuid, pub ts: DateTime<Utc>, pub actor: String,
+                       pub kind: EventKind, pub subject_id: Option<Uuid>, pub kb: Option<String>,
+                       pub diary: Option<String>, pub payload: serde_json::Value }
 impl SqliteStore {
-    /// Append inside the caller's open transaction. Returns assigned seq + id.
+    /// Append inside the caller's open transaction.
     pub fn append_event(&self, draft: &EventDraft) -> Result<(i64, Uuid), StorageError>;
     pub fn events_for_subject(&self, id: Uuid) -> Result<Vec<EventRow>, StorageError>;
 }
 ```
 
-Migration v9→v10: timestamped `db.sqlite.pre-v10-backup` first; genesis events synthesized per existing row (`memory.written` from memories incl. deleted ones followed by `memory.retracted`, `fact.observed` from facts, `conflict.opened`+`decision.recorded` from resolved queue rows, `derivation.ran` from fact_extraction_log); idempotent; `bench personal` unchanged.
+Event payloads v2 (changes vs v1 marked ←):
 
-## 3. Interval facts
+- `memory.written` (content, content_hash, importance, tags, event_time, source)
+- `memory.revised` (memory_id, content, content_hash, prev_content_hash)
+- `memory.retracted` (memory_id, reason?)
+- `memory.meta_changed` (memory_id, importance?)
+- `derivation.ran` (memory_id, content_hash, deriver, model?, output_fact_ids, fact_count)
+- `fact.observed` (fact_id, subject, subject_norm, relation, object, object_norm, valid_from,
+  valid_until?, confidence, source_memory_id, content_hash, source_kind)
+- `fact.interval_closed` (fact_id, valid_until, closed_by?, reason, **authority**,
+  **sets_superseded_by**) ← [R2: CM-2 — the projection columns `closed_by`/`close_reason`/
+  `close_authority` and the `superseded_by` compat write must be rebuildable from this one event]
+- `fact.confirmed` (fact_id)
+- `conflict.opened` (conflict_id, new_fact_id, old_fact_id, detector, rule, score?,
+  **decision_key**, **member_key**, **registry_version**) ← [IN-18]
+- `decision.recorded` (decision_id, semantic_key, **key_version**, **verdict:
+  "keep_both"|"close_old"|"reject_new"|"void"**, **authority: "caller"|"machine"**, conflict_id?,
+  note?, actor, **kb**) ← [R4: CM-5]
+- `decision.replayed` (decision_id, new_fact_id, old_fact_id, applied_verdict) — appended by the
+  APPLIER in the same transaction as its effect; an obligation on the write path, not garnish [IN-17]
+- `compile.ran` (kb, job_id?, stats)
+- `job.submitted` / `job.completed` / `job.failed` (job_id, kind, params/stats/error)
 
-`facts` table keeps its columns; adds `closed_by TEXT` (fact/event uuid) and `close_reason TEXT`. Compatibility view: `superseded_by`/`superseded_at` remain populated when `close_reason='superseded'` so existing readers keep working.
+Invariants:
+1. Every projection mutation happens in the SAME transaction as its event append.
+2. Nothing is ever deleted from `events`.
+3. `engram admin rebuild [--kb K]` drops and replays projections and reproduces byte-identical
+   projection state (property-tested). Owner: **storage-journal** (new `commands/admin.rs`;
+   dispatch arm lands via the lead patch channel) [CD-4].
+4. Export v3 = journal slice + schema version; import v3 = replay. v2 import stays supported and
+   synthesizes genesis events — owner of the slice format, replay, AND v2-genesis synthesis:
+   storage-journal; write-surfaces wires the commands [CD-9].
+
+### 2.1 Migration v9→v10 contract [R5: CW-1, CC-2, CD-7 — binding; annex: spec-fact-semantics §4.1]
+
+1. Backup BEFORE the migration transaction opens, only when stored version < 10, never for
+   `open_in_memory()`: `VACUUM INTO '<data_dir>/db.sqlite.pre-v10-backup.<YYYYMMDDHHMMSS>'`
+   (UTC timestamp; VACUUM INTO, not a file copy, so the WAL trio cannot be torn). **[R5a]** — the
+   filename in v1 of this document and constraint 4's "repo precedent" were both wrong; there is
+   no existing backup mechanism in the tree.
+2. Fact backfill: `valid_until` from `superseded_at` where set, clamped
+   `MAX(valid_from, superseded_at)`; `resolution` → `close_reason` and `resolved_by` → `authority`
+   per the annex's mapping tables.
+3. Genesis events synthesized in annex order — including `conflict.opened` for OPEN queue rows
+   (without them a rebuild cannot restore the open queue and invariant 3 fails on any store with
+   a backlog).
+4. Resolved queue rows → `decision.recorded` events keyed by `SemanticKey::for_pair`
+   (`authority` inferred per annex; unclassifiable → `verdict: "void"`).
+5. Open-queue key backfill → explicit duplicate-key collapse (survivor: lowest `created_at`,
+   ties by `id`; losers get `status='superseded_question'` + a `void` decision) → ONLY THEN
+   `CREATE UNIQUE INDEX idx_fcq_open_key`.
+6. Idempotent; `bench personal` unchanged.
+
+## 3. Relations, intervals, facts [R1, R3, R6, R7]
+
+### 3.1 Registry (engram_core::relations; content owned by fact-semantics)
 
 ```rust
 pub enum Arity { SetValued { safety: bool }, SingleValued { safety: bool } }
+pub enum Mutability { Mutable, Immutable }
+pub enum Temporality { State, Instant }
+pub enum ValueDomain { Date, Text }
+pub struct RelationSpec { pub arity: Arity, pub mutability: Mutability,
+                          pub temporality: Temporality, pub value: ValueDomain }
+pub const REGISTRY_VERSION: &str = "relations@1";
+pub const MEMBER_IDENTITY_VERSION: &str = "member_identity@1";
+pub fn relation_spec(canonical: &str) -> RelationSpec;
 pub fn relation_arity(canonical: &str) -> Arity;
-// takes_medication / allergic_to / diagnosed_with => SetValued { safety: true }
-// blood_type, birthday, died_on, nationality      => SingleValued { safety: blood_type only }
-// unknown predicates                              => SetValued { safety: false }  (unchanged default)
+pub fn canonical_relation(raw: &str) -> String;
+pub fn cessation_of(raw_or_canonical: &str) -> Option<&'static str>;
+pub fn is_safety_slot(canonical: &str) -> bool;
+/// [R6: CM-11] Canonicalizes INTERNALLY — accepts raw or canonical; callers cannot get it wrong.
 pub fn member_identity(relation: &str, object_norm: &str) -> String;
-// e.g. "empagliflozin 12.5 mg daily" -> "empagliflozin"; v1 heuristic is fact-semantics lane's call, must be pure + versioned
+/// [R3: CM-4] The legacy projection keeps a legacy NAME at every call site. `facts.rs` et al are
+/// renamed to `LegacyArity`; nothing re-exports it as `Arity`.
+pub enum LegacyArity { Single, Multi }
+pub fn predicate_arity(canonical: &str) -> LegacyArity;
 ```
 
-Write semantics (replaces classify-then-queue for set-valued relations):
-- New observation, set-valued, new member identity → coexist. NO conflict row.
-- Same member identity, same attributes → confirmation.
-- Same member identity, different attributes (dose change) → close old interval (`reason: superseded`) if non-safety; if safety, open a conflict whose `suggested_action` is `requires_context` (NEVER `supersede-old`).
-- Explicit negation ("stopped X") → interval close (`reason: stopped`), safety-gated the same way.
-- Single-valued relations keep today's recency/confidence logic, expressed as interval closes.
-- Decision replay runs BEFORE conflict opening: identical `semantic_key` with a recorded verdict applies silently and appends `decision.replayed`.
+Registry v1, pinned: `takes_medication`/`allergic_to`/`diagnosed_with` → `SetValued{safety:true}`,
+Mutable, State. `blood_type` → `SingleValued{safety:true}`, Immutable. `birthday`/`has_birthday`/
+`date_of_birth`/`born_on`/`died_on` → `SingleValued{false}`, Immutable, Instant, Date.
+`nationality` → `SingleValued{false}`, Immutable, State. `lives_in`, `works_at`, `has_role`,
+`has_age`, `married_to`, `partner_of`, `prefers_language` → `SingleValued{false}`, Mutable, State.
+`married_on`/`founded_on`/`graduated_on`/`joined_on`/`started_on`/`ended_on`/`hired_on` →
+`SetValued{false}`, Immutable, Instant, Date. Everything else, including every current
+`MULTI_VALUED_PREDICATES` entry → `SetValued{safety:false}`, Mutable, State, Text.
+
+### 3.2 Intervals (engram_core::interval)
 
 ```rust
-pub struct SemanticKey { pub subject_norm: String, pub relation: String, pub object_pair_hash: String }
-// object_pair_hash = hex(blake3(min(a_norm,b_norm) || "\x1f" || max(a_norm,b_norm)))
+pub struct Interval { pub from: DateTime<Utc>, pub until: Option<DateTime<Utc>> }
+impl Interval { pub fn of(f: &Fact) -> Interval;
+                pub fn is_open(&self) -> bool;
+                pub fn overlaps(&self, other: &Interval) -> bool;   // half-open [from, until)
+                pub fn precedes(&self, other: &Interval) -> bool;
+                pub fn is_point(&self) -> bool; }                   // until == Some(from)
+pub fn is_open_fact(f: &Fact) -> bool;   // valid_until.is_none() && superseded_by.is_none()
+pub enum CloseReason { Superseded, Stopped, Corrected, RetractedSource }
+pub enum CloseAuthority { ExplicitEnd, Caller { actor: String },
+                          ReplayedCaller { decided_at: DateTime<Utc> },
+                          SuccessorInterval, Heuristic { rule: &'static str } }
+pub enum CloseVerdict { Allow, Refuse { reason: &'static str } }
+pub fn may_close(spec: &RelationSpec, authority: &CloseAuthority) -> CloseVerdict;
+pub fn close_at(old: &Interval, successor_from: DateTime<Utc>) -> DateTime<Utc>;  // max clamp
 ```
 
-## 4. Errors and envelope
+Point intervals never overlap anything; every `Instant` relation in registry v1 is `Immutable`,
+so no `Instant` pair reaches the interval branch.
+
+### 3.3 Fact projection
+
+`Fact` gains, additive, `#[serde(default)]`: `closed_by: Option<Uuid>`,
+`close_reason: Option<String>`, `close_authority: Option<String>` [IN-3]. `superseded_by`/
+`superseded_at` stay populated when `close_reason='superseded'` (compat view). DDL and index
+order per IN-11 of the coherence report, verbatim, including `fact_conflict_queue.status` gaining
+`superseded_question` and `idx_fcq_open_key` created LAST.
+
+Write semantics (set-valued default; contradiction = temporal incompatibility on single-valued,
+or same-member overlap disagreement; safety gates interval-CLOSING and also `Duplicate`
+downgrades [IN-19 note]; decision replay runs before conflict opening). Normative detail:
+spec-fact-semantics.md §§1–2 as reviewed.
+
+**[R7: CM-8/IN-25 — suggested_action ruling.]** Vocabulary stays
+`keep-both | supersede-old | requires_context`. Safety pairs: ALWAYS `requires_context`, never
+`supersede-old`. Non-safety single-valued pairs that queued only because autonomy was `strict`
+(classifier verdict was SupersedeOld): `supersede-old` is permitted and honest. Set-valued
+non-safety different members never queue at all. The blanket removal in spec-fact-semantics §1.4
+is overruled; contract-codegen generates this enum.
+
+### 3.4 Decisions [R8: CM-6, CW-3; IN-9, IN-20]
 
 ```rust
-pub enum ErrorCode { BadInput, NotFound, WrongIdKind, Config, Transient, RateLimited, SqliteBusy, ConflictAlreadyResolved, MalformedJson }
-```
-Exit mapping: BadInput/NotFound/WrongIdKind/MalformedJson→3, Config→2, Transient/SqliteBusy→1, RateLimited→4, ConflictAlreadyResolved→3. Every error carries a non-boilerplate `suggestion`. Clap parse failures are intercepted (`try_parse`) and emitted through the JSON envelope, exit 3.
-
-Envelope additions (all additive):
-- Every listing: `returned`, `total`, optional `cursor`; legacy `count` stays = returned.
-- Every read: `metadata.scope { kbs, diary, chunks_considered }`; `data.verdict: "results" | "no_match"`; on no_match: `data.absence { top_score, threshold, searched_kbs, searched_chunks }`.
-- `edit`/`memory update` response: `facts_invalidated: usize`, `reextraction: "replayed" | "pending" | "none"`, plus job handle when async re-derivation was submitted.
-- `elapsed_ms` measured once in dispatch for every command.
-- `resolve_command` fields are replaced by `resolve { program: "engram", args: [...], allowed_actions: [...] }`; the old string field stays but contains ONE runnable command with no pipe characters.
-
-## 5. Store resolution
-
-Precedence: `--store <dir>` flag > `ENGRAM_STORE` env > ProjectDirs default. `engram agent-info`, `--help`, and clap errors must not open, create, or migrate any store. All tests set `ENGRAM_STORE` to a TempDir (never rely on HOME tricks again).
-
-## 6. Single-writer core and jobs
-
-```rust
-// engram-cli (core module) — daemon-jobs lane owns; other lanes only consume
-pub struct Core { /* store + single writer */ }
-impl Core {
-    pub fn write<T>(&self, f: impl FnOnce(&mut WriteTx) -> Result<T>) -> Result<T>; // ALL mutations
-    pub fn submit_job(&self, kind: JobKind, params: Value) -> Result<JobHandle>;    // compile, backfill, reflect
+// engram_storage — owns rows, queries, precedence
+pub struct DecisionRow { pub id: Uuid, pub kb: String, pub diary: String, pub decision_key: String,
+                         pub subject_norm: String, pub relation: String, pub pair_hash: String,
+                         pub verdict: String, pub authority: String, pub actor: String,
+                         pub note: Option<String>, pub conflict_id: Option<Uuid>,
+                         pub event_id: Uuid, pub key_version: String, pub decided_at: DateTime<Utc> }
+impl SqliteStore {
+    pub fn record_decision(&self, /* fields as DecisionRow minus id/event_id */) -> Result<Uuid, StorageError>;
+    /// Precedence IN THE QUERY: newest authority='caller' row for (kb, decision_key), else newest
+    /// 'machine' row; verdict='void' never selected. A failed lookup PROPAGATES — never read as
+    /// "nobody decided".
+    pub fn lookup_decision(&self, kb: &str, key_encoded: &str) -> Result<Option<DecisionRow>, StorageError>;
 }
+// engram_graph — owns the trait + semantics; the SqliteStore impl is a one-line adapter over
+// lookup_decision. DecisionRow's shape above is FROZEN for that reason.
+pub trait DecisionLedger { fn binding_decision(&self, kb: &str, key: &SemanticKey)
+    -> Result<Option<DecisionRecord>, StorageError>; }
 ```
-`facts resolve` claims its queue row inside the write closure (conditional UPDATE, exactly-one-row) and appends `decision.recorded`; a lost claim returns `ConflictAlreadyResolved`. CLI and daemon share one response-builder module per command family; serve.rs may not construct bespoke response JSON.
 
-## 7. Wave sequencing (who lands what, in order)
+**[R9: CD-8 — pair-hash ruling.]** No new dependency. 
+`object_pair_hash = Uuid::new_v5(SEMANTIC_KEY_NAMESPACE, (min(a_norm) ++ "\x1f" ++ max(b_norm)).as_bytes())`
+hex-encoded, with `pub const SEMANTIC_KEY_NAMESPACE: Uuid` pinned in `engram_graph` (any fixed
+uuid, chosen once). blake3 is rejected. `SEMANTIC_KEY_VERSION = "semantic_key@1"` refers to THIS
+scheme. Key scoped by `kb` at lookup, deliberately not by `diary`.
 
-1. Wave 2: engram-core types (Handle, EventKind, Arity, ErrorCode) + journal table/append + genesis migration + store resolution + contract-codegen skeleton. Everything else compiles against these.
-2. Wave 3: fact-semantics (intervals, arity, replay) + write-surfaces + read-surfaces, in worktrees, integrated in that order.
-3. Wave 4: daemon-jobs (Core, HTTP, jobs), absorbing the response builders.
-4. Wave 5: reasoning-layer (`state`, procedural kind, reflect job) on top.
+### 3.5 Queue insert [R10: CM-7, IN-10]
 
-Compat promise for the whole build: existing scripts and agents keep working unmodified; every legacy field keeps meaning what it meant; new behavior is additive or strictly-more-correct (exit codes, totals, suggestions).
+```rust
+pub enum InsertOutcome { Inserted, DuplicatePair { existing: Uuid }, DuplicateKey { existing: Uuid } }
+// insert_fact_conflict gains decision_key, member_key, registry_version params and returns InsertOutcome.
+```
+
+## 4. Errors and envelope [R11: CM-10, IN-4, IN-23, IN-24]
+
+```rust
+// engram_core::error
+pub enum ErrorCode { BadInput, NotFound, WrongIdKind, Config, Transient, RateLimited,
+                     SqliteBusy, ConflictAlreadyResolved, MalformedJson }
+```
+Exit mapping: BadInput/NotFound/WrongIdKind/MalformedJson/ConflictAlreadyResolved → 3; Config → 2;
+Transient/SqliteBusy → 1; RateLimited → 4.
+
+**StorageError → ErrorCode table [R11]:** `NotFound` → NotFound; `Busy`/"database is locked" →
+SqliteBusy; `Migration` → Config; `Serde`/malformed row → MalformedJson; everything else →
+Transient. `error.rs` (contract-codegen) implements; a contract test asserts every variant.
+
+Envelope additions (all additive): every listing carries `returned`, `total`, optional `cursor`
+(legacy `count` stays = returned); reads carry `metadata.scope { kbs, diary, chunks_considered }`,
+`data.verdict: "results" | "no_match"`, and on no_match `data.absence { top_score, threshold,
+searched_kbs, searched_chunks }`; `edit`/`memory update` responses carry `facts_invalidated` and
+`reextraction: "replayed"|"pending"|"none"`; `elapsed_ms` measured in dispatch (LANDED).
+
+**[R12: CM-9]** The resolve-payload builder is a wave-2 deliverable: new module
+`crates/engram-cli/src/respond.rs`, owner contract-codegen. It renders
+`resolve { program, args, allowed_actions }` plus the legacy `resolve_command` string containing
+ONE runnable command, no pipes. fact_write.rs, facts.rs, recall.rs, serve.rs all call it;
+`allowed_actions` values arrive from the caller (fact-semantics' `allowed_actions()`), so respond.rs
+depends on no classifier.
+
+**[R13: IN-26]** `--facts-json` stamps `SourceKind::UserStated` (write-surfaces), so
+caller-corrections are distinguishable from extraction.
+
+## 5. Store resolution and test isolation [R14: CM-13, CC-1, CD-5, CD-6]
+
+`ENGRAM_STORE` is the one name (`ENGRAM_HOME` anywhere is an error). Precedence: `--store <dir>`
+flag > `ENGRAM_STORE` > ProjectDirs. The `--store` flag is DEFERRED to wave 4 (context.rs);
+the env var is sufficient for waves 2–3. Tests: `point_at_home` in `tests/cli.rs` additionally
+sets `ENGRAM_STORE` to the same TempDir (lead patch, wave 2); new tests use `ENGRAM_STORE` alone.
+`agent-info`, `--help`, and clap errors never open, create, or migrate a store (LANDED).
+
+## 6. Single-writer core and jobs [unchanged from v1]
+
+`Core::write(...)` single entry point for mutations; `facts resolve` claims its row inside the
+write closure (conditional UPDATE, exactly-one-row) and appends `decision.recorded`; a lost claim
+is `ConflictAlreadyResolved`. Jobs API for compile/backfill/reflect. CLI and daemon share
+response builders (§4 R12 lands the module early).
+
+## 7. Ownership corrections and the patch channel [R15: CC-5, IN-29, IN-30; CD-1..CD-10]
+
+Additions to the brief's ownership table:
+- **lead (integration commits)**: `crates/engram-cli/src/commands/mod.rs`, workspace `Cargo.toml`,
+  `crates/engram-cli/tests/cli.rs`, `tests/wave0_*.rs`, `tests/wave05_*.rs`, and every one-line
+  cross-lane patch a lane's report requests under a `cross_lane_patches` section (e.g.
+  `compile.rs:866` gains `..Default::default()` when fact-semantics lands [CD-1]).
+- **storage-journal**: `crates/engram-cli/src/commands/admin.rs` (NEW, `admin rebuild`),
+  `engram_core::relations` + `engram_core::interval` files (content per §3), export-v3 slice
+  format + replay + v2-genesis synthesis.
+- **read-surfaces**: the `is_open_fact()` sweep sites in `facts.rs:123,156,157` and
+  `recall.rs:310`; storage-journal owns the fifteen `sqlite.rs` sites; the sweep is a NAMED
+  wave-3 integration gate owned by the lead, with fact-semantics' §5.42 tests un-`#[ignore]`d at
+  that gate [CD-2, CC-4].
+- Path correction: the skill asset is `crates/engram-cli/assets/skill.md`.
+- Explicitly frozen this build except via lead patches: `doctor.rs`, `repair.rs`, `chunks.rs`,
+  `ingest.rs`, `kb.rs`, `reindex.rs`, `update.rs`, `usage.rs`, `config.rs`, `budget.rs`, `bench.rs`.
+
+Already landed (do not re-spec) [CC-7]: agent-info store-free dispatch; `ENGRAM_STORE` in
+`paths.rs` with peek getters; `Handle`/`EventKind` in engram-core; dispatch-level `elapsed_ms`;
+bench-test isolation in `tests/cli.rs`.
+
+## Changelog v1→v2
+
+R1 registry+intervals in engram-core (CM-1/3/12) · R2 interval_closed carries authority +
+sets_superseded_by (CM-2) · R3 LegacyArity everywhere, no alias (CM-4) · R4 decision.recorded
+payload complete (CM-5) · R5 migration contract binding here, VACUUM INTO timestamped backup
+(CW-1/CC-2/CD-7) · R6 member_identity canonicalizes internally (CM-11) · R7 suggested_action:
+safety-only narrowing, blanket removal overruled (CM-8) · R8 DecisionRow frozen in storage,
+trait adapter in graph (CM-6/CW-3) · R9 Uuid::new_v5, blake3 rejected (CD-8) · R10 InsertOutcome
+(CM-7) · R11 ErrorCode + StorageError mapping (CM-10) · R12 respond.rs in wave 2 (CM-9) ·
+R13 UserStated source kind (IN-26) · R14 ENGRAM_STORE everywhere, --store deferred to wave 4
+(CM-13/CC-1/CD-5/CD-6) · R15 patch channel + ownership additions (CC-5/IN-29/IN-30).
