@@ -188,6 +188,28 @@ pub struct Fact {
     /// Times this exact fact was re-asserted (dedup hits). Feeds trust.
     #[serde(default)]
     pub confirmations: u32,
+    /// The successor fact (or the event) that closed this interval.
+    #[serde(default)]
+    pub closed_by: Option<Uuid>,
+    /// `CloseReason::as_str()` — superseded | stopped | corrected |
+    /// retracted_source. NULL while the interval is open.
+    #[serde(default)]
+    pub close_reason: Option<String>,
+    /// `CloseAuthority::as_str()` — explicit_end | caller | replayed_caller |
+    /// successor_interval | heuristic. WHO closed the interval is the whole
+    /// point: the safety audit asks "which safety facts did a machine retire?"
+    /// and cannot answer it from `resolution`, which mixes rule names and
+    /// actors. The landed spelling is `successor_interval`, never `successor`.
+    #[serde(default)]
+    pub close_authority: Option<String>,
+    /// Knowledge base the fact lives in. The column has always existed; the
+    /// struct did not carry it, so `insert_fact` re-derived it with a subquery
+    /// over `memories` — which silently re-homes every fact whose source
+    /// memory later moved between KBs, and makes a journal replay unable to
+    /// reproduce the original row. `""` on a row deserialized from a pre-v10
+    /// export.
+    #[serde(default)]
+    pub kb: String,
 }
 
 /// Semantic category of a fact. Closed taxonomy so conflict policies can be

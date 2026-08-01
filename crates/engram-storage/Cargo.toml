@@ -21,3 +21,8 @@ chrono.workspace = true
 uuid.workspace = true
 directories.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Every storage test opens a real file store inside a TempDir: VACUUM INTO needs
+# a directory, and no test may be able to reach the developer's real store.
+tempfile = "3"

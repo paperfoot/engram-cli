@@ -11,8 +11,9 @@ pub mod output;
 pub mod retrieval;
 
 use crate::cli::{
-    BudgetCommand, ChunksCommand, Cli, Command, ConfigCommand, DocumentsCommand, EntitiesCommand,
-    FactsCommand, GraphCommand, JobsCommand, KbCommand, MemoryCommand, PeopleCommand,
+    AdminCommand, BudgetCommand, ChunksCommand, Cli, Command, ConfigCommand, DocumentsCommand,
+    EntitiesCommand, FactsCommand, GraphCommand, JobsCommand, KbCommand, MemoryCommand,
+    PeopleCommand,
 };
 use crate::error::CliError;
 
@@ -120,6 +121,13 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             DocumentsCommand::Delete { id, confirm } => {
                 commands::documents::delete(&ctx, id, confirm)
             }
+        },
+        Command::Admin(sub) => match sub {
+            AdminCommand::Rebuild {
+                kb,
+                dry_run,
+                confirm,
+            } => commands::admin::rebuild(&ctx, kb, dry_run, confirm),
         },
         Command::Kb(sub) => match sub {
             KbCommand::Create { name, description } => {

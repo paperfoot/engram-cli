@@ -302,7 +302,7 @@ fn surface_conflicts(
     if terms.is_empty() {
         return Ok(Vec::new());
     }
-    let facts = ctx.store.facts_matching_terms(kb, &terms, 20)?;
+    let facts = ctx.store.facts_matching_terms(kb, None, &terms, 20)?;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for f in facts {
@@ -333,7 +333,10 @@ fn surface_conflicts(
 
     // Contested: open conflicts touching the query. Both values are active;
     // report both rather than silently returning one side.
-    for (row, new_f, old_f) in ctx.store.open_conflicts_matching_terms(kb, &terms, 10)? {
+    for (row, new_f, old_f) in ctx
+        .store
+        .open_conflicts_matching_terms(kb, None, &terms, 10)?
+    {
         out.push(json!({
             "status": "contested",
             "conflict_id": row.id.to_string(),

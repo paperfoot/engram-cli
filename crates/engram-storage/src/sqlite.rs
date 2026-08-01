@@ -1,6 +1,9 @@
 //! SQLite source of truth + FTS5 lexical index.
 
+use crate::decisions::InsertOutcome;
 use crate::error::StorageError;
+use crate::write_path::{close_authority_for, RetractOutcome};
+use engram_core::interval::{CloseAuthority, CloseReason};
 use engram_core::types::Memory;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -23,8 +26,11 @@ fn f32_bytes_to_vec(b: &[u8]) -> Vec<f32> {
 }
 
 pub struct SqliteStore {
-    conn: Connection,
-    #[allow(dead_code)]
+    /// `pub(crate)` so `journal`, `rebuild`, `migrate_v10`, `backup` and
+    /// `export_v3` can prepare statements against the same connection —
+    /// invariant 1 requires the event append and the projection write to share
+    /// one transaction, which means they must share one connection.
+    pub(crate) conn: Connection,
     path: PathBuf,
 }
 
@@ -64,7 +70,15 @@ pub struct DocumentDuplicateRecord {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RepairReport {
     pub dry_run: bool,
+    /// How many facts of deleted memories were FOUND. It keeps its published
+    /// name and its type, and it is now always a count of rows repair left
+    /// alone: nothing hard-deletes them any more.
     pub facts_from_deleted_memories_removed: i64,
+    /// How many of those intervals `repair` actually closed. The rename the
+    /// honest report wanted is forbidden by the published-key rule, so the new
+    /// number ships beside the old one instead of replacing it.
+    #[serde(default)]
+    pub facts_from_deleted_memories_closed: i64,
     pub derived_kbs_cleared: Vec<String>,
     pub duplicate_source_documents: Vec<DocumentDuplicateRecord>,
 }
@@ -331,6 +345,12 @@ pub struct FactExportRow {
     pub source_kind: String,
     #[serde(default)]
     pub confirmations: i64,
+    #[serde(default)]
+    pub closed_by: Option<String>,
+    #[serde(default)]
+    pub close_reason: Option<String>,
+    #[serde(default)]
+    pub close_authority: Option<String>,
 }
 
 fn default_fact_type_str() -> String {
@@ -357,7 +377,45 @@ pub struct FactConflictRow {
     pub created_at: String,
     pub resolved_at: Option<String>,
     pub resolved_by: Option<String>,
+    /// The semantic key this question is about. NULL on a row whose facts are
+    /// gone (an orphan the migration deliberately kept) and on any row written
+    /// before wave 3 taught the write path to compute one.
+    #[serde(default)]
+    pub decision_key: Option<String>,
+    #[serde(default)]
+    pub member_key: Option<String>,
+    #[serde(default)]
+    pub registry_version: Option<String>,
 }
+
+/// The queue projection, in `parse_conflict_row` order.
+pub(crate) fn conflict_columns(prefix: &str) -> String {
+    const NAMES: [&str; 16] = [
+        "id",
+        "new_fact_id",
+        "old_fact_id",
+        "diary",
+        "kb",
+        "detector",
+        "score",
+        "suggested",
+        "note",
+        "status",
+        "created_at",
+        "resolved_at",
+        "resolved_by",
+        "decision_key",
+        "member_key",
+        "registry_version",
+    ];
+    NAMES
+        .iter()
+        .map(|n| format!("{prefix}{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) const CONFLICT_COLUMN_COUNT: usize = 16;
 
 fn parse_conflict_row(r: &rusqlite::Row) -> rusqlite::Result<FactConflictRow> {
     let id: String = r.get(0)?;
@@ -377,6 +435,9 @@ fn parse_conflict_row(r: &rusqlite::Row) -> rusqlite::Result<FactConflictRow> {
         created_at: r.get(10)?,
         resolved_at: r.get(11)?,
         resolved_by: r.get(12)?,
+        decision_key: r.get(13)?,
+        member_key: r.get(14)?,
+        registry_version: r.get(15)?,
     })
 }
 
@@ -789,7 +850,55 @@ const MEMORY_CONSTRAINS_DERIVED: &str = "(
     )
 )";
 
-const CURRENT_VERSION: i32 = 9;
+pub const CURRENT_VERSION: i32 = 10;
+
+/// A fact still asserts something only while BOTH are true: no successor took
+/// its slot, and its own interval has not been closed. `close_reason='stopped'`
+/// sets `valid_until` and leaves `superseded_by` NULL, so the legacy
+/// `superseded_by IS NULL` predicate reads a stopped medication as current —
+/// the exact failure move 2 exists to prevent, introduced by move 2. Mirrors
+/// `engram_core::interval::is_open_fact`; the two are one rule in two
+/// languages and a test pins them equal.
+const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND superseded_by IS NULL)";
+
+/// The fact projection, in `parse_fact_row` order. Written once so a `SELECT`
+/// and its parser cannot drift: a wrong column offset mis-parses silently,
+/// which is how a fact's `object` ends up in its `subject_norm`.
+pub(crate) fn fact_columns(prefix: &str) -> String {
+    const NAMES: [&str; 22] = [
+        "id",
+        "source_memory_id",
+        "subject",
+        "subject_norm",
+        "predicate",
+        "object",
+        "object_norm",
+        "confidence",
+        "created_at",
+        "superseded_by",
+        "superseded_at",
+        "diary",
+        "fact_type",
+        "valid_from",
+        "valid_until",
+        "resolution",
+        "source_kind",
+        "confirmations",
+        "closed_by",
+        "close_reason",
+        "close_authority",
+        "kb",
+    ];
+    NAMES
+        .iter()
+        .map(|n| format!("{prefix}{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How many columns [`fact_columns`] emits — the stride between two fact
+/// projections in one joined row.
+pub(crate) const FACT_COLUMN_COUNT: usize = 22;
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -809,6 +918,15 @@ impl SqliteStore {
             conn,
             path: path.as_ref().to_path_buf(),
         };
+        // The pre-v10 backup, BEFORE the migration transaction opens: VACUUM
+        // INTO cannot run inside one. Only for a store that already exists and
+        // is behind — a fresh store has nothing to back up, and an up-to-date
+        // one must not pay for a copy on every CLI invocation.
+        if let Some(v) = store.try_schema_version()? {
+            if v < 10 && store.path != Path::new(":memory:") {
+                crate::backup::vacuum_into_backup(&store.conn, &store.path)?;
+            }
+        }
         store.migrate()?;
         Ok(store)
     }
@@ -835,7 +953,11 @@ impl SqliteStore {
         if !self.conn.is_autocommit() {
             return f(self);
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        // Busy is translated at the boundary so a caller can retry without
+        // string-matching an error message (R11).
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(crate::error::tx_error)?;
         match f(self) {
             Ok(v) => {
                 self.conn.execute_batch("COMMIT")?;
@@ -853,7 +975,9 @@ impl SqliteStore {
     /// writes). Under WAL, readers keep seeing the pre-transaction snapshot
     /// until `commit`, so a long-running build-then-swap is safe.
     pub fn begin_immediate(&self) -> Result<(), StorageError> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(crate::error::tx_error)?;
         Ok(())
     }
 
@@ -925,6 +1049,9 @@ impl SqliteStore {
             if current < 9 {
                 s.migrate_v9()?;
             }
+            if current < 10 {
+                s.migrate_v10()?;
+            }
             if current != CURRENT_VERSION {
                 s.conn.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -937,7 +1064,7 @@ impl SqliteStore {
 
     /// Read the schema version without creating any tables. Returns
     /// `Ok(None)` when the version table doesn't exist yet (fresh DB).
-    fn try_schema_version(&self) -> Result<Option<i32>, StorageError> {
+    pub(crate) fn try_schema_version(&self) -> Result<Option<i32>, StorageError> {
         let table_exists: bool = self
             .conn
             .query_row(
@@ -1191,7 +1318,7 @@ impl SqliteStore {
         Ok(false)
     }
 
-    fn add_column_if_missing(
+    pub(crate) fn add_column_if_missing(
         &self,
         table: &str,
         column: &str,
@@ -1456,6 +1583,13 @@ impl SqliteStore {
 
     pub fn insert_memory_with_kb(&self, m: &Memory, kb: &str) -> Result<(), StorageError> {
         self.ensure_kb(kb, None)?;
+        // The row and its event are one transaction (invariant 1). `with_tx`
+        // joins an already-open one rather than nesting, so a caller that
+        // wraps a whole write in its own transaction still gets exactly one.
+        self.with_tx(|s| s.insert_memory_row(m, kb))
+    }
+
+    fn insert_memory_row(&self, m: &Memory, kb: &str) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT INTO memories(id, content, created_at, event_time, importance,
                 emotional_weight, access_count, last_accessed, stability, source_json,
@@ -1478,6 +1612,22 @@ impl SqliteStore {
                 serde_json::to_string(&m.tags)?,
                 kb,
             ],
+        )?;
+        self.append_event(
+            &crate::journal::EventDraft::new(
+                engram_core::events::EventKind::MemoryWritten,
+                crate::journal::cli_actor(&m.diary),
+                crate::journal::payload::memory_written(
+                    &engram_core::keys::content_hash(&m.content),
+                    m.importance as i64,
+                    &m.tags,
+                    m.event_time.map(|t| t.to_rfc3339()).as_deref(),
+                    "remember",
+                    false,
+                ),
+            )
+            .scope(Some(kb), Some(&m.diary))
+            .subject(m.id),
         )?;
         Ok(())
     }
@@ -1834,6 +1984,25 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Every chunk of one memory, in position order. `list_chunks_by_memory`
+    /// spans a whole KB and filters deleted memories out; this answers "what
+    /// text does THIS memory consist of", which a provenance surface needs
+    /// even for a memory that was later retracted.
+    pub fn chunks_for_memory(&self, memory_id: Uuid) -> Result<Vec<ChunkRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.memory_id, c.content, c.position, c.section, m.diary, m.kb,
+                    c.document_id, COALESCE(d.source_path, json_extract(m.source_json, '$.path'))
+             FROM chunks c
+             JOIN memories m ON m.id = c.memory_id
+             LEFT JOIN documents d ON d.id = c.document_id
+             WHERE c.memory_id = ?1
+             ORDER BY c.position ASC, c.id ASC",
+        )?;
+        let rows = stmt.query_map(params![memory_id.to_string()], parse_chunk_record_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
     /// Fetch chunk content by id.
     pub fn get_chunk_content(&self, chunk_id: Uuid) -> Result<Option<String>, StorageError> {
         let r = self
@@ -1847,25 +2016,61 @@ impl SqliteStore {
         Ok(r)
     }
 
-    /// Mark a memory as deleted (soft delete).
+    /// Mark a memory as deleted (soft delete), CLOSING the intervals it
+    /// derived instead of deleting them.
+    ///
+    /// This is the headline defect of v0.3: `forget` hard-deleted the memory's
+    /// facts, and the FK cascade on `fact_conflict_queue` then erased every
+    /// open and resolved adjudication row that touched them. A retraction is
+    /// information — "this stopped being a source" — not an erasure, and the
+    /// questions a person already answered about those facts must survive it.
+    /// Facts therefore remain visible in history listings as closed intervals;
+    /// that is a deliberate value change on a published surface.
     ///
     /// `deleted_at` is stamped so the diary-isolation gate can tell whether a
     /// later compile has actually purged this memory from the KB's derived
     /// layer — see `MEMORY_CONSTRAINS_DERIVED`.
-    pub fn soft_delete_memory(&self, memory_id: Uuid) -> Result<bool, StorageError> {
+    pub fn soft_delete_memory(
+        &self,
+        memory_id: Uuid,
+    ) -> Result<Option<RetractOutcome>, StorageError> {
         self.with_tx(|s| {
-            let n = s.conn.execute(
+            let Some((kb, diary, already_deleted)) = s.memory_scope_including_deleted(memory_id)?
+            else {
+                return Ok(None);
+            };
+            if already_deleted {
+                return Ok(Some(RetractOutcome::default()));
+            }
+            s.conn.execute(
                 "UPDATE memories SET deleted = 1, deleted_at = ?2 WHERE id = ?1 AND deleted = 0",
                 params![memory_id.to_string(), chrono::Utc::now().to_rfc3339()],
             )?;
-            if n > 0 {
-                s.conn.execute(
-                    "DELETE FROM facts WHERE source_memory_id = ?1",
-                    params![memory_id.to_string()],
-                )?;
-                s.delete_derived_for_memory_chunks(memory_id)?;
-            }
-            Ok(n > 0)
+            // AFTER the soft delete, in the same transaction — which is why
+            // `close_facts_for_memory` must not filter on `deleted = 0`.
+            let closed = s.close_facts_for_memory(
+                memory_id,
+                chrono::Utc::now(),
+                CloseReason::RetractedSource,
+                &CloseAuthority::Caller {
+                    actor: crate::journal::cli_actor(&diary),
+                },
+                &crate::journal::cli_actor(&diary),
+            )?;
+            s.delete_derived_for_memory_chunks(memory_id)?;
+            s.append_event(
+                &crate::journal::EventDraft::new(
+                    engram_core::events::EventKind::MemoryRetracted,
+                    crate::journal::cli_actor(&diary),
+                    crate::journal::payload::memory_retracted(memory_id, Some("forget")),
+                )
+                .scope(Some(&kb), Some(&diary))
+                .subject(memory_id),
+            )?;
+            Ok(Some(RetractOutcome {
+                retracted: true,
+                closed,
+            }))
         })
     }
 
@@ -1894,44 +2099,109 @@ impl SqliteStore {
     }
 
     /// Update memory content / importance.
+    ///
+    /// A content change appends `memory.revised`, an importance-only change
+    /// `memory.meta_changed`. The distinction is load-bearing rather than
+    /// tidy: `memory.revised` is what tells a rebuild that the memory's
+    /// extraction marker must be cleared, so a pending re-extraction survives
+    /// `admin rebuild` instead of being silently un-pended (D6, option 2).
     pub fn update_memory(
         &self,
         memory_id: Uuid,
         content: Option<&str>,
         importance: Option<u8>,
     ) -> Result<bool, StorageError> {
-        let changed = match (content, importance) {
-            (Some(c), Some(i)) => self.conn.execute(
-                "UPDATE memories SET content = ?1, importance = ?2 WHERE id = ?3 AND deleted = 0",
-                params![c, i, memory_id.to_string()],
-            )?,
-            (Some(c), None) => self.conn.execute(
-                "UPDATE memories SET content = ?1 WHERE id = ?2 AND deleted = 0",
-                params![c, memory_id.to_string()],
-            )?,
-            (None, Some(i)) => self.conn.execute(
-                "UPDATE memories SET importance = ?1 WHERE id = ?2 AND deleted = 0",
-                params![i, memory_id.to_string()],
-            )?,
-            (None, None) => 0,
-        };
-        Ok(changed > 0)
+        if content.is_none() && importance.is_none() {
+            return Ok(false);
+        }
+        self.with_tx(|s| {
+            let previous: Option<(String, String)> = s
+                .conn
+                .query_row(
+                    "SELECT content, diary FROM memories WHERE id = ?1 AND deleted = 0",
+                    params![memory_id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((previous_content, diary)) = previous else {
+                return Ok(false);
+            };
+            let changed = match (content, importance) {
+                (Some(c), Some(i)) => s.conn.execute(
+                    "UPDATE memories SET content = ?1, importance = ?2 WHERE id = ?3 AND deleted = 0",
+                    params![c, i, memory_id.to_string()],
+                )?,
+                (Some(c), None) => s.conn.execute(
+                    "UPDATE memories SET content = ?1 WHERE id = ?2 AND deleted = 0",
+                    params![c, memory_id.to_string()],
+                )?,
+                (None, Some(i)) => s.conn.execute(
+                    "UPDATE memories SET importance = ?1 WHERE id = ?2 AND deleted = 0",
+                    params![i, memory_id.to_string()],
+                )?,
+                (None, None) => 0,
+            };
+            if changed == 0 {
+                return Ok(false);
+            }
+            let kb = s.kb_for_memory(memory_id)?;
+            let (kind, payload) = match content {
+                Some(c) => (
+                    engram_core::events::EventKind::MemoryRevised,
+                    crate::journal::payload::memory_revised(
+                        memory_id,
+                        &engram_core::keys::content_hash(c),
+                        &engram_core::keys::content_hash(&previous_content),
+                    ),
+                ),
+                None => (
+                    engram_core::events::EventKind::MemoryMetaChanged,
+                    crate::journal::payload::memory_meta_changed(
+                        memory_id,
+                        importance.map(|i| i as i64),
+                    ),
+                ),
+            };
+            s.append_event(
+                &crate::journal::EventDraft::new(kind, crate::journal::cli_actor(&diary), payload)
+                    .scope(kb.as_deref(), Some(&diary))
+                    .subject(memory_id),
+            )?;
+            Ok(true)
+        })
     }
 
-    /// Drop everything the fact layer derived from one memory's content —
-    /// the facts themselves and the "already extracted" marker. `edit` calls
-    /// this when content changes, so rewritten content is eligible for
-    /// extraction again instead of being permanently marked as processed.
+    /// Retire everything the fact layer derived from one memory's content and
+    /// re-open it for extraction. Despite the name it NO LONGER DELETES: it
+    /// closes each open interval with `retracted_source` and clears the
+    /// "already extracted" marker, so rewritten content is eligible for
+    /// extraction again without the FK cascade taking the adjudication ledger
+    /// with it. Returns how many intervals it closed.
+    ///
+    /// New callers use `close_facts_for_memory` + `clear_extraction_marker`
+    /// separately: `edit` needs to close facts WITHOUT clearing the marker in
+    /// some paths, and welding the two together is what made an honest
+    /// "re-extraction: replayed" impossible to report. No `#[deprecated]`
+    /// attribute — the warning would fail `clippy -D warnings` in the lane
+    /// that still calls this.
     pub fn delete_facts_for_memory(&self, memory_id: Uuid) -> Result<usize, StorageError> {
-        let id = memory_id.to_string();
-        let n = self
-            .conn
-            .execute("DELETE FROM facts WHERE source_memory_id = ?1", params![id])?;
-        self.conn.execute(
-            "DELETE FROM fact_extraction_log WHERE memory_id = ?1",
-            params![id],
-        )?;
-        Ok(n)
+        self.with_tx(|s| {
+            let diary = s
+                .memory_scope_including_deleted(memory_id)?
+                .map(|(_, d, _)| d)
+                .unwrap_or_else(|| "default".to_string());
+            let closed = s.close_facts_for_memory(
+                memory_id,
+                chrono::Utc::now(),
+                CloseReason::RetractedSource,
+                &CloseAuthority::Caller {
+                    actor: crate::journal::cli_actor(&diary),
+                },
+                &crate::journal::cli_actor(&diary),
+            )?;
+            s.clear_extraction_marker(memory_id)?;
+            Ok(closed.len())
+        })
     }
 
     /// KB of each of `ids`, as a lookup map.
@@ -2083,7 +2353,7 @@ impl SqliteStore {
     /// Hard-delete a memory and all its chunks (used by ingest rollback
     /// when embedding fails mid-batch and we want to clean up the orphan).
     pub fn hard_delete_memory(&self, memory_id: Uuid) -> Result<(), StorageError> {
-        self.delete_facts_for_memory(memory_id)?;
+        self.purge_facts_for_memory(memory_id)?;
         // Chunks are removed by ON DELETE CASCADE on the foreign key.
         self.conn.execute(
             "DELETE FROM memories WHERE id = ?1",
@@ -2538,16 +2808,15 @@ impl SqliteStore {
             return Ok(false);
         }
         self.with_tx(|s| {
+            // Route the retraction through `soft_delete_memory` so each memory
+            // gets its `memory.retracted` event and its facts are closed rather
+            // than deleted. The bare `UPDATE memories SET deleted = 1` this
+            // replaces was the fourth hard-delete path, and the only one that
+            // retracted memories with no journal record whatsoever.
             let memory_ids = s.memory_ids_for_document(id)?;
             for memory_id in &memory_ids {
-                s.delete_facts_for_memory(*memory_id)?;
+                s.soft_delete_memory(*memory_id)?;
             }
-            s.conn.execute(
-                "UPDATE memories SET deleted = 1, deleted_at = ?2
-                 WHERE id IN (SELECT memory_id FROM chunks WHERE document_id = ?1)
-                   AND deleted = 0",
-                params![id_s, chrono::Utc::now().to_rfc3339()],
-            )?;
             s.conn.execute(
                 "DELETE FROM claims
                  WHERE id IN (SELECT claim_id FROM claim_evidence WHERE document_id = ?1)",
@@ -2875,12 +3144,37 @@ impl SqliteStore {
             .iter()
             .map(|r| r.kb.clone())
             .collect::<Vec<_>>();
+        let mut facts_from_deleted_memories_closed = 0usize;
         if !dry_run {
-            self.conn.execute(
-                "DELETE FROM facts
-                 WHERE source_memory_id IN (SELECT id FROM memories WHERE deleted = 1)",
-                [],
-            )?;
+            // Facts of a deleted memory are CLOSED, not deleted. Shipping the
+            // soft-delete rewrite without this one means the next
+            // `engram repair` quietly undoes it — and takes the adjudication
+            // rows with it through the queue's FK cascade.
+            let stale: Vec<Uuid> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT f.id FROM facts f
+                       JOIN memories m ON m.id = f.source_memory_id
+                      WHERE m.deleted = 1
+                        AND f.valid_until IS NULL AND f.superseded_by IS NULL",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .filter_map(|v| Uuid::parse_str(v).ok())
+                    .collect()
+            };
+            for id in stale {
+                if self.close_fact_interval(
+                    id,
+                    chrono::Utc::now(),
+                    CloseReason::RetractedSource.as_str(),
+                    CloseAuthority::ExplicitEnd.as_str(),
+                    None,
+                    None,
+                )? {
+                    facts_from_deleted_memories_closed += 1;
+                }
+            }
             for kb in &derived_kbs_cleared {
                 self.clear_derived_for_kb(kb)?;
             }
@@ -2888,6 +3182,7 @@ impl SqliteStore {
         Ok(RepairReport {
             dry_run,
             facts_from_deleted_memories_removed,
+            facts_from_deleted_memories_closed: facts_from_deleted_memories_closed as i64,
             derived_kbs_cleared,
             duplicate_source_documents: report.duplicate_source_documents,
         })
@@ -3932,18 +4227,25 @@ impl SqliteStore {
     // lowercase.
     // ========================================================================
 
-    /// Insert a new fact. Caller is responsible for first checking whether
-    /// it conflicts with an existing active fact and superseding the old one.
+    /// Insert a new fact and append its `fact.observed`, in one transaction.
+    /// Caller is responsible for first checking whether it conflicts with an
+    /// existing active fact and superseding the old one.
     pub fn insert_fact(&self, f: &engram_core::types::Fact) -> Result<(), StorageError> {
+        self.with_tx(|s| s.insert_fact_row(f))
+    }
+
+    fn insert_fact_row(&self, f: &engram_core::types::Fact) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT INTO facts(id, source_memory_id, subject, subject_norm,
                 predicate, object, object_norm, confidence, created_at,
                 superseded_by, superseded_at, diary,
                 fact_type, valid_from, valid_until, resolution, source_kind,
-                confirmations, kb)
+                confirmations, closed_by, close_reason, close_authority, kb)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, ?18,
-                COALESCE((SELECT kb FROM memories WHERE id = ?2), 'default'))",
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                CASE WHEN ?22 = '' THEN
+                    COALESCE((SELECT kb FROM memories WHERE id = ?2), 'default')
+                ELSE ?22 END)",
             params![
                 f.id.to_string(),
                 f.source_memory_id.to_string(),
@@ -3963,7 +4265,29 @@ impl SqliteStore {
                 f.resolution,
                 f.source_kind.as_str(),
                 f.confirmations as i64,
+                f.closed_by.map(|u| u.to_string()),
+                f.close_reason,
+                f.close_authority,
+                f.kb,
             ],
+        )?;
+        // The stored kb is read BACK rather than assumed: when the caller
+        // leaves it empty the column falls back to the source memory's KB, and
+        // the event has to carry what was actually written or a replay re-runs
+        // the fallback against a memory that may have moved since.
+        let stored_kb: String = self.conn.query_row(
+            "SELECT kb FROM facts WHERE id = ?1",
+            params![f.id.to_string()],
+            |r| r.get(0),
+        )?;
+        self.append_event(
+            &crate::journal::EventDraft::new(
+                engram_core::events::EventKind::FactObserved,
+                crate::journal::cli_actor(&f.diary),
+                crate::journal::payload::fact_observed(f, false),
+            )
+            .scope(Some(&stored_kb), Some(&f.diary))
+            .subject(f.id),
         )?;
         Ok(())
     }
@@ -3977,16 +4301,15 @@ impl SqliteStore {
         predicate: &str,
         diary: &str,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                    object, object_norm, confidence, created_at,
-                    superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {facts}
              FROM facts
              WHERE subject_norm = ?1 AND predicate = ?2 AND diary = ?3
-                   AND superseded_by IS NULL
+                   AND {open}
              ORDER BY created_at DESC",
-        )?;
+            facts = fact_columns(""),
+            open = OPEN_INTERVAL_PREDICATE
+        ))?;
         let rows = stmt.query_map(params![subject_norm, predicate, diary], parse_fact_row)?;
         let mut out = Vec::new();
         for row in rows {
@@ -4006,16 +4329,15 @@ impl SqliteStore {
         diary: &str,
         kb: &str,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                    object, object_norm, confidence, created_at,
-                    superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {facts}
              FROM facts
              WHERE subject_norm = ?1 AND predicate = ?2 AND diary = ?3 AND kb = ?4
-                   AND superseded_by IS NULL
+                   AND {open}
              ORDER BY created_at DESC",
-        )?;
+            facts = fact_columns(""),
+            open = OPEN_INTERVAL_PREDICATE
+        ))?;
         let rows = stmt.query_map(params![subject_norm, predicate, diary, kb], parse_fact_row)?;
         let mut out = Vec::new();
         for row in rows {
@@ -4032,23 +4354,24 @@ impl SqliteStore {
     pub fn facts_matching_terms(
         &self,
         kb: Option<&str>,
+        diary: Option<&str>,
         terms: &[String],
         limit: usize,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sql = String::from(
-            "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                    object, object_norm, confidence, created_at,
-                    superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-             FROM facts WHERE ",
-        );
+        let mut sql = format!("SELECT {} FROM facts WHERE ", fact_columns(""));
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(k) = kb {
             binds.push(Box::new(k.to_string()));
             sql.push_str(&format!("kb = ?{} AND ", binds.len()));
+        }
+        // Without this, `recall` surfaces another diary's facts alongside its
+        // own — the cross-diary leak the diary namespace exists to prevent.
+        if let Some(d) = diary {
+            binds.push(Box::new(d.to_string()));
+            sql.push_str(&format!("diary = ?{} AND ", binds.len()));
         }
         let mut clauses = Vec::new();
         for term in terms {
@@ -4080,11 +4403,7 @@ impl SqliteStore {
     pub fn get_fact(&self, id: Uuid) -> Result<Option<engram_core::types::Fact>, StorageError> {
         self.conn
             .query_row(
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE id = ?1",
+                &format!("SELECT {} FROM facts WHERE id = ?1", fact_columns("")),
                 params![id.to_string()],
                 parse_fact_row,
             )
@@ -4102,6 +4421,13 @@ impl SqliteStore {
     /// event-time close of the old fact's validity window. `valid_until`
     /// should be the new fact's `valid_from` when known so the bi-temporal
     /// history reads "true until the replacement became true".
+    ///
+    /// Re-expressed over [`SqliteStore::close_fact_interval`] so every close
+    /// lands in the journal, with the authority DERIVED from the `resolution`
+    /// tag the caller already passes. Stamping `heuristic` unconditionally —
+    /// which is what the signature invited — makes the safety audit report the
+    /// exact opposite of the truth for `facts resolve`, whose whole point is
+    /// that a person decided.
     pub fn supersede_fact_with(
         &self,
         old_id: Uuid,
@@ -4109,23 +4435,16 @@ impl SqliteStore {
         resolution: &str,
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool, StorageError> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let until = valid_until
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_else(|| now.clone());
-        let n = self.conn.execute(
-            "UPDATE facts SET superseded_by = ?1, superseded_at = ?2,
-                    resolution = ?3, valid_until = COALESCE(valid_until, ?4)
-             WHERE id = ?5 AND superseded_by IS NULL",
-            params![
-                new_id.to_string(),
-                now,
-                resolution,
-                until,
-                old_id.to_string()
-            ],
-        )?;
-        Ok(n > 0)
+        let at = valid_until.unwrap_or_else(chrono::Utc::now);
+        let authority = close_authority_for(resolution);
+        self.close_fact_interval(
+            old_id,
+            at,
+            engram_core::interval::CloseReason::Superseded.as_str(),
+            authority,
+            Some(new_id),
+            Some(resolution),
+        )
     }
 
     /// Store the embedding of a fact's "{subject} {predicate} {object}" string.
@@ -4153,11 +4472,11 @@ impl SqliteStore {
         kb: &str,
         model: &str,
     ) -> Result<Vec<(Uuid, Vec<f32>)>, StorageError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, embedding FROM facts
              WHERE diary = ?1 AND kb = ?2 AND embed_model = ?3
-                   AND embedding IS NOT NULL AND superseded_by IS NULL",
-        )?;
+                   AND embedding IS NOT NULL AND {OPEN_INTERVAL_PREDICATE}"
+        ))?;
         let rows = stmt.query_map(params![diary, kb, model], |r| {
             let id_str: String = r.get(0)?;
             let blob: Vec<u8> = r.get(1)?;
@@ -4173,11 +4492,34 @@ impl SqliteStore {
     /// A re-asserted duplicate bumps the existing fact's confirmation count
     /// instead of inserting a second row. Confirmations feed trust weighting.
     pub fn increment_fact_confirmations(&self, id: Uuid) -> Result<(), StorageError> {
-        self.conn.execute(
-            "UPDATE facts SET confirmations = confirmations + 1 WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        Ok(())
+        self.with_tx(|s| {
+            let n = s.conn.execute(
+                "UPDATE facts SET confirmations = confirmations + 1 WHERE id = ?1",
+                params![id.to_string()],
+            )?;
+            if n == 0 {
+                return Ok(());
+            }
+            let scope: Option<(String, String)> = s
+                .conn
+                .query_row(
+                    "SELECT kb, diary FROM facts WHERE id = ?1",
+                    params![id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (kb, diary) = scope.unwrap_or_else(|| ("default".into(), "default".into()));
+            s.append_event(
+                &crate::journal::EventDraft::new(
+                    engram_core::events::EventKind::FactConfirmed,
+                    crate::journal::cli_actor(&diary),
+                    crate::journal::payload::fact_confirmed(id),
+                )
+                .scope(Some(&kb), Some(&diary))
+                .subject(id),
+            )?;
+            Ok(())
+        })
     }
 
     /// Resolve a name against the compile-time entity alias table: returns
@@ -4202,16 +4544,21 @@ impl SqliteStore {
 
     /// Distinct (display, norm) subjects of active facts in (diary, kb).
     /// Small by construction; used by fuzzy subject canonicalization.
+    /// `None` spans every diary / every KB, matching
+    /// `list_facts_by_subject_scoped`. The (display, norm) PAIR is kept rather
+    /// than narrowed to the norm: fuzzy subject canonicalization compares
+    /// against what a person actually typed.
     pub fn distinct_fact_subjects(
         &self,
-        diary: &str,
-        kb: &str,
+        diary: Option<&str>,
+        kb: Option<&str>,
     ) -> Result<Vec<(String, String)>, StorageError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT subject, subject_norm FROM facts
-             WHERE diary = ?1 AND kb = ?2 AND superseded_by IS NULL
-             GROUP BY subject_norm",
-        )?;
+             WHERE (?1 IS NULL OR diary = ?1) AND (?2 IS NULL OR kb = ?2)
+                   AND {OPEN_INTERVAL_PREDICATE}
+             GROUP BY subject_norm"
+        ))?;
         let rows = stmt.query_map(params![diary, kb], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -4221,10 +4568,17 @@ impl SqliteStore {
 
     // ----- Fact conflict queue (cooperative adjudication) -----
 
-    /// Queue an unresolved contradiction between two active facts. Idempotent
-    /// on the (new, old) pair. Both facts stay active ("contested") until the
-    /// caller or a consolidation sweep resolves the conflict — the store never
-    /// pretends to know an answer it doesn't have.
+    /// Queue an unresolved contradiction between two active facts. Both facts
+    /// stay active ("contested") until the caller or a consolidation sweep
+    /// resolves it — the store never pretends to know an answer it doesn't
+    /// have.
+    ///
+    /// Returns WHICH negative result happened, because `INSERT OR IGNORE`
+    /// returning `false` conflated "this exact ordered pair is already queued"
+    /// with "a different pair asking the same question is already queued", and
+    /// only the second one honestly means `deduplicated`. An empty
+    /// `decision_key` is stored as SQL NULL, precisely so a caller that has no
+    /// key yet cannot collide every row under `idx_fcq_open_key`.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_fact_conflict(
         &self,
@@ -4236,33 +4590,157 @@ impl SqliteStore {
         detector: &str,
         score: Option<f32>,
         suggested: &str,
-    ) -> Result<bool, StorageError> {
-        let n = self.conn.execute(
-            "INSERT OR IGNORE INTO fact_conflict_queue
-                (id, new_fact_id, old_fact_id, diary, kb, detector, score,
-                 suggested, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
-            params![
-                id.to_string(),
-                new_fact_id.to_string(),
-                old_fact_id.to_string(),
-                diary,
-                kb,
-                detector,
-                score,
-                suggested,
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(n > 0)
+        decision_key: &str,
+        member_key: &str,
+        registry_version: &str,
+    ) -> Result<InsertOutcome, StorageError> {
+        let key: Option<&str> = Some(decision_key).filter(|k| !k.is_empty());
+        let member: Option<&str> = Some(member_key).filter(|k| !k.is_empty());
+        self.with_tx(|s| {
+            // Both pre-checks run inside the caller's BEGIN IMMEDIATE, so they
+            // cannot race the insert that follows them.
+            let same_pair: Option<String> = s
+                .conn
+                .query_row(
+                    "SELECT id FROM fact_conflict_queue
+                      WHERE new_fact_id = ?1 AND old_fact_id = ?2",
+                    params![new_fact_id.to_string(), old_fact_id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = same_pair {
+                return Ok(InsertOutcome::DuplicatePair {
+                    existing: Uuid::parse_str(&existing).unwrap_or(Uuid::nil()),
+                });
+            }
+            if let Some(k) = key {
+                let same_key: Option<String> = s
+                    .conn
+                    .query_row(
+                        "SELECT id FROM fact_conflict_queue
+                          WHERE kb = ?1 AND decision_key = ?2 AND status = 'open'",
+                        params![kb, k],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = same_key {
+                    return Ok(InsertOutcome::DuplicateKey {
+                        existing: Uuid::parse_str(&existing).unwrap_or(Uuid::nil()),
+                    });
+                }
+            }
+            let created_at = chrono::Utc::now().to_rfc3339();
+            // A plain INSERT, not INSERT OR IGNORE: an ignored insert is
+            // exactly the ambiguity this signature exists to remove.
+            let inserted = s.conn.execute(
+                "INSERT INTO fact_conflict_queue
+                    (id, new_fact_id, old_fact_id, diary, kb, detector, score,
+                     suggested, status, created_at, decision_key, member_key, registry_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9, ?10, ?11, ?12)",
+                params![
+                    id.to_string(),
+                    new_fact_id.to_string(),
+                    old_fact_id.to_string(),
+                    diary,
+                    kb,
+                    detector,
+                    score,
+                    suggested,
+                    created_at,
+                    key,
+                    member,
+                    registry_version,
+                ],
+            );
+            match inserted {
+                Ok(_) => {}
+                Err(e) => {
+                    // A constraint violation surviving both pre-checks is
+                    // re-queried once and mapped to whichever duplicate it was.
+                    // If neither query finds a row the error propagates: never
+                    // report `Inserted` for a row that is not there.
+                    return s.classify_conflict_insert_failure(
+                        new_fact_id,
+                        old_fact_id,
+                        kb,
+                        key,
+                        e,
+                    );
+                }
+            }
+            s.append_event(
+                &crate::journal::EventDraft::new(
+                    engram_core::events::EventKind::ConflictOpened,
+                    crate::journal::cli_actor(diary),
+                    crate::journal::payload::conflict_opened(
+                        id,
+                        new_fact_id,
+                        old_fact_id,
+                        detector,
+                        score,
+                        Some(suggested),
+                        None,
+                        key,
+                        member,
+                        Some(registry_version),
+                        &created_at,
+                        false,
+                    ),
+                )
+                .scope(Some(kb), Some(diary))
+                .subject(id),
+            )?;
+            Ok(InsertOutcome::Inserted)
+        })
+    }
+
+    fn classify_conflict_insert_failure(
+        &self,
+        new_fact_id: Uuid,
+        old_fact_id: Uuid,
+        kb: &str,
+        key: Option<&str>,
+        original: rusqlite::Error,
+    ) -> Result<InsertOutcome, StorageError> {
+        if let Some(existing) = self
+            .conn
+            .query_row(
+                "SELECT id FROM fact_conflict_queue WHERE new_fact_id = ?1 AND old_fact_id = ?2",
+                params![new_fact_id.to_string(), old_fact_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Ok(InsertOutcome::DuplicatePair {
+                existing: Uuid::parse_str(&existing).unwrap_or(Uuid::nil()),
+            });
+        }
+        if let Some(k) = key {
+            if let Some(existing) = self
+                .conn
+                .query_row(
+                    "SELECT id FROM fact_conflict_queue
+                      WHERE kb = ?1 AND decision_key = ?2 AND status = 'open'",
+                    params![kb, k],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return Ok(InsertOutcome::DuplicateKey {
+                    existing: Uuid::parse_str(&existing).unwrap_or(Uuid::nil()),
+                });
+            }
+        }
+        Err(StorageError::from(original))
     }
 
     pub fn get_fact_conflict(&self, id: Uuid) -> Result<Option<FactConflictRow>, StorageError> {
         self.conn
             .query_row(
-                "SELECT id, new_fact_id, old_fact_id, diary, kb, detector, score,
-                        suggested, note, status, created_at, resolved_at, resolved_by
-                 FROM fact_conflict_queue WHERE id = ?1",
+                &format!(
+                    "SELECT {} FROM fact_conflict_queue WHERE id = ?1",
+                    conflict_columns("")
+                ),
                 params![id.to_string()],
                 parse_conflict_row,
             )
@@ -4276,15 +4754,15 @@ impl SqliteStore {
         kb: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FactConflictRow>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, new_fact_id, old_fact_id, diary, kb, detector, score,
-                    suggested, note, status, created_at, resolved_at, resolved_by
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {conflict}
              FROM fact_conflict_queue
              WHERE status = 'open'
                    AND (?1 IS NULL OR diary = ?1)
                    AND (?2 IS NULL OR kb = ?2)
              ORDER BY created_at DESC LIMIT ?3",
-        )?;
+            conflict = conflict_columns("")
+        ))?;
         let rows = stmt.query_map(params![diary, kb, limit as i64], parse_conflict_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
@@ -4323,6 +4801,7 @@ impl SqliteStore {
         kb: Option<&str>,
         subject: Option<&str>,
         limit: usize,
+        offset: usize,
     ) -> Result<
         Vec<(
             FactConflictRow,
@@ -4334,20 +4813,8 @@ impl SqliteStore {
         let subject_like = subject
             .map(|s| format!("%{}%", s.trim().to_lowercase()))
             .filter(|s| s.len() > 2);
-        let mut stmt = self.conn.prepare(
-            "SELECT q.id, q.new_fact_id, q.old_fact_id, q.diary, q.kb, q.detector,
-                    q.score, q.suggested, q.note, q.status, q.created_at,
-                    q.resolved_at, q.resolved_by,
-                    nf.id, nf.source_memory_id, nf.subject, nf.subject_norm,
-                    nf.predicate, nf.object, nf.object_norm, nf.confidence,
-                    nf.created_at, nf.superseded_by, nf.superseded_at, nf.diary,
-                    nf.fact_type, nf.valid_from, nf.valid_until, nf.resolution,
-                    nf.source_kind, nf.confirmations,
-                    of.id, of.source_memory_id, of.subject, of.subject_norm,
-                    of.predicate, of.object, of.object_norm, of.confidence,
-                    of.created_at, of.superseded_by, of.superseded_at, of.diary,
-                    of.fact_type, of.valid_from, of.valid_until, of.resolution,
-                    of.source_kind, of.confirmations
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {conflict}, {new_fact}, {old_fact}
              FROM fact_conflict_queue q
              JOIN facts nf ON nf.id = q.new_fact_id
              JOIN facts of ON of.id = q.old_fact_id
@@ -4355,18 +4822,25 @@ impl SqliteStore {
                    AND (?1 IS NULL OR q.diary = ?1)
                    AND (?2 IS NULL OR q.kb = ?2)
                    AND (?3 IS NULL OR nf.subject_norm LIKE ?3 OR of.subject_norm LIKE ?3)
-             ORDER BY q.created_at DESC, q.id LIMIT ?4",
-        )?;
+             ORDER BY q.created_at DESC, q.id LIMIT ?4 OFFSET ?5",
+            conflict = conflict_columns("q."),
+            new_fact = fact_columns("nf."),
+            old_fact = fact_columns("of.")
+        ))?;
         // `facts triage` asks for the whole backlog by passing usize::MAX;
         // casting that straight to i64 wraps to -1, which SQLite happens to
         // read as "no limit". Saturating is the same behaviour on purpose.
         let capped = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = stmt.query_map(params![diary, kb, subject_like, capped], |r| {
-            let row = parse_conflict_row(r)?;
-            let new_fact = parse_fact_from_offset(r, 13)?;
-            let old_fact = parse_fact_from_offset(r, 31)?;
-            Ok((row, new_fact, old_fact))
-        })?;
+        let rows = stmt.query_map(
+            params![diary, kb, subject_like, capped, offset as i64],
+            |r| {
+                let row = parse_conflict_row(r)?;
+                let new_fact = parse_fact_from_offset(r, CONFLICT_COLUMN_COUNT)?;
+                let old_fact =
+                    parse_fact_from_offset(r, CONFLICT_COLUMN_COUNT + FACT_COLUMN_COUNT)?;
+                Ok((row, new_fact, old_fact))
+            },
+        )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     }
@@ -4381,18 +4855,55 @@ impl SqliteStore {
         kb: Option<&str>,
         resolved_by: &str,
     ) -> Result<usize, StorageError> {
-        let n = self.conn.execute(
-            "UPDATE fact_conflict_queue
-             SET status = 'resolved', resolved_at = ?1, resolved_by = ?2,
-                 note = COALESCE(note, 'auto: referenced facts no longer exist')
-             WHERE status = 'open'
-                   AND (?3 IS NULL OR diary = ?3)
-                   AND (?4 IS NULL OR kb = ?4)
-                   AND (new_fact_id NOT IN (SELECT id FROM facts)
-                        OR old_fact_id NOT IN (SELECT id FROM facts))",
-            params![chrono::Utc::now().to_rfc3339(), resolved_by, diary, kb],
-        )?;
-        Ok(n)
+        self.with_tx(|s| {
+            let doomed: Vec<(String, String, String, Option<String>)> = {
+                let mut stmt = s.conn.prepare(
+                    "SELECT id, kb, diary, decision_key FROM fact_conflict_queue
+                      WHERE status = 'open'
+                        AND (?1 IS NULL OR diary = ?1)
+                        AND (?2 IS NULL OR kb = ?2)
+                        AND (new_fact_id NOT IN (SELECT id FROM facts)
+                             OR old_fact_id NOT IN (SELECT id FROM facts))",
+                )?;
+                let rows = stmt.query_map(params![diary, kb], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let n = s.conn.execute(
+                "UPDATE fact_conflict_queue
+                 SET status = 'resolved', resolved_at = ?1, resolved_by = ?2,
+                     note = COALESCE(note, 'auto: referenced facts no longer exist')
+                 WHERE status = 'open'
+                       AND (?3 IS NULL OR diary = ?3)
+                       AND (?4 IS NULL OR kb = ?4)
+                       AND (new_fact_id NOT IN (SELECT id FROM facts)
+                            OR old_fact_id NOT IN (SELECT id FROM facts))",
+                params![chrono::Utc::now().to_rfc3339(), resolved_by, diary, kb],
+            )?;
+            for (id, row_kb, row_diary, decision_key) in doomed {
+                let conflict_id = Uuid::parse_str(&id).ok();
+                // A row whose facts are gone may have no key at all. The
+                // synthetic one is shaped so it can never collide with a real
+                // SemanticKey encoding, and therefore can never replay onto an
+                // unrelated pair.
+                let key = decision_key.unwrap_or_else(|| {
+                    engram_core::keys::semantic_key_encode("orphan", "orphan", &id)
+                });
+                s.record_decision(
+                    &row_kb,
+                    &row_diary,
+                    &key,
+                    "void",
+                    "machine",
+                    resolved_by,
+                    Some("auto: referenced facts no longer exist"),
+                    conflict_id,
+                    engram_core::keys::SEMANTIC_KEY_VERSION,
+                )?;
+            }
+            Ok(n)
+        })
     }
 
     /// Source-memory preview for each fact id: `(memory_id, first line)`.
@@ -4440,6 +4951,11 @@ impl SqliteStore {
 
     /// Mark a queued conflict resolved. Returns false when the row was not
     /// open (already resolved or unknown id).
+    ///
+    /// Records NO decision, so nothing about this resolution can ever replay.
+    /// Kept for compatibility with the paths that already call it; new callers
+    /// use `resolve_conflict_with_decision`, which claims the row and records
+    /// the ruling in one transaction.
     pub fn resolve_fact_conflict(
         &self,
         id: Uuid,
@@ -4467,6 +4983,7 @@ impl SqliteStore {
     pub fn open_conflicts_matching_terms(
         &self,
         kb: Option<&str>,
+        diary: Option<&str>,
         terms: &[String],
         limit: usize,
     ) -> Result<
@@ -4480,19 +4997,23 @@ impl SqliteStore {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sql = String::from(
-            "SELECT q.id, q.new_fact_id, q.old_fact_id, q.diary, q.kb, q.detector,
-                    q.score, q.suggested, q.note, q.status, q.created_at,
-                    q.resolved_at, q.resolved_by
+        let mut sql = format!(
+            "SELECT {}
              FROM fact_conflict_queue q
              JOIN facts nf ON nf.id = q.new_fact_id
              JOIN facts of ON of.id = q.old_fact_id
              WHERE q.status = 'open' AND ",
+            conflict_columns("q.")
         );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(k) = kb {
             binds.push(Box::new(k.to_string()));
             sql.push_str(&format!("q.kb = ?{} AND ", binds.len()));
+        }
+        // Same leak, on the contradictions half of the same response.
+        if let Some(d) = diary {
+            binds.push(Box::new(d.to_string()));
+            sql.push_str(&format!("q.diary = ?{} AND ", binds.len()));
         }
         let mut clauses = Vec::new();
         for term in terms {
@@ -4547,40 +5068,31 @@ impl SqliteStore {
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE subject_norm = ?1 AND diary = ?2
                  ORDER BY created_at DESC"
             }
             (Some(_), false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE subject_norm = ?1 AND diary = ?2
-                       AND superseded_by IS NULL
+                       AND {open}
                  ORDER BY created_at DESC"
             }
             (None, true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE subject_norm = ?1
                  ORDER BY created_at DESC"
             }
             (None, false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE subject_norm = ?1 AND superseded_by IS NULL
+                "SELECT {facts}
+                 FROM facts WHERE subject_norm = ?1 AND {open}
                  ORDER BY created_at DESC"
             }
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = sql
+            .replace("{facts}", &fact_columns(""))
+            .replace("{open}", OPEN_INTERVAL_PREDICATE);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
                 .query_map(params![subject_norm, d], parse_fact_row)?
@@ -4599,45 +5111,46 @@ impl SqliteStore {
         include_superseded: bool,
         limit: usize,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
+        self.list_facts_scoped(diary, None, include_superseded, limit, 0)
+    }
+
+    fn list_facts_unscoped(
+        &self,
+        diary: Option<&str>,
+        include_superseded: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE diary = ?1 ORDER BY created_at DESC LIMIT ?2"
+                "SELECT {facts}
+                 FROM facts WHERE diary = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
             }
             (Some(_), false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE diary = ?1 AND superseded_by IS NULL
-                 ORDER BY created_at DESC LIMIT ?2"
+                "SELECT {facts}
+                 FROM facts WHERE diary = ?1 AND {open}
+                 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
             }
             (None, true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts ORDER BY created_at DESC LIMIT ?1"
+                "SELECT {facts}
+                 FROM facts ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
             }
             (None, false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE superseded_by IS NULL
-                 ORDER BY created_at DESC LIMIT ?1"
+                "SELECT {facts}
+                 FROM facts WHERE {open}
+                 ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
             }
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = sql
+            .replace("{facts}", &fact_columns(""))
+            .replace("{open}", OPEN_INTERVAL_PREDICATE);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
-                .query_map(params![d, limit as i64], parse_fact_row)?
+                .query_map(params![d, limit as i64, offset as i64], parse_fact_row)?
                 .collect::<Result<Vec<_>, _>>()?,
             None => stmt
-                .query_map(params![limit as i64], parse_fact_row)?
+                .query_map(params![limit as i64, offset as i64], parse_fact_row)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(rows)
@@ -4649,50 +5162,43 @@ impl SqliteStore {
         kb: Option<&str>,
         include_superseded: bool,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
         if kb.is_none() {
-            return self.list_facts(diary, include_superseded, limit);
+            return self.list_facts_unscoped(diary, include_superseded, limit, offset);
         }
         let k = kb.unwrap();
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE kb = ?1 AND diary = ?2 ORDER BY created_at DESC LIMIT ?3"
+                "SELECT {facts}
+                 FROM facts WHERE kb = ?1 AND diary = ?2
+                 ORDER BY created_at DESC LIMIT ?3 OFFSET ?4"
             }
             (Some(_), false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE kb = ?1 AND diary = ?2 AND superseded_by IS NULL
-                 ORDER BY created_at DESC LIMIT ?3"
+                "SELECT {facts}
+                 FROM facts WHERE kb = ?1 AND diary = ?2 AND {open}
+                 ORDER BY created_at DESC LIMIT ?3 OFFSET ?4"
             }
             (None, true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE kb = ?1 ORDER BY created_at DESC LIMIT ?2"
+                "SELECT {facts}
+                 FROM facts WHERE kb = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
             }
             (None, false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE kb = ?1 AND superseded_by IS NULL
-                 ORDER BY created_at DESC LIMIT ?2"
+                "SELECT {facts}
+                 FROM facts WHERE kb = ?1 AND {open}
+                 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
             }
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = sql
+            .replace("{facts}", &fact_columns(""))
+            .replace("{open}", OPEN_INTERVAL_PREDICATE);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
-                .query_map(params![k, d, limit as i64], parse_fact_row)?
+                .query_map(params![k, d, limit as i64, offset as i64], parse_fact_row)?
                 .collect::<Result<Vec<_>, _>>()?,
             None => stmt
-                .query_map(params![k, limit as i64], parse_fact_row)?
+                .query_map(params![k, limit as i64, offset as i64], parse_fact_row)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(rows)
@@ -4711,40 +5217,31 @@ impl SqliteStore {
         let k = kb.unwrap();
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND subject_norm = ?2 AND diary = ?3
                  ORDER BY created_at DESC"
             }
             (Some(_), false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND subject_norm = ?2 AND diary = ?3
-                       AND superseded_by IS NULL
+                       AND {open}
                  ORDER BY created_at DESC"
             }
             (None, true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND subject_norm = ?2
                  ORDER BY created_at DESC"
             }
             (None, false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE kb = ?1 AND subject_norm = ?2 AND superseded_by IS NULL
+                "SELECT {facts}
+                 FROM facts WHERE kb = ?1 AND subject_norm = ?2 AND {open}
                  ORDER BY created_at DESC"
             }
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = sql
+            .replace("{facts}", &fact_columns(""))
+            .replace("{open}", OPEN_INTERVAL_PREDICATE);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
                 .query_map(params![k, subject_norm, d], parse_fact_row)?
@@ -4760,28 +5257,26 @@ impl SqliteStore {
     /// Returns the OLD fact alongside the new one that replaced it.
     pub fn list_recent_conflicts(
         &self,
+        diary: Option<&str>,
+        kb: Option<&str>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<(engram_core::types::Fact, engram_core::types::Fact)>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT old.id, old.source_memory_id, old.subject, old.subject_norm,
-                    old.predicate, old.object, old.object_norm, old.confidence,
-                    old.created_at, old.superseded_by, old.superseded_at, old.diary,
-                    old.fact_type, old.valid_from, old.valid_until, old.resolution,
-                    old.source_kind, old.confirmations,
-                    new.id, new.source_memory_id, new.subject, new.subject_norm,
-                    new.predicate, new.object, new.object_norm, new.confidence,
-                    new.created_at, new.superseded_by, new.superseded_at, new.diary,
-                    new.fact_type, new.valid_from, new.valid_until, new.resolution,
-                    new.source_kind, new.confirmations
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {old_fact}, {new_fact}
              FROM facts old
              JOIN facts new ON new.id = old.superseded_by
              WHERE old.superseded_by IS NOT NULL
+                   AND (?1 IS NULL OR old.diary = ?1)
+                   AND (?2 IS NULL OR old.kb = ?2)
              ORDER BY old.superseded_at DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
+             LIMIT ?3 OFFSET ?4",
+            old_fact = fact_columns("old."),
+            new_fact = fact_columns("new.")
+        ))?;
+        let rows = stmt.query_map(params![diary, kb, limit as i64, offset as i64], |r| {
             let old = parse_fact_from_offset(r, 0)?;
-            let new = parse_fact_from_offset(r, 18)?;
+            let new = parse_fact_from_offset(r, FACT_COLUMN_COUNT)?;
             Ok((old, new))
         })?;
         let mut out = Vec::new();
@@ -4793,7 +5288,7 @@ impl SqliteStore {
 
     pub fn count_facts(&self) -> Result<i64, StorageError> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM facts WHERE superseded_by IS NULL",
+            &format!("SELECT COUNT(*) FROM facts WHERE {OPEN_INTERVAL_PREDICATE}"),
             [],
             |r| r.get(0),
         )?;
@@ -4914,7 +5409,7 @@ impl SqliteStore {
             "SELECT id, source_memory_id, subject, subject_norm, predicate, object,
                     object_norm, confidence, created_at, superseded_by, superseded_at,
                     diary, kb, fact_type, valid_from, valid_until, resolution,
-                    source_kind, confirmations
+                    source_kind, confirmations, closed_by, close_reason, close_authority
              FROM facts WHERE (?1 IS NULL OR kb = ?1) ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![kb], |r| {
@@ -4942,6 +5437,9 @@ impl SqliteStore {
                     .get::<_, Option<String>>(17)?
                     .unwrap_or_else(default_source_kind_str),
                 confirmations: r.get::<_, Option<i64>>(18)?.unwrap_or(0),
+                closed_by: r.get(19)?,
+                close_reason: r.get(20)?,
+                close_authority: r.get(21)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -5052,9 +5550,10 @@ impl SqliteStore {
             "INSERT OR IGNORE INTO facts(id, source_memory_id, subject, subject_norm,
                 predicate, object, object_norm, confidence, created_at,
                 superseded_by, superseded_at, diary, kb, fact_type, valid_from,
-                valid_until, resolution, source_kind, confirmations)
+                valid_until, resolution, source_kind, confirmations,
+                closed_by, close_reason, close_authority)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19)",
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 row.id,
                 row.source_memory_id,
@@ -5075,6 +5574,9 @@ impl SqliteStore {
                 row.resolution,
                 row.source_kind,
                 row.confirmations,
+                row.closed_by,
+                row.close_reason,
+                row.close_authority,
             ],
         )?;
         Ok(n > 0)
@@ -5371,6 +5873,11 @@ fn parse_fact_row(r: &rusqlite::Row) -> rusqlite::Result<engram_core::types::Fac
     parse_fact_from_offset(r, 0)
 }
 
+/// Same parser, reachable from `write_path` — one column order, one reader.
+pub(crate) fn parse_fact_row_pub(r: &rusqlite::Row) -> rusqlite::Result<engram_core::types::Fact> {
+    parse_fact_from_offset(r, 0)
+}
+
 fn parse_fact_from_offset(
     r: &rusqlite::Row,
     o: usize,
@@ -5394,6 +5901,10 @@ fn parse_fact_from_offset(
     let resolution: Option<String> = r.get(o + 15)?;
     let source_kind_str: String = r.get::<_, Option<String>>(o + 16)?.unwrap_or_default();
     let confirmations: i64 = r.get::<_, Option<i64>>(o + 17)?.unwrap_or(0);
+    let closed_by_str: Option<String> = r.get(o + 18)?;
+    let close_reason: Option<String> = r.get(o + 19)?;
+    let close_authority: Option<String> = r.get(o + 20)?;
+    let kb: String = r.get::<_, Option<String>>(o + 21)?.unwrap_or_default();
     Ok(engram_core::types::Fact {
         id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
         source_memory_id: Uuid::parse_str(&src_str).unwrap_or(Uuid::nil()),
@@ -5429,6 +5940,12 @@ fn parse_fact_from_offset(
         resolution,
         source_kind: engram_core::types::SourceKind::parse(&source_kind_str),
         confirmations: confirmations.max(0) as u32,
+        closed_by: closed_by_str
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok()),
+        close_reason,
+        close_authority,
+        kb,
     })
 }
 
@@ -5573,6 +6090,10 @@ mod tests {
             resolution: None,
             source_kind: engram_core::types::SourceKind::UserStated,
             confirmations: 0,
+            closed_by: None,
+            close_reason: None,
+            close_authority: None,
+            kb: "default".into(),
         }
     }
 
@@ -5649,31 +6170,45 @@ mod tests {
         store.insert_fact(&old_f).unwrap();
         store.insert_fact(&new_f).unwrap();
         let qid = Uuid::new_v4();
-        assert!(store
-            .insert_fact_conflict(
-                qid,
-                new_f.id,
-                old_f.id,
-                "default",
-                "default",
-                "slot",
-                Some(0.9),
-                "await_confirmation"
-            )
-            .unwrap());
-        // Same (new, old) pair queues once.
-        assert!(!store
-            .insert_fact_conflict(
-                Uuid::new_v4(),
-                new_f.id,
-                old_f.id,
-                "default",
-                "default",
-                "slot",
-                None,
-                "await_confirmation"
-            )
-            .unwrap());
+        assert_eq!(
+            store
+                .insert_fact_conflict(
+                    qid,
+                    new_f.id,
+                    old_f.id,
+                    "default",
+                    "default",
+                    "slot",
+                    Some(0.9),
+                    "await_confirmation",
+                    "",
+                    "",
+                    engram_core::relations::REGISTRY_VERSION
+                )
+                .unwrap(),
+            InsertOutcome::Inserted
+        );
+        // Same (new, old) ordered pair queues once, and says WHICH duplicate
+        // it was — the caller's `deduplicated` response is only honest for the
+        // same-key case, not this one.
+        assert_eq!(
+            store
+                .insert_fact_conflict(
+                    Uuid::new_v4(),
+                    new_f.id,
+                    old_f.id,
+                    "default",
+                    "default",
+                    "slot",
+                    None,
+                    "await_confirmation",
+                    "",
+                    "",
+                    engram_core::relations::REGISTRY_VERSION
+                )
+                .unwrap(),
+            InsertOutcome::DuplicatePair { existing: qid }
+        );
         let open = store.list_open_fact_conflicts(None, None, 10).unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].detector, "slot");
@@ -5681,11 +6216,11 @@ mod tests {
         // Term matching surfaces the contested pair from EITHER side: a query
         // about the old value must reveal that the value is contested.
         let hits = store
-            .open_conflicts_matching_terms(Some("default"), &["penicillin".into()], 10)
+            .open_conflicts_matching_terms(Some("default"), None, &["penicillin".into()], 10)
             .unwrap();
         assert_eq!(hits.len(), 1);
         let hits = store
-            .open_conflicts_matching_terms(Some("default"), &["amoxicillin".into()], 10)
+            .open_conflicts_matching_terms(Some("default"), None, &["amoxicillin".into()], 10)
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1.id, new_f.id);
@@ -5730,6 +6265,9 @@ mod tests {
                 "slot",
                 None,
                 "supersede-old",
+                "",
+                "",
+                engram_core::relations::REGISTRY_VERSION,
             )
             .unwrap();
         store
@@ -5742,6 +6280,9 @@ mod tests {
                 "semantic_cosine",
                 Some(0.8),
                 "keep-both",
+                "",
+                "",
+                engram_core::relations::REGISTRY_VERSION,
             )
             .unwrap();
 
@@ -5754,7 +6295,7 @@ mod tests {
         );
 
         let joined = store
-            .list_open_fact_conflicts_with_facts(None, None, None, 10)
+            .list_open_fact_conflicts_with_facts(None, None, None, 10, 0)
             .unwrap();
         assert_eq!(joined.len(), 2);
         for (row, nf, of) in &joined {
@@ -5775,7 +6316,7 @@ mod tests {
 
         // Subject filter narrows to one person's backlog.
         let ana_only = store
-            .list_open_fact_conflicts_with_facts(None, None, Some("ana"), 10)
+            .list_open_fact_conflicts_with_facts(None, None, Some("ana"), 10, 0)
             .unwrap();
         assert_eq!(ana_only.len(), 1);
         assert_eq!(ana_only[0].0.id, ana);
@@ -5805,7 +6346,7 @@ mod tests {
         assert_eq!(store.count_open_fact_conflicts(None, None).unwrap(), 2);
         assert_eq!(
             store
-                .list_open_fact_conflicts_with_facts(None, None, None, 10)
+                .list_open_fact_conflicts_with_facts(None, None, None, 10, 0)
                 .unwrap()
                 .len(),
             1,
