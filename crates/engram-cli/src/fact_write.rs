@@ -1215,6 +1215,10 @@ fn queue_conflict(
     } else {
         "keep-both"
     };
+    // Wave-2 stopgap: this lane does not yet compute a semantic key, and an
+    // empty `decision_key` is stored as SQL NULL precisely so the placeholder
+    // cannot collide every row under `idx_fcq_open_key`. fact-semantics fills
+    // in the real key in wave 3, at which point `DuplicateKey` starts firing.
     if ctx.store.insert_fact_conflict(
         qid,
         new_fact.id,
@@ -1224,7 +1228,11 @@ fn queue_conflict(
         detector,
         score,
         suggested,
-    )? {
+        "",
+        "",
+        engram_core::relations::REGISTRY_VERSION,
+    )? == engram_storage::InsertOutcome::Inserted
+    {
         outcome.queued.push(json!({
             "conflict_id": qid.to_string(),
             "detector": detector,

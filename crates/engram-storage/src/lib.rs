@@ -2,6 +2,7 @@
 //! vector index, FTS5 lives inside SQLite.
 
 pub mod backup;
+pub mod decisions;
 pub mod error;
 pub mod fts;
 pub mod journal;
@@ -12,6 +13,7 @@ pub mod sqlite;
 pub(crate) mod test_support;
 pub mod write_path;
 
+pub use decisions::{DecisionRow, InsertOutcome};
 pub use error::StorageError;
 pub use journal::{EventDraft, EventRow};
 pub use migrate_v10::MigrationV10Report;

@@ -1,5 +1,6 @@
 //! SQLite source of truth + FTS5 lexical index.
 
+use crate::decisions::InsertOutcome;
 use crate::error::StorageError;
 use crate::write_path::{close_authority_for, RetractOutcome};
 use engram_core::interval::{CloseAuthority, CloseReason};
@@ -4536,10 +4537,17 @@ impl SqliteStore {
 
     // ----- Fact conflict queue (cooperative adjudication) -----
 
-    /// Queue an unresolved contradiction between two active facts. Idempotent
-    /// on the (new, old) pair. Both facts stay active ("contested") until the
-    /// caller or a consolidation sweep resolves the conflict — the store never
-    /// pretends to know an answer it doesn't have.
+    /// Queue an unresolved contradiction between two active facts. Both facts
+    /// stay active ("contested") until the caller or a consolidation sweep
+    /// resolves it — the store never pretends to know an answer it doesn't
+    /// have.
+    ///
+    /// Returns WHICH negative result happened, because `INSERT OR IGNORE`
+    /// returning `false` conflated "this exact ordered pair is already queued"
+    /// with "a different pair asking the same question is already queued", and
+    /// only the second one honestly means `deduplicated`. An empty
+    /// `decision_key` is stored as SQL NULL, precisely so a caller that has no
+    /// key yet cannot collide every row under `idx_fcq_open_key`.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_fact_conflict(
         &self,
@@ -4551,25 +4559,148 @@ impl SqliteStore {
         detector: &str,
         score: Option<f32>,
         suggested: &str,
-    ) -> Result<bool, StorageError> {
-        let n = self.conn.execute(
-            "INSERT OR IGNORE INTO fact_conflict_queue
-                (id, new_fact_id, old_fact_id, diary, kb, detector, score,
-                 suggested, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
-            params![
-                id.to_string(),
-                new_fact_id.to_string(),
-                old_fact_id.to_string(),
-                diary,
-                kb,
-                detector,
-                score,
-                suggested,
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(n > 0)
+        decision_key: &str,
+        member_key: &str,
+        registry_version: &str,
+    ) -> Result<InsertOutcome, StorageError> {
+        let key: Option<&str> = Some(decision_key).filter(|k| !k.is_empty());
+        let member: Option<&str> = Some(member_key).filter(|k| !k.is_empty());
+        self.with_tx(|s| {
+            // Both pre-checks run inside the caller's BEGIN IMMEDIATE, so they
+            // cannot race the insert that follows them.
+            let same_pair: Option<String> = s
+                .conn
+                .query_row(
+                    "SELECT id FROM fact_conflict_queue
+                      WHERE new_fact_id = ?1 AND old_fact_id = ?2",
+                    params![new_fact_id.to_string(), old_fact_id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = same_pair {
+                return Ok(InsertOutcome::DuplicatePair {
+                    existing: Uuid::parse_str(&existing).unwrap_or(Uuid::nil()),
+                });
+            }
+            if let Some(k) = key {
+                let same_key: Option<String> = s
+                    .conn
+                    .query_row(
+                        "SELECT id FROM fact_conflict_queue
+                          WHERE kb = ?1 AND decision_key = ?2 AND status = 'open'",
+                        params![kb, k],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = same_key {
+                    return Ok(InsertOutcome::DuplicateKey {
+                        existing: Uuid::parse_str(&existing).unwrap_or(Uuid::nil()),
+                    });
+                }
+            }
+            let created_at = chrono::Utc::now().to_rfc3339();
+            // A plain INSERT, not INSERT OR IGNORE: an ignored insert is
+            // exactly the ambiguity this signature exists to remove.
+            let inserted = s.conn.execute(
+                "INSERT INTO fact_conflict_queue
+                    (id, new_fact_id, old_fact_id, diary, kb, detector, score,
+                     suggested, status, created_at, decision_key, member_key, registry_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9, ?10, ?11, ?12)",
+                params![
+                    id.to_string(),
+                    new_fact_id.to_string(),
+                    old_fact_id.to_string(),
+                    diary,
+                    kb,
+                    detector,
+                    score,
+                    suggested,
+                    created_at,
+                    key,
+                    member,
+                    registry_version,
+                ],
+            );
+            match inserted {
+                Ok(_) => {}
+                Err(e) => {
+                    // A constraint violation surviving both pre-checks is
+                    // re-queried once and mapped to whichever duplicate it was.
+                    // If neither query finds a row the error propagates: never
+                    // report `Inserted` for a row that is not there.
+                    return s.classify_conflict_insert_failure(
+                        new_fact_id,
+                        old_fact_id,
+                        kb,
+                        key,
+                        e,
+                    );
+                }
+            }
+            s.append_event(
+                &crate::journal::EventDraft::new(
+                    engram_core::events::EventKind::ConflictOpened,
+                    crate::journal::cli_actor(diary),
+                    crate::journal::payload::conflict_opened(
+                        id,
+                        new_fact_id,
+                        old_fact_id,
+                        detector,
+                        score,
+                        Some(suggested),
+                        None,
+                        key,
+                        member,
+                        Some(registry_version),
+                        &created_at,
+                        false,
+                    ),
+                )
+                .scope(Some(kb), Some(diary))
+                .subject(id),
+            )?;
+            Ok(InsertOutcome::Inserted)
+        })
+    }
+
+    fn classify_conflict_insert_failure(
+        &self,
+        new_fact_id: Uuid,
+        old_fact_id: Uuid,
+        kb: &str,
+        key: Option<&str>,
+        original: rusqlite::Error,
+    ) -> Result<InsertOutcome, StorageError> {
+        if let Some(existing) = self
+            .conn
+            .query_row(
+                "SELECT id FROM fact_conflict_queue WHERE new_fact_id = ?1 AND old_fact_id = ?2",
+                params![new_fact_id.to_string(), old_fact_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Ok(InsertOutcome::DuplicatePair {
+                existing: Uuid::parse_str(&existing).unwrap_or(Uuid::nil()),
+            });
+        }
+        if let Some(k) = key {
+            if let Some(existing) = self
+                .conn
+                .query_row(
+                    "SELECT id FROM fact_conflict_queue
+                      WHERE kb = ?1 AND decision_key = ?2 AND status = 'open'",
+                    params![kb, k],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return Ok(InsertOutcome::DuplicateKey {
+                    existing: Uuid::parse_str(&existing).unwrap_or(Uuid::nil()),
+                });
+            }
+        }
+        Err(StorageError::from(original))
     }
 
     pub fn get_fact_conflict(&self, id: Uuid) -> Result<Option<FactConflictRow>, StorageError> {
@@ -4688,18 +4819,55 @@ impl SqliteStore {
         kb: Option<&str>,
         resolved_by: &str,
     ) -> Result<usize, StorageError> {
-        let n = self.conn.execute(
-            "UPDATE fact_conflict_queue
-             SET status = 'resolved', resolved_at = ?1, resolved_by = ?2,
-                 note = COALESCE(note, 'auto: referenced facts no longer exist')
-             WHERE status = 'open'
-                   AND (?3 IS NULL OR diary = ?3)
-                   AND (?4 IS NULL OR kb = ?4)
-                   AND (new_fact_id NOT IN (SELECT id FROM facts)
-                        OR old_fact_id NOT IN (SELECT id FROM facts))",
-            params![chrono::Utc::now().to_rfc3339(), resolved_by, diary, kb],
-        )?;
-        Ok(n)
+        self.with_tx(|s| {
+            let doomed: Vec<(String, String, String, Option<String>)> = {
+                let mut stmt = s.conn.prepare(
+                    "SELECT id, kb, diary, decision_key FROM fact_conflict_queue
+                      WHERE status = 'open'
+                        AND (?1 IS NULL OR diary = ?1)
+                        AND (?2 IS NULL OR kb = ?2)
+                        AND (new_fact_id NOT IN (SELECT id FROM facts)
+                             OR old_fact_id NOT IN (SELECT id FROM facts))",
+                )?;
+                let rows = stmt.query_map(params![diary, kb], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let n = s.conn.execute(
+                "UPDATE fact_conflict_queue
+                 SET status = 'resolved', resolved_at = ?1, resolved_by = ?2,
+                     note = COALESCE(note, 'auto: referenced facts no longer exist')
+                 WHERE status = 'open'
+                       AND (?3 IS NULL OR diary = ?3)
+                       AND (?4 IS NULL OR kb = ?4)
+                       AND (new_fact_id NOT IN (SELECT id FROM facts)
+                            OR old_fact_id NOT IN (SELECT id FROM facts))",
+                params![chrono::Utc::now().to_rfc3339(), resolved_by, diary, kb],
+            )?;
+            for (id, row_kb, row_diary, decision_key) in doomed {
+                let conflict_id = Uuid::parse_str(&id).ok();
+                // A row whose facts are gone may have no key at all. The
+                // synthetic one is shaped so it can never collide with a real
+                // SemanticKey encoding, and therefore can never replay onto an
+                // unrelated pair.
+                let key = decision_key.unwrap_or_else(|| {
+                    engram_core::keys::semantic_key_encode("orphan", "orphan", &id)
+                });
+                s.record_decision(
+                    &row_kb,
+                    &row_diary,
+                    &key,
+                    "void",
+                    "machine",
+                    resolved_by,
+                    Some("auto: referenced facts no longer exist"),
+                    conflict_id,
+                    engram_core::keys::SEMANTIC_KEY_VERSION,
+                )?;
+            }
+            Ok(n)
+        })
     }
 
     /// Source-memory preview for each fact id: `(memory_id, first line)`.
@@ -4747,6 +4915,11 @@ impl SqliteStore {
 
     /// Mark a queued conflict resolved. Returns false when the row was not
     /// open (already resolved or unknown id).
+    ///
+    /// Records NO decision, so nothing about this resolution can ever replay.
+    /// Kept for compatibility with the paths that already call it; new callers
+    /// use `resolve_conflict_with_decision`, which claims the row and records
+    /// the ruling in one transaction.
     pub fn resolve_fact_conflict(
         &self,
         id: Uuid,
@@ -5938,31 +6111,45 @@ mod tests {
         store.insert_fact(&old_f).unwrap();
         store.insert_fact(&new_f).unwrap();
         let qid = Uuid::new_v4();
-        assert!(store
-            .insert_fact_conflict(
-                qid,
-                new_f.id,
-                old_f.id,
-                "default",
-                "default",
-                "slot",
-                Some(0.9),
-                "await_confirmation"
-            )
-            .unwrap());
-        // Same (new, old) pair queues once.
-        assert!(!store
-            .insert_fact_conflict(
-                Uuid::new_v4(),
-                new_f.id,
-                old_f.id,
-                "default",
-                "default",
-                "slot",
-                None,
-                "await_confirmation"
-            )
-            .unwrap());
+        assert_eq!(
+            store
+                .insert_fact_conflict(
+                    qid,
+                    new_f.id,
+                    old_f.id,
+                    "default",
+                    "default",
+                    "slot",
+                    Some(0.9),
+                    "await_confirmation",
+                    "",
+                    "",
+                    engram_core::relations::REGISTRY_VERSION
+                )
+                .unwrap(),
+            InsertOutcome::Inserted
+        );
+        // Same (new, old) ordered pair queues once, and says WHICH duplicate
+        // it was — the caller's `deduplicated` response is only honest for the
+        // same-key case, not this one.
+        assert_eq!(
+            store
+                .insert_fact_conflict(
+                    Uuid::new_v4(),
+                    new_f.id,
+                    old_f.id,
+                    "default",
+                    "default",
+                    "slot",
+                    None,
+                    "await_confirmation",
+                    "",
+                    "",
+                    engram_core::relations::REGISTRY_VERSION
+                )
+                .unwrap(),
+            InsertOutcome::DuplicatePair { existing: qid }
+        );
         let open = store.list_open_fact_conflicts(None, None, 10).unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].detector, "slot");
@@ -6019,6 +6206,9 @@ mod tests {
                 "slot",
                 None,
                 "supersede-old",
+                "",
+                "",
+                engram_core::relations::REGISTRY_VERSION,
             )
             .unwrap();
         store
@@ -6031,6 +6221,9 @@ mod tests {
                 "semantic_cosine",
                 Some(0.8),
                 "keep-both",
+                "",
+                "",
+                engram_core::relations::REGISTRY_VERSION,
             )
             .unwrap();
 
