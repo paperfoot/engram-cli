@@ -24,7 +24,10 @@ pub enum ErrorCode {
     BadInput,
     NotFound,
     WrongIdKind,
+    /// Serde spelling matches `as_str` — the v0.3 wire value, ruled in D20.
+    #[serde(rename = "config_error")]
     Config,
+    #[serde(rename = "transient_error")]
     Transient,
     RateLimited,
     SqliteBusy,
@@ -49,20 +52,43 @@ impl ErrorCode {
         }
     }
 
-    /// The `error.code` string in the JSON envelope.
+    /// The `error.code` string in the JSON envelope. `config_error` and
+    /// `transient_error` keep the exact wire spellings v0.3 shipped
+    /// (error.rs:70-71) — constraint 3, ruled in D20.
     pub fn as_str(self) -> &'static str {
         match self {
             ErrorCode::BadInput => "bad_input",
             ErrorCode::NotFound => "not_found",
             ErrorCode::WrongIdKind => "wrong_id_kind",
-            ErrorCode::Config => "config",
-            ErrorCode::Transient => "transient",
+            ErrorCode::Config => "config_error",
+            ErrorCode::Transient => "transient_error",
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::SqliteBusy => "sqlite_busy",
             ErrorCode::ConflictAlreadyResolved => "conflict_already_resolved",
             ErrorCode::MalformedJson => "malformed_json",
         }
     }
+
+    /// Whether "try the identical call again later" is sane advice.
+    pub fn retryable(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::Transient | ErrorCode::SqliteBusy | ErrorCode::RateLimited
+        )
+    }
+
+    /// Every code, for the generated contract's enum and exhaustive tests.
+    pub const ALL: [ErrorCode; 9] = [
+        ErrorCode::BadInput,
+        ErrorCode::NotFound,
+        ErrorCode::WrongIdKind,
+        ErrorCode::Config,
+        ErrorCode::Transient,
+        ErrorCode::RateLimited,
+        ErrorCode::SqliteBusy,
+        ErrorCode::ConflictAlreadyResolved,
+        ErrorCode::MalformedJson,
+    ];
 }
 
 #[cfg(test)]

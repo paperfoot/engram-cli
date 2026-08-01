@@ -8,6 +8,7 @@ pub mod events;
 pub mod fusion;
 pub mod handle;
 pub mod interval;
+pub mod keys;
 pub mod layers;
 pub mod names;
 pub mod relations;
