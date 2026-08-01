@@ -11,14 +11,70 @@ use contract_support::{manifest, Sandbox};
 /// changed in `cli.rs` but not in the registry fails here rather than in an
 /// agent's retry loop.
 #[test]
-fn the_manifest_entry_for_recall_is_the_generated_one() {
+fn every_transcribed_command_is_documented_by_the_contract_not_by_hand() {
     let sb = Sandbox::new();
     let m = manifest(&sb);
-    let generated = engram_contract::agent_info::render_command("recall").unwrap();
-    assert_eq!(
-        m["command_schemas"]["recall"], generated,
-        "the binary's recall entry is not the contract's"
-    );
+    for c in engram_contract::contract().commands {
+        let generated = engram_contract::agent_info::render_command(c.path).unwrap();
+        assert_eq!(
+            m["command_schemas"][c.path], generated,
+            "the binary's `{}` entry is not the contract's",
+            c.path
+        );
+    }
+}
+
+/// Every documented flag exists, on every transcribed command — the check
+/// that catches a flag renamed in `cli.rs` and left standing in the docs.
+#[test]
+fn every_documented_flag_exists_in_the_binary() {
+    let sb = Sandbox::new();
+    for c in engram_contract::contract().commands {
+        let out = sb
+            .cmd()
+            .args(c.path.split_whitespace())
+            .arg("--help")
+            .output()
+            .expect("help");
+        let help = String::from_utf8_lossy(&out.stdout);
+        for f in c.flags {
+            assert!(
+                help.contains(&format!("--{}", f.cli_long)),
+                "{} documents --{} and the binary has no such flag",
+                c.path,
+                f.cli_long
+            );
+        }
+    }
+}
+
+/// Defaults come from `cli.rs`, never from the old hand-written manifest —
+/// which has been wrong before. clap prints them, so the binary is the judge.
+#[test]
+fn every_documented_default_is_the_binarys_default() {
+    let sb = Sandbox::new();
+    for c in engram_contract::contract().commands {
+        let out = sb
+            .cmd()
+            .args(c.path.split_whitespace())
+            .arg("--help")
+            .output()
+            .expect("help");
+        let help = String::from_utf8_lossy(&out.stdout);
+        for f in c.flags {
+            let Some(default) = f.default else { continue };
+            // Booleans are flags, not values: clap prints no `[default: …]`.
+            if matches!(f.ty, engram_contract::Ty::Bool) {
+                continue;
+            }
+            assert!(
+                help.contains(&format!("[default: {default}]")),
+                "{} --{} is documented as `{default}` and `--help` disagrees",
+                c.path,
+                f.cli_long
+            );
+        }
+    }
 }
 
 #[test]
@@ -103,26 +159,6 @@ fn the_manifest_documents_engram_store_and_never_engram_home() {
 fn the_hash_is_stable_across_invocations() {
     let sb = Sandbox::new();
     assert_eq!(manifest(&sb)["schema_hash"], manifest(&sb)["schema_hash"]);
-}
-
-/// Documented flags exist, aliases included. `--limit` on `recall` is the
-/// mistake agents actually make, so it is documented AND accepted.
-#[test]
-fn every_documented_recall_flag_exists_in_the_binary() {
-    let sb = Sandbox::new();
-    let out = sb
-        .cmd()
-        .args(["recall", "--help"])
-        .output()
-        .expect("recall --help");
-    let help = String::from_utf8_lossy(&out.stdout);
-    for f in engram_contract::command("recall").unwrap().flags {
-        assert!(
-            help.contains(&format!("--{}", f.cli_long)),
-            "--{} is documented but absent from `recall --help`",
-            f.cli_long
-        );
-    }
 }
 
 /// The tripwire for a store migration landing without the documentation
