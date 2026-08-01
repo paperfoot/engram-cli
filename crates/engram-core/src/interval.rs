@@ -221,6 +221,10 @@ mod tests {
             resolution: None,
             source_kind: Default::default(),
             confirmations: 0,
+            closed_by: None,
+            close_reason: None,
+            close_authority: None,
+            kb: "default".into(),
         }
     }
 

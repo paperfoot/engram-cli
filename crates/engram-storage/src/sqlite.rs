@@ -23,8 +23,11 @@ fn f32_bytes_to_vec(b: &[u8]) -> Vec<f32> {
 }
 
 pub struct SqliteStore {
-    conn: Connection,
-    #[allow(dead_code)]
+    /// `pub(crate)` so `journal`, `rebuild`, `migrate_v10`, `backup` and
+    /// `export_v3` can prepare statements against the same connection —
+    /// invariant 1 requires the event append and the projection write to share
+    /// one transaction, which means they must share one connection.
+    pub(crate) conn: Connection,
     path: PathBuf,
 }
 
@@ -331,6 +334,12 @@ pub struct FactExportRow {
     pub source_kind: String,
     #[serde(default)]
     pub confirmations: i64,
+    #[serde(default)]
+    pub closed_by: Option<String>,
+    #[serde(default)]
+    pub close_reason: Option<String>,
+    #[serde(default)]
+    pub close_authority: Option<String>,
 }
 
 fn default_fact_type_str() -> String {
@@ -357,7 +366,45 @@ pub struct FactConflictRow {
     pub created_at: String,
     pub resolved_at: Option<String>,
     pub resolved_by: Option<String>,
+    /// The semantic key this question is about. NULL on a row whose facts are
+    /// gone (an orphan the migration deliberately kept) and on any row written
+    /// before wave 3 taught the write path to compute one.
+    #[serde(default)]
+    pub decision_key: Option<String>,
+    #[serde(default)]
+    pub member_key: Option<String>,
+    #[serde(default)]
+    pub registry_version: Option<String>,
 }
+
+/// The queue projection, in `parse_conflict_row` order.
+pub(crate) fn conflict_columns(prefix: &str) -> String {
+    const NAMES: [&str; 16] = [
+        "id",
+        "new_fact_id",
+        "old_fact_id",
+        "diary",
+        "kb",
+        "detector",
+        "score",
+        "suggested",
+        "note",
+        "status",
+        "created_at",
+        "resolved_at",
+        "resolved_by",
+        "decision_key",
+        "member_key",
+        "registry_version",
+    ];
+    NAMES
+        .iter()
+        .map(|n| format!("{prefix}{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) const CONFLICT_COLUMN_COUNT: usize = 16;
 
 fn parse_conflict_row(r: &rusqlite::Row) -> rusqlite::Result<FactConflictRow> {
     let id: String = r.get(0)?;
@@ -377,6 +424,9 @@ fn parse_conflict_row(r: &rusqlite::Row) -> rusqlite::Result<FactConflictRow> {
         created_at: r.get(10)?,
         resolved_at: r.get(11)?,
         resolved_by: r.get(12)?,
+        decision_key: r.get(13)?,
+        member_key: r.get(14)?,
+        registry_version: r.get(15)?,
     })
 }
 
@@ -789,7 +839,55 @@ const MEMORY_CONSTRAINS_DERIVED: &str = "(
     )
 )";
 
-const CURRENT_VERSION: i32 = 9;
+pub const CURRENT_VERSION: i32 = 10;
+
+/// A fact still asserts something only while BOTH are true: no successor took
+/// its slot, and its own interval has not been closed. `close_reason='stopped'`
+/// sets `valid_until` and leaves `superseded_by` NULL, so the legacy
+/// `superseded_by IS NULL` predicate reads a stopped medication as current —
+/// the exact failure move 2 exists to prevent, introduced by move 2. Mirrors
+/// `engram_core::interval::is_open_fact`; the two are one rule in two
+/// languages and a test pins them equal.
+const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND superseded_by IS NULL)";
+
+/// The fact projection, in `parse_fact_row` order. Written once so a `SELECT`
+/// and its parser cannot drift: a wrong column offset mis-parses silently,
+/// which is how a fact's `object` ends up in its `subject_norm`.
+pub(crate) fn fact_columns(prefix: &str) -> String {
+    const NAMES: [&str; 22] = [
+        "id",
+        "source_memory_id",
+        "subject",
+        "subject_norm",
+        "predicate",
+        "object",
+        "object_norm",
+        "confidence",
+        "created_at",
+        "superseded_by",
+        "superseded_at",
+        "diary",
+        "fact_type",
+        "valid_from",
+        "valid_until",
+        "resolution",
+        "source_kind",
+        "confirmations",
+        "closed_by",
+        "close_reason",
+        "close_authority",
+        "kb",
+    ];
+    NAMES
+        .iter()
+        .map(|n| format!("{prefix}{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How many columns [`fact_columns`] emits — the stride between two fact
+/// projections in one joined row.
+pub(crate) const FACT_COLUMN_COUNT: usize = 22;
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -809,6 +907,15 @@ impl SqliteStore {
             conn,
             path: path.as_ref().to_path_buf(),
         };
+        // The pre-v10 backup, BEFORE the migration transaction opens: VACUUM
+        // INTO cannot run inside one. Only for a store that already exists and
+        // is behind — a fresh store has nothing to back up, and an up-to-date
+        // one must not pay for a copy on every CLI invocation.
+        if let Some(v) = store.try_schema_version()? {
+            if v < 10 && store.path != Path::new(":memory:") {
+                crate::backup::vacuum_into_backup(&store.conn, &store.path)?;
+            }
+        }
         store.migrate()?;
         Ok(store)
     }
@@ -835,7 +942,11 @@ impl SqliteStore {
         if !self.conn.is_autocommit() {
             return f(self);
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        // Busy is translated at the boundary so a caller can retry without
+        // string-matching an error message (R11).
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(crate::error::tx_error)?;
         match f(self) {
             Ok(v) => {
                 self.conn.execute_batch("COMMIT")?;
@@ -853,7 +964,9 @@ impl SqliteStore {
     /// writes). Under WAL, readers keep seeing the pre-transaction snapshot
     /// until `commit`, so a long-running build-then-swap is safe.
     pub fn begin_immediate(&self) -> Result<(), StorageError> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(crate::error::tx_error)?;
         Ok(())
     }
 
@@ -925,6 +1038,9 @@ impl SqliteStore {
             if current < 9 {
                 s.migrate_v9()?;
             }
+            if current < 10 {
+                s.migrate_v10()?;
+            }
             if current != CURRENT_VERSION {
                 s.conn.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -937,7 +1053,7 @@ impl SqliteStore {
 
     /// Read the schema version without creating any tables. Returns
     /// `Ok(None)` when the version table doesn't exist yet (fresh DB).
-    fn try_schema_version(&self) -> Result<Option<i32>, StorageError> {
+    pub(crate) fn try_schema_version(&self) -> Result<Option<i32>, StorageError> {
         let table_exists: bool = self
             .conn
             .query_row(
@@ -1191,7 +1307,7 @@ impl SqliteStore {
         Ok(false)
     }
 
-    fn add_column_if_missing(
+    pub(crate) fn add_column_if_missing(
         &self,
         table: &str,
         column: &str,
@@ -3940,10 +4056,12 @@ impl SqliteStore {
                 predicate, object, object_norm, confidence, created_at,
                 superseded_by, superseded_at, diary,
                 fact_type, valid_from, valid_until, resolution, source_kind,
-                confirmations, kb)
+                confirmations, closed_by, close_reason, close_authority, kb)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, ?18,
-                COALESCE((SELECT kb FROM memories WHERE id = ?2), 'default'))",
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                CASE WHEN ?22 = '' THEN
+                    COALESCE((SELECT kb FROM memories WHERE id = ?2), 'default')
+                ELSE ?22 END)",
             params![
                 f.id.to_string(),
                 f.source_memory_id.to_string(),
@@ -3963,6 +4081,10 @@ impl SqliteStore {
                 f.resolution,
                 f.source_kind.as_str(),
                 f.confirmations as i64,
+                f.closed_by.map(|u| u.to_string()),
+                f.close_reason,
+                f.close_authority,
+                f.kb,
             ],
         )?;
         Ok(())
@@ -3977,16 +4099,15 @@ impl SqliteStore {
         predicate: &str,
         diary: &str,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                    object, object_norm, confidence, created_at,
-                    superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {facts}
              FROM facts
              WHERE subject_norm = ?1 AND predicate = ?2 AND diary = ?3
-                   AND superseded_by IS NULL
+                   AND {open}
              ORDER BY created_at DESC",
-        )?;
+            facts = fact_columns(""),
+            open = OPEN_INTERVAL_PREDICATE
+        ))?;
         let rows = stmt.query_map(params![subject_norm, predicate, diary], parse_fact_row)?;
         let mut out = Vec::new();
         for row in rows {
@@ -4006,16 +4127,15 @@ impl SqliteStore {
         diary: &str,
         kb: &str,
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                    object, object_norm, confidence, created_at,
-                    superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {facts}
              FROM facts
              WHERE subject_norm = ?1 AND predicate = ?2 AND diary = ?3 AND kb = ?4
-                   AND superseded_by IS NULL
+                   AND {open}
              ORDER BY created_at DESC",
-        )?;
+            facts = fact_columns(""),
+            open = OPEN_INTERVAL_PREDICATE
+        ))?;
         let rows = stmt.query_map(params![subject_norm, predicate, diary, kb], parse_fact_row)?;
         let mut out = Vec::new();
         for row in rows {
@@ -4038,13 +4158,7 @@ impl SqliteStore {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sql = String::from(
-            "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                    object, object_norm, confidence, created_at,
-                    superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-             FROM facts WHERE ",
-        );
+        let mut sql = format!("SELECT {} FROM facts WHERE ", fact_columns(""));
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(k) = kb {
             binds.push(Box::new(k.to_string()));
@@ -4080,11 +4194,7 @@ impl SqliteStore {
     pub fn get_fact(&self, id: Uuid) -> Result<Option<engram_core::types::Fact>, StorageError> {
         self.conn
             .query_row(
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE id = ?1",
+                &format!("SELECT {} FROM facts WHERE id = ?1", fact_columns("")),
                 params![id.to_string()],
                 parse_fact_row,
             )
@@ -4114,9 +4224,11 @@ impl SqliteStore {
             .map(|t| t.to_rfc3339())
             .unwrap_or_else(|| now.clone());
         let n = self.conn.execute(
-            "UPDATE facts SET superseded_by = ?1, superseded_at = ?2,
-                    resolution = ?3, valid_until = COALESCE(valid_until, ?4)
-             WHERE id = ?5 AND superseded_by IS NULL",
+            &format!(
+                "UPDATE facts SET superseded_by = ?1, superseded_at = ?2,
+                        resolution = ?3, valid_until = COALESCE(valid_until, ?4)
+                 WHERE id = ?5 AND {OPEN_INTERVAL_PREDICATE}"
+            ),
             params![
                 new_id.to_string(),
                 now,
@@ -4153,11 +4265,11 @@ impl SqliteStore {
         kb: &str,
         model: &str,
     ) -> Result<Vec<(Uuid, Vec<f32>)>, StorageError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, embedding FROM facts
              WHERE diary = ?1 AND kb = ?2 AND embed_model = ?3
-                   AND embedding IS NOT NULL AND superseded_by IS NULL",
-        )?;
+                   AND embedding IS NOT NULL AND {OPEN_INTERVAL_PREDICATE}"
+        ))?;
         let rows = stmt.query_map(params![diary, kb, model], |r| {
             let id_str: String = r.get(0)?;
             let blob: Vec<u8> = r.get(1)?;
@@ -4207,11 +4319,11 @@ impl SqliteStore {
         diary: &str,
         kb: &str,
     ) -> Result<Vec<(String, String)>, StorageError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT subject, subject_norm FROM facts
-             WHERE diary = ?1 AND kb = ?2 AND superseded_by IS NULL
-             GROUP BY subject_norm",
-        )?;
+             WHERE diary = ?1 AND kb = ?2 AND {OPEN_INTERVAL_PREDICATE}
+             GROUP BY subject_norm"
+        ))?;
         let rows = stmt.query_map(params![diary, kb], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -4260,9 +4372,10 @@ impl SqliteStore {
     pub fn get_fact_conflict(&self, id: Uuid) -> Result<Option<FactConflictRow>, StorageError> {
         self.conn
             .query_row(
-                "SELECT id, new_fact_id, old_fact_id, diary, kb, detector, score,
-                        suggested, note, status, created_at, resolved_at, resolved_by
-                 FROM fact_conflict_queue WHERE id = ?1",
+                &format!(
+                    "SELECT {} FROM fact_conflict_queue WHERE id = ?1",
+                    conflict_columns("")
+                ),
                 params![id.to_string()],
                 parse_conflict_row,
             )
@@ -4276,15 +4389,15 @@ impl SqliteStore {
         kb: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FactConflictRow>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, new_fact_id, old_fact_id, diary, kb, detector, score,
-                    suggested, note, status, created_at, resolved_at, resolved_by
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {conflict}
              FROM fact_conflict_queue
              WHERE status = 'open'
                    AND (?1 IS NULL OR diary = ?1)
                    AND (?2 IS NULL OR kb = ?2)
              ORDER BY created_at DESC LIMIT ?3",
-        )?;
+            conflict = conflict_columns("")
+        ))?;
         let rows = stmt.query_map(params![diary, kb, limit as i64], parse_conflict_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
@@ -4334,20 +4447,8 @@ impl SqliteStore {
         let subject_like = subject
             .map(|s| format!("%{}%", s.trim().to_lowercase()))
             .filter(|s| s.len() > 2);
-        let mut stmt = self.conn.prepare(
-            "SELECT q.id, q.new_fact_id, q.old_fact_id, q.diary, q.kb, q.detector,
-                    q.score, q.suggested, q.note, q.status, q.created_at,
-                    q.resolved_at, q.resolved_by,
-                    nf.id, nf.source_memory_id, nf.subject, nf.subject_norm,
-                    nf.predicate, nf.object, nf.object_norm, nf.confidence,
-                    nf.created_at, nf.superseded_by, nf.superseded_at, nf.diary,
-                    nf.fact_type, nf.valid_from, nf.valid_until, nf.resolution,
-                    nf.source_kind, nf.confirmations,
-                    of.id, of.source_memory_id, of.subject, of.subject_norm,
-                    of.predicate, of.object, of.object_norm, of.confidence,
-                    of.created_at, of.superseded_by, of.superseded_at, of.diary,
-                    of.fact_type, of.valid_from, of.valid_until, of.resolution,
-                    of.source_kind, of.confirmations
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {conflict}, {new_fact}, {old_fact}
              FROM fact_conflict_queue q
              JOIN facts nf ON nf.id = q.new_fact_id
              JOIN facts of ON of.id = q.old_fact_id
@@ -4356,15 +4457,18 @@ impl SqliteStore {
                    AND (?2 IS NULL OR q.kb = ?2)
                    AND (?3 IS NULL OR nf.subject_norm LIKE ?3 OR of.subject_norm LIKE ?3)
              ORDER BY q.created_at DESC, q.id LIMIT ?4",
-        )?;
+            conflict = conflict_columns("q."),
+            new_fact = fact_columns("nf."),
+            old_fact = fact_columns("of.")
+        ))?;
         // `facts triage` asks for the whole backlog by passing usize::MAX;
         // casting that straight to i64 wraps to -1, which SQLite happens to
         // read as "no limit". Saturating is the same behaviour on purpose.
         let capped = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = stmt.query_map(params![diary, kb, subject_like, capped], |r| {
             let row = parse_conflict_row(r)?;
-            let new_fact = parse_fact_from_offset(r, 13)?;
-            let old_fact = parse_fact_from_offset(r, 31)?;
+            let new_fact = parse_fact_from_offset(r, CONFLICT_COLUMN_COUNT)?;
+            let old_fact = parse_fact_from_offset(r, CONFLICT_COLUMN_COUNT + FACT_COLUMN_COUNT)?;
             Ok((row, new_fact, old_fact))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -4480,14 +4584,13 @@ impl SqliteStore {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sql = String::from(
-            "SELECT q.id, q.new_fact_id, q.old_fact_id, q.diary, q.kb, q.detector,
-                    q.score, q.suggested, q.note, q.status, q.created_at,
-                    q.resolved_at, q.resolved_by
+        let mut sql = format!(
+            "SELECT {}
              FROM fact_conflict_queue q
              JOIN facts nf ON nf.id = q.new_fact_id
              JOIN facts of ON of.id = q.old_fact_id
              WHERE q.status = 'open' AND ",
+            conflict_columns("q.")
         );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(k) = kb {
@@ -4547,40 +4650,31 @@ impl SqliteStore {
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE subject_norm = ?1 AND diary = ?2
                  ORDER BY created_at DESC"
             }
             (Some(_), false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE subject_norm = ?1 AND diary = ?2
-                       AND superseded_by IS NULL
+                       AND {open}
                  ORDER BY created_at DESC"
             }
             (None, true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE subject_norm = ?1
                  ORDER BY created_at DESC"
             }
             (None, false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE subject_norm = ?1 AND superseded_by IS NULL
+                "SELECT {facts}
+                 FROM facts WHERE subject_norm = ?1 AND {open}
                  ORDER BY created_at DESC"
             }
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = sql
+            .replace("{facts}", &fact_columns(""))
+            .replace("{open}", OPEN_INTERVAL_PREDICATE);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
                 .query_map(params![subject_norm, d], parse_fact_row)?
@@ -4601,37 +4695,28 @@ impl SqliteStore {
     ) -> Result<Vec<engram_core::types::Fact>, StorageError> {
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE diary = ?1 ORDER BY created_at DESC LIMIT ?2"
             }
             (Some(_), false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE diary = ?1 AND superseded_by IS NULL
+                "SELECT {facts}
+                 FROM facts WHERE diary = ?1 AND {open}
                  ORDER BY created_at DESC LIMIT ?2"
             }
             (None, true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts ORDER BY created_at DESC LIMIT ?1"
             }
             (None, false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE superseded_by IS NULL
+                "SELECT {facts}
+                 FROM facts WHERE {open}
                  ORDER BY created_at DESC LIMIT ?1"
             }
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = sql
+            .replace("{facts}", &fact_columns(""))
+            .replace("{open}", OPEN_INTERVAL_PREDICATE);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
                 .query_map(params![d, limit as i64], parse_fact_row)?
@@ -4656,37 +4741,28 @@ impl SqliteStore {
         let k = kb.unwrap();
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND diary = ?2 ORDER BY created_at DESC LIMIT ?3"
             }
             (Some(_), false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE kb = ?1 AND diary = ?2 AND superseded_by IS NULL
+                "SELECT {facts}
+                 FROM facts WHERE kb = ?1 AND diary = ?2 AND {open}
                  ORDER BY created_at DESC LIMIT ?3"
             }
             (None, true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE kb = ?1 ORDER BY created_at DESC LIMIT ?2"
             }
             (None, false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE kb = ?1 AND superseded_by IS NULL
+                "SELECT {facts}
+                 FROM facts WHERE kb = ?1 AND {open}
                  ORDER BY created_at DESC LIMIT ?2"
             }
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = sql
+            .replace("{facts}", &fact_columns(""))
+            .replace("{open}", OPEN_INTERVAL_PREDICATE);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
                 .query_map(params![k, d, limit as i64], parse_fact_row)?
@@ -4711,40 +4787,31 @@ impl SqliteStore {
         let k = kb.unwrap();
         let sql = match (diary, include_superseded) {
             (Some(_), true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND subject_norm = ?2 AND diary = ?3
                  ORDER BY created_at DESC"
             }
             (Some(_), false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND subject_norm = ?2 AND diary = ?3
-                       AND superseded_by IS NULL
+                       AND {open}
                  ORDER BY created_at DESC"
             }
             (None, true) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
+                "SELECT {facts}
                  FROM facts WHERE kb = ?1 AND subject_norm = ?2
                  ORDER BY created_at DESC"
             }
             (None, false) => {
-                "SELECT id, source_memory_id, subject, subject_norm, predicate,
-                        object, object_norm, confidence, created_at,
-                        superseded_by, superseded_at, diary,
-                    fact_type, valid_from, valid_until, resolution, source_kind, confirmations
-                 FROM facts WHERE kb = ?1 AND subject_norm = ?2 AND superseded_by IS NULL
+                "SELECT {facts}
+                 FROM facts WHERE kb = ?1 AND subject_norm = ?2 AND {open}
                  ORDER BY created_at DESC"
             }
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = sql
+            .replace("{facts}", &fact_columns(""))
+            .replace("{open}", OPEN_INTERVAL_PREDICATE);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<engram_core::types::Fact> = match diary {
             Some(d) => stmt
                 .query_map(params![k, subject_norm, d], parse_fact_row)?
@@ -4762,26 +4829,19 @@ impl SqliteStore {
         &self,
         limit: usize,
     ) -> Result<Vec<(engram_core::types::Fact, engram_core::types::Fact)>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT old.id, old.source_memory_id, old.subject, old.subject_norm,
-                    old.predicate, old.object, old.object_norm, old.confidence,
-                    old.created_at, old.superseded_by, old.superseded_at, old.diary,
-                    old.fact_type, old.valid_from, old.valid_until, old.resolution,
-                    old.source_kind, old.confirmations,
-                    new.id, new.source_memory_id, new.subject, new.subject_norm,
-                    new.predicate, new.object, new.object_norm, new.confidence,
-                    new.created_at, new.superseded_by, new.superseded_at, new.diary,
-                    new.fact_type, new.valid_from, new.valid_until, new.resolution,
-                    new.source_kind, new.confirmations
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {old_fact}, {new_fact}
              FROM facts old
              JOIN facts new ON new.id = old.superseded_by
              WHERE old.superseded_by IS NOT NULL
              ORDER BY old.superseded_at DESC
              LIMIT ?1",
-        )?;
+            old_fact = fact_columns("old."),
+            new_fact = fact_columns("new.")
+        ))?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             let old = parse_fact_from_offset(r, 0)?;
-            let new = parse_fact_from_offset(r, 18)?;
+            let new = parse_fact_from_offset(r, FACT_COLUMN_COUNT)?;
             Ok((old, new))
         })?;
         let mut out = Vec::new();
@@ -4793,7 +4853,7 @@ impl SqliteStore {
 
     pub fn count_facts(&self) -> Result<i64, StorageError> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM facts WHERE superseded_by IS NULL",
+            &format!("SELECT COUNT(*) FROM facts WHERE {OPEN_INTERVAL_PREDICATE}"),
             [],
             |r| r.get(0),
         )?;
@@ -4914,7 +4974,7 @@ impl SqliteStore {
             "SELECT id, source_memory_id, subject, subject_norm, predicate, object,
                     object_norm, confidence, created_at, superseded_by, superseded_at,
                     diary, kb, fact_type, valid_from, valid_until, resolution,
-                    source_kind, confirmations
+                    source_kind, confirmations, closed_by, close_reason, close_authority
              FROM facts WHERE (?1 IS NULL OR kb = ?1) ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![kb], |r| {
@@ -4942,6 +5002,9 @@ impl SqliteStore {
                     .get::<_, Option<String>>(17)?
                     .unwrap_or_else(default_source_kind_str),
                 confirmations: r.get::<_, Option<i64>>(18)?.unwrap_or(0),
+                closed_by: r.get(19)?,
+                close_reason: r.get(20)?,
+                close_authority: r.get(21)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -5052,9 +5115,10 @@ impl SqliteStore {
             "INSERT OR IGNORE INTO facts(id, source_memory_id, subject, subject_norm,
                 predicate, object, object_norm, confidence, created_at,
                 superseded_by, superseded_at, diary, kb, fact_type, valid_from,
-                valid_until, resolution, source_kind, confirmations)
+                valid_until, resolution, source_kind, confirmations,
+                closed_by, close_reason, close_authority)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19)",
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 row.id,
                 row.source_memory_id,
@@ -5075,6 +5139,9 @@ impl SqliteStore {
                 row.resolution,
                 row.source_kind,
                 row.confirmations,
+                row.closed_by,
+                row.close_reason,
+                row.close_authority,
             ],
         )?;
         Ok(n > 0)
@@ -5394,6 +5461,10 @@ fn parse_fact_from_offset(
     let resolution: Option<String> = r.get(o + 15)?;
     let source_kind_str: String = r.get::<_, Option<String>>(o + 16)?.unwrap_or_default();
     let confirmations: i64 = r.get::<_, Option<i64>>(o + 17)?.unwrap_or(0);
+    let closed_by_str: Option<String> = r.get(o + 18)?;
+    let close_reason: Option<String> = r.get(o + 19)?;
+    let close_authority: Option<String> = r.get(o + 20)?;
+    let kb: String = r.get::<_, Option<String>>(o + 21)?.unwrap_or_default();
     Ok(engram_core::types::Fact {
         id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
         source_memory_id: Uuid::parse_str(&src_str).unwrap_or(Uuid::nil()),
@@ -5429,6 +5500,12 @@ fn parse_fact_from_offset(
         resolution,
         source_kind: engram_core::types::SourceKind::parse(&source_kind_str),
         confirmations: confirmations.max(0) as u32,
+        closed_by: closed_by_str
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok()),
+        close_reason,
+        close_authority,
+        kb,
     })
 }
 
@@ -5573,6 +5650,10 @@ mod tests {
             resolution: None,
             source_kind: engram_core::types::SourceKind::UserStated,
             confirmations: 0,
+            closed_by: None,
+            close_reason: None,
+            close_authority: None,
+            kb: "default".into(),
         }
     }
 

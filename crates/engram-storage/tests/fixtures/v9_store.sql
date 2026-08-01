@@ -31,8 +31,9 @@
 --     (ana / lives_in / {braga, porto}) re-asked by a later re-derivation, so two
 --     OPEN rows share one decision_key. The duplicate-key collapse must merge
 --     them before idx_fcq_open_key is created, or the migration aborts on every
---     store with a backlog. Survivor is the earlier row (created_at 22:53), the
---     hand-written one (created_at 2026-07-01) is the loser.
+--     store with a backlog. Survivor is the question as FIRST asked, which here
+--     is the hand-written row (created_at 2026-07-01); the CLI-generated row
+--     (created_at 2026-08-01T22:53) is the loser.
 --   * queue rows dddddddd-…0002 (open) and dddddddd-…0003 (resolved): both
 --     reference facts that no longer exist. These CANNOT be seeded through the
 --     CLI — fact_conflict_queue carries ON DELETE CASCADE on both fact FKs and

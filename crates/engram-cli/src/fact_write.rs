@@ -917,6 +917,10 @@ pub async fn write_fact(
         resolution: None,
         source_kind,
         confirmations: 0,
+        closed_by: None,
+        close_reason: None,
+        close_authority: None,
+        kb: w.kb.to_string(),
     };
 
     // ---- Exact path: same (subject_norm, predicate) ----
@@ -1384,6 +1388,10 @@ mod tests {
             resolution: None,
             source_kind: SourceKind::AgentExtracted,
             confirmations: 0,
+            closed_by: None,
+            close_reason: None,
+            close_authority: None,
+            kb: "default".into(),
         }
     }
 
