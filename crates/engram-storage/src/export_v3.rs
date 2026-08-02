@@ -75,6 +75,58 @@ pub struct ImportV3Report {
     pub events_skipped_duplicate: usize,
     pub genesis_synthesized: usize,
     pub conflicts_skipped_orphan: usize,
+    /// [G2] Closes the file asked for and the store refused: a safety
+    /// relation retired by something other than a person. The row still
+    /// imports — OPEN.
+    pub close_authority_rejected: usize,
+}
+
+/// [G2] The close authorities a PERSON can be behind. `may_close` allows
+/// exactly these on a safety relation; an import cannot re-derive the
+/// classification that produced the row, so it checks the authority instead.
+const PERSON_SUPPLIED_AUTHORITIES: [&str; 3] = ["explicit_end", "caller", "replayed_caller"];
+
+/// [G2] Does this imported close have to be dropped?
+///
+/// True when a SAFETY relation arrives closed by anything but a person —
+/// including by nothing at all, since a close no one can name an authority
+/// for is not a close this store will honour on an allergy or a
+/// prescription. Non-safety relations are unaffected: "Bruno moved out of
+/// Lisbon" still imports closed, whoever decided it.
+///
+/// The direction of the error is deliberate. Dropping a close leaves the
+/// interval OPEN, which is the same direction `may_close` already errs in:
+/// still-allergic, still-prescribed, and visible to the caller rather than
+/// silently retired by a file.
+pub(crate) fn close_needs_person(predicate: &str, authority: Option<&str>) -> bool {
+    if !engram_core::relations::is_safety_slot(&engram_core::relations::canonical_relation(
+        predicate,
+    )) {
+        return false;
+    }
+    !authority
+        .map(|a| PERSON_SUPPLIED_AUTHORITIES.contains(&a))
+        .unwrap_or(false)
+}
+
+/// [G2] A negative-length interval. Unreadable to `Interval::overlaps` and
+/// to every consumer downstream of it; the live path and the migration both
+/// clamp it away, and an import is the only door it can still walk through.
+/// Unparsable timestamps are NOT rejected here — they are the v2 files'
+/// problem, and the parsers downstream already tolerate them.
+pub(crate) fn interval_is_inverted(from: Option<&str>, until: Option<&str>) -> bool {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    match (from.and_then(parse), until.and_then(parse)) {
+        (Some(f), Some(u)) => u < f,
+        _ => false,
+    }
+}
+
+pub(crate) fn inverted_interval_error(id: &str, from: &str, until: &str) -> StorageError {
+    StorageError::MalformedRow(format!(
+        "fact {id}: valid_until {until} precedes valid_from {from}; an interval that ends \
+         before it begins is not something this store can import"
+    ))
 }
 
 impl SqliteStore {
@@ -197,8 +249,8 @@ impl SqliteStore {
                 let row = s
                     .event_by_id(id)?
                     .expect("just appended, inside this transaction");
-                match crate::rebuild::apply(s, &row) {
-                    Ok(()) => {}
+                match crate::rebuild::apply_from(s, &row, crate::rebuild::Origin::Imported) {
+                    Ok(refused) => report.close_authority_rejected += refused,
                     Err(StorageError::NotFound(_))
                         if kind == engram_core::events::EventKind::ConflictOpened =>
                     {
@@ -257,7 +309,9 @@ impl SqliteStore {
             report.chunks += self.import_chunk_row(row)? as usize;
         }
         for row in facts {
-            report.facts += self.import_fact_row(row)? as usize;
+            let outcome = self.import_fact_row(row)?;
+            report.facts += outcome.inserted as usize;
+            report.close_authority_rejected += outcome.close_rejected as usize;
         }
         Ok(())
     }
@@ -320,6 +374,53 @@ mod tests {
             .supersede_fact_with(old.id, new.id, "caller", None)
             .unwrap();
         (m.id, new.id, old.id)
+    }
+
+    /// One OPEN allergy — a safety relation, the case `may_close` exists for.
+    fn seed_allergy(store: &SqliteStore) -> (Uuid, Uuid) {
+        let m = Memory {
+            id: Uuid::new_v4(),
+            content: "Ana is allergic to penicillin.".into(),
+            created_at: chrono::Utc::now(),
+            event_time: None,
+            importance: 5,
+            emotional_weight: 0,
+            access_count: 0,
+            last_accessed: None,
+            stability: 1.0,
+            source: MemorySource::Manual,
+            diary: "default".into(),
+            valid_from: None,
+            valid_until: None,
+            tags: vec![],
+        };
+        store.insert_memory_with_kb(&m, "personal").unwrap();
+        let f = Fact {
+            id: Uuid::new_v4(),
+            source_memory_id: m.id,
+            subject: "Ana".into(),
+            subject_norm: "ana".into(),
+            predicate: "allergic_to".into(),
+            object: "penicillin".into(),
+            object_norm: "penicillin".into(),
+            confidence: 0.95,
+            created_at: chrono::Utc::now(),
+            superseded_by: None,
+            superseded_at: None,
+            diary: "default".into(),
+            fact_type: FactType::Assertion,
+            valid_from: Some(chrono::Utc::now()),
+            valid_until: None,
+            resolution: None,
+            source_kind: SourceKind::UserStated,
+            confirmations: 0,
+            closed_by: None,
+            close_reason: None,
+            close_authority: None,
+            kb: "personal".into(),
+        };
+        store.insert_fact(&f).unwrap();
+        (m.id, f.id)
     }
 
     fn facts_digest(store: &SqliteStore) -> Vec<String> {
@@ -403,6 +504,156 @@ mod tests {
         let before = facts_digest(&target);
         target.rebuild_projections(None, false).unwrap();
         assert_eq!(facts_digest(&target), before);
+    }
+
+    // -----------------------------------------------------------------
+    // [G2] An import is the one write path whose bytes a caller edits by
+    // hand. Everything else re-derives what it stores through `may_close`;
+    // an import writes columns straight through, so the gate has to live
+    // here too or `jq` is a privilege escalation.
+    // -----------------------------------------------------------------
+
+    /// The release gate's own reproduction, in Rust: export a store, empty
+    /// the journal so nothing can contradict the rows, and hand-edit the
+    /// allergy into a CLOSED interval with `heuristic` authority — which
+    /// `may_close` refuses on every safety relation.
+    #[test]
+    fn a_forged_close_on_a_safety_relation_imports_open() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        let mut doc = source.export_v3(None).unwrap();
+        doc.events.clear();
+        doc.counts.events = 0;
+        let row = doc
+            .facts
+            .iter_mut()
+            .find(|f| f.predicate == "allergic_to")
+            .expect("the export carries the allergy");
+        // `valid_from` is forged back too, so this row fails ONE rule and the
+        // test cannot pass on the interval-order check by accident.
+        row.valid_from = Some("2026-01-01T00:00:00Z".to_string());
+        row.valid_until = Some("2026-08-01T00:00:00Z".to_string());
+        row.close_reason = Some("superseded".to_string());
+        row.close_authority = Some("heuristic".to_string());
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(
+            report.close_authority_rejected, 1,
+            "the refusal has to be COUNTED; a silent one is a store that \
+             disagrees with the file it was handed"
+        );
+        let f = target
+            .get_fact(allergy)
+            .unwrap()
+            .expect("the fact itself still imports — only its close is dropped");
+        assert_eq!(f.valid_until, None);
+        assert_eq!(f.close_reason, None);
+        assert_eq!(f.close_authority, None);
+        assert_eq!(f.superseded_by, None);
+        assert!(engram_core::interval::is_open_fact(&f));
+    }
+
+    /// The other half of the same rule: a close a PERSON is entitled to make
+    /// travels through an import intact. A gate that refused these would make
+    /// export/import lossy for every legitimately retired prescription.
+    #[test]
+    fn an_imported_caller_close_on_a_safety_relation_is_honoured() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        source
+            .close_fact_interval(
+                allergy,
+                chrono::Utc::now(),
+                "corrected",
+                "caller",
+                None,
+                Some("caller"),
+            )
+            .unwrap();
+        let doc = source.export_v3(None).unwrap();
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(report.close_authority_rejected, 0);
+        let f = target.get_fact(allergy).unwrap().unwrap();
+        assert!(f.valid_until.is_some());
+        assert_eq!(f.close_authority.as_deref(), Some("caller"));
+    }
+
+    /// The journal half of the same file. `import_v3` treats the events as
+    /// the source of truth, so a forger who edits only the events wins
+    /// unless the replay applies the same gate the rows do.
+    #[test]
+    fn a_forged_close_event_on_a_safety_relation_is_refused_too() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        source
+            .close_fact_interval(
+                allergy,
+                chrono::Utc::now(),
+                "corrected",
+                "caller",
+                None,
+                Some("caller"),
+            )
+            .unwrap();
+        let mut doc = source.export_v3(None).unwrap();
+        // The row section is left honest — only the journal is edited, so
+        // this test cannot pass on the row gate alone.
+        for f in doc.facts.iter_mut() {
+            f.valid_until = None;
+            f.close_reason = None;
+            f.close_authority = None;
+            f.closed_by = None;
+            f.superseded_by = None;
+            f.superseded_at = None;
+        }
+        for e in doc.events.iter_mut() {
+            if e.kind == "fact.interval_closed" {
+                e.payload["authority"] = serde_json::json!("heuristic");
+            }
+        }
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(report.close_authority_rejected, 1);
+        let f = target.get_fact(allergy).unwrap().unwrap();
+        assert!(
+            engram_core::interval::is_open_fact(&f),
+            "a replayed close is still a close, and the gate does not care \
+             which half of the file it arrived in"
+        );
+    }
+
+    /// A negative-length interval is not a policy question — it is nonsense
+    /// that `overlaps` and every reader downstream cannot answer. The file is
+    /// refused whole rather than half-imported.
+    #[test]
+    fn an_import_refuses_an_interval_that_ends_before_it_begins() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        let mut doc = source.export_v3(None).unwrap();
+        doc.events.clear();
+        doc.counts.events = 0;
+        let row = doc
+            .facts
+            .iter_mut()
+            .find(|f| f.predicate == "allergic_to")
+            .unwrap();
+        row.valid_from = Some("2026-01-01T00:00:00Z".to_string());
+        row.valid_until = Some("2020-01-01T00:00:00Z".to_string());
+
+        let target = extra_store(&_tmp, "target");
+        let err = target.import_v3(&doc).unwrap_err();
+        assert!(
+            err.to_string().contains("valid_until"),
+            "the message must name the field: {err}"
+        );
+        assert!(
+            target.get_fact(allergy).unwrap().is_none(),
+            "a refused import rolls back whole"
+        );
     }
 
     #[test]

@@ -22,16 +22,22 @@
 //! 2. **`facts.kb` comes from the event's `kb` column**, never from a subquery
 //!    over `memories`. Re-running that subquery at replay time silently
 //!    re-homes every fact whose source memory later moved between KBs.
-//! 3. **An orphaned queue row is skipped and counted, not inserted.** The
-//!    queue's two FKs to `facts` are `ON DELETE CASCADE`, and a plain INSERT
-//!    of a row whose facts are gone aborts the whole rebuild. This is the one
-//!    place a rebuild is knowingly not byte-identical, and it says so.
+//! 3. **An orphaned queue row is PRESERVED, not deleted and not inserted.**
+//!    The queue's two FKs to `facts` are `ON DELETE CASCADE`, so a plain
+//!    INSERT of a row whose facts are gone aborts the whole rebuild — its
+//!    `conflict.opened` therefore cannot replay. Deleting the row first and
+//!    then declining to recreate it destroys migrated history the journal
+//!    never held; so the delete skips those rows and the report names both
+//!    numbers: `conflicts_skipped_orphan` events unreplayable,
+//!    `conflicts_preserved_orphan` rows left in place. This is the one place
+//!    a rebuild is knowingly not a pure function of the journal, and it says
+//!    so on every run.
 
 use crate::error::StorageError;
 use crate::journal::EventRow;
 use crate::sqlite::SqliteStore;
 use engram_core::events::EventKind;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RebuildReport {
@@ -46,6 +52,7 @@ pub struct RebuildReport {
     pub extraction_markers: i64,
     pub lessons: i64,
     pub conflicts_skipped_orphan: usize,
+    pub conflicts_preserved_orphan: usize,
     pub embeddings_restored: usize,
     pub skipped: Vec<SkippedTable>,
 }
@@ -75,6 +82,11 @@ pub fn skipped_tables() -> Vec<SkippedTable> {
                      the rebuild rather than replayed",
         },
         SkippedTable {
+            table: "fact_conflict_queue.orphans",
+            reason: "a question whose facts are gone cannot be replayed; preserved in place \
+                     rather than deleted, and counted in conflicts_preserved_orphan",
+        },
+        SkippedTable {
             table: "claims",
             reason: "compiler cache; `engram compile` regenerates it",
         },
@@ -97,11 +109,61 @@ pub fn skipped_tables() -> Vec<SkippedTable> {
     ]
 }
 
+/// Where a replayed event came from, and therefore how far it is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// This store's own journal. Whatever it says, this store did — and that
+    /// INCLUDES the v9 history the migration synthesized, where a relation
+    /// the registry has since promoted to `safety` was closed by the old
+    /// slot-LWW heuristic. Re-gating those on every rebuild would reopen
+    /// thousands of correctly-retired prescriptions, which is a rebuild that
+    /// edits history rather than replaying it.
+    OwnJournal,
+    /// An event out of an export file — bytes a caller can edit with `jq`.
+    /// The [G2] gate applies, exactly as it does to the row sections.
+    Imported,
+}
+
 /// Replay one event onto the projections. Raw SQL only — see rule 1.
 pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
+    apply_from(store, e, Origin::OwnJournal).map(|_| ())
+}
+
+/// [G2] Replay one event, returning the number of closes the safety gate
+/// refused (0 or 1). `Origin::OwnJournal` never refuses anything, so
+/// `admin rebuild` is unchanged.
+pub fn apply_from(
+    store: &SqliteStore,
+    e: &EventRow,
+    origin: Origin,
+) -> Result<usize, StorageError> {
+    let mut refused = 0usize;
     match e.kind {
         EventKind::FactObserved => {
             let id = e.payload_uuid("fact_id")?;
+            let mut valid_until = e.payload_opt_str("valid_until");
+            if origin == Origin::Imported {
+                let valid_from = e.payload_opt_str("valid_from");
+                if crate::export_v3::interval_is_inverted(
+                    valid_from.as_deref(),
+                    valid_until.as_deref(),
+                ) {
+                    return Err(crate::export_v3::inverted_interval_error(
+                        &id.to_string(),
+                        valid_from.as_deref().unwrap_or(""),
+                        valid_until.as_deref().unwrap_or(""),
+                    ));
+                }
+                // An observation carries no authority at all, so an imported
+                // one that arrives already CLOSED on a safety relation is a
+                // close nobody signed.
+                if valid_until.is_some()
+                    && crate::export_v3::close_needs_person(&e.payload_str("relation")?, None)
+                {
+                    valid_until = None;
+                    refused += 1;
+                }
+            }
             store.conn.execute(
                 "INSERT OR IGNORE INTO facts(id, source_memory_id, subject, subject_norm,
                         predicate, object, object_norm, confidence, created_at,
@@ -109,7 +171,7 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
                         valid_until, resolution, source_kind, confirmations,
                         closed_by, close_reason, close_authority, kb)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11, ?12,
-                         ?13, ?14, ?15, 0, NULL, NULL, NULL, ?16)",
+                         ?13, ?14, ?15, ?16, NULL, NULL, NULL, ?17)",
                 params![
                     id.to_string(),
                     e.payload_str("source_memory_id")?,
@@ -132,10 +194,20 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
                     e.payload_opt_str("fact_type")
                         .unwrap_or_else(|| "assertion".to_string()),
                     e.payload_opt_str("valid_from"),
-                    e.payload_opt_str("valid_until"),
+                    valid_until,
                     e.payload_opt_str("resolution"),
                     e.payload_opt_str("source_kind")
                         .unwrap_or_else(|| "agent_extracted".to_string()),
+                    // [G5] The count the observation was made WITH. A live
+                    // insert says 0 and the `fact.confirmed` events below add
+                    // to it; a migrated row says what the v9 store had
+                    // already counted, because nothing replays those. Events
+                    // written before this field defaulted to zero, which is
+                    // what they meant.
+                    e.payload
+                        .get("confirmations")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
                     // Rule 2.
                     e.kb.clone().unwrap_or_else(|| "default".to_string()),
                 ],
@@ -144,6 +216,37 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
         EventKind::FactIntervalClosed => {
             let id = e.payload_uuid("fact_id")?;
             let sets = e.payload_bool("sets_superseded_by");
+            if origin == Origin::Imported {
+                // The relation is not in the close payload — it is in the row
+                // the earlier `fact.observed` (or the file's row section)
+                // already landed.
+                let target: Option<(String, Option<String>)> = store
+                    .conn
+                    .query_row(
+                        "SELECT predicate, valid_from FROM facts WHERE id = ?1",
+                        params![id.to_string()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((predicate, valid_from)) = target {
+                    let until = e.payload_str("valid_until")?;
+                    if crate::export_v3::interval_is_inverted(valid_from.as_deref(), Some(&until)) {
+                        return Err(crate::export_v3::inverted_interval_error(
+                            &id.to_string(),
+                            valid_from.as_deref().unwrap_or(""),
+                            &until,
+                        ));
+                    }
+                    if crate::export_v3::close_needs_person(
+                        &predicate,
+                        Some(e.payload_str("authority")?).as_deref(),
+                    ) {
+                        // The event is kept — the journal records what the
+                        // file claimed — but the projection does not move.
+                        return Ok(1);
+                    }
+                }
+            }
             store.conn.execute(
                 "UPDATE facts
                     SET valid_until = ?1, close_reason = ?2, close_authority = ?3,
@@ -412,7 +515,7 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
         | EventKind::JobCompleted
         | EventKind::JobFailed => {}
     }
-    Ok(())
+    Ok(refused)
 }
 
 impl SqliteStore {
@@ -481,8 +584,26 @@ impl SqliteStore {
         // whose pair straddles the boundary — a scoped rebuild that quietly
         // deletes another KB's questions is the same class of defect this lane
         // exists to fix.
+        //
+        // Rule 3 [G4]: an ORPHAN — a row whose facts are already gone — is
+        // not deleted, because the replay cannot put it back. The v0.3 write
+        // path deleted facts and the FK cascade took ~14.5k questions with
+        // them; the migration rescued what was left, and a rebuild that drops
+        // the survivors finishes the job the bug started. Preserve in place,
+        // count, and say so.
+        report.conflicts_preserved_orphan = self.conn.query_row(
+            "SELECT COUNT(*) FROM fact_conflict_queue q
+              WHERE (?1 IS NULL OR q.kb = ?1)
+                AND (NOT EXISTS (SELECT 1 FROM facts f WHERE f.id = q.new_fact_id)
+                     OR NOT EXISTS (SELECT 1 FROM facts f WHERE f.id = q.old_fact_id))",
+            params![kb],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
         self.conn.execute(
-            "DELETE FROM fact_conflict_queue WHERE (?1 IS NULL OR kb = ?1)",
+            "DELETE FROM fact_conflict_queue
+              WHERE (?1 IS NULL OR kb = ?1)
+                AND EXISTS (SELECT 1 FROM facts f WHERE f.id = new_fact_id)
+                AND EXISTS (SELECT 1 FROM facts f WHERE f.id = old_fact_id)",
             params![kb],
         )?;
         self.conn.execute(

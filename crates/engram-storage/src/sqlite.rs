@@ -361,6 +361,15 @@ pub struct FactExportRow {
     pub close_authority: Option<String>,
 }
 
+/// What [`SqliteStore::import_fact_row`] did with one row. A bare `bool`
+/// could only say "landed"; the caller also has to be able to report that a
+/// close was refused on the way in [G2].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportedFactRow {
+    pub inserted: bool,
+    pub close_rejected: bool,
+}
+
 fn default_fact_type_str() -> String {
     "assertion".to_string()
 }
@@ -2256,6 +2265,18 @@ impl SqliteStore {
 
     /// Record that the fact extractor has processed this memory's content.
     /// Idempotent: a later run overwrites the previous marker.
+    ///
+    /// UNWELDED, and therefore not a write path anyone may reach for [G6]:
+    /// it writes the row and appends nothing, so `admin rebuild` — which
+    /// restores `fact_extraction_log` from `derivation.ran` alone — cannot
+    /// put the marker back, and the memory silently rejoins the backfill
+    /// queue. `record_derivation` is the welded path and calls this inside
+    /// its own transaction; the migration's genesis pass is the only other
+    /// legitimate caller (it reads the markers a v9 store already had).
+    ///
+    /// Becomes `pub(crate)` the moment `write_fact_batch` stops calling it —
+    /// see the lane report. The proof of what happens meanwhile is
+    /// `write_path::tests::only_the_welded_derivation_restores_the_extraction_marker`.
     pub fn record_fact_extraction(
         &self,
         memory_id: Uuid,
@@ -4975,33 +4996,14 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// Mark a queued conflict resolved. Returns false when the row was not
-    /// open (already resolved or unknown id).
-    ///
-    /// Records NO decision, so nothing about this resolution can ever replay.
-    /// Kept for compatibility with the paths that already call it; new callers
-    /// use `resolve_conflict_with_decision`, which claims the row and records
-    /// the ruling in one transaction.
-    pub fn resolve_fact_conflict(
-        &self,
-        id: Uuid,
-        resolved_by: &str,
-        note: Option<&str>,
-    ) -> Result<bool, StorageError> {
-        let n = self.conn.execute(
-            "UPDATE fact_conflict_queue
-             SET status = 'resolved', resolved_at = ?1, resolved_by = ?2,
-                 note = COALESCE(?3, note)
-             WHERE id = ?4 AND status = 'open'",
-            params![
-                chrono::Utc::now().to_rfc3339(),
-                resolved_by,
-                note,
-                id.to_string()
-            ],
-        )?;
-        Ok(n > 0)
-    }
+    // `resolve_fact_conflict` used to live here: a bare
+    // `UPDATE fact_conflict_queue SET status='resolved'` with no event, kept
+    // "for compatibility with the paths that already call it". By the time
+    // wave 6 swept for it, no path did — and a rebuild replayed the row's
+    // `conflict.opened` and reopened every question it had answered, note and
+    // all. `resolve_conflict_with_decision` is the only way to answer a
+    // queued question, because it is the only one that also records the
+    // ruling (invariant 1, and blocker 6's defect class).
 
     /// Open conflicts in a KB whose facts mention any of the query terms —
     /// used by `recall` to surface contested values instead of silently
@@ -5575,7 +5577,32 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
-    pub fn import_fact_row(&self, row: &FactExportRow) -> Result<bool, StorageError> {
+    /// Import one fact row from an export file.
+    ///
+    /// [G2] This is the ONLY write path whose bytes a caller edits by hand,
+    /// so it is the only one that cannot trust its own input. Two things it
+    /// cannot re-derive get checked instead: an interval that ends before it
+    /// begins is refused outright, and a SAFETY relation closed by anything
+    /// but a person is imported OPEN with the close dropped and counted.
+    /// Everything else about the row is written as given.
+    pub fn import_fact_row(&self, row: &FactExportRow) -> Result<ImportedFactRow, StorageError> {
+        if crate::export_v3::interval_is_inverted(
+            row.valid_from.as_deref(),
+            row.valid_until.as_deref(),
+        ) {
+            return Err(crate::export_v3::inverted_interval_error(
+                &row.id,
+                row.valid_from.as_deref().unwrap_or(""),
+                row.valid_until.as_deref().unwrap_or(""),
+            ));
+        }
+        let closed = row.valid_until.is_some() || row.superseded_by.is_some();
+        let close_rejected = closed
+            && crate::export_v3::close_needs_person(&row.predicate, row.close_authority.as_deref());
+        // Dropping the close means dropping ALL of it: a row left with
+        // `superseded_by` set is not open under `is_open_fact`, and half a
+        // close is worse than either whole.
+        let keep = |v: &Option<String>| if close_rejected { None } else { v.clone() };
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO facts(id, source_memory_id, subject, subject_norm,
                 predicate, object, object_norm, confidence, created_at,
@@ -5594,22 +5621,25 @@ impl SqliteStore {
                 row.object_norm,
                 row.confidence,
                 row.created_at,
-                row.superseded_by,
-                row.superseded_at,
+                keep(&row.superseded_by),
+                keep(&row.superseded_at),
                 row.diary,
                 row.kb,
                 row.fact_type,
                 row.valid_from,
-                row.valid_until,
+                keep(&row.valid_until),
                 row.resolution,
                 row.source_kind,
                 row.confirmations,
-                row.closed_by,
-                row.close_reason,
-                row.close_authority,
+                keep(&row.closed_by),
+                keep(&row.close_reason),
+                keep(&row.close_authority),
             ],
         )?;
-        Ok(n > 0)
+        Ok(ImportedFactRow {
+            inserted: n > 0,
+            close_rejected,
+        })
     }
 
     pub fn embedding_profiles(
@@ -6256,11 +6286,29 @@ mod tests {
         assert_eq!(hits[0].1.id, new_f.id);
         assert_eq!(hits[0].2.id, old_f.id);
 
-        // Resolve closes it; a second resolve is a no-op.
-        assert!(store
-            .resolve_fact_conflict(qid, "caller", Some("user confirmed"))
-            .unwrap());
-        assert!(!store.resolve_fact_conflict(qid, "caller", None).unwrap());
+        // Resolve closes it; a second resolve is a no-op. Through the welded
+        // path, which is now the only one: the answer has to reach the
+        // journal or a rebuild reopens the question.
+        let key = engram_core::keys::semantic_key_encode(
+            "ana",
+            "allergic_to",
+            &engram_core::keys::object_pair_hash("amoxicillin", "penicillin"),
+        );
+        let resolve = |note: Option<&str>| {
+            store.resolve_conflict_with_decision(
+                qid,
+                "default",
+                "default",
+                &key,
+                "close_old",
+                "caller",
+                "caller",
+                note,
+                engram_core::keys::SEMANTIC_KEY_VERSION,
+            )
+        };
+        assert!(resolve(Some("user confirmed")).unwrap().is_some());
+        assert!(resolve(None).unwrap().is_none());
         assert!(store
             .list_open_fact_conflicts(None, None, 10)
             .unwrap()

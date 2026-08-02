@@ -699,4 +699,60 @@ mod tests {
             "a void must never be replayed onto a later pair"
         );
     }
+
+    /// Invariant 1, swept: EVERY path that answers a queued question has to
+    /// answer it in the journal too, or `admin rebuild` replays the
+    /// `conflict.opened` and the question comes back from the dead with the
+    /// caller's ruling gone. This is the same defect as the extraction
+    /// marker's (blocker 6) — a projection write with no event — and the
+    /// unwelded `resolve_fact_conflict` that used to sit beside this path
+    /// could not pass it, which is why it no longer exists.
+    #[test]
+    fn a_resolved_conflict_stays_resolved_through_a_rebuild() {
+        let (_tmp, _g, store) = temp_store();
+        let (_m, new, old, k) = seeded(&store);
+        let qid = Uuid::new_v4();
+        store
+            .insert_fact_conflict(
+                qid,
+                new,
+                old,
+                "default",
+                "personal",
+                "slot",
+                None,
+                "supersede-old",
+                &k,
+                "porto",
+                "relations@1",
+            )
+            .unwrap();
+        store
+            .resolve_conflict_with_decision(
+                qid,
+                "personal",
+                "default",
+                &k,
+                "close_old",
+                "caller",
+                "cli:default",
+                Some("user confirmed"),
+                SEMANTIC_KEY_VERSION,
+            )
+            .unwrap()
+            .expect("the row was open");
+
+        store.rebuild_projections(None, false).unwrap();
+        let row = store.get_fact_conflict(qid).unwrap().expect("still queued");
+        assert_eq!(row.status, "resolved");
+        assert_eq!(row.note.as_deref(), Some("user confirmed"));
+        assert_eq!(
+            store
+                .lookup_decision("personal", &k)
+                .unwrap()
+                .unwrap()
+                .verdict,
+            "close_old"
+        );
+    }
 }
