@@ -176,7 +176,7 @@ fn write_descriptor(d: &DaemonDescriptor) {
     }
 }
 
-fn remove_descriptor() {
+pub fn remove_descriptor() {
     let _ = std::fs::remove_file(descriptor_path());
 }
 

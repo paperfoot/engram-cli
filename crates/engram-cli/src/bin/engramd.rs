@@ -16,6 +16,14 @@ struct Args {
     /// Auth token required when binding to non-local addresses.
     #[arg(long)]
     token: Option<String>,
+    /// Root every path (db, vectors, config, cache) at DIR. Overrides ENGRAM_STORE.
+    ///
+    /// Applied before `AppContext::new`, so `AppContext::new` is still what
+    /// runs. Deliberately NOT `AppContext::with_db`: that overrides the db path
+    /// only, while vectors, config and cache keep resolving through `paths::`,
+    /// which would split the daemon across two stores.
+    #[arg(long, value_name = "DIR")]
+    store: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -27,6 +35,10 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
+    if let Err(err) = engram_cli::apply_store_override(args.store.as_deref()) {
+        err.emit_to_stderr();
+        return ExitCode::from(err.exit_code() as u8);
+    }
     let ctx = match AppContext::new(OutputFormat::Json, true) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -34,11 +46,41 @@ async fn main() -> ExitCode {
             return ExitCode::from(err.exit_code() as u8);
         }
     };
-    match serve::run(&ctx, args.host, args.port, args.token).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            err.emit_to_stderr();
-            ExitCode::from(err.exit_code() as u8)
+    // A signal is a shutdown, not a kill: the descriptor file is removed and
+    // the writer drains, so the next start does not have to reconcile rows the
+    // daemon could have finished.
+    let core = ctx.core.clone();
+    tokio::select! {
+        outcome = serve::run(&ctx, args.host, args.port, args.token) => match outcome {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                err.emit_to_stderr();
+                ExitCode::from(err.exit_code() as u8)
+            }
+        },
+        _ = shutdown_signal() => {
+            serve::remove_descriptor();
+            core.shutdown(std::time::Duration::from_secs(5)).await;
+            ExitCode::SUCCESS
         }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return std::future::pending().await,
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

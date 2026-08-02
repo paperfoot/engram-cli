@@ -479,7 +479,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
 /// resolution — so `engram --store X agent-info` still leaves X non-existent.
 /// A discovery command that materialises a store directory is the same class
 /// of bug as one that migrates a database.
-fn apply_store_override(dir: Option<&std::path::Path>) -> Result<(), CliError> {
+pub fn apply_store_override(dir: Option<&std::path::Path>) -> Result<(), CliError> {
     let Some(dir) = dir else { return Ok(()) };
     if dir.as_os_str().is_empty() {
         return Err(CliError::Config(
