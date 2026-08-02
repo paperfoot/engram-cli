@@ -7,7 +7,9 @@ agent-experience audit: an append-only journal as source of truth, bi-temporal
 interval facts, decision replay, a single-writer core with jobs, and a generated
 contract. Schema v9 → v12 (v10 journal + intervals, v11 lessons, v12 decision
 orientation); the v10 migration writes a `VACUUM INTO` backup beside the store
-before touching a row. v11 and v12 are additive-only and take no backup.
+before touching a row. v11 is additive-only. v12 adds one column and backfills
+it, and takes no backup for a narrower reason: the only column it writes is the
+one it just created, so no prior value is at risk.
 
 ### Breaking for agents/scripts
 
@@ -72,9 +74,13 @@ before touching a row. v11 and v12 are additive-only and take no backup.
   (`fact_decisions.loser_object_norm`, schema v12), so the ruling travels with
   the value rather than with the slot: a re-derivation that names the pair in
   the other order applies the same outcome, and it keeps applying it after a
-  `kb delete` has cascaded the conflict row away. Where no orientation was
-  ever recorded and none can be recovered, a safety pair queues instead of
-  guessing.
+  `kb delete` has cascaded the conflict row away. The v12 migration backfills
+  that orientation for every older decision whose conflict row is still there,
+  so an upgraded store does not depend on a row a later delete can cascade
+  away. Where no orientation was ever recorded and none can be recovered, the
+  pair QUEUES rather than replaying by pair order — on every relation, not
+  only the safety ones: a ruling applied backwards retires the value the
+  caller kept, whether it names a prescription or an employer.
 - Epistemic reads: `returned`/`total`/`cursor` on every listing, `verdict:
   results|no_match` with an absence certificate (scope searched, top score vs
   threshold, nearest subjects), `metadata.scope`, and honest `elapsed_ms`

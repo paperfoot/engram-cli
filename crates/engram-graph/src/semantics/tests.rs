@@ -987,10 +987,11 @@ fn record_losing(
     }
 }
 
-/// `replay` against a pair spelled (new, old) in that order, on `lives_in` —
-/// an ordinary relation. The safety cases spell their own call.
+/// `replay` against a pair spelled (new, old) in that order. The relation is
+/// not a parameter any more [G10]: replay treats a medication and an employer
+/// alike, so these cases read the same whichever one they name.
 fn replayed(prior: &DecisionRecord, current: Verdict, new: &str, old: &str) -> ReplayOutcome {
-    replay(prior, current, new, old, false)
+    replay(prior, current, new, old)
 }
 
 fn applied(outcome: ReplayOutcome) -> Option<(ConflictClass, &'static str)> {
@@ -1003,17 +1004,26 @@ fn applied(outcome: ReplayOutcome) -> Option<(ConflictClass, &'static str)> {
 #[test]
 fn a_caller_decision_binds_in_every_direction() {
     let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
+    // Keep-both carries no loser because it retired nothing.
     let keep = record(DecisionVerdict::KeepBoth, DecisionAuthority::Caller);
     assert_eq!(
         applied(replayed(&keep, queued, "porto", "lisbon")),
         Some((ConflictClass::Coexist, "replayed_keep_both"))
     );
-    let close = record(DecisionVerdict::CloseOld, DecisionAuthority::Caller);
+    let close = record_losing(
+        DecisionVerdict::CloseOld,
+        DecisionAuthority::Caller,
+        "lisbon",
+    );
     assert_eq!(
         applied(replayed(&close, queued, "porto", "lisbon")),
         Some((ConflictClass::SupersedeOld, "replayed_close_old"))
     );
-    let reject = record(DecisionVerdict::RejectNew, DecisionAuthority::Caller);
+    let reject = record_losing(
+        DecisionVerdict::RejectNew,
+        DecisionAuthority::Caller,
+        "porto",
+    );
     assert_eq!(
         applied(replayed(&reject, queued, "porto", "lisbon")),
         Some((ConflictClass::SupersedeNew, "replayed_reject_new"))
@@ -1076,35 +1086,40 @@ fn a_decision_whose_loser_is_on_neither_side_does_not_replay() {
 
 /// The blocker, at the layer that decides it. A decision with no recorded
 /// loser and no conflict row left to recover one from knows only that SOMETHING
-/// lost. On a medication that is not enough to close an interval with.
+/// lost, and that is not enough to close an interval with — on ANY relation
+/// [G10].
+///
+/// This test used to assert the opposite for the ordinary half: a legacy row
+/// replayed positionally on `lives_in`, on the theory that re-asking about
+/// every city a pre-v12 store had settled was the worse trade. Three gate
+/// passes disagreed. Pair order is not evidence, and a coin toss that lands
+/// wrong retires the value the caller KEPT — Carol's employer as surely as her
+/// dose. The queue is where an unanswerable question belongs.
 #[test]
-fn an_unprovable_orientation_never_retires_a_safety_value() {
+fn an_unprovable_orientation_never_retires_anything() {
     let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
     for verdict in [DecisionVerdict::CloseOld, DecisionVerdict::RejectNew] {
         let orphaned = record(verdict, DecisionAuthority::Caller);
         assert_eq!(
-            replay(
-                &orphaned,
-                queued,
-                "metformin 1000 mg",
-                "metformin 500 mg",
-                true
-            ),
+            replayed(&orphaned, queued, "metformin 1000 mg", "metformin 500 mg"),
             ReplayOutcome::Directionless,
             "pair order is not evidence of which dose the caller retired"
         );
-        // Off a safety relation the legacy row still replays positionally:
-        // re-asking about every city a pre-v12 store ever settled would be a
-        // worse trade than repeating the old convention.
-        assert!(matches!(
-            replay(&orphaned, queued, "porto", "lisbon", false),
-            ReplayOutcome::Applied(_)
-        ));
+        assert_eq!(
+            replayed(&orphaned, queued, "porto", "lisbon"),
+            ReplayOutcome::Directionless,
+            "nor of which city — an ordinary relation gets the same refusal"
+        );
+        assert_eq!(
+            replayed(&orphaned, queued, "acme", "beta corp"),
+            ReplayOutcome::Directionless,
+            "the reported reversal: an employer pair replayed positionally"
+        );
     }
 }
 
-/// …and the recorded loser is what buys the safety pair its replay back. The
-/// same reversed pair that queues above binds here, in the direction the caller
+/// …and the recorded loser is what buys the pair its replay back. The same
+/// reversed pair that queues above binds here, in the direction the caller
 /// chose rather than the one the re-derivation happened to emit.
 #[test]
 fn a_recorded_loser_replays_on_a_safety_relation_in_either_order() {
@@ -1115,22 +1130,20 @@ fn a_recorded_loser_replays_on_a_safety_relation_in_either_order() {
         "metformin 500 mg",
     );
     assert_eq!(
-        applied(replay(
+        applied(replayed(
             &close,
             queued,
             "metformin 1000 mg",
             "metformin 500 mg",
-            true
         )),
         Some((ConflictClass::SupersedeOld, "replayed_close_old"))
     );
     assert_eq!(
-        applied(replay(
+        applied(replayed(
             &close,
             queued,
             "metformin 500 mg",
             "metformin 1000 mg",
-            true
         )),
         Some((ConflictClass::SupersedeNew, "replayed_reject_new")),
         "reversed derivation, same retired dose"
@@ -1337,6 +1350,40 @@ fn a_replayed_decision_keeps_its_meaning_when_the_pair_is_not_reversed() {
     .unwrap();
     assert_eq!(p.closes.len(), 1, "{p:?}");
     assert_eq!(p.closes[0].fact_id, acme.id);
+}
+
+/// BLOCKER 3 in its third form [G10]: the same Carol pair, but the ledger row
+/// carries no loser and no conflict row survives to recover one from — a
+/// decision taken by a v11 binary whose queue row a `kb delete` cascaded away.
+/// `works_at` is ORDINARY, and that used to be licence to replay positionally;
+/// the reversed re-derivation then closed Beta Corp, the employer the caller
+/// had kept. It asks instead.
+#[test]
+fn an_unoriented_ordinary_decision_queues_rather_than_guessing_a_side() {
+    let acme = stored("Carol", "works_at", "Acme", "2026-01-01");
+    let mut beta = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
+    beta.source_memory_id = acme.source_memory_id;
+    let orphaned: HashMap<String, DecisionRecord> = [(
+        SemanticKey::for_pair(&FactView::of(&beta), &FactView::of(&acme)).encode(),
+        record(DecisionVerdict::CloseOld, DecisionAuthority::Caller),
+    )]
+    .into_iter()
+    .collect();
+    let prior = |k: &SemanticKey| Ok(orphaned.get(&k.encode()).cloned());
+    // Reversed: Beta Corp is the stored side, so "close the old one" would
+    // land on Beta.
+    let p = plan_write(
+        &observation_of(&acme),
+        std::slice::from_ref(&beta),
+        &[],
+        ClassifyMode::Write,
+        &prior,
+    )
+    .unwrap();
+    assert!(p.closes.is_empty(), "{p:?}");
+    assert!(p.replays.is_empty());
+    assert_eq!(p.queue.len(), 1);
+    assert_eq!(p.queue[0].verdict.rule, "replay_orientation_unknown");
 }
 
 /// A stored answer that names neither value is not an answer to THIS pair, so
