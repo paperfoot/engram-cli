@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.4.0 — UNRELEASED (branch arch/v0.4)
+
+The five-move rebuild of the write/mutate/adjudicate layer, from the 2026-08-01
+agent-experience audit: an append-only journal as source of truth, bi-temporal
+interval facts, decision replay, a single-writer core with jobs, and a generated
+contract. Schema v9 → v11 (v10 journal + intervals, v11 lessons); the v10
+migration writes a `VACUUM INTO` backup beside the store before touching a row.
+
+### Breaking for agents/scripts
+
+- `forget <unknown-id>` exits 3 `not_found`. It used to exit 0 with
+  `{"deleted": false}`, so a typo was indistinguishable from a successful
+  retraction. `deleted` keeps its meaning; `already_retracted` disambiguates
+  the idempotent case.
+- `edit --content` no longer deletes the memory's facts. They close as
+  intervals (`close_reason: "corrected"`, authority `caller`) and the response
+  says so: `facts_invalidated`, `facts_invalidated_ids`, `reextraction`.
+  Adjudication history survives edits; `admin rebuild` can prove it.
+- `export` writes format version 3 (a journal slice — lossless, including
+  retracted memories, decisions and the conflict queue). v2 and v1 files still
+  import; a v2 import synthesizes genesis events.
+- `suggested_action` on a SAFETY pair (`takes_medication`, `allergic_to`,
+  `diagnosed_with`) is always `requires_context`, never `supersede-old`.
+  `supersede-old` survives only where the classifier itself ordered the values
+  and strict autonomy was the sole reason the pair queued. `allowed_actions`
+  is unchanged — advice narrowed, permission did not.
+- `arity` for the safety relations reads `"multi"`: a medication list is a
+  SET. Two different drugs no longer queue a conflict at all; same-drug dose
+  changes queue exactly one, safety-gated.
+- `resolve_command` is one runnable, shell-quoted command with no pipe. The
+  old `--action a|b|c` template executed its first branch when pasted. The
+  structured `resolve {program, args, allowed_actions}` object sits beside it.
+- Clap parse failures emit the JSON error envelope with exit 3 (`bad_input`).
+  They used to print prose and exit 2, colliding with "config error".
+- `fact_type` for new safety-relation facts is `assertion`, not
+  `profile_slot`.
+
+### Added
+
+- Typed id handles (`mem:`/`chunk:`/`fact:`/`conflict:`/…) accepted by every
+  mutator; bare UUIDs stay valid everywhere. A chunk id fed to `edit`/`forget`
+  resolves to its memory (`resolved_from` says so); a wrong-kind id names the
+  kind it actually was and the handle that would work. Every read result
+  carries `memory_id`, `handle` and a provenance chain.
+- The events journal: every projection write appends its event in the same
+  transaction; `engram admin rebuild` drops and replays the fact and
+  adjudication projections and reproduces byte-identical state.
+- Decision replay: adjudications are keyed by semantic identity and replayed
+  on re-derivation — the store never asks the same question twice
+  (`decision.replayed` in the journal, `resolution: "replayed_*"` in
+  responses).
+- Epistemic reads: `returned`/`total`/`cursor` on every listing, `verdict:
+  results|no_match` with an absence certificate (scope searched, top score vs
+  threshold, nearest subjects), `metadata.scope`, and honest `elapsed_ms`
+  measured in dispatch on every command.
+- `engram state <subject>` — the compiled current-state view: open intervals
+  grouped by relation and member, provenance, open questions.
+- Lessons (procedural memory): `engram lessons add|list|confirm|retract`,
+  `engram reflect` distilling episodes and decisions into reusable lessons
+  (schema v11, additive).
+- Jobs: `engram jobs submit|list|show|cancel|resume|watch`, `compile --async`,
+  sleep-time compile triggers, SSE progress over the daemon.
+- A real HTTP server in `engram serve`: Content-Length framing, bounded
+  bodies, per-connection tasks, keep-alive; `/v1/recall` carries the same
+  `conflicts` array as the CLI.
+- `ENGRAM_STORE` env var and `--store` flag: root db/vectors/config/cache
+  under one directory for sandboxes and tests; `agent-info` answers without
+  opening, creating, or migrating any store.
+- `engram-contract`: the command schema as data, generating agent-info,
+  skill.md and JSON Schema, with contract tests that fail the build when docs
+  and binary drift (they caught two drifts during this build's own
+  integration).
+
 ## 0.3.1 — 2026-07-28
 - Failover hardening from the post-release code review (15 findings, all fixed):
   rotation now also fires on 400/401 key-invalid refusals (a deleted primary used to
