@@ -36,14 +36,14 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     // The discovery surface answers BEFORE any store is opened: constructing
     // AppContext runs migrations, and "run agent-info to check the setup"
     // must never be the call that migrates (or creates) a database.
-    if matches!(cli.command, Command::AgentInfo) {
-        return agent_info::run();
+    if let Command::AgentInfo { schema } = &cli.command {
+        return agent_info::run(schema.as_deref());
     }
     let ctx = context::AppContext::new(format, cli.quiet)?;
     ctx.core.set_actor(actor_for(&cli.command));
 
     match cli.command {
-        Command::AgentInfo => agent_info::run(),
+        Command::AgentInfo { schema } => agent_info::run(schema.as_deref()),
         Command::Remember {
             content,
             importance,

@@ -85,6 +85,11 @@ migration writes a `VACUUM INTO` backup beside the store before touching a row.
 - `ENGRAM_STORE` env var and `--store` flag: root db/vectors/config/cache
   under one directory for sandboxes and tests; `agent-info` answers without
   opening, creating, or migrating any store.
+- `engram agent-info --schema '<command>'` prints one command's JSON Schema —
+  input types, required arguments, and the documented output fields. Three
+  error surfaces had been telling agents to run it since before the flag
+  existed; it now exists, resolves aliases, and answers an unknown name by
+  listing the commands that have a schema.
 - `engram-contract`: the command schema as data, generating agent-info,
   skill.md and JSON Schema, with contract tests that fail the build when docs
   and binary drift (they caught two drifts during this build's own
