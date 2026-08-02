@@ -36,6 +36,16 @@ const GENESIS_NAMESPACE: Uuid = Uuid::from_u128(0x7b2e4c10_9d55_5a41_8f03_6c19ab
 /// `status='open'` listing.
 pub const STATUS_SUPERSEDED_QUESTION: &str = "superseded_question";
 
+/// `fact_decisions.loser_object_norm` is here as well as in `migrate_v12`'s
+/// ALTER [G3]: a store that first meets this table at v10 gets the column
+/// immediately and v12 is a no-op on it; a store whose table already exists
+/// gets it at v12. Both land on the same shape, which is what
+/// `add_column_if_missing` is for.
+///
+/// No SQL comments in this string, ever. SQLite keeps the CREATE text verbatim
+/// in `sqlite_master` and rewrites it on `ALTER TABLE`; a `--` line comment
+/// survives that rewrite badly enough to leave the statement unparseable, so a
+/// note written here disables the next migration to touch the table.
 pub const V10_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS fact_decisions (
     id            TEXT PRIMARY KEY,
@@ -53,10 +63,6 @@ CREATE TABLE IF NOT EXISTS fact_decisions (
     event_id      TEXT NOT NULL,
     key_version   TEXT NOT NULL,
     decided_at    TEXT NOT NULL,
-    -- G3, added here as well as by the v12 ALTER: a store that first meets
-    -- this table at v10 gets the column immediately, and `migrate_v12` is then
-    -- a no-op on it. A store whose table already exists gets it at v12. Both
-    -- land on the same shape, which is what `add_column_if_missing` is for.
     loser_object_norm TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fact_decisions_key
