@@ -330,7 +330,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 all,
                 limit,
-            } => commands::facts::list(&ctx, subject, diary, kb, all, limit),
+                cursor,
+            } => commands::facts::list(&ctx, subject, diary, kb, all, limit, cursor),
             FactsCommand::Show { subject, diary, kb } => {
                 commands::facts::show(&ctx, subject, diary, kb)
             }
@@ -340,7 +341,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 diary,
                 kb,
                 subject,
-            } => commands::facts::conflicts(&ctx, limit, open, diary, kb, subject),
+                cursor,
+            } => commands::facts::conflicts(&ctx, limit, open, diary, kb, subject, cursor),
             FactsCommand::Triage {
                 kb,
                 diary,

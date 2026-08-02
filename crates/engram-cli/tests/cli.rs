@@ -4563,7 +4563,12 @@ fn open_conflicts_are_grouped_by_subject_and_predicate_with_sources() {
         .expect("Ana group");
     assert_eq!(ana["predicate"], "allergic_to");
     assert_eq!(ana["safety_slot"], true);
-    assert_eq!(ana["arity"], "single");
+    // The relation registry is the one source of arity now, and it pins
+    // `allergic_to` as SET-valued: a person holds several allergies at once,
+    // and calling the slot single-valued is what made a second allergy look
+    // like a contradiction to be resolved.
+    assert_eq!(ana["arity"], "multi");
+    assert_eq!(ana["arity_class"], "set_valued");
     assert_eq!(ana["conflict_count"], 1);
     let entry = &ana["conflicts"][0];
     assert_eq!(entry["triage"]["auto_resolvable"], false);
