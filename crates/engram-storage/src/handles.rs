@@ -26,7 +26,10 @@ pub struct Resolved {
 /// The probe order for a bare uuid. PINNED, so two stores with the same rows
 /// answer identically — uuid collisions across tables are a practical
 /// impossibility and a deterministic answer beats a clever one.
-const PROBE_ORDER: [HandleKind; 8] = [
+/// The two kinds added by D24 sit at the END of the order, after every kind a
+/// v0.3 script could already be passing: a bare uuid that used to resolve to a
+/// memory must keep resolving to a memory.
+const PROBE_ORDER: [HandleKind; 10] = [
     HandleKind::Memory,
     HandleKind::Chunk,
     HandleKind::Fact,
@@ -35,6 +38,8 @@ const PROBE_ORDER: [HandleKind; 8] = [
     HandleKind::Document,
     HandleKind::Job,
     HandleKind::Event,
+    HandleKind::Lesson,
+    HandleKind::Wiki,
 ];
 
 fn table_of(kind: HandleKind) -> &'static str {
@@ -47,6 +52,8 @@ fn table_of(kind: HandleKind) -> &'static str {
         HandleKind::Document => "documents",
         HandleKind::Job => "compile_jobs",
         HandleKind::Event => "events",
+        HandleKind::Lesson => "lessons",
+        HandleKind::Wiki => "wiki_pages",
     }
 }
 

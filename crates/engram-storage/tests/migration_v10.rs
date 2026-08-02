@@ -167,7 +167,11 @@ fn digest(db: &PathBuf) -> Vec<(String, i64)> {
 fn a_v9_store_migrates_to_v10_with_every_object() {
     let (_tmp, db) = restore_v9();
     let store = migrate(&db);
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        engram_storage::sqlite::CURRENT_VERSION,
+        "a migrated store lands on the version this binary ships, not on a literal"
+    );
 
     for sql in [
         "SELECT COUNT(*) FROM events",
@@ -253,7 +257,11 @@ fn the_backup_is_written_before_the_transaction_and_still_reads_as_v9() {
 #[test]
 fn no_backup_for_memory_stores_fresh_stores_or_second_opens() {
     let store = SqliteStore::open_in_memory().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        engram_storage::sqlite::CURRENT_VERSION,
+        "a migrated store lands on the version this binary ships, not on a literal"
+    );
 
     let tmp = TempDir::new().unwrap();
     let fresh = tmp.path().join("db.sqlite");

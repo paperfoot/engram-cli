@@ -68,7 +68,7 @@ fn a_safety_pair_always_requires_context() {
     // tests and by the v9 migration fixture's backlog.
     let overridden = &v["metadata"]["suggested_action_overridden"];
     assert!(
-        overridden.is_null() || *overridden == Value::from(0),
+        overridden.is_null() || overridden.as_i64() == Some(0),
         "read guard overrode a fresh write — write side regressed: {overridden}"
     );
 

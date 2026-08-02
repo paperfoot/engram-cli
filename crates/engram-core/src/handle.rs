@@ -24,6 +24,15 @@ pub enum HandleKind {
     Document,
     Job,
     Event,
+    /// D24. A lesson is an addressable row that `lessons confirm|retract`
+    /// mutates by id, so it gets the same typed handle every other mutable
+    /// row has. Without it the reasoning layer would print a bare uuid on a
+    /// surface whose whole point is that ids carry their kind.
+    Lesson,
+    /// D24, read-surfaces' half. A wiki page is addressable by id in the
+    /// compiler cache; it resolves to no memory, which is why `hit_handle`
+    /// still declines to mint one for a retrieval hit.
+    Wiki,
 }
 
 impl HandleKind {
@@ -38,6 +47,8 @@ impl HandleKind {
             HandleKind::Document => "doc",
             HandleKind::Job => "job",
             HandleKind::Event => "event",
+            HandleKind::Lesson => "lesson",
+            HandleKind::Wiki => "wiki",
         }
     }
 
@@ -51,6 +62,8 @@ impl HandleKind {
             "doc" | "document" => HandleKind::Document,
             "job" => HandleKind::Job,
             "event" => HandleKind::Event,
+            "lesson" => HandleKind::Lesson,
+            "wiki" => HandleKind::Wiki,
             _ => return None,
         })
     }

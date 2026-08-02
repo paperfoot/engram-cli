@@ -8,6 +8,7 @@ pub mod export_v3;
 pub mod fts;
 pub mod handles;
 pub mod journal;
+pub mod lessons;
 pub mod migrate_v10;
 pub mod paths;
 pub mod rebuild;
@@ -21,6 +22,7 @@ pub use error::StorageError;
 pub use export_v3::{ExportV3, ImportV3Report};
 pub use handles::Resolved;
 pub use journal::{EventDraft, EventRow};
+pub use lessons::{LessonRow, LessonUpsert};
 pub use migrate_v10::MigrationV10Report;
 pub use rebuild::RebuildReport;
 pub use sqlite::{

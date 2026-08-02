@@ -858,7 +858,7 @@ const MEMORY_CONSTRAINS_DERIVED: &str = "(
     )
 )";
 
-pub const CURRENT_VERSION: i32 = 10;
+pub const CURRENT_VERSION: i32 = 11;
 
 /// A fact still asserts something only while BOTH are true: no successor took
 /// its slot, and its own interval has not been closed. `close_reason='stopped'`
@@ -1059,6 +1059,12 @@ impl SqliteStore {
             }
             if current < 10 {
                 s.migrate_v10()?;
+            }
+            // v11 is additive-only (D25): a new table and two indexes, no
+            // backfill and no row rewrite, so it takes no `VACUUM INTO`
+            // backup — that rule exists for migrations that rewrite rows.
+            if current < 11 {
+                s.migrate_v11()?;
             }
             if current != CURRENT_VERSION {
                 s.conn.execute(
