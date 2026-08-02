@@ -4,7 +4,7 @@ use crate::commands::usage::{cohere_rerank_cost_usd, estimated_tokens, gemini_em
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata, Scope, Verdict};
-use crate::read_surface::{self, RequestShape};
+use crate::read_surface;
 use crate::retrieval::{
     build_fts_query, hybrid_recall, render_answer_context, resolve_retrieval_backends, Filters,
     HybridParams, RecallMode, RetrievalProfile,
@@ -185,14 +185,8 @@ pub async fn run(
     // Same rule as `recall`: one boolean decides both `status` and `verdict`,
     // and an empty evidence pass says what it looked at rather than shrugging.
     let verdict = if results_json.is_empty() {
-        Verdict::NoMatch(read_surface::absence_from(
-            &stats,
-            searched_kbs,
-            RequestShape {
-                has_window: false,
-                has_diary_filter: diary != "*",
-            },
-        ))
+        let shape = crate::commands::recall::request_shape(&ctx.store, &diary, false)?;
+        Verdict::NoMatch(read_surface::absence_from(&stats, searched_kbs, shape))
     } else {
         Verdict::Results
     };

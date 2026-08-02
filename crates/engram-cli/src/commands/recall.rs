@@ -335,14 +335,8 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         stats.kbs_searched.clone()
     };
     let verdict = if empty {
-        Verdict::NoMatch(read_surface::absence_from(
-            &stats,
-            searched_kbs,
-            RequestShape {
-                has_window: since_dt.is_some() || until_dt.is_some(),
-                has_diary_filter: diary != "*",
-            },
-        ))
+        let shape = request_shape(&ctx.store, &diary, since_dt.is_some() || until_dt.is_some())?;
+        Verdict::NoMatch(read_surface::absence_from(&stats, searched_kbs, shape))
     } else {
         Verdict::Results
     };
@@ -394,6 +388,31 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         }
     });
     Ok(())
+}
+
+/// Which filter to blame for an empty read.
+///
+/// "The request carried a diary" is not the same claim as "the diary is why
+/// you got nothing": every recall carries a diary, because `--diary default`
+/// is the default. Blaming it unconditionally would tell a caller with an
+/// EMPTY store to go looking for a diary that never existed. So the diary is
+/// only named when the store actually holds memories somewhere else — two
+/// COUNT(*)s, and only on the path that already returned nothing.
+pub fn request_shape(
+    store: &SqliteStore,
+    diary: &str,
+    has_window: bool,
+) -> Result<RequestShape, CliError> {
+    let has_diary_filter = if diary == "*" {
+        false
+    } else {
+        store.count_memories_scoped(Some(diary), None)? == 0
+            && store.count_memories_scoped(None, None)? > 0
+    };
+    Ok(RequestShape {
+        has_window,
+        has_diary_filter,
+    })
 }
 
 /// The conflicts array plus the size of the backlog it was drawn from.
