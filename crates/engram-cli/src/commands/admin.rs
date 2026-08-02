@@ -52,6 +52,11 @@ pub fn rebuild(
         "events_replayed": report.events_replayed,
         "events_skipped_deleted_kb": report.events_skipped_deleted_kb,
         "conflicts_skipped_orphan": report.conflicts_skipped_orphan,
+        // [G8 + G9] Closes refused while replaying events this store did not
+        // write. A rebuild that quietly declines to do what its own journal
+        // asks, and reports the same numbers as one that complied, is the
+        // dishonest health check this module exists to avoid.
+        "close_authority_rejected": report.close_authority_rejected,
         "embeddings_restored": report.embeddings_restored,
         "skipped": skipped,
     });
@@ -77,6 +82,13 @@ pub fn rebuild(
             println!(
                 "  {orphans} queued conflict(s) skipped: their facts no longer exist, so the \
                  rows could not be reinserted"
+            );
+        }
+        let refused = data["close_authority_rejected"].as_u64().unwrap_or(0);
+        if refused > 0 {
+            println!(
+                "  {refused} imported close(s) refused: a safety interval never arrives closed \
+                 from outside this store, so those facts stay OPEN on every replay"
             );
         }
         // Printed on EVERY run. A rebuild that implies it restored things it

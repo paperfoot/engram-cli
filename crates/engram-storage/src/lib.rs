@@ -27,7 +27,7 @@ pub use jobs::{
     STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_QUEUED,
     STATUS_RUNNING,
 };
-pub use journal::{EventDraft, EventRow};
+pub use journal::{EventDraft, EventRow, Origin};
 pub use lessons::{LessonRow, LessonUpsert};
 pub use migrate_v10::MigrationV10Report;
 pub use rebuild::RebuildReport;
