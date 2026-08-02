@@ -348,3 +348,49 @@ R13 UserStated source kind (IN-26) · R14 ENGRAM_STORE everywhere, --store defer
   verbatim plus V2–V7 before wave 3 implementation begins.
 - Wave-2 GO conditions from §8 are hereby satisfied for storage-journal, contract-codegen, and
   write-surfaces' W1/W6 subset.
+
+## v2.2 addendum — release-gate fixes (binding, wave 6b)
+
+Codex Sol's release gate returned NO-GO with 7 blockers (docs/arch/review-final-codex-gate.md).
+These rulings pin the cross-lane shapes so the three fix lanes cannot diverge.
+
+**G1 — `ExplicitEnd` requires person-supplied provenance.** `CloseAuthority::ExplicitEnd` may be
+assigned ONLY when the observation's `source_kind` is `UserStated` or `UserConfirmed` (i.e. a
+caller-supplied `--facts-json` triple). An `AgentExtracted`/`CompileLlm` cessation carries
+`CloseAuthority::Heuristic { rule: "extractor_cessation" }` instead — which `may_close` already
+refuses on safety relations (so it queues for adjudication) and allows on non-safety ones (so
+"Bruno moved out of Lisbon" still works). The extractor's `state: "ended"` token is a HINT, never
+an authority: a model that hallucinates a cessation must not be able to retire a prescription.
+
+**G2 — imports validate what they cannot re-derive.** `import_v3` / `import_fact_row` reject a
+row where `valid_until < valid_from`, and refuse a SAFETY relation carrying a close authority
+outside {`explicit_end`, `caller`, `replayed_caller`} — such a row is imported OPEN with the
+close dropped, and the count is reported in `ImportV3Report.close_authority_rejected`. Event
+replay (`rebuild.rs`, `import_v3`'s event pass) applies the same rule. Migrated v9 history is
+unaffected: it is written by the migration, not by import.
+
+**G3 — decisions record their orientation.** `fact_decisions` gains
+`loser_object_norm TEXT` (nullable; NULL = a legacy or non-directional verdict).
+`record_decision` gains a `loser_object_norm: Option<&str>` parameter after `verdict`;
+`DecisionRow` and `engram_graph::DecisionRecord` both carry it. `replay()` applies a
+`CloseOld`/`RejectNew` verdict ONLY to the fact whose `object_norm` equals the recorded loser: if
+the pair arrives with reversed orientation the verdict is flipped to match, and if neither side
+matches the decision does not replay (the pair queues). The semantic key stays order-insensitive
+— it identifies the QUESTION; this field identifies the ANSWER.
+
+**G4 — a rebuild never destroys what it cannot recreate.** `admin rebuild` does not delete
+`fact_conflict_queue` rows whose facts are absent (orphans): it preserves them in place and
+reports `conflicts_preserved_orphan`. The byte-identical guarantee is stated over the rows the
+journal can reproduce, and the CHANGELOG says so.
+
+**G5 — `fact.observed` carries `confirmations`.** The payload gains the field; replay restores it
+instead of resetting to 0; the v10 migration emits the stored count. A rebuild that forgets how
+many times a fact was re-asserted has silently downgraded its own trust signal.
+
+**G6 — the extraction marker is welded like every other projection.** `write_fact_batch` calls
+`SqliteStore::record_derivation` (which appends `derivation.ran` in the same transaction), never
+the bare `record_fact_extraction`. The bare method becomes `pub(crate)` and is used only by the
+migration's genesis pass. Invariant 1 has no exceptions.
+
+**G7 — wire-error changes are declared.** `edit`, `facts resolve` and `jobs show` now answer
+`not_found` (was `bad_input`) on an absent uuid; the CHANGELOG's Breaking list names all three.
