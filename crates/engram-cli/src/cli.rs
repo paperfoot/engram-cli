@@ -317,6 +317,27 @@ Examples:
         cursor: Option<String>,
     },
 
+    /// Procedural memory: what the WORK taught us, not what is true.
+    #[command(subcommand)]
+    Lessons(LessonsCommand),
+
+    /// Propose lessons from the decision journal and your corrections.
+    Reflect {
+        /// Knowledge base/domain namespace.
+        #[arg(long, default_value = "default")]
+        kb: String,
+        /// Scan events at or after this instant (RFC3339 or YYYY-MM-DD).
+        /// Without it, resume from the last run's high-water mark.
+        #[arg(long)]
+        since: Option<String>,
+        /// Max journal events to scan in one pass.
+        #[arg(long, default_value_t = 2000)]
+        window: usize,
+        /// Print the candidates and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Re-embed chunks with the active embedding model/profile.
     Reindex {
         /// Knowledge base/domain namespace.
@@ -766,6 +787,68 @@ pub enum JobsCommand {
     },
     /// Show one job.
     Show { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LessonsCommand {
+    /// Record a lesson about the work. Written already confirmed: a human who
+    /// typed the sentence has confirmed it.
+    Add {
+        /// What to do next time.
+        lesson: String,
+        /// When it applies: a slug, `[a-z0-9_]{1,64}`.
+        #[arg(long)]
+        trigger: String,
+        /// Knowledge base/domain namespace.
+        #[arg(long, default_value = "default")]
+        kb: String,
+        /// Diary the recallable twin lands in. `default`, because `recall`
+        /// defaults there too and a lesson nobody recalls is a silo.
+        #[arg(long, default_value = "default")]
+        diary: String,
+        /// Journal event this lesson came from. Repeatable.
+        #[arg(long)]
+        evidence: Vec<String>,
+        /// Override the recorded confidence (0.0..=1.0).
+        #[arg(long)]
+        confidence: Option<f32>,
+        /// Embed the twin with the deterministic offline stub.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// List lessons. Retired ones are excluded unless asked for by name.
+    #[command(visible_aliases = ["ls"])]
+    List {
+        /// Knowledge base/domain namespace, or "*" for all.
+        #[arg(long, default_value = "*")]
+        kb: String,
+        /// Only this trigger.
+        #[arg(long)]
+        trigger: Option<String>,
+        /// proposed | confirmed | retired.
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Opaque page token from a previous response.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Promote a proposed lesson and make it recallable.
+    Confirm {
+        id: String,
+        #[arg(long)]
+        note: Option<String>,
+        /// Embed the twin with the deterministic offline stub.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Take a lesson out of the default listing. Never deletes it.
+    Retract {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -61,7 +61,7 @@ fn parse_handle(raw: &str) -> Result<Handle, CliError> {
         HandleParseError::BadUuid(_) => CliError::BadInput(format!("invalid UUID {raw}: {e}")),
         HandleParseError::UnknownKind(p) => CliError::BadInput(format!(
             "unknown id kind `{p}`: expected one of mem, chunk, fact, conflict, entity, doc, \
-             job, event"
+             job, event, lesson, wiki"
         )),
     })
 }

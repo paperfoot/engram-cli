@@ -36,7 +36,7 @@ pub const SCHEMA_V11: &str = r#"
 CREATE TABLE IF NOT EXISTS lessons (
     id            TEXT PRIMARY KEY,
     kb            TEXT NOT NULL DEFAULT 'default',
-    diary         TEXT NOT NULL DEFAULT 'lessons',
+    diary         TEXT NOT NULL DEFAULT 'default',
     trigger       TEXT NOT NULL,
     lesson        TEXT NOT NULL,
     lesson_norm   TEXT NOT NULL,
@@ -175,12 +175,23 @@ impl SqliteStore {
                 .optional()?;
             match existing {
                 Some(mut prior) => {
+                    let mut new_evidence = false;
                     for id in &row.evidence {
                         if !prior.evidence.contains(id) {
                             prior.evidence.push(*id);
+                            new_evidence = true;
                         }
                     }
-                    prior.occurrences += 1;
+                    // THE COUNTER MEANS "learned again", not "written again".
+                    // A reflection pass re-reading a window it already read
+                    // brings no new evidence, and bumping the count there
+                    // would inflate every lesson on a schedule — the counter
+                    // would measure how often the job ran. Evidence-free
+                    // lessons (a human typing the same sentence twice) always
+                    // count: the person IS the new occurrence.
+                    if new_evidence || row.evidence.is_empty() {
+                        prior.occurrences += 1;
+                    }
                     prior.updated_at = row.updated_at;
                     // A twin written on a later pass is still this lesson's
                     // twin; a twin already recorded is never overwritten.

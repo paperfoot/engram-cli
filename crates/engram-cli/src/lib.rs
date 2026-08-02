@@ -1,5 +1,11 @@
 //! engram-cli — library half of the binary, makes commands testable.
 
+// `agent_info`'s manifest is one `json!` literal and every command adds a
+// level of macro recursion to it. The default limit of 128 is reached at the
+// size the manifest already is, so a new command otherwise fails to compile
+// for a reason that names neither the command nor the manifest.
+#![recursion_limit = "512"]
+
 pub mod agent_info;
 pub mod cli;
 pub mod commands;
@@ -14,8 +20,8 @@ pub mod retrieval;
 
 use crate::cli::{
     AdminCommand, BudgetCommand, ChunksCommand, Cli, Command, ConfigCommand, DocumentsCommand,
-    EntitiesCommand, FactsCommand, GraphCommand, JobsCommand, KbCommand, MemoryCommand,
-    PeopleCommand,
+    EntitiesCommand, FactsCommand, GraphCommand, JobsCommand, KbCommand, LessonsCommand,
+    MemoryCommand, PeopleCommand,
 };
 use crate::error::CliError;
 
@@ -212,6 +218,65 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 include_closed,
                 limit,
                 cursor,
+            },
+        ),
+        Command::Lessons(sub) => match sub {
+            LessonsCommand::Add {
+                lesson,
+                trigger,
+                kb,
+                diary,
+                evidence,
+                confidence,
+                offline,
+            } => {
+                commands::lessons::add(
+                    &ctx,
+                    commands::lessons::AddArgs {
+                        lesson,
+                        trigger,
+                        kb,
+                        diary,
+                        evidence,
+                        confidence,
+                        offline,
+                    },
+                )
+                .await
+            }
+            LessonsCommand::List {
+                kb,
+                trigger,
+                status,
+                limit,
+                cursor,
+            } => commands::lessons::list(
+                &ctx,
+                commands::lessons::ListArgs {
+                    kb,
+                    trigger,
+                    status,
+                    limit,
+                    cursor,
+                },
+            ),
+            LessonsCommand::Confirm { id, note, offline } => {
+                commands::lessons::confirm(&ctx, id, note, offline).await
+            }
+            LessonsCommand::Retract { id, reason } => commands::lessons::retract(&ctx, id, reason),
+        },
+        Command::Reflect {
+            kb,
+            since,
+            window,
+            dry_run,
+        } => commands::reflect::run(
+            &ctx,
+            commands::reflect::ReflectArgs {
+                kb,
+                since,
+                window,
+                dry_run,
             },
         ),
         Command::Reindex { kb, all, offline } => {
