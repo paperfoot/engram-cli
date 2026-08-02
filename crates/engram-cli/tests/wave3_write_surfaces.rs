@@ -929,6 +929,12 @@ fn the_duplicate_content_path_stamps_the_same_source_kind() {
     );
     assert_eq!(v["data"]["deduplicated"], true);
     assert_eq!(v["data"]["facts_source_kind"], "user_stated");
+    // The dedup answer names another memory's id, which is exactly where a
+    // bare uuid gets copied into the next command — so it carries a handle.
+    assert_eq!(
+        v["data"]["handle"],
+        format!("mem:{}", v["data"]["id"].as_str().unwrap())
+    );
 
     let rows = facts(dir.path());
     assert_eq!(rows, vec![("Ana".to_string(), "user_stated".to_string())]);

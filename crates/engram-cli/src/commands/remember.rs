@@ -281,12 +281,17 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             let mut meta = Metadata::default();
             meta.add("deduplicated", true);
             meta.add("existing_id", existing.to_string());
+            // The dedup path answers with SOMEONE ELSE'S id, which is exactly
+            // where a bare uuid is most likely to be copied into the next
+            // command — so it carries the typed handle too.
+            meta.add("handle", crate::commands::memory::render_handle(existing));
             meta.add("facts_added", outcome.added);
             meta.add("facts_source_kind", facts_source_kind);
             print_success(
                 ctx.format,
                 json!({
                     "id": existing.to_string(),
+                    "handle": crate::commands::memory::render_handle(existing),
                     "stored": false,
                     "deduplicated": true,
                     "kb": kb,
