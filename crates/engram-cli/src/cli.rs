@@ -605,6 +605,10 @@ pub enum DocumentsCommand {
         /// Max documents to return.
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Opaque continuation token from a previous page's `cursor`. Do not
+        /// construct or parse it; pass it back verbatim.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Show one document.
     Show { id: String },
@@ -796,6 +800,10 @@ pub enum PeopleCommand {
         /// Minimum mention count filter.
         #[arg(long, default_value_t = 1)]
         min_mentions: u32,
+        /// Opaque continuation token from a previous page's `cursor`. Do not
+        /// construct or parse it; pass it back verbatim.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Show one person: aliases, relations with provenance, and the memories
     /// that mention them.
@@ -826,6 +834,10 @@ pub enum EntitiesCommand {
         /// Knowledge base/domain namespace. Pass "*" for all.
         #[arg(long, default_value = "default")]
         kb: String,
+        /// Opaque continuation token from a previous page's `cursor`. Do not
+        /// construct or parse it; pass it back verbatim.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Show details for one entity.
     #[command(visible_aliases = ["get"])]
@@ -861,6 +873,11 @@ pub enum FactsCommand {
         /// Max facts to return.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Opaque continuation token from a previous page's `cursor`. Do not
+        /// construct or parse it; pass it back verbatim. A cursor is valid
+        /// only on the surface and scope that issued it.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Show every fact (active + historic) about a subject.
     #[command(visible_aliases = ["get"])]
@@ -901,6 +918,10 @@ Examples:
         /// Implies --open: the supersession history is not subject-indexed.
         #[arg(long)]
         subject: Option<String>,
+        /// Opaque continuation token from a previous page's `cursor`. Do not
+        /// construct or parse it; pass it back verbatim.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Re-classify ALREADY-QUEUED conflicts and auto-resolve the ones today's
     /// write path would never have queued (second values of multi-valued

@@ -8,7 +8,9 @@
 
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::output::{print_success, Metadata};
+use crate::output::{print_success, Listing, Metadata, Scope};
+use crate::read_surface::{self, CursorKey, Provenance};
+use engram_core::handle::HandleKind;
 use engram_storage::{EntityRecord, RelationRecord};
 use serde_json::{json, Value};
 
@@ -17,12 +19,41 @@ const LIST_RELATIONS: usize = 5;
 /// Upper bound on relations pulled for one person in the show view.
 const SHOW_RELATIONS: usize = 200;
 
-pub fn list(ctx: &AppContext, kb: String, limit: usize, min_mentions: u32) -> Result<(), CliError> {
+pub fn list(
+    ctx: &AppContext,
+    kb: String,
+    limit: usize,
+    min_mentions: u32,
+    cursor: Option<String>,
+) -> Result<(), CliError> {
     let kb_filter = if kb == "*" { None } else { Some(kb.as_str()) };
-    let people = ctx.store.list_entities_by_kind(
+    let key = CursorKey::new(
+        "people.list",
+        &[
+            ("kb", kb_filter),
+            ("min_mentions", Some(&min_mentions.to_string())),
+        ],
+    );
+    let offset = match &cursor {
+        Some(raw) => read_surface::decode_cursor(raw, &key)?,
+        None => 0,
+    };
+    // Over-fetch and skip: `list_entities_by_kind` has no OFFSET yet.
+    let people: Vec<_> = ctx
+        .store
+        .list_entities_by_kind(
+            kb_filter,
+            engram_graph::people::KIND_PERSON,
+            limit.saturating_add(offset),
+            min_mentions,
+        )?
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect();
+    let total = ctx.store.count_entities_by_kind(
         kb_filter,
         engram_graph::people::KIND_PERSON,
-        limit,
         min_mentions,
     )?;
 
@@ -34,6 +65,8 @@ pub fn list(ctx: &AppContext, kb: String, limit: usize, min_mentions: u32) -> Re
         let ranked = rank_relations(&person.canonical_name, relations);
         rows.push(json!({
             "name": person.canonical_name,
+            "entity_id": person.id.to_string(),
+            "handle": read_surface::handle(HandleKind::Entity, person.id),
             "kb": person.kb,
             "aliases": person.aliases,
             "mentions": person.mention_count,
@@ -49,47 +82,64 @@ pub fn list(ctx: &AppContext, kb: String, limit: usize, min_mentions: u32) -> Re
     let mut meta = Metadata::default();
     meta.add("kb", kb.clone());
     meta.add("people", rows.len());
-    print_success(
-        ctx.format,
-        json!({ "kb": kb, "people": rows }),
-        meta,
-        |data| {
-            let Some(arr) = data.get("people").and_then(|v| v.as_array()) else {
-                return;
-            };
-            if arr.is_empty() {
-                println!("(no people yet — run `engram compile --kb <kb> --all`)");
-                return;
-            }
-            for person in arr {
-                let name = person["name"].as_str().unwrap_or("");
-                let mentions = person["mentions"].as_u64().unwrap_or(0);
-                let aliases = person["aliases"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                if aliases.is_empty() {
-                    println!("{mentions:5}  {name}");
-                } else {
-                    println!("{mentions:5}  {name}  (aka {aliases})");
-                }
-                for edge in person["top_relations"].as_array().into_iter().flatten() {
-                    println!(
-                        "         {} -> {}",
-                        edge["predicate"].as_str().unwrap_or(""),
-                        edge["other"].as_str().unwrap_or("")
-                    );
-                }
-            }
-            println!();
-            println!("{} people", arr.len());
+    Scope::undiaried(
+        vec![kb.clone()],
+        if kb_filter.is_some() {
+            "flag"
+        } else {
+            "all_kbs"
         },
-    );
+    )
+    .attach(&mut meta);
+    let Value::Object(mut payload) = json!({ "kb": kb, "people": rows }) else {
+        unreachable!("json! object literal");
+    };
+    Listing::page(
+        people.len(),
+        total,
+        read_surface::next_cursor(&key, offset, people.len(), total),
+    )
+    .attach(&mut payload);
+    print_success(ctx.format, Value::Object(payload), meta, |data| {
+        let Some(arr) = data.get("people").and_then(|v| v.as_array()) else {
+            return;
+        };
+        if arr.is_empty() {
+            println!("(no people yet — run `engram compile --kb <kb> --all`)");
+            return;
+        }
+        for person in arr {
+            let name = person["name"].as_str().unwrap_or("");
+            let mentions = person["mentions"].as_u64().unwrap_or(0);
+            let aliases = person["aliases"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            if aliases.is_empty() {
+                println!("{mentions:5}  {name}");
+            } else {
+                println!("{mentions:5}  {name}  (aka {aliases})");
+            }
+            for edge in person["top_relations"].as_array().into_iter().flatten() {
+                println!(
+                    "         {} -> {}",
+                    edge["predicate"].as_str().unwrap_or(""),
+                    edge["other"].as_str().unwrap_or("")
+                );
+            }
+        }
+        println!();
+        println!(
+            "{} of {} people",
+            arr.len(),
+            data["total"].as_i64().unwrap_or(arr.len() as i64)
+        );
+    });
     Ok(())
 }
 
@@ -384,6 +434,17 @@ fn memory_snippets(
         out.push(json!({
             "memory_id": chunk.memory_id.to_string(),
             "chunk_id": chunk.chunk_id.to_string(),
+            // The same handle and chain every other surface publishes, so a
+            // caller can hand this row to `edit` without a second lookup.
+            "handle": read_surface::handle(HandleKind::Memory, chunk.memory_id),
+            "provenance": Provenance {
+                chunk_id: Some(chunk.chunk_id),
+                memory_id: Some(chunk.memory_id),
+                document_id: chunk.document_id,
+                kb: Some(chunk.kb.clone()),
+                diary: Some(chunk.diary.clone()),
+                ..Default::default()
+            }.to_json(),
             "source": chunk.source,
             "snippet": snippet(&chunk.content),
         }));

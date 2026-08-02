@@ -8,7 +8,9 @@
 
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::output::{print_success, Metadata};
+use crate::output::{print_success, Listing, Metadata, Scope};
+use crate::read_surface;
+use engram_core::handle::HandleKind;
 use engram_graph::expand::{expand_entity_names, expand_seeds_top_n, GraphEdge};
 use engram_graph::people::KIND_PERSON;
 use engram_storage::RelationRecord;
@@ -120,6 +122,10 @@ pub fn neighbors(
                 .cmp(b.1["name"].as_str().unwrap_or(""))
         })
     });
+    // The neighbourhood BEFORE the cap is the honest total: a caller that saw
+    // ten neighbours had no way to know whether the graph had eleven or two
+    // hundred.
+    let neighbors_total = nodes.len() as i64;
     let neighbors: Vec<Value> = nodes
         .into_iter()
         .map(|(_, node)| node)
@@ -137,53 +143,61 @@ pub fn neighbors(
     meta.add("people", people);
     meta.add("hops", hops);
     meta.add("min_weight", min_weight);
-    print_success(
-        ctx.format,
-        json!({
-            "kb": kb,
-            "entity": name,
-            "resolved": seed.as_ref().map(|e| json!({
-                "name": e.canonical_name,
-                "kind": e.kind,
-                "aliases": e.aliases,
-                "mentions": e.mention_count,
-            })),
-            "hops": hops,
-            "min_weight": min_weight,
-            "neighbors": neighbors,
-            "relations": relations,
-        }),
-        meta,
-        |data| {
-            let entity = data["resolved"]["name"]
-                .as_str()
-                .unwrap_or_else(|| data["entity"].as_str().unwrap_or(""));
-            let kind = data["resolved"]["kind"].as_str().unwrap_or("unknown");
-            println!("{entity}  ({kind})");
-            let Some(list) = data["neighbors"].as_array() else {
-                return;
-            };
-            if list.is_empty() {
-                println!("(no neighbors)");
-                return;
-            }
-            for node in list {
+    Scope::undiaried(vec![kb.clone()], "flag").attach(&mut meta);
+    let Value::Object(mut payload) = json!({
+        "kb": kb,
+        "entity": name,
+        "resolved": seed.as_ref().map(|e| json!({
+            "name": e.canonical_name,
+            "kind": e.kind,
+            "aliases": e.aliases,
+            "mentions": e.mention_count,
+            "entity_id": e.id.to_string(),
+            "handle": read_surface::handle(HandleKind::Entity, e.id),
+        })),
+        "hops": hops,
+        "min_weight": min_weight,
+        "neighbors": neighbors,
+        "relations": relations,
+        // The edge list is not capped; the neighbour list is. Counting them
+        // together would repeat the count-means-page defect one field over.
+        "relations_returned": relations.len(),
+        "relations_total": relations.len() as i64,
+    }) else {
+        unreachable!("json! object literal");
+    };
+    // No cursor: the walk is ranked by graph distance, not paged, and a cursor
+    // would promise a stable offset the BFS does not have.
+    Listing::page(neighbors.len(), neighbors_total, None).attach(&mut payload);
+    print_success(ctx.format, Value::Object(payload), meta, |data| {
+        let entity = data["resolved"]["name"]
+            .as_str()
+            .unwrap_or_else(|| data["entity"].as_str().unwrap_or(""));
+        let kind = data["resolved"]["kind"].as_str().unwrap_or("unknown");
+        println!("{entity}  ({kind})");
+        let Some(list) = data["neighbors"].as_array() else {
+            return;
+        };
+        if list.is_empty() {
+            println!("(no neighbors)");
+            return;
+        }
+        for node in list {
+            println!(
+                "  {}  [{}]",
+                node["name"].as_str().unwrap_or(""),
+                node["kind"].as_str().unwrap_or("")
+            );
+            for relation in node["relations"].as_array().into_iter().flatten() {
                 println!(
-                    "  {}  [{}]",
-                    node["name"].as_str().unwrap_or(""),
-                    node["kind"].as_str().unwrap_or("")
+                    "      {} — {} -> {}",
+                    relation["subject"].as_str().unwrap_or(""),
+                    relation["predicate"].as_str().unwrap_or(""),
+                    relation["object"].as_str().unwrap_or("")
                 );
-                for relation in node["relations"].as_array().into_iter().flatten() {
-                    println!(
-                        "      {} — {} -> {}",
-                        relation["subject"].as_str().unwrap_or(""),
-                        relation["predicate"].as_str().unwrap_or(""),
-                        relation["object"].as_str().unwrap_or("")
-                    );
-                }
             }
-        },
-    );
+        }
+    });
     Ok(())
 }
 

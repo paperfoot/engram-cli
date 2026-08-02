@@ -18,11 +18,20 @@
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_write::{
-    classify_pair, is_safety_slot, predicate_arity, write_fact_batch, Autonomy, ClassifyMode,
-    ConflictClass, FactBatch, FactExtractionMarker, FactWriteCtx, FactWriteOutcome, LegacyArity,
-    MemoryTime, Verdict,
+    classify_pair, write_fact_batch, Autonomy, ClassifyMode, ConflictClass, FactBatch,
+    FactExtractionMarker, FactWriteCtx, FactWriteOutcome, MemoryTime, Verdict,
 };
-use crate::output::{print_success, Metadata};
+use crate::output::{print_success, Listing, Metadata, Scope};
+use crate::read_surface::{self, CursorKey};
+use crate::respond;
+use engram_core::handle::HandleKind;
+use engram_core::interval::is_open_fact;
+// R3/CM-4: `Arity` in this file is the registry's two-shape arity and nothing
+// else. The legacy single/multi projection keeps a legacy NAME at every call
+// site, so a reader never has to ask which `Arity` they are looking at.
+use engram_core::relations::{
+    canonical_relation, is_safety_slot, predicate_arity, relation_spec, Arity, LegacyArity,
+};
 use engram_core::types::{Fact, SourceKind};
 use engram_embed::stub::StubEmbedder;
 use engram_embed::Embedder;
@@ -48,6 +57,7 @@ pub fn list(
     kb: Option<String>,
     all: bool,
     limit: usize,
+    cursor: Option<String>,
 ) -> Result<(), CliError> {
     let kb_label = kb
         .as_deref()
@@ -60,27 +70,49 @@ pub fn list(
     } else {
         Some(kb_label.as_str())
     };
-    let facts = match subject {
-        Some(s) => {
-            let s_norm = normalize(&s);
-            let diary_filter = if diary == "*" {
-                None
-            } else {
-                Some(diary.as_str())
-            };
-            ctx.store
-                .list_facts_by_subject_scoped(&s_norm, diary_filter, kb_filter, all)?
+    let diary_filter = if diary == "*" {
+        None
+    } else {
+        Some(diary.as_str())
+    };
+    let subject_norm = subject.as_deref().map(normalize);
+    // The cursor is bound to the filters that produced it: paging a different
+    // scope at the same offset is a wrong answer that looks like a right one.
+    let key = CursorKey::new(
+        "facts.list",
+        &[
+            ("kb", kb_filter),
+            ("diary", diary_filter),
+            ("subject", subject_norm.as_deref()),
+            ("all", Some(if all { "1" } else { "0" })),
+        ],
+    );
+    let offset = match &cursor {
+        Some(raw) => read_surface::decode_cursor(raw, &key)?,
+        None => 0,
+    };
+    let (facts, total, cursor_out) = match &subject_norm {
+        // The subject query is UNBOUNDED in storage today — no limit, no
+        // offset — so it returns everything and says so rather than
+        // pretending to have paged. `total == returned` here is the honest
+        // answer, not a coincidence.
+        Some(s_norm) => {
+            let rows =
+                ctx.store
+                    .list_facts_by_subject_scoped(s_norm, diary_filter, kb_filter, all)?;
+            let total = rows.len() as i64;
+            (rows, total, None)
         }
         None => {
-            let diary_filter = if diary == "*" {
-                None
-            } else {
-                Some(diary.as_str())
-            };
-            ctx.store
-                .list_facts_scoped(diary_filter, kb_filter, all, limit, 0)?
+            let rows = ctx
+                .store
+                .list_facts_scoped(diary_filter, kb_filter, all, limit, offset)?;
+            let total = ctx.store.count_facts_scoped(diary_filter, kb_filter, all)?;
+            let next = read_surface::next_cursor(&key, offset, rows.len(), total);
+            (rows, total, next)
         }
     };
+    let listing = Listing::page(facts.len(), total, cursor_out);
 
     let fact_kbs = ctx
         .store
@@ -92,52 +124,83 @@ pub fn list(
     };
 
     let diary_scope = if diary == "*" { "all_diaries" } else { "flag" };
-    let payload = json!({
+    let kb_scope = if kb_filter.is_some() {
+        "flag"
+    } else {
+        "all_kbs"
+    };
+    let serde_json::Value::Object(mut payload) = json!({
         "kb": kb_label,
-        "kb_scope": if kb_filter.is_some() { "flag" } else { "all_kbs" },
+        "kb_scope": kb_scope,
         "diary": diary,
         "diary_scope": diary_scope,
-        "count": facts.len(),
         "facts": facts.iter().map(labelled).collect::<Vec<_>>(),
-    });
+    }) else {
+        unreachable!("json! object literal");
+    };
+    // `count` stays and still equals the page length; `total` is the number
+    // of facts that match in scope. A caller that saw `count: 50` had no way
+    // to know whether there were 50 facts or 5,000.
+    listing.attach(&mut payload);
+    let empty = facts.is_empty();
+    if empty {
+        crate::output::Verdict::NoMatch(read_surface::absence_for_listing(
+            vec![kb_label.clone()],
+            "no_chunks_in_scope",
+        ))
+        .attach(&mut payload);
+    } else {
+        crate::output::Verdict::Results.attach(&mut payload);
+    }
 
     let mut meta = Metadata::default();
     meta.add("kb", kb_label.clone());
-    meta.add(
-        "kb_scope",
-        if kb_filter.is_some() {
-            "flag"
-        } else {
-            "all_kbs"
-        },
-    );
+    meta.add("kb_scope", kb_scope);
     meta.add("diary", diary.clone());
     meta.add("diary_scope", diary_scope);
-    print_success(ctx.format, payload, meta, |data| {
-        let rows = data["facts"].as_array().cloned().unwrap_or_default();
-        if rows.is_empty() {
-            println!("(no facts)");
-            return;
-        }
-        for f in &rows {
-            let status = if f["superseded_by"].is_null() {
-                ""
-            } else {
-                " [superseded]"
-            };
+    Scope::listing(vec![kb_label.clone()], diary.clone(), kb_scope).attach(&mut meta);
+    print_success(
+        ctx.format,
+        serde_json::Value::Object(payload),
+        meta,
+        |data| {
+            let rows = data["facts"].as_array().cloned().unwrap_or_default();
+            if rows.is_empty() {
+                println!("(no facts)");
+                return;
+            }
+            for f in &rows {
+                // A stopped medication must not print as an active one: the
+                // label follows `open`, and names the reason it closed.
+                let status = if f["open"] == json!(true) {
+                    String::new()
+                } else {
+                    format!(
+                        " [closed: {}]",
+                        f["close_reason"].as_str().unwrap_or("unknown")
+                    )
+                };
+                println!(
+                    "  [{}] {} -- {} -> {}  (conf={:.2}){}",
+                    f["kb"].as_str().unwrap_or("?"),
+                    f["subject"].as_str().unwrap_or(""),
+                    f["predicate"].as_str().unwrap_or(""),
+                    f["object"].as_str().unwrap_or(""),
+                    f["confidence"].as_f64().unwrap_or(0.0),
+                    status
+                );
+            }
+            println!();
             println!(
-                "  [{}] {} -- {} -> {}  (conf={:.2}){}",
-                f["kb"].as_str().unwrap_or("?"),
-                f["subject"].as_str().unwrap_or(""),
-                f["predicate"].as_str().unwrap_or(""),
-                f["object"].as_str().unwrap_or(""),
-                f["confidence"].as_f64().unwrap_or(0.0),
-                status
+                "{} of {} facts",
+                rows.len(),
+                data["total"].as_i64().unwrap_or(rows.len() as i64)
             );
-        }
-        println!();
-        println!("{} facts", rows.len());
-    });
+            if let Some(c) = data["cursor"].as_str() {
+                println!("more: engram facts list --cursor {c}");
+            }
+        },
+    );
     Ok(())
 }
 
@@ -153,20 +216,39 @@ pub fn show(ctx: &AppContext, subject: String, diary: String, kb: String) -> Res
         .store
         .list_facts_by_subject_scoped(&s_norm, diary_filter, kb_filter, true)?;
 
-    let active: Vec<&Fact> = facts.iter().filter(|f| f.superseded_by.is_none()).collect();
-    let historic: Vec<&Fact> = facts.iter().filter(|f| f.superseded_by.is_some()).collect();
+    // THE SWEEP. `superseded_by.is_none()` called a stopped medication
+    // active: closing an interval with reason `stopped` leaves no successor,
+    // so the old test read the row as current and the store answered from it.
+    let active: Vec<&Fact> = facts.iter().filter(|f| is_open_fact(f)).collect();
+    let historic: Vec<&Fact> = facts.iter().filter(|f| !is_open_fact(f)).collect();
 
+    // `show` is unlimited by construction, so `total == returned` on both
+    // arrays — said out loud rather than left for a caller to assume.
     let payload = json!({
         "subject": subject,
         "subject_norm": s_norm,
         "kb": kb,
         "active_count": active.len(),
         "historic_count": historic.len(),
+        "returned": active.len() + historic.len(),
+        "total": (active.len() + historic.len()) as i64,
+        "count": active.len() + historic.len(),
         "active":  active.iter().map(|f| fact_to_json(f)).collect::<Vec<_>>(),
         "historic": historic.iter().map(|f| fact_to_json(f)).collect::<Vec<_>>(),
     });
 
-    print_success(ctx.format, payload, Metadata::default(), |_| {
+    let mut meta = Metadata::default();
+    Scope::listing(
+        vec![kb.clone()],
+        diary.clone(),
+        if kb_filter.is_some() {
+            "flag"
+        } else {
+            "all_kbs"
+        },
+    )
+    .attach(&mut meta);
+    print_success(ctx.format, payload, meta, |_| {
         if facts.is_empty() {
             println!("(no facts about {})", subject);
             return;
@@ -180,15 +262,22 @@ pub fn show(ctx: &AppContext, subject: String, diary: String, kb: String) -> Res
         }
         if !historic.is_empty() {
             println!();
-            println!("History (superseded):");
+            println!("History (closed intervals):");
             for f in &historic {
+                // `valid_until` first: it is when the state ENDED.
+                // `superseded_at` is a transaction timestamp and only ever a
+                // fallback for rows written before the interval columns.
                 let when = f
-                    .superseded_at
+                    .valid_until
+                    .or(f.superseded_at)
                     .map(|t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%d").to_string())
                     .unwrap_or_else(|| "?".into());
                 println!(
-                    "  {} -> {}  (was true until {})",
-                    f.predicate, f.object, when
+                    "  {} -> {}  (was true until {}; {})",
+                    f.predicate,
+                    f.object,
+                    when,
+                    f.close_reason.as_deref().unwrap_or("closed")
                 );
             }
         }
@@ -203,20 +292,39 @@ pub fn conflicts(
     diary: Option<String>,
     kb: Option<String>,
     subject: Option<String>,
+    cursor: Option<String>,
 ) -> Result<(), CliError> {
     // A subject filter only means something for the queue — the supersession
     // history is a chronological ledger, not a per-person view.
     if open || subject.is_some() {
-        return open_conflicts(ctx, limit, diary, kb, subject);
+        return open_conflicts(ctx, limit, diary, kb, subject, cursor);
     }
+    let key = CursorKey::new(
+        "facts.conflicts",
+        &[("kb", kb.as_deref()), ("diary", diary.as_deref())],
+    );
+    let offset = match &cursor {
+        Some(raw) => read_surface::decode_cursor(raw, &key)?,
+        None => 0,
+    };
+    // The history view accepted --kb and --diary and ignored both. It reads
+    // them now, which NARROWS what a scoped caller sees; the narrowing is the
+    // fix, and `metadata.scope` says which scope produced the answer.
     let pairs = ctx
         .store
-        .list_recent_conflicts(diary.as_deref(), kb.as_deref(), limit, 0)?;
+        .list_recent_conflicts(diary.as_deref(), kb.as_deref(), limit, offset)?;
+    let total = ctx
+        .store
+        .count_recent_conflicts(diary.as_deref(), kb.as_deref())?;
+    let listing = Listing::page(
+        pairs.len(),
+        total,
+        read_surface::next_cursor(&key, offset, pairs.len(), total),
+    );
     let open_count = ctx
         .store
         .count_open_fact_conflicts(diary.as_deref(), kb.as_deref())?;
-    let payload = json!({
-        "count": pairs.len(),
+    let serde_json::Value::Object(mut payload) = json!({
         "conflicts": pairs.iter().map(|(old, new)| json!({
             "subject": old.subject,
             "predicate": old.predicate,
@@ -235,8 +343,18 @@ pub fn conflicts(
         } else {
             None
         },
-    });
-    print_success(ctx.format, payload, Metadata::default(), |_| {
+    }) else {
+        unreachable!("json! object literal");
+    };
+    listing.attach(&mut payload);
+    let mut meta = Metadata::default();
+    Scope::listing(
+        vec![kb.clone().unwrap_or_else(|| "*".into())],
+        diary.clone().unwrap_or_else(|| "*".into()),
+        if kb.is_some() { "flag" } else { "all_kbs" },
+    )
+    .attach(&mut meta);
+    print_success(ctx.format, serde_json::Value::Object(payload), meta, |_| {
         if pairs.is_empty() {
             println!("(no conflicts recorded)");
         }
@@ -252,7 +370,7 @@ pub fn conflicts(
         }
         if !pairs.is_empty() {
             println!();
-            println!("{} conflicts", pairs.len());
+            println!("{} of {total} conflicts", pairs.len());
         }
         if open_count > 0 {
             println!(
@@ -275,13 +393,26 @@ fn open_conflicts(
     diary: Option<String>,
     kb: Option<String>,
     subject: Option<String>,
+    cursor: Option<String>,
 ) -> Result<(), CliError> {
+    let key = CursorKey::new(
+        "facts.conflicts.open",
+        &[
+            ("kb", kb.as_deref()),
+            ("diary", diary.as_deref()),
+            ("subject", subject.as_deref()),
+        ],
+    );
+    let offset = match &cursor {
+        Some(raw) => read_surface::decode_cursor(raw, &key)?,
+        None => 0,
+    };
     let rows = ctx.store.list_open_fact_conflicts_with_facts(
         diary.as_deref(),
         kb.as_deref(),
         subject.as_deref(),
         limit,
-        0,
+        offset,
     )?;
     let total_open = ctx
         .store
@@ -302,8 +433,14 @@ fn open_conflicts(
         .filter(|e| e["triage"]["auto_resolvable"] == json!(true))
         .count();
 
-    let payload = json!({
-        "count": entries.len(),
+    let overridden = entries
+        .iter()
+        .filter(|e| e["suggested_action_overridden"] == json!(true))
+        .count();
+    let serde_json::Value::Object(mut payload) = json!({
+        // `total_open` was already the honest backlog here; `total` is the
+        // canonical spelling of the same number, and `count` stays equal to
+        // the page.
         "total_open": total_open,
         "kb": kb.clone().unwrap_or_else(|| "*".into()),
         "subject": subject,
@@ -312,42 +449,63 @@ fn open_conflicts(
         "groups": groups,
         // Flat list kept for callers written against the original shape.
         "open_conflicts": entries.clone(),
-    });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
-        if entries.is_empty() {
-            println!("(no open conflicts — nothing awaiting resolution)");
-            return;
-        }
-        for g in data["groups"].as_array().cloned().unwrap_or_default() {
-            println!(
-                "{} — {} [{}] ({} open{})",
-                g["subject"].as_str().unwrap_or("?"),
-                g["predicate"].as_str().unwrap_or("?"),
-                g["kb"].as_str().unwrap_or("?"),
-                g["conflict_count"].as_u64().unwrap_or(0),
-                if g["safety_slot"] == json!(true) {
-                    ", safety slot"
-                } else {
-                    ""
-                },
-            );
-            for e in g["conflicts"].as_array().cloned().unwrap_or_default() {
-                println!(
-                    "  {}  '{}' vs '{}'  ({})",
-                    e["conflict_id"].as_str().unwrap_or("?"),
-                    e["old"]["object"].as_str().unwrap_or("?"),
-                    e["new"]["object"].as_str().unwrap_or("?"),
-                    e["triage"]["rule"].as_str().unwrap_or("?"),
-                );
+    }) else {
+        unreachable!("json! object literal");
+    };
+    Listing::page(
+        entries.len(),
+        total_open,
+        read_surface::next_cursor(&key, offset, entries.len(), total_open),
+    )
+    .attach(&mut payload);
+    let mut meta = Metadata::default();
+    meta.suggested_action_overridden(overridden);
+    Scope::listing(
+        vec![kb.clone().unwrap_or_else(|| "*".into())],
+        diary.clone().unwrap_or_else(|| "*".into()),
+        if kb.is_some() { "flag" } else { "all_kbs" },
+    )
+    .attach(&mut meta);
+    print_success(
+        ctx.format,
+        serde_json::Value::Object(payload),
+        meta,
+        |data| {
+            if entries.is_empty() {
+                println!("(no open conflicts — nothing awaiting resolution)");
+                return;
             }
-        }
-        println!();
-        println!(
+            for g in data["groups"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{} — {} [{}] ({} open{})",
+                    g["subject"].as_str().unwrap_or("?"),
+                    g["predicate"].as_str().unwrap_or("?"),
+                    g["kb"].as_str().unwrap_or("?"),
+                    g["conflict_count"].as_u64().unwrap_or(0),
+                    if g["safety_slot"] == json!(true) {
+                        ", safety slot"
+                    } else {
+                        ""
+                    },
+                );
+                for e in g["conflicts"].as_array().cloned().unwrap_or_default() {
+                    println!(
+                        "  {}  '{}' vs '{}'  ({})",
+                        e["conflict_id"].as_str().unwrap_or("?"),
+                        e["old"]["object"].as_str().unwrap_or("?"),
+                        e["new"]["object"].as_str().unwrap_or("?"),
+                        e["triage"]["rule"].as_str().unwrap_or("?"),
+                    );
+                }
+            }
+            println!();
+            println!(
             "{} of {total_open} open conflicts shown; {auto_resolvable} would be auto-resolved by \
              `engram facts triage`",
             entries.len()
         );
-    });
+        },
+    );
     Ok(())
 }
 
@@ -360,22 +518,45 @@ fn conflict_entry(
     sources: &HashMap<Uuid, (Uuid, String)>,
 ) -> serde_json::Value {
     let verdict = classify_pair(new_f, old_f, row.score, ClassifyMode::Triage);
-    json!({
+    let safety = is_safety_slot(&canonical_relation(&new_f.predicate))
+        || is_safety_slot(&canonical_relation(&old_f.predicate));
+    // R7's read-side guard. The stored value on a pre-wave-3 row may say
+    // `supersede-old` on a medication slot; an agent that executes advice
+    // retires a live prescription, so the live rule wins on read too.
+    let suggested = read_surface::suggested_action_for(row.suggested.as_deref(), safety);
+    let serde_json::Value::Object(mut entry) = json!({
         "conflict_id": row.id.to_string(),
+        "handle": read_surface::handle(HandleKind::Conflict, row.id),
         "kb": row.kb,
         "diary": row.diary,
         "detector": row.detector,
         "score": row.score,
-        "suggested_action": row.suggested,
+        "suggested_action": suggested,
+        "suggested_action_overridden":
+            read_surface::suggested_action_overridden(row.suggested.as_deref(), suggested),
+        "safety": safety,
+        // NULL on any queue row written before the v10 migration. Null means
+        // "pre-v10 row", not "unknown".
+        "decision_key": row.decision_key,
+        "member_key": row.member_key,
+        "registry_version": row.registry_version,
         "created_at": row.created_at,
         "new": conflict_side(new_f, sources),
         "old": conflict_side(old_f, sources),
         "triage": verdict_json(&verdict),
-        "resolve_command": format!(
-            "engram facts resolve {} --action supersede-old|keep-both|reject-new",
-            row.id
-        ),
-    })
+    }) else {
+        unreachable!("json! object literal");
+    };
+    // ONE runnable command, no pipes. The old template shipped
+    // `--action supersede-old|keep-both|reject-new`, and a paste of that runs
+    // the destructive branch. Permission (`allowed_actions`) is separate from
+    // advice (`suggested_action`) and is never narrowed by safety: a caller
+    // decision is authority, R7 only constrains what we recommend.
+    respond::attach(
+        &mut entry,
+        &respond::resolve_conflict(row.id, crate::commands::recall::ALLOWED_ACTIONS),
+    );
+    serde_json::Value::Object(entry)
 }
 
 fn conflict_side(f: &Fact, sources: &HashMap<Uuid, (Uuid, String)>) -> serde_json::Value {
@@ -430,17 +611,32 @@ fn group_conflicts(
         .map(|key| {
             let members = buckets.remove(&key).unwrap_or_default();
             let (kb, subject, predicate) = key;
-            let canonical =
-                canonical_predicate(predicate.split(" / ").next().unwrap_or(&predicate));
+            // One canonicalization before the registry is consulted: the
+            // extractor's spelling map and the relation registry are different
+            // tables, and looking a raw predicate up in the second is how a
+            // safety slot reads as an ordinary one.
+            let canonical = canonical_relation(&canonical_predicate(
+                predicate.split(" / ").next().unwrap_or(&predicate),
+            ));
             json!({
                 "kb": kb,
                 "subject": subject,
                 "predicate": predicate,
+                // Unchanged JSON, unambiguous type: the legacy projection
+                // keeps a legacy NAME so nobody has to ask which `Arity` a
+                // call site means (R3).
                 "arity": match predicate_arity(&canonical) {
                     LegacyArity::Single => "single",
                     LegacyArity::Multi => "multi",
                 },
+                "arity_class": match relation_spec(&canonical).arity {
+                    Arity::SetValued { .. } => "set_valued",
+                    Arity::SingleValued { .. } => "single_valued",
+                },
+                // `safety_slot` keeps its name and value: agent-info
+                // documents it and a rename breaks a documented field.
                 "safety_slot": is_safety_slot(&canonical),
+                "safety": is_safety_slot(&canonical),
                 "conflict_count": members.len(),
                 "newest_at": members.first().and_then(|m| m["created_at"].as_str()).unwrap_or(""),
                 "conflicts": members,
@@ -1098,9 +1294,35 @@ fn preview_of(content: &str) -> String {
 }
 
 fn fact_to_json(f: &Fact) -> serde_json::Value {
+    let canonical = canonical_relation(&f.predicate);
     json!({
         "id": f.id.to_string(),
         "source_memory_id": f.source_memory_id.to_string(),
+        // Same name as every other surface uses for the same thing, plus the
+        // handle a mutator accepts. `id` is unchanged.
+        "memory_id": f.source_memory_id.to_string(),
+        "handle": read_surface::handle(HandleKind::Fact, f.id),
+        "provenance": read_surface::Provenance {
+            memory_id: Some(f.source_memory_id),
+            kb: Some(f.kb.clone()),
+            diary: Some(f.diary.clone()),
+            derived_from: Some(read_surface::DERIVED_FACT),
+            ..Default::default()
+        }.to_json(),
+        // The single definition of "still asserted". A fact with a closed
+        // interval and no successor — a medication the user STOPPED — reads
+        // as false here, where `superseded_by` alone read it as current.
+        "open": is_open_fact(f),
+        "closed_by": f.closed_by.map(|u| u.to_string()),
+        "close_reason": f.close_reason,
+        "close_authority": f.close_authority,
+        // Computed from the registry at read time, so they are right on a
+        // pre-v10 store too.
+        "arity_class": match relation_spec(&canonical).arity {
+            Arity::SetValued { .. } => "set_valued",
+            Arity::SingleValued { .. } => "single_valued",
+        },
+        "safety": is_safety_slot(&canonical),
         "subject": f.subject,
         "subject_norm": f.subject_norm,
         "predicate": f.predicate,

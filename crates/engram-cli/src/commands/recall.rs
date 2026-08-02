@@ -3,35 +3,71 @@
 use crate::commands::usage::{cohere_rerank_cost_usd, estimated_tokens, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::output::{print_envelope, Metadata};
+use crate::output::{print_envelope, Metadata, Scope, Verdict};
+use crate::read_surface::{self, RequestShape};
+use crate::respond;
 use crate::retrieval::{
     hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
     HybridParams, RecallMode, RetrievalProfile,
 };
 use chrono::{DateTime, Utc};
 use engram_core::layers::approx_tokens;
+use engram_core::relations::{canonical_relation, is_safety_slot};
 use engram_core::temporal::{parse_bound, DayBound};
-use engram_core::types::Layer;
-use serde_json::json;
+use engram_core::types::{Fact, Layer};
+use engram_storage::SqliteStore;
+use serde_json::{json, Value};
 use std::time::Instant;
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    ctx: &AppContext,
-    query: String,
-    top_k: usize,
-    layer: String,
-    mode: String,
-    profile: String,
-    kb: Option<String>,
-    all_kbs: bool,
-    diary: String,
-    rerank_top_n: Option<usize>,
-    graph_hops: u8,
-    allow_mixed_embeddings: bool,
-    since: Option<String>,
-    until: Option<String>,
-) -> Result<(), CliError> {
+/// One recall request, however it was spelled.
+///
+/// `recall`, `search` and `memory search` used to be three call shapes into
+/// one function, and the third hard-coded a different layer, rerank depth and
+/// graph fan-out — two commands with one name, answering differently. One
+/// struct means a default that differs is visible in `cli.rs` rather than
+/// buried in a dispatch arm.
+pub struct RecallArgs {
+    pub query: String,
+    pub top_k: usize,
+    pub layer: String,
+    pub mode: String,
+    pub profile: String,
+    pub kb: Option<String>,
+    pub all_kbs: bool,
+    pub diary: String,
+    pub rerank_top_n: Option<usize>,
+    pub graph_hops: u8,
+    pub allow_mixed_embeddings: bool,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    /// Which spelling the caller used, reported as `metadata.command_alias`
+    /// (blessed by D2). It changes NO behaviour; it makes a transcript
+    /// traceable to the surface that produced it.
+    pub alias: &'static str,
+}
+
+/// What a caller may do with an open conflict, in the order `respond.rs`
+/// publishes them (`keep-both` first: the only universally safe blind
+/// action). Permission is never narrowed by safety — advice is (R7).
+pub const ALLOWED_ACTIONS: &[&str] = &["keep-both", "supersede-old", "reject-new"];
+
+pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
+    let RecallArgs {
+        query,
+        top_k,
+        layer,
+        mode,
+        profile,
+        kb,
+        all_kbs,
+        diary,
+        rerank_top_n,
+        graph_hops,
+        allow_mixed_embeddings,
+        since,
+        until,
+        alias,
+    } = args;
     if query.trim().is_empty() {
         return Err(CliError::BadInput("query cannot be empty".into()));
     }
@@ -89,6 +125,7 @@ pub async fn run(
 
     let results = outcome.results;
     let notes = outcome.notes;
+    let stats = outcome.stats;
 
     // The memory-layer token budget trims the returned set to fit an agent's
     // context window. But it must never silently return FEWER than the caller's
@@ -115,7 +152,22 @@ pub async fn run(
     // disagree), report it so the caller can "cite both / note the update"
     // instead of unknowingly answering from a stale fact. This is the read-path
     // half of the contradiction-resolution promise.
-    let conflicts = surface_conflicts(ctx, scope.as_deref(), &query)?;
+    //
+    // The diary is threaded through both halves now: a `--diary work` recall
+    // used to report a conflict between two `personal` facts, which is a
+    // cross-diary leak on the exact surface that exists to stop silent wrong
+    // answers.
+    let conflict_diary = if diary == "*" {
+        None
+    } else {
+        Some(diary.as_str())
+    };
+    let surface = surface_conflicts(&ctx.store, scope.as_deref(), conflict_diary, &query, 10)?;
+    let conflicts = surface.items;
+    let conflicts_overridden = conflicts
+        .iter()
+        .filter(|c| c["suggested_action_overridden"] == json!(true))
+        .count();
 
     // `layered` is a Vec<&HybridResult>; `.iter()` would hand the renderer
     // `&&HybridResult`, so copy the references out.
@@ -124,6 +176,12 @@ pub async fn run(
         .iter()
         .map(|r| json!({
             "id": r.id.to_string(),
+            // The id a mutator accepts. `id` keeps its meaning (the row's own
+            // id, which for a chunk hit is a chunk id) and this is the one to
+            // hand `edit` or `forget`.
+            "memory_id": r.provenance.memory_id.map(|m| m.to_string()),
+            "handle": read_surface::hit_handle(&r.kind, r.id),
+            "provenance": r.provenance.to_json(),
             "kind": r.kind,
             "score": r.score,
             "rerank_score": r.rerank_score,
@@ -246,113 +304,297 @@ pub async fn run(
         format!("{:.6}", gemini_query_cost + cohere_cost),
     );
 
-    let status = if results_json.is_empty() {
-        "no_results"
-    } else {
-        "success"
-    };
-    print_envelope(
-        ctx.format,
-        status,
-        json!({
-            "status": status,
-            "answer_context": answer_context,
-            "results": results_json,
-            "conflicts": conflicts,
-            "metadata": {
-                "profile": profile_enum.as_str(),
-                "embed_model": backends.embed_model,
-                "embed_dims": backends.embed_dims,
-                "prompt_format": backends.prompt_format,
-                "reranker": backends.reranker_label,
-                "candidates_considered": rerank_candidates,
-                "kb": scope.label(),
-                "kb_scope": scope.origin.as_str(),
-                "diary_isolation": notes.diary_isolation_json(),
-                "temporal_scope": notes.temporal_scope_json()
-            }
-        }),
-        meta,
-        |data| {
-            if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
-                for r in arr {
-                    let score = r.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("result");
-                    let content = r.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                    let snippet: String = content.chars().take(110).collect();
-                    println!("{:.3}  {:10}  {}", score, kind, snippet);
-                }
-            }
+    meta.command_alias(alias);
+    meta.suggested_action_overridden(conflicts_overridden);
+    // What this read actually looked at — the answer to "did you search the
+    // namespace I meant?", which no response could previously give.
+    Scope::retrieval(
+        if scope.as_deref().is_some() {
+            vec![scope.label().to_string()]
+        } else if stats.kbs_searched.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            stats.kbs_searched.clone()
         },
-    );
+        if diary == "*" { "*" } else { diary.as_str() },
+        scope.origin.as_str(),
+        stats.chunks_considered,
+    )
+    .attach(&mut meta);
+
+    // `verdict` and `status` are computed from the SAME boolean, in one place:
+    // two fields answering one question is how `count` came to mean two
+    // things.
+    let empty = results_json.is_empty();
+    let status = if empty { "no_results" } else { "success" };
+    let searched_kbs = if scope.as_deref().is_some() {
+        vec![scope.label().to_string()]
+    } else if stats.kbs_searched.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        stats.kbs_searched.clone()
+    };
+    let verdict = if empty {
+        let shape = request_shape(&ctx.store, &diary, since_dt.is_some() || until_dt.is_some())?;
+        Verdict::NoMatch(read_surface::absence_from(&stats, searched_kbs, shape))
+    } else {
+        Verdict::Results
+    };
+
+    let Value::Object(mut data) = json!({
+        "status": status,
+        // A ranked read is a truncation, not a page: its order depends on a
+        // network reranker whose output is not guaranteed stable between
+        // calls, so an offset cursor would be a lie with a stable-looking
+        // shape. There is no `cursor` here, ever — to see more, raise
+        // --top-k. `candidates_fused` is the pool the ranking chose from and
+        // is deliberately NOT called `total`, which means "matching rows in
+        // scope" everywhere it appears.
+        "returned": results_json.len(),
+        "candidates_fused": stats.candidates_fused,
+        "conflicts_returned": conflicts.len(),
+        "conflicts_total": surface.total,
+        "answer_context": answer_context,
+        "results": results_json,
+        "conflicts": conflicts,
+        "metadata": {
+            "profile": profile_enum.as_str(),
+            "embed_model": backends.embed_model,
+            "embed_dims": backends.embed_dims,
+            "prompt_format": backends.prompt_format,
+            "reranker": backends.reranker_label,
+            "candidates_considered": rerank_candidates,
+            "kb": scope.label(),
+            "kb_scope": scope.origin.as_str(),
+            "diary_isolation": notes.diary_isolation_json(),
+            "temporal_scope": notes.temporal_scope_json()
+        }
+    }) else {
+        unreachable!("json! object literal");
+    };
+    // `absence` lands only on `no_match`: a certificate of absence beside
+    // results would be a certificate of nothing.
+    verdict.attach(&mut data);
+
+    print_envelope(ctx.format, status, Value::Object(data), meta, |data| {
+        if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
+            for r in arr {
+                let score = r.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("result");
+                let content = r.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let snippet: String = content.chars().take(110).collect();
+                println!("{:.3}  {:10}  {}", score, kind, snippet);
+            }
+        }
+    });
     Ok(())
 }
 
-/// Find contradictions relevant to the query and return them as JSON.
-/// Two kinds are surfaced: RESOLVED supersessions (a fact was updated —
-/// cite the current value) and CONTESTED pairs (an unresolved conflict is
-/// queued — both values are active and the caller should not pick one
-/// silently). The memory never pretends to know an answer it doesn't have.
-fn surface_conflicts(
-    ctx: &AppContext,
+/// Which filter to blame for an empty read.
+///
+/// "The request carried a diary" is not the same claim as "the diary is why
+/// you got nothing": every recall carries a diary, because `--diary default`
+/// is the default. Blaming it unconditionally would tell a caller with an
+/// EMPTY store to go looking for a diary that never existed. So the diary is
+/// only named when the store actually holds memories somewhere else — two
+/// COUNT(*)s, and only on the path that already returned nothing.
+pub fn request_shape(
+    store: &SqliteStore,
+    diary: &str,
+    has_window: bool,
+) -> Result<RequestShape, CliError> {
+    let has_diary_filter = if diary == "*" {
+        false
+    } else {
+        store.count_memories_scoped(Some(diary), None)? == 0
+            && store.count_memories_scoped(None, None)? > 0
+    };
+    Ok(RequestShape {
+        has_window,
+        has_diary_filter,
+    })
+}
+
+/// The conflicts array plus the size of the backlog it was drawn from.
+///
+/// `total` is separate from `items.len()` because the two are different
+/// questions and a caller that reads one for the other under-reports a queue:
+/// the shape pinned by D9 so the daemon renders the same object the CLI does.
+pub struct ConflictSurface {
+    pub items: Vec<Value>,
+    pub total: i64,
+}
+
+/// Find contradictions relevant to the query.
+///
+/// Two kinds are surfaced: CLOSED intervals (a fact stopped being true — cite
+/// the current value, or say the state ended) and CONTESTED pairs (an
+/// unresolved conflict is queued, both values are active, and the caller must
+/// not pick one silently). The memory never pretends to know an answer it
+/// does not have.
+///
+/// Takes `&SqliteStore` rather than `&AppContext` (D9) so the daemon can call
+/// it from a pooled reader, and takes `diary` because the version that did not
+/// leaked one diary's conflicts into another's recall.
+pub fn surface_conflicts(
+    store: &SqliteStore,
     kb: Option<&str>,
+    diary: Option<&str>,
     query: &str,
-) -> Result<Vec<serde_json::Value>, CliError> {
+    limit: usize,
+) -> Result<ConflictSurface, CliError> {
     let terms = query_terms(query);
     if terms.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ConflictSurface {
+            items: Vec::new(),
+            total: 0,
+        });
     }
-    let facts = ctx.store.facts_matching_terms(kb, None, &terms, 20)?;
+    let facts = store.facts_matching_terms(kb, diary, &terms, 20)?;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for f in facts {
-        // Only superseded facts represent a recorded contradiction/update.
-        let Some(superseded_by) = f.superseded_by else {
+        // THE SWEEP. This used to read `superseded_by`, so a medication the
+        // user STOPPED — closed interval, no successor — never surfaced here
+        // and the store went on answering as if it were current. `is_open_fact`
+        // is the one definition of "still asserted".
+        if engram_core::interval::is_open_fact(&f) {
             continue;
-        };
+        }
         if !seen.insert(f.id) {
             continue;
         }
-        let new_object = ctx
-            .store
-            .get_fact(superseded_by)?
-            .map(|nf| nf.object)
-            .unwrap_or_default();
+        // A fact closed because the state ENDED has no successor, and printing
+        // an empty `new_object` as though it did is the stopped-medication bug
+        // inverted. Follow `closed_by` first (it names whatever closed the
+        // interval), then the compat `superseded_by`.
+        let successor = f.closed_by.or(f.superseded_by);
+        let new_object = match successor {
+            Some(id) => store.get_fact(id)?.map(|nf| nf.object),
+            None => None,
+        };
         out.push(json!({
-            "status": "superseded",
+            "status": closed_status(&f),
             "subject": f.subject,
             "predicate": f.predicate,
             "old_object": f.object,
             "new_object": new_object,
+            "close_reason": f.close_reason,
+            "close_authority": f.close_authority,
+            "valid_from": f.valid_from.map(|t| t.to_rfc3339()),
+            "valid_until": f.valid_until.map(|t| t.to_rfc3339()),
             "superseded_at": f.superseded_at.map(|t| t.to_rfc3339()),
             "old_fact_id": f.id.to_string(),
-            "new_fact_id": superseded_by.to_string(),
-            "note": "this fact was updated in the knowledge base; cite the current value or surface the change",
+            "old_fact_handle": read_surface::handle(engram_core::handle::HandleKind::Fact, f.id),
+            "new_fact_id": successor.map(|id| id.to_string()),
+            "note": closed_note(&f),
         }));
     }
 
     // Contested: open conflicts touching the query. Both values are active;
     // report both rather than silently returning one side.
-    for (row, new_f, old_f) in ctx
-        .store
-        .open_conflicts_matching_terms(kb, None, &terms, 10)?
-    {
-        out.push(json!({
-            "status": "contested",
-            "conflict_id": row.id.to_string(),
-            "subject": new_f.subject,
-            "predicate": new_f.predicate,
-            "values": [old_f.object, new_f.object],
-            "detector": row.detector,
-            "suggested_action": row.suggested,
-            "resolve_command": format!(
-                "engram facts resolve {} --action supersede-old|keep-both|reject-new",
-                row.id
-            ),
-            "note": "unresolved contradiction — do not pick a value silently; resolve it or surface both to the user",
-        }));
+    let contested = store.open_conflicts_matching_terms(kb, diary, &terms, limit)?;
+    let open_total = store.count_open_conflicts_matching_terms(kb, diary, &terms)?;
+    for (row, new_f, old_f) in contested {
+        let safety = pair_is_safety(&new_f, &old_f);
+        let suggested = read_surface::suggested_action_for(row.suggested.as_deref(), safety);
+        let rendered = respond::conflicts(&[respond::ConflictInput {
+            id: row.id,
+            new: &new_f,
+            old: &old_f,
+            detector: &row.detector,
+            suggested,
+            allowed: ALLOWED_ACTIONS,
+            status: "contested",
+        }]);
+        let Some(Value::Object(mut entry)) = rendered.into_iter().next() else {
+            continue;
+        };
+        entry.insert("kb".to_string(), json!(row.kb));
+        entry.insert("diary".to_string(), json!(row.diary));
+        entry.insert("decision_key".to_string(), json!(row.decision_key));
+        entry.insert("member_key".to_string(), json!(row.member_key));
+        entry.insert("registry_version".to_string(), json!(row.registry_version));
+        entry.insert("safety".to_string(), json!(safety));
+        // Named per row, not just counted in metadata: a write-side regression
+        // that keeps emitting `supersede-old` on a safety pair must stay
+        // visible through the guard that corrects it.
+        entry.insert(
+            "suggested_action_overridden".to_string(),
+            json!(read_surface::suggested_action_overridden(
+                row.suggested.as_deref(),
+                suggested
+            )),
+        );
+        entry.insert("new".to_string(), conflict_side(&new_f));
+        entry.insert("old".to_string(), conflict_side(&old_f));
+        out.push(Value::Object(entry));
     }
-    Ok(out)
+    // The closed-interval half is a bounded scan with no counting query, so
+    // its rows count once; the contested half reports its true backlog. A
+    // caller that sees `conflicts_returned: 3, conflicts_total: 953` knows
+    // there is a queue behind the page — the number nobody had before.
+    let closed_rows = out.len() as i64 - (open_total.min(limit as i64));
+    Ok(ConflictSurface {
+        total: closed_rows.max(0) + open_total,
+        items: out,
+    })
+}
+
+/// The status word for a closed interval. Widened from `superseded` alone,
+/// because a stopped medication and a corrected typo are not the same event
+/// and an agent that treats them alike gives medical advice from a retired
+/// prescription.
+fn closed_status(f: &Fact) -> &'static str {
+    match f.close_reason.as_deref() {
+        Some("superseded") => "superseded",
+        Some("stopped") => "ended",
+        Some("corrected") => "corrected",
+        Some("retracted_source") => "retracted",
+        // Pre-v10 rows: a successor means it was superseded, anything else is
+        // honestly just closed.
+        _ if f.superseded_by.is_some() => "superseded",
+        _ => "closed",
+    }
+}
+
+fn closed_note(f: &Fact) -> &'static str {
+    match f.close_reason.as_deref() {
+        Some("stopped") => {
+            "this state ENDED and has no successor; do not cite it as current and do not \
+             invent a replacement value"
+        }
+        _ => "this fact was updated in the knowledge base; cite the current value or surface the change",
+    }
+}
+
+fn pair_is_safety(new_f: &Fact, old_f: &Fact) -> bool {
+    is_safety_slot(&canonical_relation(&new_f.predicate))
+        || is_safety_slot(&canonical_relation(&old_f.predicate))
+}
+
+/// One side of a conflict, with the provenance every other row now carries.
+fn conflict_side(f: &Fact) -> Value {
+    json!({
+        "id": f.id.to_string(),
+        "handle": read_surface::handle(engram_core::handle::HandleKind::Fact, f.id),
+        "memory_id": f.source_memory_id.to_string(),
+        "subject": f.subject,
+        "predicate": f.predicate,
+        "object": f.object,
+        "confidence": f.confidence,
+        "created_at": f.created_at.to_rfc3339(),
+        "open": engram_core::interval::is_open_fact(f),
+        "valid_from": f.valid_from.map(|t| t.to_rfc3339()),
+        "valid_until": f.valid_until.map(|t| t.to_rfc3339()),
+        "provenance": read_surface::Provenance {
+            memory_id: Some(f.source_memory_id),
+            kb: Some(f.kb.clone()),
+            diary: Some(f.diary.clone()),
+            derived_from: Some(read_surface::DERIVED_FACT),
+            ..Default::default()
+        }.to_json(),
+    })
 }
 
 /// Lowercase content tokens from a query (length >= 3, no stopwords) used to

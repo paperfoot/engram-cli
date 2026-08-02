@@ -4649,6 +4649,7 @@ fn open_conflicts_are_grouped_by_subject_and_predicate_with_sources() {
         ana["arity"], "multi",
         "a medication is a SET — this projection flipping from `single` IS the polypharmacy fix"
     );
+    assert_eq!(ana["arity_class"], "set_valued");
     assert_eq!(ana["conflict_count"], 1);
     let entry = &ana["conflicts"][0];
     assert_eq!(entry["triage"]["auto_resolvable"], false);

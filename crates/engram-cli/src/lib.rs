@@ -8,6 +8,7 @@ pub mod error;
 pub mod fact_llm;
 pub mod fact_write;
 pub mod output;
+pub mod read_surface;
 pub mod respond;
 pub mod retrieval;
 
@@ -81,19 +82,22 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         } => {
             commands::recall::run(
                 &ctx,
-                query,
-                top_k,
-                layer,
-                mode,
-                profile,
-                kb,
-                all_kbs,
-                diary,
-                rerank_top_n,
-                graph_hops,
-                allow_mixed_embeddings,
-                since,
-                until,
+                commands::recall::RecallArgs {
+                    query,
+                    top_k,
+                    layer,
+                    mode,
+                    profile,
+                    kb,
+                    all_kbs,
+                    diary,
+                    rerank_top_n,
+                    graph_hops,
+                    allow_mixed_embeddings,
+                    since,
+                    until,
+                    alias: "recall",
+                },
             )
             .await
         }
@@ -115,9 +119,12 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             .await
         }
         Command::Documents(sub) => match sub {
-            DocumentsCommand::List { kb, all_kbs, limit } => {
-                commands::documents::list(&ctx, kb, all_kbs, limit)
-            }
+            DocumentsCommand::List {
+                kb,
+                all_kbs,
+                limit,
+                cursor,
+            } => commands::documents::list(&ctx, kb, all_kbs, limit, cursor),
             DocumentsCommand::Show { id } => commands::documents::show(&ctx, id),
             DocumentsCommand::Delete { id, confirm } => {
                 commands::documents::delete(&ctx, id, confirm)
@@ -249,21 +256,28 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 since,
                 until,
             } => {
+                // One code path with `recall`, one envelope, one set of
+                // fields. The defaults that still differ (layer, rerank depth,
+                // graph fan-out) are preserved deliberately and are now
+                // visible in one place instead of hiding in this arm.
                 commands::recall::run(
                     &ctx,
-                    query,
-                    top_k,
-                    "topic".to_string(),
-                    mode,
-                    profile,
-                    kb,
-                    all_kbs,
-                    diary,
-                    None,
-                    1,
-                    false,
-                    since,
-                    until,
+                    commands::recall::RecallArgs {
+                        query,
+                        top_k,
+                        layer: "topic".to_string(),
+                        mode,
+                        profile,
+                        kb,
+                        all_kbs,
+                        diary,
+                        rerank_top_n: None,
+                        graph_hops: 1,
+                        allow_mixed_embeddings: false,
+                        since,
+                        until,
+                        alias: "memory search",
+                    },
                 )
                 .await
             }
@@ -299,7 +313,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 limit,
                 min_mentions,
                 kb,
-            } => commands::entities::list(&ctx, limit, min_mentions, kb),
+                cursor,
+            } => commands::entities::list(&ctx, limit, min_mentions, kb, cursor),
             EntitiesCommand::Show { name, kb } => commands::entities::show(&ctx, name, kb),
         },
         Command::People(sub) => match sub {
@@ -307,7 +322,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 limit,
                 min_mentions,
-            } => commands::people::list(&ctx, kb, limit, min_mentions),
+                cursor,
+            } => commands::people::list(&ctx, kb, limit, min_mentions, cursor),
             PeopleCommand::Show { name, kb, snippets } => {
                 commands::people::show(&ctx, name, kb, snippets)
             }
@@ -319,7 +335,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 all,
                 limit,
-            } => commands::facts::list(&ctx, subject, diary, kb, all, limit),
+                cursor,
+            } => commands::facts::list(&ctx, subject, diary, kb, all, limit, cursor),
             FactsCommand::Show { subject, diary, kb } => {
                 commands::facts::show(&ctx, subject, diary, kb)
             }
@@ -329,7 +346,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 diary,
                 kb,
                 subject,
-            } => commands::facts::conflicts(&ctx, limit, open, diary, kb, subject),
+                cursor,
+            } => commands::facts::conflicts(&ctx, limit, open, diary, kb, subject, cursor),
             FactsCommand::Triage {
                 kb,
                 diary,
