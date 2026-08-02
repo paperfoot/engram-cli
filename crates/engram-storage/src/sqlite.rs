@@ -1079,8 +1079,11 @@ impl SqliteStore {
             if current < 11 {
                 s.migrate_v11()?;
             }
-            // v12 is additive-only for the same reason: one nullable column on
-            // `fact_decisions`, no backfill and no row rewrite (D25).
+            // v12 adds one nullable column to `fact_decisions` and backfills
+            // it [G10], so it is NOT additive-only. It still takes no D25
+            // backup, for a narrower reason stated at `migrate_v12`: the only
+            // column it writes is the one it just created, so there is no
+            // prior value a bad backfill could destroy.
             if current < 12 {
                 s.migrate_v12()?;
             }

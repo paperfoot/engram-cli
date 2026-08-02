@@ -33,8 +33,9 @@ pub struct DecisionRow {
     /// key names the QUESTION and sorts its object pair, so it cannot say which
     /// side lost; without this column a replay onto a re-derived pair falls
     /// back to pair ORDER, and a reversed derivation retires the value the
-    /// caller kept. `None` on a `keep_both`/`void` (nothing lost) and on any
-    /// row written before schema v12.
+    /// caller kept. `None` on a `keep_both`/`void` (nothing lost), and on a
+    /// pre-v12 row the migration could not orient because its conflict row had
+    /// already been deleted — for which `replay` queues rather than guesses.
     pub loser_object_norm: Option<String>,
     pub authority: String,
     pub actor: String,
@@ -90,15 +91,49 @@ fn parse_decision_row(r: &rusqlite::Row) -> rusqlite::Result<DecisionRow> {
 }
 
 impl SqliteStore {
-    /// v11 → v12. One additive column: `fact_decisions.loser_object_norm`.
+    /// v11 → v12. One added column, `fact_decisions.loser_object_norm`, and a
+    /// backfill of every existing decision whose conflict row is still there
+    /// [G10].
     ///
-    /// Additive-only, so per D25 it takes no `VACUUM INTO` backup — that rule
-    /// exists for migrations that rewrite rows, and this one rewrites nothing.
-    /// The rows already in the table stay `NULL`, which reads as NOT RECORDED
-    /// rather than "no loser"; `engram-graph` recovers those from the conflict
-    /// row they answered, and refuses to guess when it cannot.
+    /// Leaving those rows `NULL` and recovering the orientation at read time
+    /// looked equivalent, and is not: `recover_loser` reads the queue row, the
+    /// queue row hangs off the facts by foreign key, and a `kb delete` cascades
+    /// it away while the decision survives. An orientation that lives only in a
+    /// destructible row is an orientation the store can be made to forget —
+    /// after which "close the old one" lands on whichever value the next
+    /// re-derivation happens to emit second. Writing it down at migration time,
+    /// while the evidence still exists, is what makes an upgraded v11 store
+    /// keep the caller's ruling.
+    ///
+    /// The conflict row names `old_fact_id` and `new_fact_id`; the verdict says
+    /// which of them lost. `keep_both` and `void` retired nothing and are left
+    /// alone. A decision whose conflict row (or losing fact) is already gone
+    /// stays `NULL` — the migration never invents an orientation it cannot read,
+    /// and those pairs now QUEUE on their next derivation instead of replaying
+    /// positionally.
+    ///
+    /// This no longer skips the D25 backup on "additive-only" grounds — it does
+    /// write rows. It needs no rollback copy for a narrower reason: the only
+    /// column it writes is the one it just created, every write is guarded by
+    /// `IS NULL`, and so there is no prior value for a bad backfill to destroy.
     pub(crate) fn migrate_v12(&self) -> Result<(), StorageError> {
         self.add_column_if_missing("fact_decisions", "loser_object_norm", "TEXT")?;
+        self.conn.execute(
+            "UPDATE fact_decisions
+                SET loser_object_norm = (
+                    SELECT f.object_norm
+                      FROM fact_conflict_queue q
+                      JOIN facts f
+                        ON f.id = CASE fact_decisions.verdict
+                                    WHEN 'close_old' THEN q.old_fact_id
+                                    ELSE q.new_fact_id
+                                  END
+                     WHERE q.id = fact_decisions.conflict_id)
+              WHERE loser_object_norm IS NULL
+                AND conflict_id IS NOT NULL
+                AND verdict IN ('close_old', 'reject_new')",
+            [],
+        )?;
         Ok(())
     }
 
@@ -796,6 +831,213 @@ mod tests {
                 .unwrap()
                 .verdict,
             "close_old"
+        );
+    }
+
+    /// The shape a v0.4-rc binary left behind: `fact_decisions` with no
+    /// orientation column at all. Nothing else about the table moved between
+    /// v11 and v12, so dropping the column and rewinding the stamp reproduces
+    /// that store — and the next `SqliteStore::open` then runs the REAL
+    /// migration over it rather than a test-only imitation.
+    fn demote_to_v11(store: &SqliteStore) {
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE fact_decisions DROP COLUMN loser_object_norm;
+                 UPDATE schema_version SET version = 11;",
+            )
+            .unwrap();
+    }
+
+    fn queued(store: &SqliteStore, new: Uuid, old: Uuid, k: &str, new_object: &str) -> Uuid {
+        let qid = Uuid::new_v4();
+        store
+            .insert_fact_conflict(
+                qid,
+                new,
+                old,
+                "default",
+                "personal",
+                "slot",
+                None,
+                "supersede-old",
+                k,
+                new_object,
+                "relations@1",
+            )
+            .unwrap();
+        qid
+    }
+
+    /// G10's storage half. A decision taken on a v11 store carries no
+    /// orientation, and the read-time recovery that stood in for one reads the
+    /// queue row — which hangs off the facts by foreign key, so a `kb delete`
+    /// takes it and leaves the ruling to be re-applied by pair order. The
+    /// migration writes the orientation down while the evidence is still there.
+    #[test]
+    fn the_v12_migration_orients_a_v11_decision_from_its_conflict_row() {
+        let (tmp, _g, store) = temp_store();
+        let (_m, new, old, k) = seeded(&store);
+        let qid = queued(&store, new, old, &k, "porto");
+        store
+            .resolve_conflict_with_decision(
+                qid,
+                "personal",
+                "default",
+                &k,
+                "close_old",
+                Some("lisbon"),
+                "caller",
+                "cli:default",
+                None,
+                SEMANTIC_KEY_VERSION,
+            )
+            .unwrap()
+            .expect("the row was open");
+        demote_to_v11(&store);
+        drop(store);
+
+        let store = SqliteStore::open(tmp.path().join("db.sqlite")).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 12);
+        assert_eq!(
+            store
+                .lookup_decision("personal", &k)
+                .unwrap()
+                .unwrap()
+                .loser_object_norm
+                .as_deref(),
+            Some("lisbon"),
+            "the conflict row named the loser; the migration had to read it"
+        );
+
+        // The cascade that used to erase the orientation. `kb delete` removes
+        // the facts, the queue row goes with them by foreign key, and the
+        // decision survives — now with its side still written down.
+        store
+            .conn
+            .execute("DELETE FROM facts WHERE kb = 'personal'", [])
+            .unwrap();
+        assert!(
+            store.get_fact_conflict(qid).unwrap().is_none(),
+            "the queue row must actually cascade, or this proves nothing"
+        );
+        assert_eq!(
+            store
+                .lookup_decision("personal", &k)
+                .unwrap()
+                .unwrap()
+                .loser_object_norm
+                .as_deref(),
+            Some("lisbon"),
+            "an orientation that only lives in a destructible row is deletable"
+        );
+    }
+
+    /// …and it never invents one. A verdict that retired nothing, and a
+    /// directional verdict whose evidence is already gone, both stay NULL —
+    /// which `replay` reads as "queue this", not as "no loser".
+    #[test]
+    fn the_v12_migration_leaves_what_it_cannot_read_unoriented() {
+        let (tmp, _g, store) = temp_store();
+        let (m, new, old, k) = seeded(&store);
+        let braga = another_fact(&store, m, "Braga");
+        let faro = another_fact(&store, m, "Faro");
+
+        // The control: directional, evidence intact. It must come back
+        // oriented, or the two NULLs below prove nothing about the sweep.
+        let q_live = queued(&store, new, old, &k, "porto");
+        store
+            .resolve_conflict_with_decision(
+                q_live,
+                "personal",
+                "default",
+                &k,
+                "close_old",
+                Some("lisbon"),
+                "caller",
+                "cli:default",
+                None,
+                SEMANTIC_KEY_VERSION,
+            )
+            .unwrap()
+            .expect("open");
+
+        // Directional, but its evidence is destroyed before the migration runs.
+        let k_gone = key("braga", "porto");
+        let q_gone = queued(&store, braga, new, &k_gone, "braga");
+        store
+            .resolve_conflict_with_decision(
+                q_gone,
+                "personal",
+                "default",
+                &k_gone,
+                "close_old",
+                Some("porto"),
+                "caller",
+                "cli:default",
+                None,
+                SEMANTIC_KEY_VERSION,
+            )
+            .unwrap()
+            .expect("open");
+
+        // Non-directional: keep-both retired nothing, so there is nothing to
+        // backfill and NULL is the honest answer rather than a gap.
+        let k_keep = key("faro", "lisbon");
+        let q_keep = queued(&store, faro, old, &k_keep, "faro");
+        store
+            .resolve_conflict_with_decision(
+                q_keep,
+                "personal",
+                "default",
+                &k_keep,
+                "keep_both",
+                None,
+                "caller",
+                "cli:default",
+                None,
+                SEMANTIC_KEY_VERSION,
+            )
+            .unwrap()
+            .expect("open");
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM facts WHERE id = ?1",
+                params![braga.to_string()],
+            )
+            .unwrap();
+        assert!(store.get_fact_conflict(q_gone).unwrap().is_none());
+        demote_to_v11(&store);
+        drop(store);
+
+        let store = SqliteStore::open(tmp.path().join("db.sqlite")).unwrap();
+        assert!(
+            store
+                .lookup_decision("personal", &k_gone)
+                .unwrap()
+                .unwrap()
+                .loser_object_norm
+                .is_none(),
+            "no conflict row, no orientation — guessing is what G10 forbids"
+        );
+        assert!(store
+            .lookup_decision("personal", &k_keep)
+            .unwrap()
+            .unwrap()
+            .loser_object_norm
+            .is_none());
+        // The one it CAN read is still read: the sweep is per row, not
+        // all-or-nothing.
+        assert_eq!(
+            store
+                .lookup_decision("personal", &k)
+                .unwrap()
+                .unwrap()
+                .loser_object_norm
+                .as_deref(),
+            Some("lisbon")
         );
     }
 }
