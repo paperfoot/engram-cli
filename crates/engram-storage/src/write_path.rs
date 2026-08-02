@@ -762,6 +762,58 @@ mod tests {
         assert!(store.clear_extraction_marker(m).unwrap());
     }
 
+    /// Blocker 6 / ruling G6, from the storage side, with the gate's own
+    /// scenario: a memory holding no extractable claim. Both memories below
+    /// are processed and factless, so `fact_extraction_log` is the ONLY thing
+    /// keeping either out of the backfill queue — and a rebuild restores that
+    /// table from `derivation.ran` and nothing else.
+    ///
+    /// The welded write survives. The bare marker does not: after a rebuild
+    /// the memory is pending again and the next backfill pays the provider
+    /// for an answer the store already had. That is why `write_fact_batch`
+    /// must call `record_derivation`, and why the bare method exists only for
+    /// the migration's genesis pass.
+    #[test]
+    fn only_the_welded_derivation_restores_the_extraction_marker() {
+        let (_tmp, _g, store) = temp_store();
+        let welded = memory(&store, "No extractable atomic claim here.");
+        store
+            .record_derivation(
+                welded,
+                &engram_core::keys::content_hash("No extractable atomic claim here."),
+                crate::journal::EXTRACTOR_FACT_LLM,
+                Some("stub-chat"),
+                &[],
+                "cli:default",
+            )
+            .unwrap();
+        let bare = memory(&store, "Nothing atomic in this one either.");
+        store
+            .record_fact_extraction(bare, Some("stub-chat"), 0, "remember")
+            .unwrap();
+
+        let pending = |store: &SqliteStore| -> Vec<Uuid> {
+            store
+                .list_memories_pending_fact_extraction(None, None, None)
+                .unwrap()
+                .iter()
+                .map(|(_, m)| m.id)
+                .collect()
+        };
+        assert!(
+            pending(&store).is_empty(),
+            "both memories are processed before the rebuild"
+        );
+
+        store.rebuild_projections(None, false).unwrap();
+
+        assert_eq!(
+            pending(&store),
+            vec![bare],
+            "a marker with no event is a marker a rebuild cannot put back"
+        );
+    }
+
     #[test]
     fn an_edit_appends_revised_and_an_importance_bump_appends_meta_changed() {
         let (_tmp, _g, store) = temp_store();

@@ -2265,6 +2265,18 @@ impl SqliteStore {
 
     /// Record that the fact extractor has processed this memory's content.
     /// Idempotent: a later run overwrites the previous marker.
+    ///
+    /// UNWELDED, and therefore not a write path anyone may reach for [G6]:
+    /// it writes the row and appends nothing, so `admin rebuild` — which
+    /// restores `fact_extraction_log` from `derivation.ran` alone — cannot
+    /// put the marker back, and the memory silently rejoins the backfill
+    /// queue. `record_derivation` is the welded path and calls this inside
+    /// its own transaction; the migration's genesis pass is the only other
+    /// legitimate caller (it reads the markers a v9 store already had).
+    ///
+    /// Becomes `pub(crate)` the moment `write_fact_batch` stops calling it —
+    /// see the lane report. The proof of what happens meanwhile is
+    /// `write_path::tests::only_the_welded_derivation_restores_the_extraction_marker`.
     pub fn record_fact_extraction(
         &self,
         memory_id: Uuid,
