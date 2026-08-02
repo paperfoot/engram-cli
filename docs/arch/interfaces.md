@@ -394,3 +394,45 @@ migration's genesis pass. Invariant 1 has no exceptions.
 
 **G7 — wire-error changes are declared.** `edit`, `facts resolve` and `jobs show` now answer
 `not_found` (was `bad_input`) on an absent uuid; the CHANGELOG's Breaking list names all three.
+
+## v2.3 addendum — the import trust boundary, rebuilt (binding)
+
+Three gate passes found the same class of hole in the same place. Pass 1: a non-person
+`close_authority` closed a safety interval on import. Pass 2: a forged POINT shape bypassed the
+authority check. Pass 3: a forged `reason: "stopped"` bypassed the shape check, a forged row
+shadowed a legitimate event, and a rejected event was laundered into trusted history by
+`admin rebuild`. Each fix consulted one more attacker-controlled field. That is the defect —
+not any of the individual fields.
+
+**G8 — a safety interval NEVER arrives closed from outside.** On every import path (v1, v2, v3;
+fact rows and replayed events alike), a fact whose relation is `takes_medication`,
+`allergic_to` or `diagnosed_with` lands OPEN. No field is consulted — not `close_authority`,
+not `close_reason`, not the interval shape — because every one of them is written by whoever
+wrote the file. The close is dropped whole (`valid_until`, `close_reason`, `close_authority`,
+`closed_by`, `superseded_by`, `superseded_at`), counted in
+`ImportV3Report.close_authority_rejected`, and surfaced by `engram import`.
+
+The error direction is deliberate and is the whole argument: over-reporting an allergy or a
+prescription is survivable and visible; under-reporting one is a medical incident. A store that
+imports "she stopped taking it" as "she is still taking it" is wrong in the direction a human
+notices and corrects. The reverse is wrong in the direction that kills someone.
+
+This RETIRES `cessation_close_is_exempt` and the v2.2 point-interval exemption entirely. The
+hazard that exemption existed to prevent — an exported extracted-cessation point re-opening — is
+accepted: a re-opened cessation claim is a duplicate open claim sitting beside the real one,
+already queued for adjudication. Noise, not danger. Fidelity loses to safety at a trust boundary.
+
+Non-safety relations are unchanged: "Bruno moved out of Lisbon" still imports closed.
+
+**G9 — events remember where they came from.** `events` gains `origin TEXT NOT NULL DEFAULT
+'own'` (schema v13, additive). Imported events are stamped `'imported'` and are re-evaluated as
+untrusted on EVERY replay, including `admin rebuild`. Without this, refusing a close at import
+time is theatre: the refused event stays in the journal and the next rebuild applies it as the
+store's own trusted history.
+
+**G10 — an unprovable decision orientation queues, whatever the relation.** `ReplayOutcome::
+Directionless` queues for ALL relations, not only safety ones. A caller's decision applied
+backwards is corruption whether it concerns a prescription or an employer; the safety/ordinary
+split was a scope error. The v11→v12 migration additionally backfills `loser_object_norm` for
+existing decisions whose conflict row still exists, so a store upgraded from v11 keeps its
+orientation instead of depending on a row a later `kb delete` can cascade away.
