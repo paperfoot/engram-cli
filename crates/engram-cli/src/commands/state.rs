@@ -447,19 +447,14 @@ fn provenance_for(ctx: &AppContext, f: &Fact) -> Result<Provenance, CliError> {
     })
 }
 
-/// D12's struct with this lane's two fields attached. `to_json` is
-/// read-surfaces' and does not carry them, so they are added here rather than
-/// by editing another lane's serializer.
+/// D12's struct with the mutator handles attached. `observed_at` and `snippet`
+/// used to be re-inserted here because `Provenance::to_json` dropped them;
+/// it now serializes every field of the struct, so this adds only the handles.
 fn provenance_json(p: &Provenance) -> Value {
     let mut obj = match p.to_json() {
         Value::Object(m) => m,
         other => return other,
     };
-    obj.insert(
-        "observed_at".to_string(),
-        json!(p.observed_at.map(|t| t.to_rfc3339())),
-    );
-    obj.insert("snippet".to_string(), json!(p.snippet));
     // The handle a mutator accepts, beside the raw id: a chunk id that `edit`
     // rejects is the exact defect typed handles exist to remove.
     if let Some(m) = p.memory_id {
