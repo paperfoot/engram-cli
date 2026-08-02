@@ -1158,14 +1158,12 @@ fn dispatch(
             if verdict.rule == "restates_closed_interval" {
                 // Re-opening a window someone deliberately ended is the one
                 // thing this arm exists to prevent.
-                plan.insert = None;
-                plan.absorbed = Some("restates_closed_interval");
+                absorb(plan, "restates_closed_interval");
             }
         }
         ConflictClass::Duplicate => {
-            plan.insert = None;
+            absorb(plan, "duplicate_object");
             plan.confirm.push(old_view.fact.id);
-            plan.absorbed = Some("duplicate_object");
         }
         ConflictClass::SupersedeOld => {
             let authority = close_authority(&verdict, replayed);
@@ -1216,6 +1214,22 @@ fn dispatch(
         }
     }
     Ok(())
+}
+
+/// The observation turned out to be news to nobody, so NOTHING it implied
+/// survives.
+///
+/// Clearing the rest of the plan is not tidiness. An earlier sibling can
+/// already have planned a close — "Ana lives in Paris" arrives, closes the
+/// open London interval, and is then absorbed by a Paris interval that was
+/// deliberately ended in 2020. Keeping the close would retire the current
+/// value on the strength of an assertion the planner just discarded.
+fn absorb(plan: &mut WritePlan, rule: &'static str) {
+    plan.insert = None;
+    plan.closes.clear();
+    plan.queue.clear();
+    plan.replays.clear();
+    plan.absorbed = Some(rule);
 }
 
 type PairContext<'a, 'f> = (

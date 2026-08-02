@@ -424,6 +424,34 @@ fn a_reinstated_medication_is_a_second_interval_not_a_duplicate() {
     assert!(p.closes.is_empty());
 }
 
+/// An absorbed observation takes its whole plan with it.
+///
+/// "Ana lives in Paris" closes the open London interval on its way past — and
+/// is then absorbed by a Paris interval somebody deliberately ended in 2020.
+/// Keeping the close would retire the CURRENT value on the strength of an
+/// assertion the planner just discarded.
+#[test]
+fn an_absorbed_observation_closes_nothing_on_its_way_out() {
+    let london = stored("Ana", "lives_in", "London", "2015-01-01");
+    let paris_then = closed(
+        stored("Ana", "lives_in", "Paris", "2018-01-01"),
+        "2020-01-01",
+    );
+    let paris_again = stored("Ana", "lives_in", "Paris", "2019-01-01");
+    let p = plan(
+        &observation_of(&paris_again),
+        &[london.clone(), paris_then.clone()],
+    );
+    assert_eq!(p.absorbed, Some("restates_closed_interval"));
+    assert!(p.insert.is_none());
+    assert!(
+        p.closes.is_empty(),
+        "the London interval must survive an assertion nobody kept: {:?}",
+        p.closes
+    );
+    assert!(p.queue.is_empty());
+}
+
 #[test]
 fn a_backdated_assertion_inside_a_closed_window_is_settled() {
     let stopped = closed(
@@ -1000,6 +1028,135 @@ fn the_drain_resolves_what_the_new_rules_would_never_have_queued() {
     let v = triage_verdict(&new, &old, None, &never_settled);
     assert_eq!(triage_resolution(&v), "triage_recency");
     assert_eq!(triage_decision(&v), DecisionVerdict::CloseOld);
+}
+
+/// A backlog shaped like the one the audit found — 951 open rows, dominated by
+/// second values of set relations and by pairs whose loser was already retired
+/// — and what the new rules do to each class (spec §4.1 Phase 2).
+///
+/// This is the drain's claim written as a table rather than as a number: every
+/// class that should leave the queue leaves it, and every class that is a
+/// genuine question stays. The count is not the point; the DISPOSITION is.
+#[test]
+fn the_drain_disposes_of_every_class_in_the_backlog_table() {
+    let never_settled = |_: Uuid| false;
+    let mut retired = stored("Ana", "allergic_to", "penicillin", "2020-01-01");
+    retired.superseded_by = Some(Uuid::new_v4());
+
+    let mut same_memo_a = stored("Carol", "works_at", "Acme", "2026-01-01");
+    let same_memo_b = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
+    same_memo_a.source_memory_id = same_memo_b.source_memory_id;
+
+    // (name, new, old, expected class, expected rule)
+    let backlog: Vec<(&str, Fact, Fact, ConflictClass, &str)> = vec![
+        (
+            "different medications on one person",
+            stored("Ana", "takes_medication", "rapamycin 6 mg", "2026-02-01"),
+            stored("Ana", "takes_medication", "metformin 500 mg", "2026-01-01"),
+            ConflictClass::Coexist,
+            "safety_set_coexist",
+        ),
+        (
+            "different allergies on one person",
+            stored("Ana", "allergic_to", "amoxicillin", "2026-01-01"),
+            stored("Ana", "allergic_to", "penicillin", "2020-01-01"),
+            ConflictClass::Coexist,
+            "safety_set_coexist",
+        ),
+        (
+            "a pair whose loser was already retired",
+            stored("Ana", "allergic_to", "amoxicillin", "2026-01-01"),
+            retired,
+            ConflictClass::Settled,
+            "already_settled",
+        ),
+        (
+            "single-valued values that never overlapped",
+            stored("Elias", "lives_in", "Lisbon", "2024-02-01"),
+            closed(
+                stored("Elias", "lives_in", "London", "2015-06-01"),
+                "2020-01-01",
+            ),
+            ConflictClass::Coexist,
+            "disjoint_intervals",
+        ),
+        (
+            "a second value of a set relation",
+            stored("Elias", "knows", "Carol", "2026-02-01"),
+            stored("Elias", "knows", "Alice", "2026-01-01"),
+            ConflictClass::Coexist,
+            "multi_valued",
+        ),
+        (
+            "two people, opposite values",
+            stored("Bob", "lives_in", "Porto", "2026-02-01"),
+            stored("Alice", "lives_in", "Berlin", "2026-01-01"),
+            ConflictClass::Coexist,
+            "different_subject",
+        ),
+        (
+            "two attributes of one person",
+            stored("Elias", "has_role", "CEO", "2026-02-01"),
+            stored("Elias", "lives_in", "Lisbon", "2026-01-01"),
+            ConflictClass::Coexist,
+            "different_predicate",
+        ),
+        // …and the residue, which is what a review flow is FOR.
+        (
+            "same medication, different dose",
+            stored("Ana", "takes_medication", "metformin 1000 mg", "2026-06-01"),
+            stored("Ana", "takes_medication", "metformin 500 mg", "2026-01-01"),
+            ConflictClass::Queue,
+            "safety_member_change",
+        ),
+        (
+            "two employers from one memo",
+            same_memo_b.clone(),
+            same_memo_a.clone(),
+            ConflictClass::Queue,
+            "same_source_contradiction",
+        ),
+        (
+            "two birthdays",
+            stored("Ana", "birthday", "1991-04-12", "2026-01-01"),
+            stored("Ana", "birthday", "1990-04-12", "2020-01-01"),
+            ConflictClass::Queue,
+            "immutable_attribute_disagreement",
+        ),
+    ];
+
+    let mut resolved = 0usize;
+    for (name, new, old, class, rule) in &backlog {
+        let v = triage_verdict(new, old, None, &never_settled);
+        assert_eq!(v.class, *class, "{name}: {:?}/{}", v.class, v.rule);
+        assert_eq!(v.rule, *rule, "{name}");
+        if v.is_auto_resolvable() {
+            resolved += 1;
+            // A coexistence is an ANSWER and binds a later write; a `Settled`
+            // pair answers nothing — its question stopped existing — so it
+            // records `void` and never replays. Both are terminal, and the
+            // difference is exactly what stops a cascaded row from binding.
+            let decided = triage_decision(&v);
+            if v.class == ConflictClass::Coexist {
+                assert_eq!(decided, DecisionVerdict::KeepBoth, "{name}");
+            } else {
+                assert_eq!(decided, DecisionVerdict::Void, "{name}");
+            }
+        }
+    }
+    assert_eq!(
+        resolved, 7,
+        "seven of ten classes leave the queue unattended"
+    );
+    // Not one of them closed a safety interval.
+    for (name, new, old, _, _) in &backlog {
+        let v = triage_verdict(new, old, None, &never_settled);
+        let safety = FactView::of(new).is_safety() || FactView::of(old).is_safety();
+        assert!(
+            !safety || triage_decision(&v) != DecisionVerdict::CloseOld,
+            "{name} would have retired a safety fact"
+        );
+    }
 }
 
 #[test]
