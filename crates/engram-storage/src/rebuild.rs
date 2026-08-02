@@ -10,6 +10,7 @@
 //! | `facts` (minus `embedding`/`embed_model`) | yes | embeddings are a recomputable cache, and a 768-float blob has no business in a JSON payload |
 //! | `fact_conflict_queue`, `fact_decisions` | yes | from `conflict.opened` + `decision.recorded` |
 //! | `derivations`, `fact_extraction_log` | yes | from `derivation.ran`, minus the markers `memory.revised` cleared |
+//! | `lessons` | yes | from `lesson.recorded|confirmed|retracted` (D24) |
 //! | `memories`, `chunks` | **no** | access telemetry and chunk embeddings are deliberately not journaled |
 //! | `claims`, `entities`, `relations`, `wiki_pages`, `source_spans` | **no** | compiler caches; `engram compile` regenerates them |
 //!
@@ -43,6 +44,7 @@ pub struct RebuildReport {
     pub decisions: i64,
     pub derivations: i64,
     pub extraction_markers: i64,
+    pub lessons: i64,
     pub conflicts_skipped_orphan: usize,
     pub embeddings_restored: usize,
     pub skipped: Vec<SkippedTable>,
@@ -323,6 +325,82 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
                 )?;
             }
         }
+        // Procedural memory (D24). Replay SETS `occurrences` from the payload
+        // rather than incrementing a counter: the payload carries the
+        // post-write count, so a lesson learned five times rebuilds as five
+        // whether the replay sees one event or five.
+        EventKind::LessonRecorded => {
+            let id = e.payload_uuid("lesson_id")?;
+            store.conn.execute(
+                "INSERT INTO lessons(id, kb, diary, trigger, lesson, lesson_norm, status,
+                        source_kind, confidence, occurrences, evidence_json, memory_id, rule,
+                        created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                 ON CONFLICT(id) DO UPDATE SET
+                        occurrences = excluded.occurrences,
+                        evidence_json = excluded.evidence_json,
+                        memory_id = COALESCE(excluded.memory_id, lessons.memory_id),
+                        updated_at = excluded.updated_at",
+                params![
+                    id.to_string(),
+                    e.payload_opt_str("kb")
+                        .or_else(|| e.kb.clone())
+                        .unwrap_or_else(|| "default".to_string()),
+                    e.payload_opt_str("diary")
+                        .or_else(|| e.diary.clone())
+                        .unwrap_or_else(|| "lessons".to_string()),
+                    e.payload_str("trigger")?,
+                    e.payload_str("lesson")?,
+                    e.payload_str("lesson_norm")?,
+                    e.payload_str("status")?,
+                    e.payload_opt_str("source_kind")
+                        .unwrap_or_else(|| "agent_extracted".to_string()),
+                    e.payload
+                        .get("confidence")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.5),
+                    e.payload
+                        .get("occurrences")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(1),
+                    e.payload
+                        .get("evidence")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "[]".to_string()),
+                    e.payload_opt_str("memory_id"),
+                    e.payload_opt_str("rule"),
+                    // `created_at` comes from the payload, never from `now()`:
+                    // a rebuilt lesson dated at rebuild time is a lesson whose
+                    // history was quietly rewritten.
+                    e.payload_opt_str("created_at")
+                        .unwrap_or_else(|| e.ts.to_rfc3339()),
+                    e.payload_opt_str("updated_at")
+                        .unwrap_or_else(|| e.ts.to_rfc3339()),
+                ],
+            )?;
+        }
+        EventKind::LessonConfirmed | EventKind::LessonRetracted => {
+            let id = e.payload_uuid("lesson_id")?;
+            let status = if e.kind == EventKind::LessonConfirmed {
+                crate::lessons::STATUS_CONFIRMED
+            } else {
+                crate::lessons::STATUS_RETIRED
+            };
+            store.conn.execute(
+                "UPDATE lessons
+                    SET status = ?1,
+                        memory_id = COALESCE(?2, memory_id),
+                        updated_at = ?3
+                  WHERE id = ?4",
+                params![
+                    status,
+                    e.payload_opt_str("memory_id"),
+                    e.payload_opt_str("updated_at")
+                        .unwrap_or_else(|| e.ts.to_rfc3339()),
+                    id.to_string(),
+                ],
+            )?;
+        }
         // No projection effect: an audit record of an applied replay, and the
         // provenance of memories/compile/jobs, which this rebuild does not own.
         EventKind::DecisionReplayed
@@ -425,6 +503,13 @@ impl SqliteStore {
             "DELETE FROM facts WHERE (?1 IS NULL OR kb = ?1)",
             params![kb],
         )?;
+        // Lessons are a journalled projection like any other (D24): dropping
+        // and replaying them is what keeps invariant 3 true on a store where
+        // anyone ran `engram lessons add`.
+        self.conn.execute(
+            "DELETE FROM lessons WHERE (?1 IS NULL OR kb = ?1)",
+            params![kb],
+        )?;
 
         // The open-key unique index constrains the FINAL state, not every
         // intermediate one: a question that was later collapsed is `open` at
@@ -477,6 +562,7 @@ impl SqliteStore {
         report.decisions = self.count_rows("fact_decisions", kb)?;
         report.derivations = self.count_rows("derivations", None)?;
         report.extraction_markers = self.count_rows("fact_extraction_log", None)?;
+        report.lessons = self.count_rows("lessons", kb)?;
         Ok(report)
     }
 

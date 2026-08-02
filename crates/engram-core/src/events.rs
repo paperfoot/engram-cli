@@ -29,6 +29,14 @@ pub enum EventKind {
     JobSubmitted,
     JobCompleted,
     JobFailed,
+    // Procedural memory (D24). A lesson is a claim about the WORK, not about
+    // the world, and it is journalled for the same reason a fact is: the
+    // `lessons` projection has to be rebuildable, and a machine-proposed
+    // sentence that cannot be traced back to the events that suggested it is
+    // an opinion with no evidence.
+    LessonRecorded,
+    LessonConfirmed,
+    LessonRetracted,
 }
 
 impl EventKind {
@@ -51,6 +59,9 @@ impl EventKind {
             EventKind::JobSubmitted => "job.submitted",
             EventKind::JobCompleted => "job.completed",
             EventKind::JobFailed => "job.failed",
+            EventKind::LessonRecorded => "lesson.recorded",
+            EventKind::LessonConfirmed => "lesson.confirmed",
+            EventKind::LessonRetracted => "lesson.retracted",
         }
     }
 
@@ -71,12 +82,15 @@ impl EventKind {
             "job.submitted" => EventKind::JobSubmitted,
             "job.completed" => EventKind::JobCompleted,
             "job.failed" => EventKind::JobFailed,
+            "lesson.recorded" => EventKind::LessonRecorded,
+            "lesson.confirmed" => EventKind::LessonConfirmed,
+            "lesson.retracted" => EventKind::LessonRetracted,
             _ => return None,
         })
     }
 
     /// Every kind, for exhaustive tests and the rebuild dispatcher.
-    pub const ALL: [EventKind; 15] = [
+    pub const ALL: [EventKind; 18] = [
         EventKind::MemoryWritten,
         EventKind::MemoryRevised,
         EventKind::MemoryRetracted,
@@ -92,6 +106,9 @@ impl EventKind {
         EventKind::JobSubmitted,
         EventKind::JobCompleted,
         EventKind::JobFailed,
+        EventKind::LessonRecorded,
+        EventKind::LessonConfirmed,
+        EventKind::LessonRetracted,
     ];
 }
 

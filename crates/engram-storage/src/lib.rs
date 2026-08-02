@@ -9,6 +9,7 @@ pub mod fts;
 pub mod handles;
 pub mod jobs;
 pub mod journal;
+pub mod lessons;
 pub mod migrate_v10;
 pub mod paths;
 pub mod rebuild;
@@ -27,6 +28,7 @@ pub use jobs::{
     STATUS_RUNNING,
 };
 pub use journal::{EventDraft, EventRow};
+pub use lessons::{LessonRow, LessonUpsert};
 pub use migrate_v10::MigrationV10Report;
 pub use rebuild::RebuildReport;
 pub use sqlite::{
