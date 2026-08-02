@@ -52,7 +52,12 @@ CREATE TABLE IF NOT EXISTS fact_decisions (
     conflict_id   TEXT,
     event_id      TEXT NOT NULL,
     key_version   TEXT NOT NULL,
-    decided_at    TEXT NOT NULL
+    decided_at    TEXT NOT NULL,
+    -- G3, added here as well as by the v12 ALTER: a store that first meets
+    -- this table at v10 gets the column immediately, and `migrate_v12` is then
+    -- a no-op on it. A store whose table already exists gets it at v12. Both
+    -- land on the same shape, which is what `add_column_if_missing` is for.
+    loser_object_norm TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fact_decisions_key
     ON fact_decisions(kb, decision_key, authority, decided_at DESC);
@@ -588,6 +593,17 @@ impl QueueSeed {
             _ => "machine",
         }
     }
+
+    /// WHICH value the v9 row retired [G3]. The supersession pointers say it
+    /// outright, so the ~14.5k migrated decisions arrive oriented instead of
+    /// depending forever on a queue row that a `kb delete` can cascade away.
+    fn loser_object_norm(&self) -> Option<&str> {
+        match self.verdict() {
+            "reject_new" => Some(&self.new_object_norm),
+            "close_old" => Some(&self.old_object_norm),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) struct ResolvedCounts {
@@ -657,6 +673,7 @@ impl SqliteStore {
                     &key,
                     SEMANTIC_KEY_VERSION,
                     seed.verdict(),
+                    seed.loser_object_norm(),
                     seed.authority(),
                     conflict_uuid,
                     seed.note.as_deref(),
@@ -687,6 +704,7 @@ impl SqliteStore {
                 &seed.new_subject_norm,
                 &seed.relation(),
                 seed.verdict(),
+                seed.loser_object_norm(),
                 seed.authority(),
                 seed.resolved_by.as_deref().unwrap_or("migration"),
                 seed.note.as_deref(),
@@ -835,6 +853,8 @@ impl SqliteStore {
                             key,
                             SEMANTIC_KEY_VERSION,
                             "void",
+                            // A collapse retires a QUESTION, not a value.
+                            None,
                             "machine",
                             loser,
                             Some("auto: merged into an identical open question"),
@@ -869,6 +889,7 @@ impl SqliteStore {
                         &subject_norm,
                         &relation,
                         "void",
+                        None,
                         "machine",
                         "migration",
                         Some("auto: merged into an identical open question"),
@@ -947,6 +968,7 @@ impl SqliteStore {
         subject_norm: &str,
         relation: &str,
         verdict: &str,
+        loser_object_norm: Option<&str>,
         authority: &str,
         actor: &str,
         note: Option<&str>,
@@ -962,8 +984,8 @@ impl SqliteStore {
         Ok(self.conn.execute(
             "INSERT OR IGNORE INTO fact_decisions(id, kb, diary, decision_key, subject_norm,
                     relation, pair_hash, verdict, authority, actor, note, conflict_id,
-                    event_id, key_version, decided_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    event_id, key_version, decided_at, loser_object_norm)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 id.to_string(),
                 kb,
@@ -980,6 +1002,7 @@ impl SqliteStore {
                 event_id.to_string(),
                 SEMANTIC_KEY_VERSION,
                 decided_at,
+                loser_object_norm,
             ],
         )?)
     }

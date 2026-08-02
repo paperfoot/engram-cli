@@ -5,8 +5,9 @@
 The five-move rebuild of the write/mutate/adjudicate layer, from the 2026-08-01
 agent-experience audit: an append-only journal as source of truth, bi-temporal
 interval facts, decision replay, a single-writer core with jobs, and a generated
-contract. Schema v9 → v11 (v10 journal + intervals, v11 lessons); the v10
-migration writes a `VACUUM INTO` backup beside the store before touching a row.
+contract. Schema v9 → v12 (v10 journal + intervals, v11 lessons, v12 decision
+orientation); the v10 migration writes a `VACUUM INTO` backup beside the store
+before touching a row. v11 and v12 are additive-only and take no backup.
 
 ### Breaking for agents/scripts
 
@@ -67,7 +68,13 @@ migration writes a `VACUUM INTO` backup beside the store before touching a row.
 - Decision replay: adjudications are keyed by semantic identity and replayed
   on re-derivation — the store never asks the same question twice
   (`decision.replayed` in the journal, `resolution: "replayed_*"` in
-  responses).
+  responses). Each decision also records the value it retired
+  (`fact_decisions.loser_object_norm`, schema v12), so the ruling travels with
+  the value rather than with the slot: a re-derivation that names the pair in
+  the other order applies the same outcome, and it keeps applying it after a
+  `kb delete` has cascaded the conflict row away. Where no orientation was
+  ever recorded and none can be recovered, a safety pair queues instead of
+  guessing.
 - Epistemic reads: `returned`/`total`/`cursor` on every listing, `verdict:
   results|no_match` with an absence certificate (scope searched, top score vs
   threshold, nearest subjects), `metadata.scope`, and honest `elapsed_ms`

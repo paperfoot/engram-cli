@@ -867,7 +867,7 @@ const MEMORY_CONSTRAINS_DERIVED: &str = "(
     )
 )";
 
-pub const CURRENT_VERSION: i32 = 11;
+pub const CURRENT_VERSION: i32 = 12;
 
 /// A fact still asserts something only while BOTH are true: no successor took
 /// its slot, and its own interval has not been closed. `close_reason='stopped'`
@@ -1078,6 +1078,11 @@ impl SqliteStore {
             // backup — that rule exists for migrations that rewrite rows.
             if current < 11 {
                 s.migrate_v11()?;
+            }
+            // v12 is additive-only for the same reason: one nullable column on
+            // `fact_decisions`, no backfill and no row rewrite (D25).
+            if current < 12 {
+                s.migrate_v12()?;
             }
             if current != CURRENT_VERSION {
                 s.conn.execute(
@@ -4942,6 +4947,8 @@ impl SqliteStore {
                     &row_diary,
                     &key,
                     "void",
+                    // A void retires the QUESTION, not either value.
+                    None,
                     "machine",
                     resolved_by,
                     Some("auto: referenced facts no longer exist"),
@@ -6307,6 +6314,7 @@ mod tests {
                 "default",
                 &key,
                 "close_old",
+                Some("penicillin"),
                 "caller",
                 "caller",
                 note,

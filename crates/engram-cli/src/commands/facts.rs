@@ -36,7 +36,9 @@ use engram_core::types::{Fact, SourceKind};
 use engram_embed::stub::StubEmbedder;
 use engram_embed::Embedder;
 use engram_graph::facts::{canonical_predicate, extract_facts, normalize};
-use engram_graph::semantics::{triage_decision, FactView, SemanticKey, SEMANTIC_KEY_VERSION};
+use engram_graph::semantics::{
+    triage_decision, DecisionVerdict, FactView, SemanticKey, SEMANTIC_KEY_VERSION,
+};
 use engram_storage::sqlite::FactConflictRow;
 use serde_json::json;
 use std::collections::HashMap;
@@ -817,12 +819,24 @@ pub fn triage(
                         _ => SemanticKey::for_pair(&FactView::of(new_f), &FactView::of(old_f))
                             .encode(),
                     };
+                    let decided = triage_decision(&verdict);
+                    // The value this sweep retires [G3]. `close_old` retires
+                    // the row's old fact, `reject_new` (and the duplicate that
+                    // maps onto it) the new one; a `keep_both` or a `void`
+                    // retires nothing. Recorded on the decision so it survives
+                    // the queue row that a `kb delete` can cascade away.
+                    let loser = match decided {
+                        DecisionVerdict::CloseOld => Some(old_f.object_norm.as_str()),
+                        DecisionVerdict::RejectNew => Some(new_f.object_norm.as_str()),
+                        DecisionVerdict::KeepBoth | DecisionVerdict::Void => None,
+                    };
                     let claimed = store.resolve_conflict_with_decision(
                         row.id,
                         &row.kb,
                         &row.diary,
                         &key,
-                        triage_decision(&verdict).as_str(),
+                        decided.as_str(),
+                        loser,
                         "machine",
                         "triage",
                         Some(&format!(

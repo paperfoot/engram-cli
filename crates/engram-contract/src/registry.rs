@@ -22,7 +22,7 @@ use crate::model::*;
 /// against a second literal: the tripwire fires the wave a migration lands
 /// without the documentation moving with it. Cross-lane patch 2f makes the
 /// storage constant `pub` and this becomes a derivation instead of a mirror.
-pub const SCHEMA_VERSION: u32 = 11; // v11: lessons, additive-only (wave 5, D25)
+pub const SCHEMA_VERSION: u32 = 12; // v12: fact_decisions.loser_object_norm (G3, additive-only)
 
 pub const CONTRACT_VERSION: &str = "contract@1";
 

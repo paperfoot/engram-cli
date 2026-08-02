@@ -661,15 +661,12 @@ impl DecisionRecord {
                 object_pair_hash: r.pair_hash,
             },
             verdict: DecisionVerdict::parse(&r.verdict),
-            // G3's storage half — a `loser_object_norm` column on
-            // `fact_decisions`, written by `record_decision` — lands in the
-            // storage lane; this line becomes `r.loser_object_norm` the moment
-            // it does. Until then, and forever for the rows written before it,
-            // `binding_decision` recovers the orientation from the queue row
-            // (see `recover_loser`). `None` means NOT RECORDED, never "no
-            // loser": `replay` reads it as a legacy row and keeps the v0.4.0
-            // behaviour rather than guessing.
-            loser_object_norm: None,
+            // G3's storage half landed in schema v12, so this is the recorded
+            // orientation and not a placeholder. `None` means NOT RECORDED —
+            // a row written before v12, or a verdict that retired nothing —
+            // and `binding_decision` then tries `recover_loser` before `replay`
+            // decides what an unprovable orientation may do.
+            loser_object_norm: r.loser_object_norm,
             authority: DecisionAuthority::parse(&r.authority),
             actor: r.actor,
             decided_at: r.decided_at,
@@ -713,19 +710,26 @@ impl DecisionLedger for SqliteStore {
     }
 }
 
-/// WHICH value a decision retired, recovered from the queue row it answered.
+/// THE LEGACY PATH ONLY: which value a decision retired, recovered from the
+/// queue row it answered.
 ///
-/// `fact_decisions` carried no orientation before G3 and the semantic key
-/// cannot supply one — it hashes the object pair in sorted order because it
+/// `fact_decisions` carried no orientation before schema v12, and the semantic
+/// key cannot supply one — it hashes the object pair in sorted order because it
 /// names the QUESTION. The conflict row knows: a `close_old` retired its
 /// `old_fact_id`, a `reject_new` its `new_fact_id`. Reading it here means a
 /// ruling taken before the column existed still lands on the value the caller
 /// actually rejected, instead of on whichever side of the pair happens to
 /// arrive second in the next re-derivation.
 ///
+/// Nothing written at v12 or later depends on this: those rows carry their own
+/// loser, which is the point — the queue row is destructible (a `kb delete`
+/// cascades it through the fact foreign keys while the decision survives), and
+/// an orientation that lives only there is an orientation that can be deleted
+/// out from under a safety ruling.
+///
 /// Every absence answers `None` — no conflict id, a cascaded queue row, a
-/// deleted fact — and `None` replays exactly as v0.4.0-rc1 did. Recovery is
-/// best effort; it never invents an orientation.
+/// deleted fact. Recovery is best effort; it never invents an orientation, and
+/// [`replay`] decides what an unprovable one is allowed to do.
 fn recover_loser(
     store: &SqliteStore,
     record: &DecisionRecord,
@@ -763,6 +767,12 @@ pub enum ReplayOutcome {
     /// applying it in either direction would be a coin toss with an audit
     /// trail.
     Unmatched,
+    /// A directional decision with no recorded loser and nothing left to
+    /// recover one from, on a relation where guessing wrong retires a
+    /// medication, an allergy or a diagnosis. It queues. A decision whose
+    /// orientation nobody can prove is not a decision that may close a safety
+    /// interval [G3].
+    Directionless,
 }
 
 /// What a prior decision does to a freshly classified pair.
@@ -786,11 +796,17 @@ pub enum ReplayOutcome {
 /// `current` is read for one reason: a decision that would change nothing is
 /// not replayed, so a settled or absorbed pair does not accumulate
 /// `decision.replayed` events describing a no-op.
+///
+/// `pair_is_safety` is the relation's safety class, and it governs the one case
+/// where the direction cannot be established at all: on an ordinary relation an
+/// unoriented legacy row still replays positionally, and on a safety relation
+/// it queues.
 pub fn replay(
     prior: &DecisionRecord,
     current: Verdict,
     new_object_norm: &str,
     old_object_norm: &str,
+    pair_is_safety: bool,
 ) -> ReplayOutcome {
     if matches!(
         current.class,
@@ -811,9 +827,13 @@ pub fn replay(
             }
         }
         (DecisionAuthority::Machine, _) => ReplayOutcome::NotBinding,
-        (DecisionAuthority::Caller, verdict) => {
-            replay_directional(prior, verdict, new_object_norm, old_object_norm)
-        }
+        (DecisionAuthority::Caller, verdict) => replay_directional(
+            prior,
+            verdict,
+            new_object_norm,
+            old_object_norm,
+            pair_is_safety,
+        ),
     }
 }
 
@@ -823,14 +843,26 @@ fn replay_directional(
     verdict: DecisionVerdict,
     new_object_norm: &str,
     old_object_norm: &str,
+    pair_is_safety: bool,
 ) -> ReplayOutcome {
     let close_old = Verdict::new(ConflictClass::SupersedeOld, "replayed_close_old");
     let reject_new = Verdict::new(ConflictClass::SupersedeNew, "replayed_reject_new");
     let Some(loser) = prior.loser_object_norm.as_deref() else {
-        // A row from before the ledger recorded which value lost, and whose
-        // queue row is gone too. It replays in the orientation it was stored
-        // in — the pre-G3 behaviour — because inventing one would be worse
-        // than repeating one.
+        // A row from before schema v12 recorded which value lost, and whose
+        // queue row is gone too, so nothing left in the store can say which
+        // side the caller retired.
+        //
+        // On a safety relation that is where replay STOPS. Falling back to
+        // pair order here is what reversed a caller's ruling on `metformin
+        // 500 mg` vs `1000 mg` once a `kb delete` had cascaded the conflict
+        // row away: the re-derivation emitted the pair in the other order, and
+        // "close the old one" landed on the dose the caller had kept.
+        if pair_is_safety {
+            return ReplayOutcome::Directionless;
+        }
+        // Elsewhere it still replays in the orientation it was stored in — the
+        // pre-G3 behaviour — because for a city or an employer, repeating an
+        // old convention beats turning every legacy row into a question.
         return ReplayOutcome::Applied(match verdict {
             DecisionVerdict::CloseOld => close_old,
             _ => reject_new,
@@ -1316,6 +1348,7 @@ fn dispatch(
             verdict,
             &new_view.fact.object_norm,
             &old_view.fact.object_norm,
+            new_view.is_safety() || old_view.is_safety(),
         ) {
             ReplayOutcome::Applied(applied) => {
                 plan.replays.push(PlannedReplay {
@@ -1339,6 +1372,13 @@ fn dispatch(
             // answer we cannot map is a reason to ask, not to act.
             ReplayOutcome::Unmatched => (
                 Verdict::new(ConflictClass::Queue, "replay_loser_unmatched"),
+                None,
+            ),
+            // Same withdrawal, different reason: the stored answer may well be
+            // about this pair, but nothing can say which half of it lost, and
+            // this relation is one where a wrong guess retires a medication.
+            ReplayOutcome::Directionless => (
+                Verdict::new(ConflictClass::Queue, "replay_orientation_unknown"),
                 None,
             ),
         },

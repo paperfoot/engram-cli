@@ -227,3 +227,91 @@ fn keep_both_is_an_answer_the_store_remembers() {
         "both values stay live and the question stays answered"
     );
 }
+
+/// The re-gate's blocker B, as the CLI reaches it. A `kb delete` cascades the
+/// conflict row away through the two fact foreign keys, while the decision —
+/// which has no foreign key — survives under a name the caller can reuse. So
+/// the ruling outlives the only row that said which side of it lost.
+///
+/// Before G3's storage half, replay then fell back to pair ORDER: the caller
+/// had kept `metformin 1000 mg`, the re-derivation named the doses the other
+/// way round, and "close the old one" closed the 1000 mg. A reversed
+/// prescription, applied silently, on the relation where that matters most.
+///
+/// The decision now carries the value it retired, so the outcome travels with
+/// the dose instead of with the slot.
+#[test]
+fn a_purged_conflict_row_cannot_reverse_a_prescription() {
+    const ASCENDING: &str = r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin 500 mg"},
+                                {"subject":"Ana","predicate":"takes_medication","object":"metformin 1000 mg"}]"#;
+    const DESCENDING: &str = r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin 1000 mg"},
+                                 {"subject":"Ana","predicate":"takes_medication","object":"metformin 500 mg"}]"#;
+    let tmp = store();
+    let remember = |facts: &str, content: &str| {
+        run_json(
+            &mut engram(tmp.path()),
+            &[
+                "remember",
+                content,
+                "--kb",
+                "medical",
+                "--offline",
+                "--facts-json",
+                facts,
+            ],
+        )
+    };
+    let doses = || -> Vec<String> {
+        let mut v: Vec<String> = run_json(
+            &mut engram(tmp.path()),
+            &["facts", "list", "--subject", "Ana", "--kb", "medical"],
+        )["data"]["facts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| f["object"].as_str().map(str::to_string))
+            .collect();
+        v.sort();
+        v
+    };
+
+    run_json(&mut engram(tmp.path()), &["kb", "create", "medical"]);
+    let first = remember(
+        ASCENDING,
+        "Ana takes metformin 500 mg and metformin 1000 mg.",
+    );
+    let conflict_id = first["data"]["adjudication_needed"][0]["conflict_id"]
+        .as_str()
+        .expect("a dose change on a safety relation is a question")
+        .to_string();
+    run_json(
+        &mut engram(tmp.path()),
+        &[
+            "facts",
+            "resolve",
+            &conflict_id,
+            "--action",
+            "supersede-old",
+        ],
+    );
+    assert_eq!(doses(), vec!["metformin 1000 mg".to_string()]);
+
+    // The purge. Recreating the KB under the same name is what lets the
+    // orphaned decision meet a fresh derivation of its own question.
+    run_json(
+        &mut engram(tmp.path()),
+        &["kb", "delete", "medical", "--confirm"],
+    );
+    run_json(&mut engram(tmp.path()), &["kb", "create", "medical"]);
+    let reversed = remember(
+        DESCENDING,
+        "Reversed after purge: metformin 1000 mg and metformin 500 mg.",
+    );
+    assert_eq!(
+        doses(),
+        vec!["metformin 1000 mg".to_string()],
+        "the caller kept the 1000 mg dose; no re-derivation order may retire \
+         it: {reversed}"
+    );
+}
