@@ -119,9 +119,12 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             .await
         }
         Command::Documents(sub) => match sub {
-            DocumentsCommand::List { kb, all_kbs, limit } => {
-                commands::documents::list(&ctx, kb, all_kbs, limit)
-            }
+            DocumentsCommand::List {
+                kb,
+                all_kbs,
+                limit,
+                cursor,
+            } => commands::documents::list(&ctx, kb, all_kbs, limit, cursor),
             DocumentsCommand::Show { id } => commands::documents::show(&ctx, id),
             DocumentsCommand::Delete { id, confirm } => {
                 commands::documents::delete(&ctx, id, confirm)
@@ -310,7 +313,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 limit,
                 min_mentions,
                 kb,
-            } => commands::entities::list(&ctx, limit, min_mentions, kb),
+                cursor,
+            } => commands::entities::list(&ctx, limit, min_mentions, kb, cursor),
             EntitiesCommand::Show { name, kb } => commands::entities::show(&ctx, name, kb),
         },
         Command::People(sub) => match sub {
@@ -318,7 +322,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 limit,
                 min_mentions,
-            } => commands::people::list(&ctx, kb, limit, min_mentions),
+                cursor,
+            } => commands::people::list(&ctx, kb, limit, min_mentions, cursor),
             PeopleCommand::Show { name, kb, snippets } => {
                 commands::people::show(&ctx, name, kb, snippets)
             }
