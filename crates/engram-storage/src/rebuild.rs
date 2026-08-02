@@ -158,6 +158,10 @@ pub fn apply_from(
                 // one that arrives already CLOSED on a safety relation is a
                 // close nobody signed.
                 if valid_until.is_some()
+                    && !crate::export_v3::close_is_point(
+                        valid_from.as_deref(),
+                        valid_until.as_deref(),
+                    )
                     && crate::export_v3::close_needs_person(&e.payload_str("relation")?, None)
                 {
                     valid_until = None;
@@ -237,10 +241,12 @@ pub fn apply_from(
                             &until,
                         ));
                     }
-                    if crate::export_v3::close_needs_person(
-                        &predicate,
-                        Some(e.payload_str("authority")?).as_deref(),
-                    ) {
+                    if !crate::export_v3::close_is_point(valid_from.as_deref(), Some(&until))
+                        && crate::export_v3::close_needs_person(
+                            &predicate,
+                            Some(e.payload_str("authority")?).as_deref(),
+                        )
+                    {
                         // The event is kept — the journal records what the
                         // file claimed — but the projection does not move.
                         return Ok(1);

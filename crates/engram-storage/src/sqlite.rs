@@ -2277,7 +2277,7 @@ impl SqliteStore {
     /// Becomes `pub(crate)` the moment `write_fact_batch` stops calling it —
     /// see the lane report. The proof of what happens meanwhile is
     /// `write_path::tests::only_the_welded_derivation_restores_the_extraction_marker`.
-    pub fn record_fact_extraction(
+    pub(crate) fn record_fact_extraction(
         &self,
         memory_id: Uuid,
         model: Option<&str>,
@@ -5597,7 +5597,13 @@ impl SqliteStore {
             ));
         }
         let closed = row.valid_until.is_some() || row.superseded_by.is_some();
+        // A point interval is exempt: re-opening it would manufacture an
+        // ongoing prescription out of a sentence that said it ended.
         let close_rejected = closed
+            && !crate::export_v3::close_is_point(
+                row.valid_from.as_deref(),
+                row.valid_until.as_deref(),
+            )
             && crate::export_v3::close_needs_person(&row.predicate, row.close_authority.as_deref());
         // Dropping the close means dropping ALL of it: a row left with
         // `superseded_by` set is not open under `is_open_fact`, and half a

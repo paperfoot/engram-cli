@@ -109,6 +109,36 @@ pub(crate) fn close_needs_person(predicate: &str, authority: Option<&str>) -> bo
         .unwrap_or(false)
 }
 
+/// [G2 + G1] A POINT interval is exempt from the rule above, and the
+/// exemption is the whole reason this function exists separately.
+///
+/// An extracted cessation — "Ana stopped metformin", from a model, not a
+/// person — is stored as a point interval born closed with `heuristic`
+/// authority, and the pair is queued for a human. It asserts "this claim was
+/// recorded and is NOT ongoing". Run the close-dropping rule over it and the
+/// import re-opens it, which does not restore a prescription somebody
+/// retired: it MANUFACTURES an ongoing prescription nobody ever asserted,
+/// out of a sentence that said the opposite.
+///
+/// So the direction that is safe for a span is exactly wrong for a point.
+/// A span says "she was taking it, until X decided otherwise" — dropping a
+/// weak X leaves the prescription standing, which is the cautious answer. A
+/// point says "the only claim here is that it ended"; there is no earlier
+/// assertion to fall back to, and inventing one is the dangerous answer.
+pub(crate) fn close_is_point(from: Option<&str>, until: Option<&str>) -> bool {
+    match (from, until) {
+        (Some(f), Some(u)) => {
+            let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+            match (parse(f), parse(u)) {
+                (Some(f), Some(u)) => f == u,
+                // Unparsable but byte-identical is still the same instant.
+                _ => f == u,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// [G2] A negative-length interval. Unreadable to `Interval::overlaps` and
 /// to every consumer downstream of it; the live path and the migration both
 /// clamp it away, and an import is the only door it can still walk through.
@@ -667,5 +697,42 @@ mod tests {
             err.to_string().contains("upgrade engram"),
             "the message must point up, not down: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod point_exemption_tests {
+    use super::*;
+
+    /// The cross-lane hazard the semantics lane flagged at merge: G1 stores an
+    /// EXTRACTED cessation as a point interval born closed with `heuristic`
+    /// authority, and G2's close-dropping rule would have re-opened it on
+    /// import — turning "Ana stopped metformin" into an active prescription.
+    #[test]
+    fn a_point_close_on_a_safety_relation_survives_import() {
+        let t = "2026-08-02T10:00:00Z";
+        assert!(
+            close_is_point(Some(t), Some(t)),
+            "same instant on both ends is a point"
+        );
+        // The rule itself still fires for this relation+authority …
+        assert!(close_needs_person("takes_medication", Some("heuristic")));
+        // … and the exemption is what keeps the point from being re-opened.
+        // (Call sites AND these two conditions; see import_fact_row.)
+    }
+
+    #[test]
+    fn a_span_close_on_a_safety_relation_is_still_dropped() {
+        assert!(!close_is_point(
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-08-02T10:00:00Z")
+        ));
+        assert!(close_needs_person("takes_medication", Some("heuristic")));
+    }
+
+    #[test]
+    fn an_open_interval_is_not_a_point() {
+        assert!(!close_is_point(Some("2026-01-01T00:00:00Z"), None));
+        assert!(!close_is_point(None, None));
     }
 }

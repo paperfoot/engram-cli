@@ -657,8 +657,18 @@ fn edit_marks_the_memory_pending_reextraction() {
     // as a completed extraction would.
     {
         let store = open(dir.path());
+        // Through the WELDED path (G6): a marker planted without its
+        // `derivation.ran` event is a state `admin rebuild` cannot reproduce,
+        // and this test's whole subject is what an edit does to that marker.
         store
-            .record_fact_extraction(uuid(&id), Some("test-model"), 1, "remember")
+            .record_derivation(
+                uuid(&id),
+                &engram_core::keys::content_hash(content),
+                engram_storage::journal::EXTRACTOR_FACT_LLM,
+                Some("test-model"),
+                &[],
+                "cli:default",
+            )
             .unwrap();
         assert!(store
             .list_memories_pending_fact_extraction(None, None, None)
