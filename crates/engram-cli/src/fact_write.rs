@@ -157,6 +157,10 @@ pub struct FactWriteOutcome {
     /// cessation with nothing open to close, a prior decision replayed. Same
     /// JSON shape as `date_warnings`, so an agent parses one shape.
     pub plan_notes: Vec<serde_json::Value>,
+    /// The rows this batch actually INSERTED, in write order. They are the
+    /// `derivation.ran` output list, which is what lets `admin rebuild`
+    /// reconstruct the extraction marker instead of losing it [G6].
+    pub fact_ids: Vec<Uuid>,
 }
 
 impl FactWriteOutcome {
@@ -173,6 +177,7 @@ impl FactWriteOutcome {
         self.queued.extend(other.queued);
         self.date_warnings.extend(other.date_warnings);
         self.plan_notes.extend(other.plan_notes);
+        self.fact_ids.extend(other.fact_ids);
     }
 }
 
@@ -507,6 +512,11 @@ pub struct FactExtractionMarker<'a> {
     pub model: Option<&'a str>,
     /// `remember` | `backfill` — recorded for provenance.
     pub source: &'a str,
+    /// `content_hash` of the memory the extractor read. The derivation is
+    /// keyed by (content, extractor), not by memory id, so an `edit` that
+    /// restores earlier text finds the earlier run instead of paying for it
+    /// twice.
+    pub content_hash: &'a str,
 }
 
 /// One memory's facts, plus the marker they earn.
@@ -603,11 +613,22 @@ pub async fn write_fact_batch(
     }
     if failed.is_none() {
         if let Some(marker) = &batch.marker {
-            if let Err(e) = ctx.store.record_fact_extraction(
+            // INVARIANT 1 HAS NO EXCEPTIONS [G6]. `record_fact_extraction`
+            // mutates `fact_extraction_log` with no event behind it, so the
+            // marker every normal extraction earned was a projection row
+            // `admin rebuild` could not reconstruct: rebuild deletes the
+            // derivation tables and refills them from `derivation.ran`, the
+            // memory reappeared in the backfill queue, and the next sweep paid
+            // a provider for a call the store had already made and thrown
+            // away. `record_derivation` appends the event and writes both
+            // markers in this same transaction.
+            if let Err(e) = ctx.store.record_derivation(
                 w.memory_id,
+                marker.content_hash,
+                engram_storage::journal::EXTRACTOR_FACT_LLM,
                 marker.model,
-                total as i64,
-                marker.source,
+                &scratch.fact_ids,
+                &format!("cli:{}", marker.source),
             ) {
                 failed = Some((total, CliError::from(e)));
             }
@@ -946,6 +967,7 @@ fn apply_plan(
                 Some(tag),
             )?;
         }
+        outcome.fact_ids.push(fact.id);
     } else if plan.absorbed.is_some() {
         outcome.deduped += 1;
     }

@@ -1194,11 +1194,13 @@ pub async fn backfill(
             autonomy: Autonomy::default(),
             source_kind: SourceKind::AgentExtracted,
         };
+        let marker_hash = engram_core::keys::content_hash(&memory.content);
         let batch = FactBatch {
             facts: &extracted,
             marker: Some(FactExtractionMarker {
                 model: Some(&model),
                 source: "backfill",
+                content_hash: &marker_hash,
             }),
         };
         // Same rule as `remember`: the facts and the marker that retires this
