@@ -4984,33 +4984,14 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// Mark a queued conflict resolved. Returns false when the row was not
-    /// open (already resolved or unknown id).
-    ///
-    /// Records NO decision, so nothing about this resolution can ever replay.
-    /// Kept for compatibility with the paths that already call it; new callers
-    /// use `resolve_conflict_with_decision`, which claims the row and records
-    /// the ruling in one transaction.
-    pub fn resolve_fact_conflict(
-        &self,
-        id: Uuid,
-        resolved_by: &str,
-        note: Option<&str>,
-    ) -> Result<bool, StorageError> {
-        let n = self.conn.execute(
-            "UPDATE fact_conflict_queue
-             SET status = 'resolved', resolved_at = ?1, resolved_by = ?2,
-                 note = COALESCE(?3, note)
-             WHERE id = ?4 AND status = 'open'",
-            params![
-                chrono::Utc::now().to_rfc3339(),
-                resolved_by,
-                note,
-                id.to_string()
-            ],
-        )?;
-        Ok(n > 0)
-    }
+    // `resolve_fact_conflict` used to live here: a bare
+    // `UPDATE fact_conflict_queue SET status='resolved'` with no event, kept
+    // "for compatibility with the paths that already call it". By the time
+    // wave 6 swept for it, no path did — and a rebuild replayed the row's
+    // `conflict.opened` and reopened every question it had answered, note and
+    // all. `resolve_conflict_with_decision` is the only way to answer a
+    // queued question, because it is the only one that also records the
+    // ruling (invariant 1, and blocker 6's defect class).
 
     /// Open conflicts in a KB whose facts mention any of the query terms —
     /// used by `recall` to surface contested values instead of silently
@@ -6293,11 +6274,29 @@ mod tests {
         assert_eq!(hits[0].1.id, new_f.id);
         assert_eq!(hits[0].2.id, old_f.id);
 
-        // Resolve closes it; a second resolve is a no-op.
-        assert!(store
-            .resolve_fact_conflict(qid, "caller", Some("user confirmed"))
-            .unwrap());
-        assert!(!store.resolve_fact_conflict(qid, "caller", None).unwrap());
+        // Resolve closes it; a second resolve is a no-op. Through the welded
+        // path, which is now the only one: the answer has to reach the
+        // journal or a rebuild reopens the question.
+        let key = engram_core::keys::semantic_key_encode(
+            "ana",
+            "allergic_to",
+            &engram_core::keys::object_pair_hash("amoxicillin", "penicillin"),
+        );
+        let resolve = |note: Option<&str>| {
+            store.resolve_conflict_with_decision(
+                qid,
+                "default",
+                "default",
+                &key,
+                "close_old",
+                "caller",
+                "caller",
+                note,
+                engram_core::keys::SEMANTIC_KEY_VERSION,
+            )
+        };
+        assert!(resolve(Some("user confirmed")).unwrap().is_some());
+        assert!(resolve(None).unwrap().is_none());
         assert!(store
             .list_open_fact_conflicts(None, None, 10)
             .unwrap()
