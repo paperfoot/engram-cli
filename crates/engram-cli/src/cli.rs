@@ -58,7 +58,7 @@ pub enum Command {
         /// Extraction is ON by default whenever an OpenRouter key resolves;
         /// use this for bulk/low-value writes you don't want facts from.
         /// `--no-facts` is accepted as the older spelling.
-        #[arg(long, alias = "no-facts")]
+        #[arg(long, visible_alias = "no-facts")]
         no_extract_facts: bool,
 
         /// Deprecated: fact extraction is now the default, so this flag is
@@ -694,7 +694,7 @@ pub enum MemoryCommand {
         kb: String,
         /// Skip LLM-based fact extraction + contradiction detection.
         /// Extraction is ON by default whenever an OpenRouter key resolves.
-        #[arg(long, alias = "no-facts")]
+        #[arg(long, visible_alias = "no-facts")]
         no_extract_facts: bool,
         /// Deprecated: extraction is the default; still forces extraction
         /// alongside --facts-json.
