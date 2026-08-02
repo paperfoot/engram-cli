@@ -3,12 +3,13 @@
 use crate::commands::usage::{cohere_rerank_cost_usd, estimated_tokens, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::output::{print_success, Metadata};
+use crate::output::{print_success, Metadata, Scope, Verdict};
+use crate::read_surface::{self, RequestShape};
 use crate::retrieval::{
     build_fts_query, hybrid_recall, render_answer_context, resolve_retrieval_backends, Filters,
     HybridParams, RecallMode, RetrievalProfile,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
@@ -64,14 +65,15 @@ pub async fn run(
         profile_enum,
         if all_kbs { None } else { Some(kb.as_str()) },
     )?;
-    let results = hybrid_recall(
+    let outcome = hybrid_recall(
         &ctx.store,
         backends.embedder.as_ref(),
         backends.reranker.as_deref(),
         params,
     )
-    .await?
-    .results;
+    .await?;
+    let results = outcome.results;
+    let stats = outcome.stats;
 
     let query_tokens = estimated_tokens(&query);
     let gemini_cost = if backends.cloud_embedder {
@@ -129,6 +131,10 @@ pub async fn run(
         .map(|r| {
             json!({
                 "id": r.id.to_string(),
+                // The id a mutator accepts, and the chain it came down.
+                "memory_id": r.provenance.memory_id.map(|m| m.to_string()),
+                "handle": read_surface::hit_handle(&r.kind, r.id),
+                "provenance": r.provenance.to_json(),
                 "kind": r.kind,
                 "score": r.score,
                 "rerank_score": r.rerank_score,
@@ -159,10 +165,43 @@ pub async fn run(
     meta.add("kb", if all_kbs { "*" } else { kb.as_str() });
     meta.add("results", results_json.len());
     meta.add("cited_results", cited);
-    print_success(
-        ctx.format,
-        json!({
+    meta.command_alias("research");
+    let searched_kbs = if all_kbs {
+        if stats.kbs_searched.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            stats.kbs_searched.clone()
+        }
+    } else {
+        vec![kb.clone()]
+    };
+    Scope::retrieval(
+        searched_kbs.clone(),
+        if diary == "*" { "*" } else { diary.as_str() },
+        if all_kbs { "all_kbs" } else { "flag" },
+        stats.chunks_considered,
+    )
+    .attach(&mut meta);
+    // Same rule as `recall`: one boolean decides both `status` and `verdict`,
+    // and an empty evidence pass says what it looked at rather than shrugging.
+    let verdict = if results_json.is_empty() {
+        Verdict::NoMatch(read_surface::absence_from(
+            &stats,
+            searched_kbs,
+            RequestShape {
+                has_window: false,
+                has_diary_filter: diary != "*",
+            },
+        ))
+    } else {
+        Verdict::Results
+    };
+
+    let Value::Object(mut data) = json!({
             "status": status,
+            // Ranked, not paged: no cursor here either (see recall).
+            "returned": results_json.len(),
+            "candidates_fused": stats.candidates_fused,
             "query": query,
             "query_plan": {
                 "mode": "explore",
@@ -189,9 +228,13 @@ pub async fn run(
                 "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
             }
-        }),
-        meta,
-        |data| println!("{}", serde_json::to_string_pretty(data).unwrap()),
-    );
+    }) else {
+        unreachable!("json! object literal");
+    };
+    verdict.attach(&mut data);
+
+    print_success(ctx.format, Value::Object(data), meta, |data| {
+        println!("{}", serde_json::to_string_pretty(data).unwrap())
+    });
     Ok(())
 }

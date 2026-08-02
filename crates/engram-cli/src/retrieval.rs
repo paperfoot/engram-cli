@@ -4,6 +4,9 @@
 //!   query -> dense Gemini/stub search -> FTS5 BM25 -> claim/wiki/entity search
 //!        -> graph expansion -> RRF fusion -> optional Cohere rerank.
 
+use crate::read_surface::{
+    Provenance, RecallStats, DERIVED_ENTITY, DERIVED_RELATION, DERIVED_WIKI,
+};
 use chrono::{DateTime, Utc};
 use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
 use engram_core::types::RetrievalSource;
@@ -298,6 +301,11 @@ pub struct HybridResult {
     pub kb: String,
     pub citations: Vec<SourceCitation>,
     pub sources: Vec<RetrievalSource>,
+    /// chunk → memory → document for this hit, resolved once here so no caller
+    /// re-derives it. `recall` used to return chunk ids under a bare `id`, and
+    /// `edit`/`forget` reject those: the agent that hit it concluded the
+    /// memory had been deleted and rewrote it by hand.
+    pub provenance: Provenance,
 }
 
 /// Identifier of the answer-context envelope, reported by `engram agent-info`
@@ -602,6 +610,11 @@ impl RecallNotes {
 pub struct RecallOutcome {
     pub results: Vec<HybridResult>,
     pub notes: RecallNotes,
+    /// What the read looked at, populated EVEN WHEN `results` is empty. This
+    /// is what makes the absence certificate provable rather than asserted:
+    /// an empty answer that can say "I scored 0 chunks in kb `personal`" is a
+    /// scoping diagnosis, and one that cannot is a shrug.
+    pub stats: RecallStats,
 }
 
 #[derive(Debug, Clone)]
@@ -758,6 +771,25 @@ where
     // materialized lazily for only the post-fusion rerank pool (see below).
     let chunk_index: HashMap<Uuid, &StoredChunkEmbedding> =
         chunks.iter().map(|c| (c.chunk_id, c)).collect();
+
+    // The certificate's raw material, recorded before anything can truncate
+    // it. `chunks` is already post-diary/kb/window filtering, so a zero here
+    // means the SCOPE was empty, which is a different answer from "nothing
+    // matched" and the read surface reports it as one.
+    let mut stats = RecallStats {
+        chunks_considered: chunks.len(),
+        kbs_searched: {
+            let mut kbs: Vec<String> = chunks
+                .iter()
+                .map(|c| c.kb.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            kbs.sort();
+            kbs
+        },
+        ..RecallStats::default()
+    };
 
     if params.mode != RecallMode::Wiki {
         let q_emb = embedder
@@ -921,10 +953,16 @@ where
         return Ok(RecallOutcome {
             results: Vec::new(),
             notes,
+            stats,
         });
     }
 
     let fused = reciprocal_rank_fusion(&runs, params.rrf_k);
+    // Recorded BEFORE the rerank truncation: `total` on a ranked read means
+    // "candidates the ranking chose from", and taking it after the trim would
+    // make it a second name for `returned`.
+    stats.candidates_fused = fused.len();
+    stats.top_score = fused.first().map(|(_, s)| s.into_inner());
 
     // Resolve content for ONLY the post-fusion rerank pool. Chunk candidates
     // that were never materialized (dense/lexical-only hits) get their content
@@ -951,6 +989,7 @@ where
         return Ok(RecallOutcome {
             results: Vec::new(),
             notes,
+            stats,
         });
     }
 
@@ -1054,6 +1093,42 @@ where
             sources.push(RetrievalSource::Reranker);
         }
         sources.sort_by_key(source_rank);
+        // Provenance, per kind. A derived row says WHY it has no memory
+        // instead of carrying a plausible-looking id that resolves to
+        // somebody else's memory.
+        let provenance = match kind.as_str() {
+            "chunk" => {
+                let chunk = chunk_index.get(&id);
+                Provenance {
+                    chunk_id: Some(id),
+                    memory_id: chunk.map(|c| c.memory_id),
+                    document_id: chunk
+                        .and_then(|c| c.document_id)
+                        .or_else(|| citations.first().and_then(|c| c.document_id)),
+                    kb: Some(cand_kb.clone()),
+                    diary: chunk.map(|c| c.diary.clone()),
+                    ..Provenance::default()
+                }
+            }
+            "claim" => {
+                let parent = parent_chunk.or_else(|| citations.first().and_then(|c| c.chunk_id));
+                let parent_row = parent.and_then(|p| chunk_index.get(&p));
+                Provenance {
+                    chunk_id: parent,
+                    // Filled in below for parents outside this scope's chunk
+                    // index — one batch query per response, never one per row.
+                    memory_id: parent_row.map(|c| c.memory_id),
+                    document_id: citations.first().and_then(|c| c.document_id),
+                    kb: Some(cand_kb.clone()),
+                    diary: parent_row.map(|c| c.diary.clone()),
+                    ..Provenance::default()
+                }
+            }
+            "wiki_page" => Provenance::derived(cand_kb.clone(), DERIVED_WIKI),
+            "entity" => Provenance::derived(cand_kb.clone(), DERIVED_ENTITY),
+            "relation" => Provenance::derived(cand_kb.clone(), DERIVED_RELATION),
+            _ => Provenance::for_kb(cand_kb.clone()),
+        };
         results.push(HybridResult {
             id,
             kind,
@@ -1063,10 +1138,33 @@ where
             kb: cand_kb,
             citations,
             sources,
+            provenance,
         });
     }
 
-    Ok(RecallOutcome { results, notes })
+    // The claims whose parent chunk fell outside this scope's chunk index
+    // still have a memory behind them; one batch lookup resolves all of them.
+    let unresolved: Vec<Uuid> = results
+        .iter()
+        .filter(|r| r.provenance.memory_id.is_none())
+        .filter_map(|r| r.provenance.chunk_id)
+        .collect();
+    if !unresolved.is_empty() {
+        let map = store.memory_ids_for_chunks(&unresolved)?;
+        for r in results.iter_mut() {
+            if r.provenance.memory_id.is_none() {
+                if let Some(chunk) = r.provenance.chunk_id {
+                    r.provenance.memory_id = map.get(&chunk).copied();
+                }
+            }
+        }
+    }
+
+    Ok(RecallOutcome {
+        results,
+        notes,
+        stats,
+    })
 }
 
 fn source_rank(s: &RetrievalSource) -> u8 {
@@ -1301,6 +1399,7 @@ mod tests {
             kb: kb.to_string(),
             citations: Vec::new(),
             sources: Vec::new(),
+            provenance: Provenance::for_kb(kb),
         }
     }
 

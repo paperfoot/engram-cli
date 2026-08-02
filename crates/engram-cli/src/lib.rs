@@ -82,19 +82,22 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         } => {
             commands::recall::run(
                 &ctx,
-                query,
-                top_k,
-                layer,
-                mode,
-                profile,
-                kb,
-                all_kbs,
-                diary,
-                rerank_top_n,
-                graph_hops,
-                allow_mixed_embeddings,
-                since,
-                until,
+                commands::recall::RecallArgs {
+                    query,
+                    top_k,
+                    layer,
+                    mode,
+                    profile,
+                    kb,
+                    all_kbs,
+                    diary,
+                    rerank_top_n,
+                    graph_hops,
+                    allow_mixed_embeddings,
+                    since,
+                    until,
+                    alias: "recall",
+                },
             )
             .await
         }
@@ -250,21 +253,28 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 since,
                 until,
             } => {
+                // One code path with `recall`, one envelope, one set of
+                // fields. The defaults that still differ (layer, rerank depth,
+                // graph fan-out) are preserved deliberately and are now
+                // visible in one place instead of hiding in this arm.
                 commands::recall::run(
                     &ctx,
-                    query,
-                    top_k,
-                    "topic".to_string(),
-                    mode,
-                    profile,
-                    kb,
-                    all_kbs,
-                    diary,
-                    None,
-                    1,
-                    false,
-                    since,
-                    until,
+                    commands::recall::RecallArgs {
+                        query,
+                        top_k,
+                        layer: "topic".to_string(),
+                        mode,
+                        profile,
+                        kb,
+                        all_kbs,
+                        diary,
+                        rerank_top_n: None,
+                        graph_hops: 1,
+                        allow_mixed_embeddings: false,
+                        since,
+                        until,
+                        alias: "memory search",
+                    },
                 )
                 .await
             }
