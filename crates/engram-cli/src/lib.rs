@@ -192,6 +192,28 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             }
             JobsCommand::Show { id } => commands::jobs::show(&ctx, id),
         },
+        Command::State {
+            subject,
+            kb,
+            diary,
+            relation,
+            as_of,
+            include_closed,
+            limit,
+            cursor,
+        } => commands::state::run(
+            &ctx,
+            commands::state::StateArgs {
+                subject,
+                kb,
+                diary,
+                relation,
+                as_of,
+                include_closed,
+                limit,
+                cursor,
+            },
+        ),
         Command::Reindex { kb, all, offline } => {
             commands::reindex::run(&ctx, kb, all, offline).await
         }

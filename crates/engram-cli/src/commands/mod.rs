@@ -27,6 +27,7 @@ pub mod repair;
 pub mod research;
 pub mod serve;
 pub mod skill;
+pub mod state;
 pub mod update;
 pub mod usage;
 pub mod wiki;

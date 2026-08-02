@@ -286,6 +286,37 @@ Examples:
     #[command(subcommand)]
     Jobs(JobsCommand),
 
+    /// What is TRUE NOW about one subject: open intervals only, grouped by
+    /// relation, with provenance and the open questions still queued.
+    ///
+    /// `lessons` and `reflect` are their own top-level commands, not
+    /// subcommands here, so no subject name is a reserved word.
+    State {
+        /// The subject of the facts — a name, not a handle.
+        subject: String,
+        /// Knowledge base/domain namespace, or "*" for all.
+        #[arg(long, default_value = "*")]
+        kb: String,
+        /// Specialist agent diary namespace, or "*" for all.
+        #[arg(long, default_value = "*")]
+        diary: String,
+        /// Narrow to one relation (raw or canonical).
+        #[arg(long)]
+        relation: Option<String>,
+        /// State as it was at this instant (RFC3339 or YYYY-MM-DD).
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Attach the closed intervals under each value's `history`.
+        #[arg(long)]
+        include_closed: bool,
+        /// Max open values per page.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Opaque page token from a previous response.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+
     /// Re-embed chunks with the active embedding model/profile.
     Reindex {
         /// Knowledge base/domain namespace.
