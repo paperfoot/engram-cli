@@ -60,18 +60,27 @@ fn a_safety_pair_always_requires_context() {
         assert_eq!(c["suggested_action"], Value::from("requires_context"));
         assert_eq!(c["safety"], Value::Bool(true));
     }
-    // The guard fired, and it says so, so a write-side regression cannot hide
-    // behind the read-side correction.
-    assert_eq!(
-        v["metadata"]["suggested_action_overridden"],
-        Value::from(contested.len())
+    // Written AFTER the wave-3 write path merged: fresh rows are stored with
+    // the correct suggestion, so the read-side guard has nothing to override
+    // and must say so honestly — a nonzero count here would mean the write
+    // side regressed and the guard is papering over it. The guard's override
+    // behaviour for pre-v10 legacy rows is pinned by read_surface's unit
+    // tests and by the v9 migration fixture's backlog.
+    let overridden = &v["metadata"]["suggested_action_overridden"];
+    assert!(
+        overridden.is_null() || *overridden == Value::from(0),
+        "read guard overrode a fresh write — write side regressed: {overridden}"
     );
 
-    // Same answer on the queue view, from the same guard.
+    // Same answer on the queue view: stored correct, not corrected.
     let q = run_json(dir.path(), &["facts", "conflicts", "--open"]);
     for e in q["data"]["open_conflicts"].as_array().expect("entries") {
         assert_eq!(e["suggested_action"], Value::from("requires_context"));
-        assert_eq!(e["suggested_action_overridden"], Value::Bool(true));
+        let e_over = &e["suggested_action_overridden"];
+        assert!(
+            e_over.is_null() || *e_over == Value::Bool(false),
+            "{e_over}"
+        );
     }
 }
 

@@ -298,6 +298,14 @@ pub struct MemoryExportRow {
     pub valid_until: Option<String>,
     pub tags_json: String,
     pub kb: String,
+    /// WR-11: a retracted memory MUST export — its closed facts still
+    /// reference it, and dropping the row makes the file unimportable (FK
+    /// death on facts.source_memory_id). Serde defaults keep pre-fix v3
+    /// files readable.
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -5346,8 +5354,8 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, content, created_at, event_time, importance, emotional_weight,
                     access_count, last_accessed, stability, source_json, diary,
-                    valid_from, valid_until, tags_json, kb
-             FROM memories WHERE deleted = 0 AND (?1 IS NULL OR kb = ?1)
+                    valid_from, valid_until, tags_json, kb, deleted, deleted_at
+             FROM memories WHERE (?1 IS NULL OR kb = ?1)
              ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![kb], |r| {
@@ -5367,6 +5375,8 @@ impl SqliteStore {
                 valid_until: r.get(12)?,
                 tags_json: r.get(13)?,
                 kb: r.get(14)?,
+                deleted: r.get::<_, i64>(15)? != 0,
+                deleted_at: r.get(16)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -5484,8 +5494,8 @@ impl SqliteStore {
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO memories(id, content, created_at, event_time, importance,
                 emotional_weight, access_count, last_accessed, stability, source_json,
-                diary, valid_from, valid_until, tags_json, kb, deleted)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)",
+                diary, valid_from, valid_until, tags_json, kb, deleted, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 row.id,
                 row.content,
@@ -5502,6 +5512,8 @@ impl SqliteStore {
                 row.valid_until,
                 row.tags_json,
                 row.kb,
+                row.deleted as i64,
+                row.deleted_at,
             ],
         )?;
         Ok(n > 0)

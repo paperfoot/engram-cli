@@ -31,8 +31,12 @@ impl Interval {
     /// `superseded_by` set but no `valid_until` (pre-v6 rows).
     pub fn of(f: &Fact) -> Interval {
         let from = f.valid_from.unwrap_or(f.created_at);
+        // D13: a row with a successor is never open under EITHER predicate.
+        // `superseded_by` set with both timestamps NULL (pre-v6 rows reached
+        // via import) closes at `created_at` rather than reading as open here
+        // while `is_open_fact` calls it closed.
         let until = f.valid_until.or(if f.superseded_by.is_some() {
-            f.superseded_at
+            f.superseded_at.or(Some(f.created_at))
         } else {
             None
         });

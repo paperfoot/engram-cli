@@ -1011,11 +1011,6 @@ fn export_then_import_round_trips_into_an_empty_store() {
 }
 
 #[test]
-#[ignore = "blocked on storage-journal: export_memories filters `deleted = 0` (sqlite.rs:5350) while \
-            export_facts still carries the intervals forget closed, so importing a store that has \
-            ever been forgotten from fails on the facts.source_memory_id FK. Needs `deleted` in \
-            MemoryExportRow + an export that carries retracted rows — a storage schema change, not \
-            a CLI one. Reported as WR-11."]
 fn a_round_trip_preserves_closed_intervals() {
     let source = store();
     let id = seed_with_facts(source.path(), "Ana moved to Lisbon.", ANA_LISBON);
