@@ -185,6 +185,11 @@ impl Provenance {
     /// Nulls are PRESERVED, not omitted: agents branch on null, and dropping
     /// the key makes "we looked and there is none" indistinguishable from
     /// "this build does not implement the field".
+    ///
+    /// `observed_at` and `snippet` are struct fields, so serializing six of the
+    /// eight was a silent truncation: every caller but `state` reported a hit's
+    /// provenance without the two fields that say WHEN it was observed and WHAT
+    /// the text was — the citation half of a citation.
     pub fn to_json(&self) -> Value {
         json!({
             "chunk_id": self.chunk_id.map(|i| i.to_string()),
@@ -193,6 +198,8 @@ impl Provenance {
             "kb": self.kb,
             "diary": self.diary,
             "derived_from": self.derived_from,
+            "observed_at": self.observed_at.map(|t| t.to_rfc3339()),
+            "snippet": self.snippet,
         })
     }
 }
@@ -474,6 +481,29 @@ mod tests {
         assert!(v.get("memory_id").is_some(), "the key must still be there");
         assert_eq!(v["derived_from"], json!(DERIVED_WIKI));
         assert_eq!(v["kb"], json!("work"));
+        // Every field of the struct is serialized, nulls included: a caller
+        // that reads `provenance.snippet` must not get `undefined` on the
+        // surfaces that happen not to fill it in.
+        for key in ["observed_at", "snippet"] {
+            assert!(v.get(key).is_some(), "{key} was dropped by to_json");
+            assert!(v[key].is_null());
+        }
+    }
+
+    #[test]
+    fn provenance_serializes_observed_at_and_snippet_when_it_has_them() {
+        let p = Provenance {
+            observed_at: Some(
+                DateTime::parse_from_rfc3339("2026-03-01T09:30:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            snippet: Some("Ana moved to Lisbon".into()),
+            ..Provenance::for_kb("personal")
+        };
+        let v = p.to_json();
+        assert_eq!(v["observed_at"], json!("2026-03-01T09:30:00+00:00"));
+        assert_eq!(v["snippet"], json!("Ana moved to Lisbon"));
     }
 
     #[test]
