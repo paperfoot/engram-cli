@@ -19,6 +19,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub quiet: bool,
 
+    /// Root every path (db, vectors, config, cache) at DIR. Overrides ENGRAM_STORE.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub store: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -256,6 +260,9 @@ Examples:
         /// Limit LLM extraction chunks to control cost. Deterministic compile still scans all chunks.
         #[arg(long)]
         max_llm_chunks: Option<usize>,
+        /// Submit the compile as a background job and return its handle immediately.
+        #[arg(long = "async")]
+        r#async: bool,
     },
 
     /// Run an evidence-first research retrieval pass over a KB.
@@ -732,9 +739,44 @@ pub enum JobsCommand {
         /// Max jobs to return.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Only jobs of this kind (compile|backfill).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only jobs in this status (queued|running|completed|paused|failed|cancelled|abandoned).
+        #[arg(long)]
+        status: Option<String>,
     },
     /// Show one job.
     Show { id: String },
+    /// Submit a background job.
+    Submit {
+        /// compile|backfill.
+        #[arg(long)]
+        kind: String,
+        /// Knowledge base/domain namespace.
+        #[arg(long, default_value = "default")]
+        kb: String,
+        /// Runner parameters as a JSON object.
+        #[arg(long)]
+        params: Option<String>,
+        /// Queue the job and return, without running it here.
+        #[arg(long)]
+        detach: bool,
+        /// Block until the job reaches a terminal state.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Ask a running job to stop at its next checkpoint.
+    Cancel { id: String },
+    /// Continue a paused or failed job from its cursor.
+    Resume {
+        id: String,
+        /// Accept re-running LLM extraction that was already paid for.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Follow one job, one NDJSON line per change.
+    Watch { id: String },
 }
 
 #[derive(Subcommand, Debug)]

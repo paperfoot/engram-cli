@@ -7,6 +7,7 @@ pub mod error;
 pub mod export_v3;
 pub mod fts;
 pub mod handles;
+pub mod jobs;
 pub mod journal;
 pub mod migrate_v10;
 pub mod paths;
@@ -20,6 +21,11 @@ pub use decisions::{DecisionRow, InsertOutcome};
 pub use error::StorageError;
 pub use export_v3::{ExportV3, ImportV3Report};
 pub use handles::Resolved;
+pub use jobs::{
+    CompilePressure, JobFilter, JobHeartbeat, JobRow, NewJob, SubmitOutcome, STATUS_ABANDONED,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_QUEUED,
+    STATUS_RUNNING,
+};
 pub use journal::{EventDraft, EventRow};
 pub use migrate_v10::MigrationV10Report;
 pub use rebuild::RebuildReport;

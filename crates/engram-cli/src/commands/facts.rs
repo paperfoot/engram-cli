@@ -36,6 +36,7 @@ use engram_core::types::{Fact, SourceKind};
 use engram_embed::stub::StubEmbedder;
 use engram_embed::Embedder;
 use engram_graph::facts::{canonical_predicate, extract_facts, normalize};
+use engram_graph::semantics::{triage_decision, FactView, SemanticKey, SEMANTIC_KEY_VERSION};
 use engram_storage::sqlite::FactConflictRow;
 use serde_json::json;
 use std::collections::HashMap;
@@ -647,70 +648,66 @@ fn group_conflicts(
 
 /// Resolve a queued conflict. The caller decides; engram records the
 /// decision and applies the supersession (never a deletion).
-pub fn resolve(
+///
+/// The whole sequence — claim, decision, event, supersession — runs inside one
+/// `Core::write` transaction. It used to be five unguarded statements whose
+/// booleans were discarded, so two concurrent resolves both passed the
+/// `status == "open"` check, both superseded a fact, and both printed
+/// `"resolved": true`; with different actions the pair could end up with each
+/// fact superseded by the other. The claim's boolean is now load-bearing and
+/// the loser gets `conflict_already_resolved` (exit 3), which an agent can
+/// tell apart from a typo.
+pub async fn resolve(
     ctx: &AppContext,
     id: String,
     action: String,
     note: Option<String>,
 ) -> Result<(), CliError> {
-    let qid = uuid::Uuid::parse_str(&id)
+    let qid = uuid::Uuid::parse_str(id.strip_prefix("conflict:").unwrap_or(&id))
         .map_err(|_| CliError::BadInput(format!("'{id}' is not a valid conflict id")))?;
-    let Some(row) = ctx.store.get_fact_conflict(qid)? else {
-        return Err(CliError::BadInput(format!("no conflict with id {id}")));
-    };
-    if row.status != "open" {
-        return Err(CliError::BadInput(format!(
-            "conflict {id} is already {} — nothing to resolve",
-            row.status
-        )));
-    }
-    let (Some(new_f), Some(old_f)) = (
-        ctx.store.get_fact(row.new_fact_id)?,
-        ctx.store.get_fact(row.old_fact_id)?,
-    ) else {
-        return Err(CliError::BadInput(format!(
-            "conflict {id} references facts that no longer exist"
-        )));
-    };
+    let parsed = respond::ResolveAction::parse(&action).ok_or_else(|| {
+        CliError::BadInput(format!(
+            "unknown action '{action}' (expected {})",
+            respond::ResolveAction::ALL
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    })?;
+    let applied = ctx
+        .core
+        .resolve_conflict(crate::engine::ResolveRequest {
+            conflict_id: qid,
+            action: parsed,
+            note,
+            actor: ctx.core.actor(),
+        })
+        .await?;
 
-    let applied = match action.as_str() {
-        "supersede-old" => {
-            ctx.store
-                .supersede_fact_with(old_f.id, new_f.id, "caller", new_f.valid_from)?;
-            json!({
-                "kept": fact_to_json(&new_f),
-                "superseded": fact_to_json(&old_f),
-            })
-        }
-        "keep-both" => json!({
-            "kept": [fact_to_json(&new_f), fact_to_json(&old_f)],
+    let result = match &applied.closed {
+        Some(closed) => json!({
+            "kept": fact_to_json(&applied.kept[0]),
+            "superseded": fact_to_json(closed),
+        }),
+        None => json!({
+            "kept": applied.kept.iter().map(fact_to_json).collect::<Vec<_>>(),
             "note": "both facts remain active; recorded as non-contradictory",
         }),
-        "reject-new" => {
-            ctx.store
-                .supersede_fact_with(new_f.id, old_f.id, "caller", None)?;
-            json!({
-                "kept": fact_to_json(&old_f),
-                "superseded": fact_to_json(&new_f),
-            })
-        }
-        other => {
-            return Err(CliError::BadInput(format!(
-                "unknown action '{other}' (expected supersede-old|keep-both|reject-new)"
-            )))
-        }
     };
-    ctx.store
-        .resolve_fact_conflict(qid, "caller", note.as_deref())?;
-
     let payload = json!({
-        "conflict_id": id,
-        "action": action,
+        "conflict_id": applied.conflict_id.to_string(),
+        "handle": read_surface::handle(HandleKind::Conflict, applied.conflict_id),
+        "action": applied.action,
         "resolved": true,
-        "result": applied,
+        // The decision is the artefact, `keep-both` included: without it the
+        // caller's answer is forgotten and the same question is asked again on
+        // every re-derivation.
+        "decision_id": applied.decision_id.to_string(),
+        "result": result,
     });
     print_success(ctx.format, payload, Metadata::default(), |_| {
-        println!("Resolved conflict {id} with action {action}");
+        println!("Resolved conflict {qid} with action {action}");
     });
     Ok(())
 }
@@ -853,14 +850,30 @@ pub fn triage(
                     }
                 }
                 if !dry_run {
-                    store.resolve_fact_conflict(
+                    // A sweep that resolves a question and records nothing has
+                    // to ask it again on the next re-derivation. Every triage
+                    // resolution is `authority = machine`, and only its
+                    // `keep_both` verdicts bind a later write — the ledger's
+                    // own precedence rule, not this file's.
+                    let key = match row.decision_key.clone() {
+                        Some(k) if !k.is_empty() => k,
+                        _ => SemanticKey::for_pair(&FactView::of(new_f), &FactView::of(old_f))
+                            .encode(),
+                    };
+                    store.resolve_conflict_with_decision(
                         row.id,
+                        &row.kb,
+                        &row.diary,
+                        &key,
+                        triage_decision(&verdict).as_str(),
+                        "machine",
                         "triage",
                         Some(&format!(
                             "auto: {} ({})",
                             verdict.rule,
                             class_name(verdict.class)
                         )),
+                        SEMANTIC_KEY_VERSION,
                     )?;
                 }
             }

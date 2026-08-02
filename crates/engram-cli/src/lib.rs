@@ -4,6 +4,7 @@ pub mod agent_info;
 pub mod cli;
 pub mod commands;
 pub mod context;
+pub mod engine;
 pub mod error;
 pub mod fact_llm;
 pub mod fact_write;
@@ -20,6 +21,10 @@ use crate::cli::{
 use crate::error::CliError;
 
 pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
+    // FIRST — before any path is resolved, before mark_command_start, and
+    // before the AgentInfo early return below, so `engram --store /tmp/x
+    // agent-info` reports /tmp/x's paths rather than the user's real ones.
+    apply_store_override(cli.store.as_deref())?;
     output::mark_command_start();
     let format = output::OutputFormat::detect(cli.json);
     // The discovery surface answers BEFORE any store is opened: constructing
@@ -29,6 +34,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         return agent_info::run();
     }
     let ctx = context::AppContext::new(format, cli.quiet)?;
+    ctx.core.set_actor(actor_for(&cli.command));
 
     match cli.command {
         Command::AgentInfo => agent_info::run(),
@@ -153,17 +159,37 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             extraction_model,
             synthesis_model,
             max_llm_chunks,
+            r#async,
         } => {
-            commands::compile::run(
-                &ctx,
-                kb,
-                all,
-                llm,
-                extraction_model,
-                synthesis_model,
-                max_llm_chunks,
-            )
-            .await
+            if r#async {
+                let params = serde_json::json!({
+                    "llm": llm,
+                    "extraction_model": extraction_model,
+                    "synthesis_model": synthesis_model,
+                    "max_llm_chunks": max_llm_chunks,
+                    "trigger": "manual",
+                });
+                commands::jobs::submit(
+                    &ctx,
+                    "compile".to_string(),
+                    kb,
+                    Some(params.to_string()),
+                    true,
+                    false,
+                )
+                .await
+            } else {
+                commands::compile::run(
+                    &ctx,
+                    kb,
+                    all,
+                    llm,
+                    extraction_model,
+                    synthesis_model,
+                    max_llm_chunks,
+                )
+                .await
+            }
         }
         Command::Research {
             query,
@@ -187,10 +213,24 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             .await
         }
         Command::Jobs(sub) => match sub {
-            JobsCommand::List { kb, all_kbs, limit } => {
-                commands::jobs::list(&ctx, kb, all_kbs, limit)
-            }
+            JobsCommand::List {
+                kb,
+                all_kbs,
+                limit,
+                kind,
+                status,
+            } => commands::jobs::list(&ctx, kb, all_kbs, limit, kind, status),
             JobsCommand::Show { id } => commands::jobs::show(&ctx, id),
+            JobsCommand::Submit {
+                kind,
+                kb,
+                params,
+                detach,
+                wait,
+            } => commands::jobs::submit(&ctx, kind, kb, params, detach, wait).await,
+            JobsCommand::Cancel { id } => commands::jobs::cancel(&ctx, id).await,
+            JobsCommand::Resume { id, force } => commands::jobs::resume(&ctx, id, force).await,
+            JobsCommand::Watch { id } => commands::jobs::watch(&ctx, id).await,
         },
         Command::Reindex { kb, all, offline } => {
             commands::reindex::run(&ctx, kb, all, offline).await
@@ -356,7 +396,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 dry_run,
             } => commands::facts::triage(&ctx, kb, diary, subject, limit, dry_run),
             FactsCommand::Resolve { id, action, note } => {
-                commands::facts::resolve(&ctx, id, action, note)
+                commands::facts::resolve(&ctx, id, action, note).await
             }
             FactsCommand::Backfill {
                 kb,
@@ -422,5 +462,58 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 dry_run,
             } => commands::chunks::repair(&ctx, kb, all_kbs, dry_run).await,
         },
+    }
+}
+
+/// `--store <dir>` > `ENGRAM_STORE` > ProjectDirs (interfaces §5).
+///
+/// Implemented by exporting the flag's value into `ENGRAM_STORE`, because
+/// `paths::store_override()` reads the environment on every call and because
+/// the export is load-bearing on its own: `POST /v1/ingest` re-enters the CLI
+/// as a child process, and without it a `--store`-isolated daemon would ingest
+/// into the user's real store.
+///
+/// It creates NOTHING. The path is made absolute without touching the
+/// filesystem (`canonicalize` would require it to exist), and directory
+/// creation stays in `paths::ensure()`, which runs on the first real path
+/// resolution — so `engram --store X agent-info` still leaves X non-existent.
+/// A discovery command that materialises a store directory is the same class
+/// of bug as one that migrates a database.
+fn apply_store_override(dir: Option<&std::path::Path>) -> Result<(), CliError> {
+    let Some(dir) = dir else { return Ok(()) };
+    if dir.as_os_str().is_empty() {
+        return Err(CliError::Config(
+            "--store needs a directory; an empty value is not the same as leaving it unset".into(),
+        ));
+    }
+    if dir.exists() && !dir.is_dir() {
+        return Err(CliError::Config(format!(
+            "--store {} exists and is not a directory",
+            dir.display()
+        )));
+    }
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    // One call, at process start, before this lane spawns any thread or task.
+    std::env::set_var("ENGRAM_STORE", &absolute);
+    Ok(())
+}
+
+/// `cli:<diary>` where the subcommand carries a diary, plain `cli` otherwise.
+/// The journal's `actor` column is how a rebuild says who did what, and
+/// "someone using the CLI" is a worse answer than the diary they were in.
+fn actor_for(command: &Command) -> String {
+    let diary = match command {
+        Command::Remember { diary, .. } => Some(diary.clone()),
+        Command::Recall { diary, .. } => Some(diary.clone()),
+        Command::Research { diary, .. } => Some(diary.clone()),
+        _ => None,
+    };
+    match diary {
+        Some(d) if !d.is_empty() && d != "*" => format!("cli:{d}"),
+        _ => "cli".to_string(),
     }
 }

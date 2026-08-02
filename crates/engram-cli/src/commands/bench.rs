@@ -316,11 +316,7 @@ async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
     use uuid::Uuid;
 
     let store = SqliteStore::open_in_memory()?;
-    let fixture_ctx = AppContext {
-        format: ctx.format,
-        quiet: true,
-        store,
-    };
+    let fixture_ctx = AppContext::fixture(ctx.format, store);
     let kb = "scientific-mini";
     fixture_ctx
         .store
