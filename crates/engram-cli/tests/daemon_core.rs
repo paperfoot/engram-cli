@@ -258,7 +258,14 @@ fn the_daemon_opens_its_readers_once_not_per_request() {
     // pool is warmed at bind, so a burst of reads adds no connections and the
     // daemon reports a schema it never had to re-check.
     assert_eq!(health["data"]["ok"], true, "{health}");
-    assert_eq!(health["data"]["schema_version"], 10, "{health}");
+    // Pinned to the storage constant, not a literal: this test asserts the
+    // pool reports the schema it migrated to, not which schema that happens
+    // to be this month.
+    assert_eq!(
+        health["data"]["schema_version"],
+        engram_storage::sqlite::CURRENT_VERSION,
+        "{health}"
+    );
     assert!(
         health["data"]["writer"]["alive"].as_bool().unwrap_or(false),
         "a health check that says ok while writes are impossible is the \
