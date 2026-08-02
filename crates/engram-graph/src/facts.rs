@@ -36,6 +36,12 @@ RULES:
 - confidence: 0.0..=1.0. 1.0 = explicit declarative statement; 0.7 = paraphrase or implicit; 0.4 = inferred from indirect mention.
 - fact_type: one of profile_slot (single-valued attribute: employer, city, age), preference, relationship, event (something that happened at a time), procedural (how to do something), assertion (anything else).
 - valid_from: if the text states WHEN the fact became true, an ABSOLUTE ISO date (YYYY-MM-DD) resolved against the DATE CONTEXT below. Never a phrase ("last March", "since the summer") — a date nobody can parse is thrown away downstream. If you cannot resolve it to an absolute date, use null.
+- valid_until: if the text states WHEN the fact STOPPED being true, an ABSOLUTE ISO date resolved the same way. Same warning: a date nobody can parse is thrown away. Otherwise null.
+- state: "ended" when the text says the state STOPPED ("stopped taking X", "no longer works at Y", "moved out of Z in June"); "ongoing" otherwise. An "ended" fact CLOSES the stored interval instead of opening a second one.
+
+COEXISTENCE:
+- A second medication, allergy, diagnosis, friend or project is an ADDITIONAL fact, never a replacement. Never drop an earlier value to make the list tidy — a missing allergy is a medical incident, an extra one is a question someone can answer.
+- Only emit "ended" when the text SAYS the state ended. Silence is not an ending.
 
 SKIP:
 - Greetings, opinions, hedged statements ("might", "I think", "probably").
@@ -44,7 +50,7 @@ SKIP:
 - Generic facts that aren't about a specific entity ("the sky is blue").
 
 OUTPUT:
-A JSON array of objects with keys: subject, predicate, object, confidence, fact_type, valid_from.
+A JSON array of objects with keys: subject, predicate, object, confidence, fact_type, valid_from, valid_until, state.
 If there are no extractable facts, output exactly: []
 Output ONLY the JSON. No prose, no code fences, no commentary.
 
@@ -53,9 +59,18 @@ EXAMPLE INPUT:
 
 EXAMPLE OUTPUT:
 [
-  {"subject":"Ada Example","predicate":"founded","object":"Example Labs","confidence":1.0,"fact_type":"event","valid_from":"2024-01-01"},
-  {"subject":"Ada Example","predicate":"lives_in","object":"Lisbon","confidence":1.0,"fact_type":"profile_slot","valid_from":"2026-03-01"},
-  {"subject":"Ada Example","predicate":"prefers_language","object":"Rust","confidence":1.0,"fact_type":"preference","valid_from":null}
+  {"subject":"Ada Example","predicate":"founded","object":"Example Labs","confidence":1.0,"fact_type":"event","valid_from":"2024-01-01","valid_until":null,"state":"ongoing"},
+  {"subject":"Ada Example","predicate":"lives_in","object":"Lisbon","confidence":1.0,"fact_type":"profile_slot","valid_from":"2026-03-01","valid_until":null,"state":"ongoing"},
+  {"subject":"Ada Example","predicate":"prefers_language","object":"Rust","confidence":1.0,"fact_type":"preference","valid_from":null,"valid_until":null,"state":"ongoing"}
+]
+
+EXAMPLE INPUT (a cessation):
+"Ada stopped taking metformin in June 2026, but she is still on rapamycin."
+
+EXAMPLE OUTPUT:
+[
+  {"subject":"Ada","predicate":"takes_medication","object":"metformin","confidence":1.0,"fact_type":"assertion","valid_from":null,"valid_until":"2026-06-01","state":"ended"},
+  {"subject":"Ada","predicate":"takes_medication","object":"rapamycin","confidence":1.0,"fact_type":"assertion","valid_from":null,"valid_until":null,"state":"ongoing"}
 ]"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +86,46 @@ pub struct ExtractedFact {
     /// ISO date (or RFC3339) when the fact became true, if stated.
     #[serde(default)]
     pub valid_from: Option<String>,
+    /// ISO date when the fact STOPPED being true, if the text says so. The
+    /// other half of the interval: without it every assertion runs to
+    /// infinity and two true-at-different-times values look like a
+    /// contradiction.
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    /// `"ongoing"` (default) | `"ended"`. An explicit cessation CLOSES the
+    /// open interval instead of opening a second one — "stopped taking
+    /// metformin" is not a second metformin fact.
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+impl Default for ExtractedFact {
+    fn default() -> Self {
+        ExtractedFact {
+            subject: String::new(),
+            predicate: String::new(),
+            object: String::new(),
+            confidence: default_confidence(),
+            fact_type: None,
+            valid_from: None,
+            valid_until: None,
+            state: None,
+        }
+    }
+}
+
+impl ExtractedFact {
+    /// True when the extractor said the state ENDED. Tolerant of casing and
+    /// of the spellings a model reaches for unprompted.
+    pub fn says_ended(&self) -> bool {
+        let state = self
+            .state
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        matches!(state.as_str(), "ended" | "stopped" | "past" | "over")
+    }
 }
 
 fn default_confidence() -> f32 {
@@ -201,25 +256,16 @@ pub fn normalize(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
-/// Map predicate synonyms onto one canonical form so slot policies key
+/// Map predicate synonyms onto one canonical form so the registry keys
 /// reliably. Deliberately small: semantic conflict detection does not depend
-/// on this map (the embedding gate handles paraphrase); this only routes
-/// known single-valued slots onto their policy.
+/// on this map (the embedding gate handles paraphrase); this only routes known
+/// spellings onto one relation.
+///
+/// Delegates to `engram_core::relations::canonical_relation`, which is the
+/// spelling the v9→v10 migration uses to key ~14.5k decision rows. Two synonym
+/// maps would mean a decision keyed by one and looked up by the other.
 pub fn canonical_predicate(p: &str) -> String {
-    let p = p.trim().to_lowercase().replace([' ', '-'], "_");
-    match p.as_str() {
-        "employed_by" | "employer" | "job_at" | "works_for" | "employed_at" => "works_at",
-        "resides_in" | "home_city" | "based_in" | "living_in" | "residence" => "lives_in",
-        "age" | "aged" | "is_age" => "has_age",
-        "role" | "position" | "job_title" | "title" => "has_role",
-        "spouse" | "spouse_of" | "wife_of" | "husband_of" => "married_to",
-        "dating" | "girlfriend_of" | "boyfriend_of" | "in_relationship_with" => "partner_of",
-        "allergy" | "has_allergy" | "allergic" => "allergic_to",
-        "medication" | "on_medication" | "takes_drug" | "prescribed" => "takes_medication",
-        "favorite_language" | "preferred_language" | "codes_in" => "prefers_language",
-        _ => return p,
-    }
-    .to_string()
+    engram_core::relations::canonical_relation(p)
 }
 
 /// Conflict policy for single-valued ("slot") predicates.
@@ -231,17 +277,26 @@ pub enum SlotPolicy {
     AwaitConfirmation,
 }
 
-/// Policy for a canonical predicate, or None when the predicate is not a
-/// known single-valued slot (multi-valued predicates like `prefers` or
-/// `founded` can coexist and are handled by the semantic gate instead).
+/// Policy for a canonical predicate, or None when the relation is set-valued.
+///
+/// DEPRECATED, and it does not round-trip: it is now defined by arity, so the
+/// safety SETS (`takes_medication`, `allergic_to`, `diagnosed_with`) map to
+/// `None` where they used to return `AwaitConfirmation`. That is exactly why
+/// `is_safety_slot` is expressed against the registry and never against this
+/// shim — a shim-based safety check would answer FALSE for the three relations
+/// it exists to flag. Kept only so an external caller does not break at the
+/// same moment its meaning changes.
+#[deprecated(
+    since = "0.4.0",
+    note = "use engram_core::relations::relation_spec; this shim is defined by arity and \
+            answers differently for the safety sets"
+)]
 pub fn slot_policy(canonical: &str) -> Option<SlotPolicy> {
-    match canonical {
-        "works_at" | "lives_in" | "has_age" | "has_role" | "married_to" | "partner_of"
-        | "prefers_language" | "born_on" => Some(SlotPolicy::LastWriterWins),
-        "allergic_to" | "takes_medication" | "diagnosed_with" | "blood_type" => {
-            Some(SlotPolicy::AwaitConfirmation)
-        }
-        _ => None,
+    use engram_core::relations::Arity;
+    match engram_core::relations::relation_spec(canonical).arity {
+        Arity::SingleValued { safety: true } => Some(SlotPolicy::AwaitConfirmation),
+        Arity::SingleValued { safety: false } => Some(SlotPolicy::LastWriterWins),
+        Arity::SetValued { .. } => None,
     }
 }
 
@@ -250,19 +305,13 @@ pub fn slot_policy(canonical: &str) -> Option<SlotPolicy> {
 /// on 1990-04-12, not on the day someone typed it into the store. Callers feed
 /// this into the bi-temporal `valid_from` column so birthdays, anniversaries,
 /// and start dates answer "when" questions instead of reporting write time.
+///
+/// Re-expressed against the registry's value domain, so the list lives in one
+/// place — the table that also decides arity and mutability for the same
+/// relations.
 pub fn date_valued_predicate(canonical: &str) -> bool {
-    matches!(
-        canonical,
-        "born_on"
-            | "died_on"
-            | "married_on"
-            | "founded_on"
-            | "graduated_on"
-            | "joined_on"
-            | "started_on"
-            | "ended_on"
-            | "hired_on"
-    )
+    engram_core::relations::relation_spec(canonical).value
+        == engram_core::relations::ValueDomain::Date
 }
 
 // ----- Conflict adjudication (full-autonomy mode) -----
@@ -274,7 +323,9 @@ Decide ONE action:
 - "coexist": the new fact and the existing facts are all true simultaneously (different aspects, not contradictory).
 - "reject_new": the new fact is redundant with or less reliable than what is stored; do not store it.
 
-Judge by meaning, not wording. An update to a single-valued attribute (city, employer, dosage) supersedes. Additional values of a multi-valued attribute (another preference, another project) coexist.
+Judge by meaning, not wording. An update to a single-valued attribute (city, employer) supersedes. Additional values of a multi-valued attribute (another preference, another project) coexist.
+
+A SET-VALUED attribute — medications, allergies, diagnoses, relationships — coexists unless the text says one ENDED. A second medication is not evidence that the first one stopped. Only a single-valued attribute supersedes.
 
 OUTPUT: one JSON object, nothing else:
 {"action":"supersede","ids":["<id>", ...]} or {"action":"coexist"} or {"action":"reject_new"}"#;
@@ -431,15 +482,30 @@ mod tests {
         assert_eq!(canonical_predicate("Founded By"), "founded_by");
     }
 
+    /// The shim's NEW answers, written down so nobody reads the deprecation
+    /// note as "unchanged". `allergic_to` is a safety SET now, so it has no
+    /// slot policy at all — which is why every safety check in the tree goes
+    /// through `relations::is_safety_slot` instead of through here.
     #[test]
-    fn slot_policies_route_correctly() {
+    #[allow(deprecated)]
+    fn the_slot_policy_shim_follows_the_registry_and_says_so() {
         assert_eq!(slot_policy("lives_in"), Some(SlotPolicy::LastWriterWins));
         assert_eq!(
+            slot_policy("blood_type"),
+            Some(SlotPolicy::AwaitConfirmation),
+            "the one true safety SLOT"
+        );
+        assert_eq!(
             slot_policy("allergic_to"),
-            Some(SlotPolicy::AwaitConfirmation)
+            None,
+            "a safety SET has no slot policy — this is the shim's breaking change"
         );
         assert_eq!(slot_policy("prefers"), None);
         assert_eq!(slot_policy("inhibits"), None);
+        assert!(
+            engram_core::relations::is_safety_slot("allergic_to"),
+            "…and the safety answer must still be true, from the registry"
+        );
     }
 
     #[test]

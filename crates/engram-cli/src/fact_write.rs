@@ -1,355 +1,75 @@
-//! Write-path v2 orchestration: semantic supersession + cooperative
-//! adjudication.
+//! Write-path v3: the APPLIER. It resolves an observation, loads the
+//! intervals that could be affected, asks `engram_graph::semantics` what the
+//! observation means, and performs exactly what came back.
 //!
 //! Per extracted fact:
-//! 1. canonicalize the predicate (synonym map) and the subject (alias/fuzzy
-//!    cascade against known subjects), then normalize;
-//! 2. exact path — an active fact with the same (subject_norm, predicate):
-//!    same object → dedup (confirmation++); different object → the conflict
-//!    classifier decides (see below);
-//! 3. semantic path — the embedding novelty gate classifies against all
-//!    active facts: duplicate → confirmation++; novel → insert; uncertain →
-//!    the classifier again, and only what it cannot settle is escalated by
-//!    autonomy mode: `full` asks this system's LLM, `assisted` (default)
-//!    inserts the new fact as *contested* and queues the conflict for the
-//!    calling agent, `strict` always queues.
+//! 1. canonicalize the relation (registry synonyms + cessation forms) and the
+//!    subject (alias/fuzzy cascade against known subjects), then normalize;
+//! 2. resolve the INTERVAL the assertion covers — `valid_from`, and now
+//!    `valid_until`, with the same discipline: a date nobody can read is
+//!    reported and dropped, never silently set to now;
+//! 3. load every fact on the same (subject, relation), open or closed — the
+//!    only rows an interval decision can involve;
+//! 4. `plan_write` decides, purely. Prior caller decisions are replayed before
+//!    any question is re-asked;
+//! 5. apply: insert, confirm, close, queue — in that order, inside the
+//!    caller's transaction.
 //!
-//! The caller is a frontier agent with conversation context this store
-//! cannot see — `assisted` mode hands it the adjudication instead of paying
-//! for a worse-informed LLM call here.
+//! WHY THE SPLIT. The classifier used to live here, and the arity it used was
+//! derived from "does this predicate have a slot policy" — so
+//! `takes_medication` was a single-valued slot and five concurrent
+//! medications produced ten pairwise "conflicts", each suggesting the previous
+//! drug be superseded. A guarantee that can only be tested by writing five
+//! facts into SQLite and counting queue rows is a guarantee nobody checks. The
+//! plan is a value: `plan_write` for the fifth medication yields an empty
+//! `queue` and an empty `closes`, and that is an assertion over fixtures.
 //!
-//! CONFLICT CLASSIFICATION (`classify_pair`) is the gate in front of the
-//! queue. Importing 1,332 real memories produced 2,953 facts and 9,510
-//! queued "conflicts" — a backlog no human will ever adjudicate, which
-//! buries the handful of contradictions that matter. Almost none of them
-//! were contradictions: candidates about a different person, candidates on a
-//! different predicate, and second values of multi-valued predicates
-//! (`knows`, `friend_of`, `met_at`) which are additions, not disagreements.
-//! The classifier resolves those without queueing and reserves the queue for
-//! same-slot contradictions with no recency ordering — plus every safety
-//! slot, which is never auto-superseded.
+//! The caller is a frontier agent with conversation context this store cannot
+//! see — `assisted` mode hands it the adjudication instead of paying for a
+//! worse-informed LLM call here. Under `full` the LLM may adjudicate, but it
+//! is a `Heuristic` authority: it can no longer close a safety interval.
 
 use crate::context::AppContext;
 use crate::error::CliError;
 use chrono::{DateTime, Utc};
+use engram_core::interval::{may_close, CloseAuthority, CloseReason, CloseVerdict, Interval};
+use engram_core::relations::{canonical_relation, cessation_of, member_identity, relation_spec};
 use engram_core::temporal::parse_moment;
 use engram_core::types::{Fact, FactType, SourceKind};
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::facts::{
-    adjudicate, canonical_predicate, date_valued_predicate, normalize, slot_policy,
-    AdjudicationAction, ExtractedFact, SlotPolicy,
+    adjudicate, canonical_predicate, date_valued_predicate, normalize, AdjudicationAction,
+    ExtractedFact,
 };
 use engram_graph::gate::{novelty_gate, GateDecision};
+use engram_graph::semantics::{
+    classify_mode_for, compile_resolution, plan_write, DecisionLedger, Observation,
+    ObservationState, PlanNote, PlannedClose, PlannedConflict, SemanticKey, UnknownAutonomy,
+    WritePlan,
+};
 use engram_llm::ChatLlm;
 use serde_json::json;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// How much authority this process has over conflict resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Autonomy {
-    /// Adjudicate uncertain conflicts with our own LLM call.
-    Full,
-    /// Queue uncertain conflicts for the calling agent (default).
-    #[default]
-    Assisted,
-    /// Never auto-supersede anything; queue every conflict.
-    Strict,
-}
+// ---------------------------------------------------------------------------
+// The classifier moved to `engram_graph::semantics` so `facts triage`,
+// `engram state` and the daemon can read the same rules without depending on
+// the CLI crate. These re-exports keep one import path for the call sites that
+// already had one; `LegacyArity` deliberately keeps its LEGACY NAME (R3) — an
+// `as Arity` alias would be a public trap with no in-repo consumer.
+// ---------------------------------------------------------------------------
+pub use engram_core::relations::{is_safety_slot, predicate_arity, LegacyArity};
+pub use engram_graph::semantics::{
+    allowed_actions, classify_pair, classify_views, safety_gate, suggested_action, Autonomy,
+    ClassifyMode, ConflictClass, Verdict, MULTI_VALUED_PREDICATES,
+};
 
-impl Autonomy {
-    pub fn parse(s: &str) -> Result<Autonomy, CliError> {
-        match s {
-            "full" => Ok(Autonomy::Full),
-            "assisted" => Ok(Autonomy::Assisted),
-            "strict" => Ok(Autonomy::Strict),
-            other => Err(CliError::BadInput(format!(
-                "unknown autonomy mode '{other}' (expected full|assisted|strict)"
-            ))),
-        }
-    }
-}
-
-// ===========================================================================
-// Conflict classification
-// ===========================================================================
-
-/// How many values one `(subject, predicate)` slot may hold at once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Arity {
-    /// One value at a time — a new value replaces the old one.
-    Single,
-    /// Many values coexist — a second value is an addition, not a conflict.
-    Multi,
-}
-
-/// Canonical predicates that are single-valued but carry no slot policy of
-/// their own. `slot_policy` covers the profile/safety slots; these are the
-/// remaining "a person has exactly one" attributes.
-const SINGLE_VALUED_EXTRA: &[&str] = &[
-    "died_on",
-    "birthday",
-    "has_birthday",
-    "date_of_birth",
-    "nationality",
-    "has_nationality",
-];
-
-/// Canonical predicates that are explicitly multi-valued. The DEFAULT for an
-/// unknown predicate is also multi-valued — this list documents the ones that
-/// dominate a personal store (networking, family, events) and pins them in a
-/// test, because treating them as slots is what turned a person's whole
-/// address book into a conflict queue.
-pub const MULTI_VALUED_PREDICATES: &[&str] = &[
-    "knows",
-    "friend_of",
-    "friends_with",
-    "met_at",
-    "met",
-    "family_of",
-    "related_to",
-    "sibling_of",
-    "parent_of",
-    "child_of",
-    "colleague_of",
-    "worked_with",
-    "mentor_of",
-    "introduced_by",
-    "introduced_to",
-    "invested_in",
-    "founded",
-    "owns",
-    "is_member_of",
-    "attended",
-    "visited",
-    "speaks",
-    "prefers",
-    "likes",
-    "dislikes",
-    "interested_in",
-    "works_on",
-];
-
-/// Single- vs multi-valued. Unknown predicates default to MULTI: the cost of
-/// a wrong `Multi` is two coexisting facts, the cost of a wrong `Single` is a
-/// true fact silently superseded or a human asked to adjudicate a non-event.
-pub fn predicate_arity(canonical: &str) -> Arity {
-    if slot_policy(canonical).is_some() || SINGLE_VALUED_EXTRA.contains(&canonical) {
-        Arity::Single
-    } else {
-        Arity::Multi
-    }
-}
-
-/// Safety-critical slots (allergies, medication, diagnoses, blood type). A
-/// fact on one of these is never auto-superseded, at write time or in a bulk
-/// triage — a wrong answer here is a medical incident, not a stale profile
-/// field. The only thing either path may do unattended is drop a queued pair
-/// that is about two DIFFERENT people, which supersedes nothing.
-pub fn is_safety_slot(canonical: &str) -> bool {
-    matches!(slot_policy(canonical), Some(SlotPolicy::AwaitConfirmation))
-}
-
-/// What to do with one `(new fact, old fact)` pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConflictClass {
-    /// Not a conflict: both facts are true at the same time.
-    Coexist,
-    /// Same claim: keep the existing fact, count a confirmation.
-    Duplicate,
-    /// Single-valued slot, the new value is the current one.
-    SupersedeOld,
-    /// Single-valued slot, the INCOMING value is the stale one.
-    SupersedeNew,
-    /// One of the pair is already superseded — nothing left to decide.
-    Settled,
-    /// A human (or the calling agent) must decide.
-    Queue,
-}
-
-/// A classification plus the rule that produced it. The rule name is reported
-/// in `facts triage` output so a bulk auto-resolution is auditable rather
-/// than a number the user has to trust.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Verdict {
-    pub class: ConflictClass,
-    pub rule: &'static str,
-}
-
-impl Verdict {
-    const fn new(class: ConflictClass, rule: &'static str) -> Self {
-        Verdict { class, rule }
-    }
-    pub fn is_auto_resolvable(&self) -> bool {
-        !matches!(self.class, ConflictClass::Queue)
-    }
-}
-
-/// Which side of the fact layer is asking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClassifyMode {
-    /// The write path: an agent is asserting this value right now, so
-    /// ingestion order is itself evidence (last writer wins the slot).
-    Write,
-    /// `facts triage`: re-reading a backlog where ingestion order proves
-    /// nothing, so only an explicit event-time ordering (or a wide confidence
-    /// gap) resolves a slot. Everything else about the rules is identical to
-    /// `Write` — same function, same safety guarantees.
-    Triage,
-}
-
-/// Event times closer together than this are "the same moment" — clock noise
-/// and same-batch writes must not read as a correction.
-const RECENCY_MARGIN_SECS: i64 = 1;
-
-/// Confidence gap above which the more-confident value wins a single-valued
-/// slot outright instead of asking a human (see `classify_pair`).
-const CONFIDENCE_GAP: f32 = 0.3;
-
-/// Cosine above which two DIFFERENT predicates on the same subject are
-/// treated as the same slot phrased two ways ("lives_in" vs "home_base_is").
-/// Below it they are simply two different attributes.
-const PARAPHRASE_SIMILARITY: f32 = 0.88;
-
-/// Event time of a fact: when it became true, falling back to when the store
-/// learned it.
-fn effective_time(f: &Fact) -> DateTime<Utc> {
-    f.valid_from.unwrap_or(f.created_at)
-}
-
-/// Classify a candidate conflict between an incoming/newer fact and an
-/// existing one. Pure and side-effect free so the write path and `facts
-/// triage` apply exactly the same rules — that identity is what makes triage
-/// "resolve everything the new rules would never have queued" true by
-/// construction rather than by a second, drifting implementation.
-///
-/// `score` is the novelty gate's cosine when the pair came from the semantic
-/// path, `None` for exact (same subject + predicate) pairs.
-pub fn classify_pair(new: &Fact, old: &Fact, score: Option<f32>, mode: ClassifyMode) -> Verdict {
-    let new_pred = canonical_predicate(&new.predicate);
-    let old_pred = canonical_predicate(&old.predicate);
-    let safety = is_safety_slot(&new_pred) || is_safety_slot(&old_pred);
-    let same_subject = new.subject_norm == old.subject_norm;
-
-    if !same_subject {
-        // Two people can hold opposite values without contradicting anyone.
-        // This verdict never touches a fact — both stay active, the pair is
-        // simply not a question — so it is safe even for a safety predicate:
-        // one person's allergy is not evidence about another's.
-        return Verdict::new(ConflictClass::Coexist, "different_subject");
-    }
-    // One subject, a safety slot involved: the only class that may ever come
-    // out of here is Queue. A wrong answer about an allergy, a medication or
-    // a diagnosis is a medical incident, so neither the write path nor a bulk
-    // triage is allowed to pick a winner — a human confirms it.
-    if safety {
-        return Verdict::new(ConflictClass::Queue, "safety_slot");
-    }
-    if new.superseded_by.is_some() || old.superseded_by.is_some() {
-        return Verdict::new(ConflictClass::Settled, "already_settled");
-    }
-    if new_pred != old_pred {
-        // Same subject, different predicates: only a near-identical phrasing
-        // can be the same slot in disguise, and even then a human decides —
-        // superseding across predicates would rewrite a claim nobody made.
-        let paraphrase = score.unwrap_or(0.0) >= PARAPHRASE_SIMILARITY
-            && predicate_arity(&new_pred) == Arity::Single
-            && predicate_arity(&old_pred) == Arity::Single;
-        return if paraphrase {
-            Verdict::new(ConflictClass::Queue, "paraphrase_slot")
-        } else {
-            Verdict::new(ConflictClass::Coexist, "different_predicate")
-        };
-    }
-    if new.object_norm == old.object_norm {
-        return Verdict::new(ConflictClass::Duplicate, "duplicate_object");
-    }
-    if predicate_arity(&new_pred) == Arity::Multi {
-        // `Ana knows Bob` does not stop being true when `Ana knows Carol`
-        // arrives. This single rule is most of the 9,510.
-        return Verdict::new(ConflictClass::Coexist, "multi_valued");
-    }
-
-    // Single-valued, non-safety, same slot, different values: a real
-    // disagreement. Resolve it when the evidence orders the two values.
-    let (nt, ot) = (effective_time(new), effective_time(old));
-    let gap = (nt - ot).num_seconds();
-    let same_source = new.source_memory_id == old.source_memory_id;
-    if !same_source && gap >= RECENCY_MARGIN_SECS {
-        let rule = match mode {
-            // Preserve the long-standing audit tags on the write path.
-            ClassifyMode::Write => write_supersede_rule(&new_pred),
-            ClassifyMode::Triage => "recency_supersede",
-        };
-        return Verdict::new(ConflictClass::SupersedeOld, rule);
-    }
-    if !same_source && gap <= -RECENCY_MARGIN_SECS {
-        // The incoming value is older than what is stored (a backfill of an
-        // old memory, or an out-of-order import): the stored value stands.
-        return Verdict::new(ConflictClass::SupersedeNew, "recency_stale");
-    }
-    if same_source {
-        // Both values came out of one text: ordering them by clock is
-        // meaningless, so this is exactly the contradiction a human wants.
-        return Verdict::new(ConflictClass::Queue, "same_source_contradiction");
-    }
-    // Comparable event times. The write path still has ingestion order to go
-    // on — an agent asserting a value now is asserting the current one.
-    if mode == ClassifyMode::Write {
-        return Verdict::new(ConflictClass::SupersedeOld, write_supersede_rule(&new_pred));
-    }
-    let conf_gap = new.confidence - old.confidence;
-    if conf_gap >= CONFIDENCE_GAP {
-        return Verdict::new(ConflictClass::SupersedeOld, "confidence_gap");
-    }
-    if conf_gap <= -CONFIDENCE_GAP {
-        return Verdict::new(ConflictClass::SupersedeNew, "confidence_gap");
-    }
-    Verdict::new(ConflictClass::Queue, "comparable_values")
-}
-
-/// Audit tag for a write-path supersession, unchanged from write-path v2:
-/// `slot_lww` for a declared profile slot, `exact_match` otherwise.
-fn write_supersede_rule(canonical: &str) -> &'static str {
-    match slot_policy(canonical) {
-        Some(SlotPolicy::LastWriterWins) => "slot_lww",
-        _ => "exact_match",
-    }
-}
-
-/// Which rule set a writer gets.
-///
-/// Ingestion order is evidence only when an agent is asserting a value NOW:
-/// `remember` and `facts backfill` are that agent, and last-writer-wins on a
-/// profile slot is the behaviour they promise. A COMPILED fact is a re-reading
-/// of text that was already in the store, and the order chunks happen to be
-/// compiled in is `ORDER BY position, id` — a UUID tiebreak. Letting that
-/// decide which of two papers holds a slot is not a decision, it is a coin
-/// toss with an audit trail. So a compiled fact gets exactly the rules
-/// `facts triage` applies to a backlog: only an explicit event-time ordering
-/// (or a wide confidence gap) settles a slot; everything else is queued.
-fn classify_mode_for(source_kind: SourceKind) -> ClassifyMode {
-    match source_kind {
-        SourceKind::CompileLlm => ClassifyMode::Triage,
-        _ => ClassifyMode::Write,
-    }
-}
-
-/// Audit tag written into `facts.resolution` when the COMPILER settles a slot.
-///
-/// `resolution` is the only record of WHO retired a value months later:
-/// `caller` for an explicit `facts resolve`, `slot_lww`/`exact_match` for a
-/// write-time assertion, `triage_*` for the backlog sweep. "A paper the
-/// compiler read disagreed with an older paper" is a different claim from
-/// "the user told us so", so it gets its own namespace rather than borrowing
-/// one. Under `ClassifyMode::Triage` only these three rules can supersede;
-/// anything else keeps the classifier's own name.
-fn compile_resolution(rule: &'static str) -> &'static str {
-    match rule {
-        "recency_supersede" => "compile_recency",
-        "recency_stale" => "compile_stale",
-        "confidence_gap" => "compile_confidence",
-        other => other,
+/// The autonomy parse error, carried across the crate boundary as a type so
+/// `engram-graph` never has to know what a CLI error is.
+impl From<UnknownAutonomy> for CliError {
+    fn from(e: UnknownAutonomy) -> CliError {
+        CliError::BadInput(e.to_string())
     }
 }
 
@@ -433,6 +153,10 @@ pub struct FactWriteOutcome {
     pub queued: Vec<serde_json::Value>,
     /// Unreadable extractor/caller dates, with the date used instead.
     pub date_warnings: Vec<serde_json::Value>,
+    /// Non-fatal reports from the planner: an unreadable `valid_until`, a
+    /// cessation with nothing open to close, a prior decision replayed. Same
+    /// JSON shape as `date_warnings`, so an agent parses one shape.
+    pub plan_notes: Vec<serde_json::Value>,
 }
 
 impl FactWriteOutcome {
@@ -448,6 +172,7 @@ impl FactWriteOutcome {
         self.conflicts.extend(other.conflicts);
         self.queued.extend(other.queued);
         self.date_warnings.extend(other.date_warnings);
+        self.plan_notes.extend(other.plan_notes);
     }
 }
 
@@ -507,6 +232,48 @@ fn resolve_valid_from(
         fallback,
     });
     (Some(at), warning)
+}
+
+/// When this fact STOPPED being true, if the text said so.
+///
+/// Same discipline as `resolve_valid_from` and for the same reason, mirrored:
+/// an unreadable `valid_until` is DROPPED and reported, never guessed. A
+/// guessed end date closes an interval that is still running — the exact
+/// failure the safety gate exists to prevent, arriving through the date
+/// parser instead of through the classifier. A `valid_until` that precedes
+/// `valid_from` is also dropped: a negative-length interval is nonsense to
+/// every consumer that reads it, and the clamp belongs at the close, not here.
+fn resolve_valid_until(
+    ef: &ExtractedFact,
+    valid_from: Option<DateTime<Utc>>,
+) -> (Option<DateTime<Utc>>, Option<PlanNote>) {
+    let supplied = ef
+        .valid_until
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(raw) = supplied else {
+        return (None, None);
+    };
+    let Some(parsed) = parse_moment(raw) else {
+        return (
+            None,
+            Some(PlanNote::UnreadableValidUntil {
+                raw: truncate_for_report(raw),
+            }),
+        );
+    };
+    if let Some(from) = valid_from {
+        if parsed < from {
+            return (
+                None,
+                Some(PlanNote::ValidUntilBeforeValidFrom {
+                    raw: truncate_for_report(raw),
+                }),
+            );
+        }
+    }
+    (Some(parsed), None)
 }
 
 /// Resolve a raw subject against known fact subjects in (diary, kb):
@@ -855,6 +622,86 @@ pub async fn write_fact_batch(
     }
 }
 
+/// Everything the planner needs about one incoming assertion, resolved
+/// against the store as it is now.
+///
+/// Returns `None` when the triple is not writable at all (an empty subject,
+/// relation or object) — unchanged from write-path v2, and silent on purpose:
+/// an extractor emitting a blank object is not a user-facing failure.
+fn build_observation(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    ef: &ExtractedFact,
+    outcome: &mut FactWriteOutcome,
+) -> Option<Observation> {
+    // A cessation predicate names the END of another relation's interval, not
+    // a relation of its own: "stopped_taking" is a `takes_medication` fact
+    // with `state: Ended`, and storing it under its own predicate is how a
+    // stopped medication used to end up looking like a second one.
+    let cessation = cessation_of(&ef.predicate);
+    let relation = match cessation {
+        Some(r) => r.to_string(),
+        None => canonical_relation(&ef.predicate),
+    };
+    let state = if cessation.is_some() || ef.says_ended() {
+        ObservationState::Ended
+    } else {
+        ObservationState::Ongoing
+    };
+    let (subject, subject_norm) = canonicalize_subject(ctx, w.diary, w.kb, &ef.subject);
+    let object_norm = normalize(&ef.object);
+    if subject_norm.is_empty() || relation.is_empty() || object_norm.is_empty() {
+        return None;
+    }
+    let spec = relation_spec(&relation);
+    // A profile slot is now defined by ARITY, not by "has a slot policy". The
+    // safety sets stop being `profile_slot` because they are not slots — a
+    // value change on a legacy field, recorded in the CHANGELOG, and nothing
+    // in this repo branches on it.
+    let fact_type = match (spec.is_single_valued(), ef.fact_type.as_deref()) {
+        (true, _) => FactType::ProfileSlot,
+        (false, Some(t)) => FactType::parse(t),
+        (false, None) => FactType::Assertion,
+    };
+    let (valid_from, date_warning) = resolve_valid_from(ef, &relation, w.memory_time);
+    if let Some(warning) = date_warning {
+        // Recorded before any dedup/queue branch: the date was unreadable
+        // whatever happens to the fact itself, and the caller is the only one
+        // who can fix the source.
+        outcome
+            .date_warnings
+            .push(warning.to_json(&subject, &relation));
+    }
+    let (valid_until, until_note) = resolve_valid_until(ef, valid_from);
+    if let Some(note) = until_note {
+        outcome.plan_notes.push(note.to_json(&subject, &relation));
+    }
+    let from = valid_from.unwrap_or(w.memory_time.created_at);
+    Some(Observation {
+        fact_id: Uuid::new_v4(),
+        member: member_identity(&relation, &object_norm),
+        subject,
+        subject_norm,
+        relation,
+        spec,
+        object: ef.object.clone(),
+        object_norm,
+        confidence: ef.confidence,
+        source_memory_id: w.memory_id,
+        source_kind: w.source_kind,
+        fact_type,
+        diary: w.diary.to_string(),
+        kb: w.kb.to_string(),
+        interval: Interval {
+            from,
+            until: valid_until,
+        },
+        state,
+        autonomy: w.autonomy,
+        queue_everything: queue_everything(),
+    })
+}
+
 pub async fn write_fact(
     ctx: &AppContext,
     w: &FactWriteCtx<'_>,
@@ -879,316 +726,279 @@ pub async fn write_fact(
             )));
         }
     }
-    let (memory_id, diary, kb) = (w.memory_id, w.diary, w.kb);
-    let (embedder, llm, autonomy, source_kind) = (w.embedder, w.llm, w.autonomy, w.source_kind);
-    let predicate = canonical_predicate(&ef.predicate);
-    let (subject, subject_norm) = canonicalize_subject(ctx, diary, kb, &ef.subject);
-    let object_norm = normalize(&ef.object);
-    if subject_norm.is_empty() || predicate.is_empty() || object_norm.is_empty() {
-        return Ok(());
-    }
-
-    let policy = slot_policy(&predicate);
-    let fact_type = match (policy.is_some(), ef.fact_type.as_deref()) {
-        (true, _) => FactType::ProfileSlot,
-        (false, Some(t)) => FactType::parse(t),
-        (false, None) => FactType::Assertion,
-    };
-    let (valid_from, date_warning) = resolve_valid_from(ef, &predicate, w.memory_time);
-    if let Some(warning) = date_warning {
-        // Recorded before any dedup/queue branch: the date was unreadable
-        // whatever happens to the fact itself, and the caller is the only one
-        // who can fix the source.
-        outcome
-            .date_warnings
-            .push(warning.to_json(&subject, &predicate));
-    }
-
-    let new_fact = Fact {
-        id: Uuid::new_v4(),
-        source_memory_id: memory_id,
-        subject: subject.clone(),
-        subject_norm: subject_norm.clone(),
-        predicate: predicate.clone(),
-        object: ef.object.clone(),
-        object_norm: object_norm.clone(),
-        confidence: ef.confidence,
-        created_at: Utc::now(),
-        superseded_by: None,
-        superseded_at: None,
-        diary: diary.to_string(),
-        fact_type,
-        valid_from,
-        valid_until: None,
-        resolution: None,
-        source_kind,
-        confirmations: 0,
-        closed_by: None,
-        close_reason: None,
-        close_authority: None,
-        kb: w.kb.to_string(),
-    };
-
-    // ---- Exact path: same (subject_norm, predicate) ----
-    let exact = ctx
-        .store
-        .get_active_facts_in_kb(&subject_norm, &predicate, diary, kb)?;
-    if let Some(same) = exact.iter().find(|f| f.object_norm == object_norm) {
-        ctx.store.increment_fact_confirmations(same.id)?;
-        outcome.deduped += 1;
-        return Ok(());
-    }
-    if !exact.is_empty() {
-        // Same question, different answer — or, for a multi-valued predicate,
-        // simply a second answer. The classifier decides per pair.
-        insert_with_embedding(ctx, &new_fact, embedder, cache).await?;
-        outcome.added += 1;
-        for old in &exact {
-            apply_write_verdict(
-                ctx,
-                &new_fact,
-                old,
-                diary,
-                kb,
-                "slot",
-                None,
-                autonomy,
-                source_kind,
-                outcome,
-            )?;
-        }
-        return Ok(());
-    }
-
-    // ---- Semantic path: novelty gate over all active facts ----
-    let Some(embedder) = embedder else {
-        // No embedder (offline / no key): exact path already ran; insert.
-        ctx.store.insert_fact(&new_fact)?;
-        outcome.added += 1;
+    let Some(observation) = build_observation(ctx, w, ef, outcome) else {
         return Ok(());
     };
-    let text = fact_text(&subject, &predicate, &ef.object);
-    let embedding = embed_fact_text(embedder, cache, &text).await?;
-    let existing = ctx
-        .store
-        .active_fact_embeddings(diary, kb, &embedder.model())?;
-    let (dup_t, novel_t) = gate_thresholds();
-    match novelty_gate(&embedding, &existing, dup_t, novel_t) {
-        GateDecision::Duplicate { fact_id, .. } => {
-            ctx.store.increment_fact_confirmations(fact_id)?;
-            outcome.deduped += 1;
-        }
-        GateDecision::Novel => {
-            ctx.store.insert_fact(&new_fact)?;
-            ctx.store
-                .set_fact_embedding(new_fact.id, &embedding, &embedder.model())?;
-            outcome.added += 1;
-        }
-        GateDecision::Uncertain { candidates } => {
-            let cand_facts: Vec<(Fact, f32)> = candidates
-                .iter()
-                .filter_map(|(id, s)| ctx.store.get_fact(*id).ok().flatten().map(|f| (f, *s)))
-                .collect();
-            // Classify BEFORE escalating. The gate's uncertain band is a
-            // similarity band, not a contradiction: most candidates are about
-            // someone else or about a different attribute of the same person.
-            // Filtering here is what stops a personal store from queueing
-            // three "conflicts" per imported fact.
-            let mut cand_facts: Vec<(Fact, f32)> = cand_facts;
-            let mut settled: Vec<(Fact, f32)> = Vec::new();
-            if !queue_everything() {
-                cand_facts.retain(|(f, s)| {
-                    let keep =
-                        classify_pair(&new_fact, f, Some(*s), classify_mode_for(source_kind)).class
-                            == ConflictClass::Queue;
-                    if !keep {
-                        settled.push((f.clone(), *s));
-                    }
-                    keep
-                });
-            }
-            if cand_facts.is_empty() {
-                // Nothing here a human or an LLM could improve on.
-                ctx.store.insert_fact(&new_fact)?;
-                ctx.store
-                    .set_fact_embedding(new_fact.id, &embedding, &embedder.model())?;
-                outcome.added += 1;
-                for (f, s) in &settled {
-                    apply_write_verdict(
-                        ctx,
-                        &new_fact,
-                        f,
-                        diary,
-                        kb,
-                        "semantic_cosine",
-                        Some(*s),
-                        autonomy,
-                        source_kind,
-                        outcome,
-                    )?;
+    let (diary, kb) = (w.diary, w.kb);
+
+    // Every fact on this (subject, relation), OPEN OR CLOSED. Closed rows are
+    // not optional: without them a restarted medication reads as a duplicate,
+    // and a backdated assertion re-opens a window someone deliberately ended.
+    // Only same-relation rows are considered, so the fifth medication compares
+    // against zero facts rather than four.
+    let siblings = ctx.store.facts_for_relation(
+        Some(kb),
+        Some(diary),
+        &observation.subject_norm,
+        &observation.relation,
+        true,
+    )?;
+
+    let text = fact_text(
+        &observation.subject,
+        &observation.relation,
+        &observation.object,
+    );
+    let mut embedding: Option<Vec<f32>> = None;
+    let mut others: Vec<(Fact, f32)> = Vec::new();
+    if let Some(embedder) = w.embedder {
+        if siblings.is_empty() {
+            // The novelty gate answers "is this new to the store at all", so
+            // it only runs when nothing on this relation could answer it —
+            // the same shape, and the same cost, as write-path v2.
+            let emb = embed_fact_text(embedder, cache, &text).await?;
+            let existing = ctx
+                .store
+                .active_fact_embeddings(diary, kb, &embedder.model())?;
+            let (dup_t, novel_t) = gate_thresholds();
+            match novelty_gate(&emb, &existing, dup_t, novel_t) {
+                GateDecision::Duplicate { fact_id, .. } => {
+                    ctx.store.increment_fact_confirmations(fact_id)?;
+                    outcome.deduped += 1;
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            match (autonomy, llm) {
-                (Autonomy::Full, Some(llm)) => {
-                    let rendered: Vec<String> = cand_facts
+                GateDecision::Novel => {}
+                GateDecision::Uncertain { candidates } => {
+                    others = candidates
                         .iter()
-                        .map(|(f, _)| {
-                            format!("{} | {} {} {}", f.id, f.subject, f.predicate, f.object)
+                        .filter_map(|(id, s)| {
+                            ctx.store.get_fact(*id).ok().flatten().map(|f| (f, *s))
                         })
                         .collect();
-                    let action = adjudicate(llm, &text, &rendered)
-                        .await
-                        .unwrap_or(AdjudicationAction::Coexist);
-                    match action {
-                        AdjudicationAction::RejectNew => {
-                            outcome.deduped += 1;
-                            return Ok(());
-                        }
-                        AdjudicationAction::Supersede(ids) => {
-                            ctx.store.insert_fact(&new_fact)?;
-                            ctx.store.set_fact_embedding(
-                                new_fact.id,
-                                &embedding,
-                                &embedder.model(),
-                            )?;
-                            for (f, _) in &cand_facts {
-                                if ids.iter().any(|i| i == &f.id.to_string()) {
-                                    ctx.store.supersede_fact_with(
-                                        f.id,
-                                        new_fact.id,
-                                        "semantic_llm",
-                                        new_fact.valid_from,
-                                    )?;
-                                    outcome.conflicts.push(conflict_payload(
-                                        f,
-                                        &new_fact,
-                                        "semantic_llm",
-                                    ));
-                                }
-                            }
-                            outcome.added += 1;
-                        }
-                        AdjudicationAction::Coexist => {
-                            ctx.store.insert_fact(&new_fact)?;
-                            ctx.store.set_fact_embedding(
-                                new_fact.id,
-                                &embedding,
-                                &embedder.model(),
-                            )?;
-                            outcome.added += 1;
-                        }
-                    }
-                }
-                _ => {
-                    // Assisted/strict (or full without an LLM): store the new
-                    // fact as contested and hand the decision to the caller.
-                    ctx.store.insert_fact(&new_fact)?;
-                    ctx.store
-                        .set_fact_embedding(new_fact.id, &embedding, &embedder.model())?;
-                    for (f, score) in &cand_facts {
-                        queue_conflict(
-                            ctx,
-                            &new_fact,
-                            f,
-                            diary,
-                            kb,
-                            "semantic_cosine",
-                            Some(*score),
-                            outcome,
-                        )?;
-                    }
-                    outcome.added += 1;
                 }
             }
+            embedding = Some(emb);
+        } else {
+            // The fact IS stored either way; a failed embed only costs the
+            // novelty gate one vector. With the pre-warmed cache this makes no
+            // call at all in the common path.
+            embedding = embed_fact_text(embedder, cache, &text).await.ok();
         }
     }
-    Ok(())
+
+    // The only thing in the planner that touches a store, and it propagates:
+    // a failed decision lookup read as "nobody has decided this" re-asks a
+    // settled safety question and can re-close an interval the caller
+    // reinstated.
+    let prior = |key: &SemanticKey| ctx.store.binding_decision(kb, key);
+    let mut plan = plan_write(
+        &observation,
+        &siblings,
+        &others,
+        classify_mode_for(w.source_kind),
+        &prior,
+    )?;
+
+    if w.autonomy == Autonomy::Full && !plan.queue.is_empty() {
+        if let Some(llm) = w.llm {
+            adjudicate_plan(llm, &text, &observation, &siblings, &others, &mut plan).await;
+        }
+    }
+
+    apply_plan(
+        ctx,
+        w,
+        &observation,
+        &plan,
+        &siblings,
+        &others,
+        embedding.as_deref(),
+        outcome,
+    )
 }
 
-/// Classify one candidate pair and carry out the verdict. `new_fact` is
-/// already in the store; the classifier decides whether the pair is a
-/// supersession, a non-event, or something only the caller can settle.
+/// `--autonomy full`: let this system's LLM settle what the classifier queued.
+///
+/// The LLM is a `Heuristic` authority and nothing more. Its `supersede` can
+/// close a routine interval and CANNOT close a safety one — `may_close`
+/// refuses, the pair stays queued, and the caller (who has the conversation)
+/// decides. That is the one behaviour change `--autonomy full` sees: more
+/// queued pairs on medical content, fewer everywhere else.
+///
+/// A failed adjudication is not an error: the pairs stay queued, which is what
+/// `assisted` would have done anyway.
+async fn adjudicate_plan(
+    llm: &dyn ChatLlm,
+    text: &str,
+    observation: &Observation,
+    siblings: &[Fact],
+    others: &[(Fact, f32)],
+    plan: &mut WritePlan,
+) {
+    let by_id: HashMap<Uuid, &Fact> = siblings
+        .iter()
+        .chain(others.iter().map(|(f, _)| f))
+        .map(|f| (f.id, f))
+        .collect();
+    let rendered: Vec<String> = plan
+        .queue
+        .iter()
+        .filter_map(|q| by_id.get(&q.old_fact_id))
+        .map(|f| format!("{} | {} {} {}", f.id, f.subject, f.predicate, f.object))
+        .collect();
+    if rendered.is_empty() {
+        return;
+    }
+    let action = adjudicate(llm, text, &rendered)
+        .await
+        .unwrap_or(AdjudicationAction::Coexist);
+    match action {
+        AdjudicationAction::RejectNew => {
+            plan.insert = None;
+            plan.queue.clear();
+            plan.absorbed = Some("semantic_llm");
+        }
+        AdjudicationAction::Coexist => plan.queue.clear(),
+        AdjudicationAction::Supersede(ids) => {
+            let authority = CloseAuthority::Heuristic {
+                rule: "semantic_llm",
+            };
+            let mut kept: Vec<PlannedConflict> = Vec::new();
+            for q in std::mem::take(&mut plan.queue) {
+                let named = ids.iter().any(|i| i == &q.old_fact_id.to_string());
+                let allowed = by_id
+                    .get(&q.old_fact_id)
+                    .map(|f| relation_spec(&canonical_predicate(&f.predicate)))
+                    .map(|spec| may_close(&spec, &authority) == CloseVerdict::Allow)
+                    .unwrap_or(false);
+                match (named, allowed) {
+                    (true, true) => plan.closes.push(PlannedClose {
+                        fact_id: q.old_fact_id,
+                        at: observation.interval.from,
+                        reason: CloseReason::Superseded,
+                        authority: authority.clone(),
+                        closed_by: Some(observation.fact_id),
+                        resolution_tag: "semantic_llm",
+                    }),
+                    // Named but refused: an LLM is not evidence that a
+                    // medication stopped. The question survives.
+                    (true, false) => kept.push(q),
+                    (false, _) => {}
+                }
+            }
+            plan.queue = kept;
+        }
+    }
+}
+
+/// Carry out a plan. Nothing here decides anything: every branch is a
+/// `WritePlan` field, in the order the plan promises (insert, confirm, close,
+/// queue), inside the caller's transaction.
 #[allow(clippy::too_many_arguments)]
-fn apply_write_verdict(
+fn apply_plan(
     ctx: &AppContext,
-    new_fact: &Fact,
-    old: &Fact,
-    diary: &str,
-    kb: &str,
-    detector: &str,
-    score: Option<f32>,
-    autonomy: Autonomy,
-    source_kind: SourceKind,
+    w: &FactWriteCtx<'_>,
+    observation: &Observation,
+    plan: &WritePlan,
+    siblings: &[Fact],
+    others: &[(Fact, f32)],
+    embedding: Option<&[f32]>,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), CliError> {
-    let verdict = classify_pair(new_fact, old, score, classify_mode_for(source_kind));
-    // The tag says who decided, not just why.
-    let tag = match source_kind {
-        SourceKind::CompileLlm => compile_resolution(verdict.rule),
-        _ => verdict.rule,
-    };
-    // `strict` promised never to auto-supersede: it escalates every real
-    // disagreement. It does NOT invent conflicts out of coexisting values —
-    // a second `knows` is not a decision anyone has to make.
-    let class = match (verdict.class, autonomy) {
-        (ConflictClass::SupersedeOld | ConflictClass::SupersedeNew, Autonomy::Strict) => {
-            ConflictClass::Queue
-        }
-        (ConflictClass::Duplicate, _) => ConflictClass::Duplicate,
-        (c, _) if queue_everything() => {
-            let _ = c;
-            ConflictClass::Queue
-        }
-        (c, _) => c,
-    };
-    match class {
-        ConflictClass::Coexist | ConflictClass::Settled => {}
-        ConflictClass::Duplicate => {
-            // The exact path dedupes before inserting, so this only fires if
-            // a duplicate slipped through another route: keep the original
-            // row (its id is what other tables reference) and count a
-            // confirmation instead of leaving two identical active facts.
+    let inserted = plan
+        .insert
+        .as_ref()
+        .map(|_| observation.to_fact(Utc::now()));
+    if let (Some(fact), Some(planned)) = (inserted.as_ref(), plan.insert.as_ref()) {
+        ctx.store.insert_fact(fact)?;
+        if let (Some(emb), Some(embedder)) = (embedding, w.embedder) {
             ctx.store
-                .supersede_fact_with(new_fact.id, old.id, "duplicate", None)?;
-            ctx.store.increment_fact_confirmations(old.id)?;
-            outcome.deduped += 1;
-            outcome.added = outcome.added.saturating_sub(1);
+                .set_fact_embedding(fact.id, emb, &embedder.model())?;
         }
-        ConflictClass::SupersedeOld => {
-            ctx.store
-                .supersede_fact_with(old.id, new_fact.id, tag, new_fact.valid_from)?;
-            outcome.conflicts.push(conflict_payload(old, new_fact, tag));
+        outcome.added += 1;
+        // A cessation with nothing open to close is born and then closed, so
+        // the journal carries a reason instead of a mute pre-dead row.
+        if let Some((reason, authority)) = &planned.close {
+            let at = planned.interval.until.unwrap_or(planned.interval.from);
+            ctx.store.close_fact_interval(
+                fact.id,
+                at,
+                reason.as_str(),
+                authority.as_str(),
+                None,
+                Some("explicit_end"),
+            )?;
         }
-        ConflictClass::SupersedeNew => {
-            ctx.store
-                .supersede_fact_with(new_fact.id, old.id, tag, old.valid_from)?;
-            outcome.conflicts.push(conflict_payload(new_fact, old, tag));
+    } else if plan.absorbed.is_some() {
+        outcome.deduped += 1;
+    }
+
+    for id in &plan.confirm {
+        ctx.store.increment_fact_confirmations(*id)?;
+    }
+
+    let by_id: HashMap<Uuid, &Fact> = siblings
+        .iter()
+        .chain(others.iter().map(|(f, _)| f))
+        .chain(inserted.iter())
+        .map(|f| (f.id, f))
+        .collect();
+
+    for close in &plan.closes {
+        let tag = resolution_tag(w.source_kind, close.resolution_tag);
+        let closed = ctx.store.close_fact_interval(
+            close.fact_id,
+            close.at,
+            close.reason.as_str(),
+            close.authority.as_str(),
+            close.closed_by,
+            Some(tag),
+        )?;
+        if !closed {
+            continue;
         }
-        ConflictClass::Queue => {
-            queue_conflict(ctx, new_fact, old, diary, kb, detector, score, outcome)?;
+        if let Some(loser) = by_id.get(&close.fact_id) {
+            let winner = close.closed_by.and_then(|id| by_id.get(&id)).copied();
+            outcome
+                .conflicts
+                .push(conflict_payload(loser, winner.unwrap_or(loser), tag));
         }
+    }
+
+    // A replay is only real once its effect is: one `decision.replayed` per
+    // applied decision, in the same transaction as the write it caused.
+    for replayed in &plan.replays {
+        ctx.store.record_replay(
+            w.kb,
+            w.diary,
+            replayed.decision_id,
+            replayed.new_fact_id,
+            Some(replayed.old_fact_id),
+            replayed.verdict.as_str(),
+            &format!("cli:{}", w.diary),
+        )?;
+    }
+
+    for queued in &plan.queue {
+        queue_conflict(ctx, w, observation, queued, &by_id, outcome)?;
+    }
+
+    for note in &plan.notes {
+        outcome
+            .plan_notes
+            .push(note.to_json(&observation.subject, &observation.relation));
     }
     Ok(())
 }
 
-async fn insert_with_embedding(
-    ctx: &AppContext,
-    fact: &Fact,
-    embedder: Option<&dyn Embedder>,
-    cache: &FactEmbedCache,
-) -> Result<(), CliError> {
-    ctx.store.insert_fact(fact)?;
-    if let Some(e) = embedder {
-        let text = fact_text(&fact.subject, &fact.predicate, &fact.object);
-        // Unchanged on purpose: the fact IS stored, only the novelty gate
-        // loses one vector. With the pre-warmed cache this makes no call at
-        // all in the common path.
-        if let Ok(emb) = embed_fact_text(e, cache, &text).await {
-            ctx.store.set_fact_embedding(fact.id, &emb, &e.model())?;
-        }
+/// The audit tag that lands in `facts.resolution`: it says WHO retired a value
+/// months later, so a compiled supersession does not borrow the write path's
+/// namespace.
+fn resolution_tag(source_kind: SourceKind, rule: &'static str) -> &'static str {
+    match source_kind {
+        SourceKind::CompileLlm => compile_resolution(rule),
+        _ => rule,
     }
-    Ok(())
 }
 
 fn conflict_payload(old: &Fact, new: &Fact, resolution: &str) -> serde_json::Value {
@@ -1204,55 +1014,79 @@ fn conflict_payload(old: &Fact, new: &Fact, resolution: &str) -> serde_json::Val
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Open one question, carrying the semantic key that lets it be answered once.
+///
+/// Three things changed here. The suggestion comes from `suggested_action`
+/// rather than from `detector == "slot"` — that hard-coded string advised
+/// `supersede-old` on every slot pair, allergies included. The row carries
+/// `decision_key`, `member_key` and `registry_version`, so the answer survives
+/// a re-derivation and a registry change can re-key instead of re-litigate.
+/// And the command is built by `respond.rs`: ONE runnable command, no pipes.
 fn queue_conflict(
     ctx: &AppContext,
-    new_fact: &Fact,
-    old_fact: &Fact,
-    diary: &str,
-    kb: &str,
-    detector: &str,
-    score: Option<f32>,
+    w: &FactWriteCtx<'_>,
+    observation: &Observation,
+    planned: &PlannedConflict,
+    by_id: &HashMap<Uuid, &Fact>,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), CliError> {
-    let qid = Uuid::new_v4();
-    let suggested = if detector == "slot" {
-        "supersede-old"
-    } else {
-        "keep-both"
+    let Some(old_fact) = by_id.get(&planned.old_fact_id).copied() else {
+        return Ok(());
     };
-    // Wave-2 stopgap: this lane does not yet compute a semantic key, and an
-    // empty `decision_key` is stored as SQL NULL precisely so the placeholder
-    // cannot collide every row under `idx_fcq_open_key`. fact-semantics fills
-    // in the real key in wave 3, at which point `DuplicateKey` starts firing.
-    if ctx.store.insert_fact_conflict(
+    let new_fact = by_id
+        .get(&planned.new_fact_id)
+        .copied()
+        .cloned()
+        .unwrap_or_else(|| observation.to_fact(Utc::now()));
+    let qid = Uuid::new_v4();
+    let key = planned.key.encode();
+    let insert_outcome = ctx.store.insert_fact_conflict(
         qid,
-        new_fact.id,
-        old_fact.id,
-        diary,
-        kb,
-        detector,
-        score,
-        suggested,
-        "",
-        "",
-        engram_core::relations::REGISTRY_VERSION,
-    )? == engram_storage::InsertOutcome::Inserted
-    {
-        outcome.queued.push(json!({
-            "conflict_id": qid.to_string(),
-            "detector": detector,
-            "score": score,
-            "new": fact_summary(new_fact),
-            "old": fact_summary(old_fact),
-            "suggested_action": suggested,
-            "status": "contested",
-            "resolve_command": format!(
-                "engram facts resolve {qid} --action supersede-old|keep-both|reject-new"
-            ),
-            "note": "both values stay active until resolved; recall will report this subject as contested",
-        }));
+        planned.new_fact_id,
+        planned.old_fact_id,
+        w.diary,
+        w.kb,
+        planned.detector,
+        planned.score,
+        planned.suggested,
+        &key,
+        &planned.member_key,
+        planned.registry_version,
+    )?;
+    // A key collision is REPORTED, not swallowed, and the two collisions are
+    // told apart. `Ok(false)` used to mean "nothing was inserted" for two
+    // unrelated reasons, and the recovery built on it could name a conflict id
+    // for a different pair — or nothing at all.
+    let (conflict_id, deduplicated) = match insert_outcome {
+        engram_storage::InsertOutcome::Inserted => (qid, false),
+        // A DIFFERENT pair already asks this exact question. Storage matched
+        // the semantic key, so `deduplicated` is honest here and only here.
+        engram_storage::InsertOutcome::DuplicateKey { existing } => (existing, true),
+        // The same pair is already queued. Nothing is inferred.
+        engram_storage::InsertOutcome::DuplicatePair { existing } => (existing, false),
+    };
+    let resolve = crate::respond::resolve_conflict(conflict_id, planned.allowed);
+    let mut obj = serde_json::Map::new();
+    obj.insert("conflict_id".into(), json!(conflict_id.to_string()));
+    obj.insert("detector".into(), json!(planned.detector));
+    obj.insert("score".into(), json!(planned.score));
+    obj.insert("rule".into(), json!(planned.verdict.rule));
+    obj.insert("new".into(), fact_summary(&new_fact));
+    obj.insert("old".into(), fact_summary(old_fact));
+    obj.insert("suggested_action".into(), json!(planned.suggested));
+    obj.insert("status".into(), json!("contested"));
+    obj.insert("decision_key".into(), json!(key));
+    if deduplicated {
+        obj.insert("deduplicated".into(), json!(true));
     }
+    crate::respond::attach(&mut obj, &resolve);
+    obj.insert(
+        "note".into(),
+        json!(
+            "both values stay active until resolved; recall will report this subject as contested"
+        ),
+    );
+    outcome.queued.push(serde_json::Value::Object(obj));
     Ok(())
 }
 
@@ -1273,9 +1107,16 @@ mod tests {
             subject: "Ana".into(),
             predicate: predicate.into(),
             object: object.into(),
-            confidence: 1.0,
-            fact_type: None,
             valid_from: valid_from.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn ending(predicate: &str, object: &str, until: Option<&str>) -> ExtractedFact {
+        ExtractedFact {
+            valid_until: until.map(|s| s.to_string()),
+            state: Some("ended".into()),
+            ..extracted(predicate, object, None)
         }
     }
 
@@ -1376,258 +1217,45 @@ mod tests {
         assert_ne!(token_sort("robert smith"), token_sort("robert smythe"));
     }
 
-    // ----- Conflict classification -----
+    // ----- valid_until: the other half of the interval -----
 
-    /// A stored fact. `at` is the event time; every fact gets its own source
-    /// memory unless the caller pins one, because "came out of the same text"
-    /// is itself a classification signal.
-    fn stored(subject: &str, predicate: &str, object: &str, at: &str) -> Fact {
-        let t = moment(at);
-        Fact {
-            id: Uuid::new_v4(),
-            source_memory_id: Uuid::new_v4(),
-            subject: subject.into(),
-            subject_norm: normalize(subject),
-            predicate: predicate.into(),
-            object: object.into(),
-            object_norm: normalize(object),
-            confidence: 1.0,
-            created_at: t,
-            superseded_by: None,
-            superseded_at: None,
-            diary: "default".into(),
-            fact_type: FactType::Assertion,
-            valid_from: Some(t),
-            valid_until: None,
-            resolution: None,
-            source_kind: SourceKind::AgentExtracted,
-            confirmations: 0,
-            closed_by: None,
-            close_reason: None,
-            close_authority: None,
-            kb: "default".into(),
-        }
-    }
-
-    fn triage(new: &Fact, old: &Fact) -> Verdict {
-        classify_pair(new, old, None, ClassifyMode::Triage)
+    #[test]
+    fn a_readable_end_date_closes_the_interval() {
+        let ef = ending("takes_medication", "metformin", Some("2026-06-01"));
+        let (until, note) = resolve_valid_until(&ef, Some(moment("2026-01-01")));
+        assert_eq!(until.unwrap(), moment("2026-06-01"));
+        assert!(note.is_none());
+        assert!(ef.says_ended());
     }
 
     #[test]
-    fn arity_defaults_to_multi_and_knows_the_slots() {
-        assert_eq!(predicate_arity("lives_in"), Arity::Single);
-        assert_eq!(predicate_arity("works_at"), Arity::Single);
-        assert_eq!(predicate_arity("has_role"), Arity::Single);
-        assert_eq!(predicate_arity("born_on"), Arity::Single);
-        assert_eq!(predicate_arity("allergic_to"), Arity::Single);
-        for p in MULTI_VALUED_PREDICATES {
-            assert_eq!(predicate_arity(p), Arity::Multi, "{p} must be multi-valued");
-        }
-        // Unknown predicates are multi-valued: a wrong Single silently hides
-        // a true fact, a wrong Multi only keeps both.
-        assert_eq!(predicate_arity("collaborated_with"), Arity::Multi);
+    fn an_unreadable_end_date_is_dropped_and_reported_never_guessed() {
+        // A guessed end date closes an interval that is still running — the
+        // safety failure, arriving through the date parser.
+        let ef = ending("takes_medication", "metformin", Some("some time last year"));
+        let (until, note) = resolve_valid_until(&ef, Some(moment("2026-01-01")));
+        assert_eq!(until, None);
+        assert!(matches!(note, Some(PlanNote::UnreadableValidUntil { .. })));
     }
 
     #[test]
-    fn second_value_of_a_multi_valued_predicate_is_not_a_conflict() {
-        let old = stored("Elias", "knows", "Alice", "2026-01-01");
-        let new = stored("Elias", "knows", "Bob", "2026-02-01");
-        let v = triage(&new, &old);
-        assert_eq!(v.class, ConflictClass::Coexist);
-        assert_eq!(v.rule, "multi_valued");
-        // ...and the same holds on the write path, in every autonomy mode.
-        assert_eq!(
-            classify_pair(&new, &old, None, ClassifyMode::Write).class,
-            ConflictClass::Coexist
-        );
+    fn an_end_before_the_start_is_dropped_not_stored_backwards() {
+        let ef = ending("lives_in", "Lisbon", Some("2019-01-01"));
+        let (until, note) = resolve_valid_until(&ef, Some(moment("2026-01-01")));
+        assert_eq!(until, None);
+        assert!(matches!(
+            note,
+            Some(PlanNote::ValidUntilBeforeValidFrom { .. })
+        ));
     }
 
     #[test]
-    fn different_subjects_never_conflict() {
-        let old = stored("Alice", "lives_in", "Berlin", "2026-01-01");
-        let new = stored("Bob", "lives_in", "Porto", "2026-02-01");
-        assert_eq!(triage(&new, &old).rule, "different_subject");
-        assert_eq!(triage(&new, &old).class, ConflictClass::Coexist);
-    }
-
-    #[test]
-    fn different_predicates_on_one_subject_coexist_unless_they_are_one_slot() {
-        let old = stored("Elias", "lives_in", "Lisbon", "2026-01-01");
-        let new = stored("Elias", "has_role", "CEO", "2026-02-01");
-        assert_eq!(triage(&new, &old).rule, "different_predicate");
-        // A near-identical embedding of two single-valued predicates is the
-        // paraphrase case the novelty gate exists for — a human decides,
-        // because superseding across predicates rewrites a claim nobody made.
-        let old = stored("Elias", "lives_in", "Lisbon", "2026-01-01");
-        let new = stored("Elias", "home_city_is", "Porto", "2026-02-01");
-        assert_eq!(
-            classify_pair(&new, &old, Some(0.93), ClassifyMode::Triage).class,
-            ConflictClass::Coexist,
-            "an unknown predicate is multi-valued, so it cannot claim a slot"
-        );
-        let old = stored("Elias", "lives_in", "Lisbon", "2026-01-01");
-        let new = stored("Elias", "born_on", "1980-01-01", "2026-02-01");
-        let v = classify_pair(&new, &old, Some(0.93), ClassifyMode::Triage);
-        assert_eq!(v.class, ConflictClass::Queue);
-        assert_eq!(v.rule, "paraphrase_slot");
-        // Below the paraphrase band the two are simply different attributes.
-        assert_eq!(
-            classify_pair(&new, &old, Some(0.70), ClassifyMode::Triage).rule,
-            "different_predicate"
-        );
-    }
-
-    #[test]
-    fn identical_objects_are_duplicates_not_contradictions() {
-        let old = stored("Elias", "works_at", "Acme", "2026-01-01");
-        let new = stored("Elias", "works_at", "acme", "2026-02-01");
-        let v = triage(&new, &old);
-        assert_eq!(v.class, ConflictClass::Duplicate);
-        assert_eq!(v.rule, "duplicate_object");
-    }
-
-    #[test]
-    fn safety_slots_are_never_auto_resolved_for_one_subject() {
-        let old = stored("Ana", "allergic_to", "penicillin", "2020-01-01");
-        let new = stored("Ana", "allergic_to", "amoxicillin", "2026-01-01");
-        // Six years of recency ordering is not enough: this stays queued.
-        assert_eq!(triage(&new, &old).class, ConflictClass::Queue);
-        assert_eq!(triage(&new, &old).rule, "safety_slot");
-        assert_eq!(
-            classify_pair(&new, &old, None, ClassifyMode::Write).class,
-            ConflictClass::Queue
-        );
-        // Any predicate paired with a safety slot on the same subject queues.
-        let other = stored("Ana", "takes_medication", "amoxicillin", "2026-01-01");
-        assert_eq!(triage(&other, &old).rule, "safety_slot");
-        // Different people never contradict each other, and un-queueing that
-        // pair supersedes nothing — no allergy can be hidden by it.
-        let bob = stored("Bob", "allergic_to", "peanuts", "2026-01-01");
-        assert_eq!(triage(&bob, &old).rule, "different_subject");
-        assert_eq!(triage(&bob, &old).class, ConflictClass::Coexist);
-    }
-
-    #[test]
-    fn a_clear_event_time_ordering_resolves_a_slot_in_both_directions() {
-        let old = stored("Elias", "lives_in", "London", "2015-06-01");
-        let new = stored("Elias", "lives_in", "Lisbon", "2024-02-01");
-        let v = triage(&new, &old);
-        assert_eq!(v.class, ConflictClass::SupersedeOld);
-        assert_eq!(v.rule, "recency_supersede");
-        // Backfilling an OLD memory must not overwrite the current value.
-        let v = triage(&old, &new);
-        assert_eq!(v.class, ConflictClass::SupersedeNew);
-        assert_eq!(v.rule, "recency_stale");
-    }
-
-    #[test]
-    fn two_values_from_one_memory_are_a_real_contradiction() {
-        let mut old = stored("Carol", "works_at", "Acme", "2026-01-01");
-        let mut new = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
-        new.source_memory_id = Uuid::new_v4();
-        old.source_memory_id = new.source_memory_id;
-        // Even with a clock gap: one text, two employers, no ordering.
-        new.valid_from = Some(moment("2026-06-01"));
-        let v = triage(&new, &old);
-        assert_eq!(v.class, ConflictClass::Queue);
-        assert_eq!(v.rule, "same_source_contradiction");
-    }
-
-    #[test]
-    fn comparable_values_stay_queued_in_triage_but_last_writer_wins_at_write_time() {
-        let old = stored("Elias", "works_at", "Acme", "2026-01-01");
-        let mut new = stored("Elias", "works_at", "Beta Corp", "2026-01-01");
-        new.created_at = old.created_at;
-        let v = triage(&new, &old);
-        assert_eq!(v.class, ConflictClass::Queue);
-        assert_eq!(v.rule, "comparable_values");
-        // The write path has one more piece of evidence — an agent is
-        // asserting this value right now — and keeps write-path v2's tag.
-        let v = classify_pair(&new, &old, None, ClassifyMode::Write);
-        assert_eq!(v.class, ConflictClass::SupersedeOld);
-        assert_eq!(v.rule, "slot_lww");
-    }
-
-    #[test]
-    fn a_wide_confidence_gap_settles_a_slot_without_a_human() {
-        let old = stored("Elias", "works_at", "Acme", "2026-01-01");
-        let mut new = stored("Elias", "works_at", "Beta Corp", "2026-01-01");
-        new.created_at = old.created_at;
-        new.confidence = 1.0;
-        let mut old_weak = old.clone();
-        old_weak.confidence = 0.4;
-        let v = triage(&new, &old_weak);
-        assert_eq!(v.class, ConflictClass::SupersedeOld);
-        assert_eq!(v.rule, "confidence_gap");
-        // A guess must not overwrite a confident value either.
-        let v = triage(&old_weak, &new);
-        assert_eq!(v.class, ConflictClass::SupersedeNew);
-        assert_eq!(v.rule, "confidence_gap");
-    }
-
-    #[test]
-    fn an_already_superseded_fact_leaves_nothing_to_decide() {
-        let mut old = stored("Elias", "works_at", "Acme", "2026-01-01");
-        let new = stored("Elias", "works_at", "Beta Corp", "2026-02-01");
-        old.superseded_by = Some(Uuid::new_v4());
-        let v = triage(&new, &old);
-        assert_eq!(v.class, ConflictClass::Settled);
-        assert_eq!(v.rule, "already_settled");
-        assert!(v.is_auto_resolvable());
-    }
-
-    #[test]
-    fn only_the_queue_class_needs_a_human() {
-        for (class, expected) in [
-            (ConflictClass::Coexist, true),
-            (ConflictClass::Duplicate, true),
-            (ConflictClass::SupersedeOld, true),
-            (ConflictClass::SupersedeNew, true),
-            (ConflictClass::Settled, true),
-            (ConflictClass::Queue, false),
-        ] {
-            assert_eq!(
-                Verdict::new(class, "test").is_auto_resolvable(),
-                expected,
-                "{class:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_compiled_fact_is_read_like_a_backlog_not_like_an_assertion() {
-        assert_eq!(
-            classify_mode_for(SourceKind::CompileLlm),
-            ClassifyMode::Triage
-        );
-        for kind in [
-            SourceKind::AgentExtracted,
-            SourceKind::UserStated,
-            SourceKind::UserConfirmed,
-            SourceKind::Import,
-        ] {
-            assert_eq!(classify_mode_for(kind), ClassifyMode::Write, "{kind:?}");
-        }
-        // The consequence: two values a compile cannot order stay a question.
-        // Under the write path's rules the LAST chunk compiled would silently
-        // own the slot — and chunk order is a UUID tiebreak.
-        let old = stored("Carol", "works_at", "Acme", "2026-01-01");
-        let mut new = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
-        new.created_at = old.created_at;
-        assert_eq!(
-            classify_pair(&new, &old, None, classify_mode_for(SourceKind::CompileLlm)).class,
-            ConflictClass::Queue
-        );
-        assert_eq!(
-            classify_pair(
-                &new,
-                &old,
-                None,
-                classify_mode_for(SourceKind::AgentExtracted)
-            )
-            .class,
-            ConflictClass::SupersedeOld
-        );
+    fn no_end_date_is_not_a_warning() {
+        let ef = extracted("lives_in", "Lisbon", None);
+        let (until, note) = resolve_valid_until(&ef, Some(moment("2026-01-01")));
+        assert_eq!(until, None);
+        assert!(note.is_none());
+        assert!(!ef.says_ended(), "silence is not a cessation");
     }
 
     #[test]

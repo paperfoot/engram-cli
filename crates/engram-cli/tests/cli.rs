@@ -1787,8 +1787,16 @@ fn slot_last_writer_wins_supersedes_and_recall_reports_update() {
     );
 }
 
+/// THE ASSERTION WAS THE BUG (spec-fact-semantics §5.41, CLP-1).
+///
+/// This test used to demand that two DIFFERENT allergies on one person queue a
+/// conflict. They do not contradict each other: an allergy is a SET, and a
+/// second member is an addition. Demanding a question here is what produced
+/// ten "conflicts" from five medications, and what buried the handful of real
+/// contradictions under a backlog nobody reads. What survives is the half that
+/// was always true — nothing was superseded — now stated as coexistence.
 #[test]
-fn safety_slot_queues_conflict_and_recall_reports_contested() {
+fn two_different_allergies_coexist_and_supersede_nothing() {
     let (tmp, _cmd) = with_isolated_home();
     remember_with_facts(
         &tmp,
@@ -1796,20 +1804,23 @@ fn safety_slot_queues_conflict_and_recall_reports_contested() {
         r#"[{"subject":"Ana","predicate":"allergic_to","object":"penicillin"}]"#,
         "assisted",
     );
-    // A different allergy value must NOT auto-supersede (await-confirmation):
-    // both stay active and the conflict queues for the caller.
     let v = remember_with_facts(
         &tmp,
-        "Actually Ana is allergic to amoxicillin.",
+        "Ana is also allergic to amoxicillin.",
         r#"[{"subject":"Ana","predicate":"allergic_to","object":"amoxicillin"}]"#,
         "assisted",
     );
-    let queued = v["data"]["adjudication_needed"].as_array().unwrap();
-    assert_eq!(queued.len(), 1, "safety slot must queue, not supersede");
-    assert_eq!(queued[0]["status"], "contested");
-    let conflict_id = queued[0]["conflict_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        v["data"]["adjudication_needed"].as_array().unwrap().len(),
+        0,
+        "a second allergy is an addition, not a disagreement"
+    );
+    assert_eq!(
+        v["data"]["conflicts"].as_array().unwrap().len(),
+        0,
+        "and nothing was superseded"
+    );
 
-    // Both values active.
     let out = cmd_in(&tmp)
         .args(["facts", "list", "--subject", "Ana", "--json"])
         .assert()
@@ -1817,12 +1828,71 @@ fn safety_slot_queues_conflict_and_recall_reports_contested() {
         .get_output()
         .stdout
         .clone();
-    let v = parse_stdout(&out);
-    assert_eq!(v["data"]["facts"].as_array().unwrap().len(), 2);
+    let facts = parse_stdout(&out)["data"]["facts"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    for f in &facts {
+        assert!(
+            f["valid_until"].is_null(),
+            "both allergies stay open: {f:?}"
+        );
+    }
+}
+
+/// The half that is still a question, and the sibling CLP-1 asks for: a DOSE
+/// change on ONE medication is a real disagreement about one member, it queues
+/// exactly one conflict, and `recall` reports the subject contested.
+#[test]
+fn a_dose_change_queues_one_conflict_and_recall_reports_contested() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_with_facts(
+        &tmp,
+        "Ana takes metformin 500 mg daily.",
+        r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin 500 mg daily"}]"#,
+        "assisted",
+    );
+    let v = remember_with_facts(
+        &tmp,
+        "Ana's metformin went up to 1000 mg daily.",
+        r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin 1000 mg daily"}]"#,
+        "assisted",
+    );
+    let queued = v["data"]["adjudication_needed"].as_array().unwrap();
+    assert_eq!(queued.len(), 1, "one member, two doses: {queued:?}");
+    assert_eq!(queued[0]["status"], "contested");
+    assert_eq!(
+        queued[0]["suggested_action"], "requires_context",
+        "a safety pair is never advised toward a supersession"
+    );
+    let resolve_command = queued[0]["resolve_command"].as_str().unwrap();
+    assert!(
+        !resolve_command.contains('|'),
+        "a pasted pipe runs the destructive branch: {resolve_command}"
+    );
+    let conflict_id = queued[0]["conflict_id"].as_str().unwrap().to_string();
+
+    // Both doses are still active — the gate refuses every machine close.
+    let out = cmd_in(&tmp)
+        .args(["facts", "list", "--subject", "Ana", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let facts = parse_stdout(&out)["data"]["facts"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(facts.len(), 2);
+    for f in &facts {
+        assert!(f["valid_until"].is_null(), "{f:?}");
+    }
 
     // recall flags the subject as contested with both values.
     let out = cmd_in(&tmp)
-        .args(["recall", "Ana penicillin allergy", "--json"])
+        .args(["recall", "Ana metformin dose", "--json"])
         .assert()
         .success()
         .get_output()
@@ -1835,12 +1905,10 @@ fn safety_slot_queues_conflict_and_recall_reports_contested() {
         .iter()
         .filter(|c| c["status"] == "contested")
         .collect();
-    assert_eq!(contested.len(), 1, "recall must mark the allergy contested");
-    let values = contested[0]["values"].as_array().unwrap();
-    assert!(values.iter().any(|v| v == "penicillin"));
-    assert!(values.iter().any(|v| v == "amoxicillin"));
+    assert_eq!(contested.len(), 1, "recall must mark the dose contested");
 
-    // conflicts --open lists it; resolve applies the caller's decision.
+    // conflicts --open lists it; resolve applies the caller's decision, which
+    // is the one authority entitled to close a safety interval.
     let out = cmd_in(&tmp)
         .args(["facts", "conflicts", "--open", "--json"])
         .assert()
@@ -1848,8 +1916,7 @@ fn safety_slot_queues_conflict_and_recall_reports_contested() {
         .get_output()
         .stdout
         .clone();
-    let v = parse_stdout(&out);
-    assert_eq!(v["data"]["count"], 1);
+    assert_eq!(parse_stdout(&out)["data"]["count"], 1);
 
     let out = cmd_in(&tmp)
         .args([
@@ -1859,7 +1926,7 @@ fn safety_slot_queues_conflict_and_recall_reports_contested() {
             "--action",
             "supersede-old",
             "--note",
-            "user confirmed the correction",
+            "prescriber confirmed the increase",
             "--json",
         ])
         .assert()
@@ -1867,10 +1934,8 @@ fn safety_slot_queues_conflict_and_recall_reports_contested() {
         .get_output()
         .stdout
         .clone();
-    let v = parse_stdout(&out);
-    assert_eq!(v["data"]["resolved"], true);
+    assert_eq!(parse_stdout(&out)["data"]["resolved"], true);
 
-    // Queue is empty; only the new value remains active with resolution=caller.
     let out = cmd_in(&tmp)
         .args(["facts", "conflicts", "--open", "--json"])
         .assert()
@@ -1891,7 +1956,7 @@ fn safety_slot_queues_conflict_and_recall_reports_contested() {
         .unwrap()
         .clone();
     assert_eq!(facts.len(), 1);
-    assert_eq!(facts[0]["object"], "amoxicillin");
+    assert_eq!(facts[0]["object"], "metformin 1000 mg daily");
 }
 
 #[test]
@@ -4388,6 +4453,17 @@ fn seed_legacy_backlog(tmp: &tempfile::TempDir) {
             "Elias has the role of CEO.",
             r#"[{"subject":"Elias","predicate":"has_role","object":"CEO"}]"#,
         ),
+        // The safety pair that is a REAL question: one medication, two doses.
+        // Two different allergies (above) are not — they coexist, and the
+        // sweep resolves them. See spec-fact-semantics §5.41 / CLP-1.
+        (
+            "Ana started metformin 500 mg daily.",
+            r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin 500 mg daily"}]"#,
+        ),
+        (
+            "Ana's metformin went up to 1000 mg daily.",
+            r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin 1000 mg daily"}]"#,
+        ),
     ] {
         remember_legacy(tmp, content, facts);
     }
@@ -4432,9 +4508,14 @@ fn triage_resolves_the_obvious_and_keeps_the_real_contradictions() {
     );
     assert_eq!(d["facts_superseded"], 1);
 
-    // What is left is exactly the safety slot and the one-memo contradiction.
+    // What is left is exactly the safety pair and the one-memo contradiction.
+    // The safety pair is a DOSE CHANGE: two different allergies coexist now,
+    // and a sweep that "kept" them was keeping a non-question.
     let reasons = d["remaining_by_reason"].as_object().unwrap();
-    assert_eq!(reasons.get("safety_slot").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(
+        reasons.get("safety_member_change").and_then(|v| v.as_u64()),
+        Some(1)
+    );
     assert_eq!(
         reasons
             .get("same_source_contradiction")
@@ -4464,13 +4545,14 @@ fn triage_resolves_the_obvious_and_keeps_the_real_contradictions() {
         "a triage supersession must be auditable"
     );
 
-    // Ana keeps BOTH allergy values active — a safety slot is never decided
-    // by a sweep.
+    // Ana keeps every safety value active — both allergies (which coexist)
+    // and both metformin doses (which are a question nobody but a person may
+    // answer). A sweep decides neither.
     let v = run_json(
         &mut cmd_in(&tmp),
         &["facts", "show", "Ana", "--kb", "personal", "--diary", "*"],
     );
-    assert_eq!(v["data"]["active_count"], 2);
+    assert_eq!(v["data"]["active_count"], 4);
 
     // The remainder is still resolvable by hand.
     let open = run_json(&mut cmd_in(&tmp), &["facts", "conflicts", "--open"]);
@@ -4561,13 +4643,16 @@ fn open_conflicts_are_grouped_by_subject_and_predicate_with_sources() {
         .iter()
         .find(|g| g["subject"] == "Ana")
         .expect("Ana group");
-    assert_eq!(ana["predicate"], "allergic_to");
+    assert_eq!(ana["predicate"], "takes_medication");
     assert_eq!(ana["safety_slot"], true);
-    assert_eq!(ana["arity"], "single");
+    assert_eq!(
+        ana["arity"], "multi",
+        "a medication is a SET — this projection flipping from `single` IS the polypharmacy fix"
+    );
     assert_eq!(ana["conflict_count"], 1);
     let entry = &ana["conflicts"][0];
     assert_eq!(entry["triage"]["auto_resolvable"], false);
-    assert_eq!(entry["triage"]["rule"], "safety_slot");
+    assert_eq!(entry["triage"]["rule"], "safety_member_change");
     assert!(entry["resolve_command"]
         .as_str()
         .unwrap()
@@ -4577,11 +4662,14 @@ fn open_conflicts_are_grouped_by_subject_and_predicate_with_sources() {
         entry["new"]["object"].as_str().unwrap(),
         entry["old"]["object"].as_str().unwrap(),
     ];
-    assert!(objects.contains(&"penicillin") && objects.contains(&"amoxicillin"));
+    assert!(
+        objects.contains(&"metformin 500 mg daily") && objects.contains(&"metformin 1000 mg daily"),
+        "{objects:?}"
+    );
     assert!(entry["new"]["source_preview"]
         .as_str()
         .unwrap()
-        .contains("allergic"));
+        .contains("metformin"));
     assert!(entry["new"]["source_memory_id"].is_string());
 
     // A subject filter narrows to one person's backlog, without --open.
