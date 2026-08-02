@@ -31,7 +31,13 @@ pub struct Cli {
 pub enum Command {
     /// Print machine-readable capability manifest.
     #[command(visible_alias = "info")]
-    AgentInfo,
+    AgentInfo {
+        /// Print one command's JSON Schema instead of the whole manifest, e.g.
+        /// `--schema 'facts resolve'`. Aliases resolve; an unknown name lists
+        /// the valid ones.
+        #[arg(long, value_name = "COMMAND")]
+        schema: Option<String>,
+    },
 
     /// Store a new memory.
     Remember {

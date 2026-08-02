@@ -20,6 +20,13 @@ migration writes a `VACUUM INTO` backup beside the store before touching a row.
   vanished after `deleted: true` will find them present-but-closed; `facts
   list` labels them `[closed: retracted_source]` and excludes them from
   active reads.
+- Three more commands changed their wire error on an id that does not exist.
+  `edit <uuid> --importance 3`, `facts resolve <uuid> --action keep-both` and
+  `jobs show <uuid>` each answered `bad_input` in 0.3.1 and answer `not_found`
+  now; all three still exit 3, so only a script branching on `error.code` sees
+  the change — and that is precisely the script that should. An id that will
+  never exist is not a malformed argument, and `bad_input` sent agents back to
+  re-check their flags instead of their handles.
 - `kb delete --confirm` remains a hard delete of the KB's projections (its
   journal events survive). It is the one deliberately destructive KB-level
   command and is documented as such rather than journalled — the append-only
@@ -78,6 +85,11 @@ migration writes a `VACUUM INTO` backup beside the store before touching a row.
 - `ENGRAM_STORE` env var and `--store` flag: root db/vectors/config/cache
   under one directory for sandboxes and tests; `agent-info` answers without
   opening, creating, or migrating any store.
+- `engram agent-info --schema '<command>'` prints one command's JSON Schema —
+  input types, required arguments, and the documented output fields. Three
+  error surfaces had been telling agents to run it since before the flag
+  existed; it now exists, resolves aliases, and answers an unknown name by
+  listing the commands that have a schema.
 - `engram-contract`: the command schema as data, generating agent-info,
   skill.md and JSON Schema, with contract tests that fail the build when docs
   and binary drift (they caught two drifts during this build's own

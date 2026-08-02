@@ -12,7 +12,15 @@ use std::io::Write;
 /// opening, creating, or migrating any store — `dispatch` returns before
 /// `AppContext::new`, and the path fields below use the non-creating peek
 /// getters.
-pub fn run() -> Result<(), CliError> {
+///
+/// `schema` narrows the answer to one command. Three separate error surfaces
+/// have been telling agents to run `agent-info --schema '<command>'` since
+/// before the flag existed; the generator was always there, so this is the
+/// door, not a new room.
+pub fn run(schema: Option<&str>) -> Result<(), CliError> {
+    if let Some(path) = schema {
+        return print_schema(path);
+    }
     let manifest = json!({
         "name": "engram",
         "version": env!("CARGO_PKG_VERSION"),
@@ -38,7 +46,7 @@ pub fn run() -> Result<(), CliError> {
             "`--store <dir>` works on every command and on `engramd`, and outranks ENGRAM_STORE. Use it for scratch work rather than exporting an env var you will forget to unset."
         ],
         "commands": {
-            "agent-info | info": "Print this manifest (raw JSON, not enveloped)",
+            "agent-info | info": "Print this manifest (raw JSON, not enveloped). `agent-info --schema '<command>'` prints ONE command's JSON Schema instead — input types, required arguments, and the output envelope's documented fields. Aliases resolve (`--schema search` is `recall`), and an unknown name is exit 3 listing every command that has a schema.",
             "kb create <name>": "Create/update a knowledge base. Flags: --description <text>. Rarely needed: writing with --kb <name> registers the KB.",
             "kb list | kb show <name> | kb delete <name> --confirm": "Manage domain KBs.",
             "kb repair [--dry-run]": "Register KBs that hold memories but are missing from `kb list` — the residue of stores written by builds that predated write-time registration. Idempotent and additive; never touches memories. `doctor --integrity` reports the same fault as `unregistered_kbs`.",
@@ -444,6 +452,33 @@ pub fn run() -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{}", serde_json::to_string_pretty(&manifest).unwrap());
     Ok(())
+}
+
+/// One command's JSON Schema, raw like the manifest itself.
+///
+/// The failure names every command it would have accepted. An error that
+/// answers "no such command" and then repeats the suggestion the caller just
+/// followed is a loop with a confident tone — which is exactly what this
+/// invocation used to be.
+fn print_schema(path: &str) -> Result<(), CliError> {
+    match engram_contract::jsonschema::schema_for(path) {
+        Some(schema) => {
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{}", serde_json::to_string_pretty(&schema).unwrap());
+            Ok(())
+        }
+        None => {
+            let known = engram_contract::contract()
+                .commands
+                .iter()
+                .map(|c| c.path)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CliError::BadInput(format!(
+                "no command `{path}` — `agent-info --schema` describes: {known}"
+            )))
+        }
+    }
 }
 
 /// Splice in everything `engram-contract` owns.
