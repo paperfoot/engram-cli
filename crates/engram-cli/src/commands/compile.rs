@@ -113,16 +113,28 @@ pub async fn run(
         }),
         max_llm_chunks,
     };
-    let job_id = ctx.store.create_compile_job(
-        &kb,
-        "evidence",
-        json!({
-            "llm": options.llm,
-            "extraction_model": options.extraction_model,
-            "synthesis_model": options.synthesis_model,
-            "max_llm_chunks": options.max_llm_chunks,
-        }),
-    )?;
+    // Abandon and insert in ONE transaction. The legacy `create_compile_job`
+    // clears only `running` rows, so a `queued` row left by `jobs submit
+    // --detach` would make this insert fail on the partial unique index with a
+    // raw SQL message. Widening the abandon here keeps the synchronous compile
+    // working and keeps "at most one live job per (kind, kb)" true.
+    let job_id = ctx.with_store_tx(|s| {
+        s.abandon_live_jobs(
+            "compile",
+            &kb,
+            "superseded by a synchronous compile of the same KB",
+        )?;
+        Ok(s.create_compile_job(
+            &kb,
+            "evidence",
+            json!({
+                "llm": options.llm,
+                "extraction_model": options.extraction_model,
+                "synthesis_model": options.synthesis_model,
+                "max_llm_chunks": options.max_llm_chunks,
+            }),
+        )?)
+    })?;
     let stats = match compile_kb_with_options(ctx, &kb, options.clone()).await {
         Ok(stats) => {
             ctx.store
@@ -167,6 +179,111 @@ pub async fn run(
 
 pub async fn compile_kb(ctx: &AppContext, kb: &str) -> Result<CompileStats, CliError> {
     compile_kb_with_options(ctx, kb, CompileOptions::default()).await
+}
+
+// ---------------------------------------------------------------------------
+// Compile as a job
+// ---------------------------------------------------------------------------
+
+/// The runner behind `engram jobs submit --kind compile`, `POST /v1/jobs` and
+/// the sleep-time trigger.
+///
+/// It wraps [`compile_kb_with_options`], which is still monolithic: the
+/// build-then-swap is one transaction and there is no mid-compile checkpoint,
+/// so this runner returns `Completed` or an error and never `Paused`. Stated
+/// rather than papered over — an unresumable job that says so is honest, and a
+/// job reporting `paused` with no cursor would tell `jobs resume` there is
+/// something to continue from when there is not.
+pub struct CompileRunner;
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CompileParams {
+    #[serde(default)]
+    pub llm: bool,
+    #[serde(default)]
+    pub extraction_model: Option<String>,
+    #[serde(default)]
+    pub synthesis_model: Option<String>,
+    #[serde(default)]
+    pub max_llm_chunks: Option<usize>,
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
+    /// `manual` | `sleep_time` | `api`. Reported by `jobs list`, so a user can
+    /// see which compiles they asked for and which the daemon decided on.
+    #[serde(default)]
+    pub trigger: Option<String>,
+}
+
+impl CompileParams {
+    pub fn into_options(self) -> CompileOptions {
+        CompileOptions {
+            llm: self.llm,
+            extraction_model: self.extraction_model.unwrap_or_else(|| {
+                crate::commands::config::resolve_setting(
+                    "ENGRAM_COMPILER_EXTRACTION_MODEL",
+                    "compiler.extraction_model",
+                    DEFAULT_EXTRACTION_MODEL,
+                )
+            }),
+            synthesis_model: self.synthesis_model.unwrap_or_else(|| {
+                crate::commands::config::resolve_setting(
+                    "ENGRAM_COMPILER_SYNTHESIS_MODEL",
+                    "compiler.synthesis_model",
+                    DEFAULT_SYNTHESIS_MODEL,
+                )
+            }),
+            max_llm_chunks: self.max_llm_chunks,
+        }
+    }
+}
+
+impl crate::engine::JobRunner for CompileRunner {
+    fn kind(&self) -> &'static str {
+        "compile"
+    }
+
+    fn validate(&self, params: serde_json::Value) -> Result<serde_json::Value, CliError> {
+        let parsed: CompileParams =
+            serde_json::from_value(params).map_err(|e| CliError::MalformedJson {
+                field: "params",
+                detail: e.to_string(),
+            })?;
+        Ok(serde_json::to_value(parsed)?)
+    }
+
+    fn run<'a>(
+        &'a self,
+        jc: &'a crate::engine::JobCtx,
+        params: &'a serde_json::Value,
+        _cursor: &'a serde_json::Value,
+    ) -> crate::engine::jobs::JobFuture<'a> {
+        Box::pin(async move {
+            let parsed: CompileParams = serde_json::from_value(params.clone()).unwrap_or_default();
+            let stats = compile_kb_with_options(jc.app(), &jc.kb, parsed.into_options()).await?;
+            let stats_json = serde_json::to_value(&stats)?;
+            // `compile.ran`, in the transaction of the write it describes. A
+            // paused compile appends nothing, which is correct: the derived
+            // layer was not swapped.
+            let kb = jc.kb.clone();
+            let job_id = jc.id;
+            let payload = stats_json.clone();
+            jc.core
+                .write("compile.ran", move |w| {
+                    w.store.append_event(
+                        &engram_storage::journal::EventDraft::new(
+                            engram_core::events::EventKind::CompileRan,
+                            w.actor,
+                            json!({ "kb": kb, "job_id": job_id, "stats": payload }),
+                        )
+                        .subject(job_id)
+                        .scope(Some(&kb), None),
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            Ok(crate::engine::JobOutcome::Completed { stats: stats_json })
+        })
+    }
 }
 
 pub async fn compile_kb_with_options(

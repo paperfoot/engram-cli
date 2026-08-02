@@ -114,19 +114,17 @@ fn a_repeated_coexistence_never_becomes_a_question() {
 /// pair be derived again and watch the store apply the answer instead of
 /// asking.
 ///
-/// BLOCKED, and honestly so. `facts resolve` still writes through the legacy
-/// `resolve_fact_conflict` path and appends no `decision.recorded` — D8 gives
-/// `resolve_conflict_with_decision` to read-surfaces in wave 3, and it has not
-/// landed here. Until it does there is nothing in `fact_decisions` to replay,
-/// so this asserts nothing rather than passing vacuously.
+/// Unblocked in wave 4. `facts resolve` now runs through
+/// `Core::resolve_conflict`, which wraps storage's
+/// `resolve_conflict_with_decision` (D8), so a `caller` decision exists in
+/// `fact_decisions` for the pair's semantic key and the planner can find it.
 ///
-/// The replay SEMANTICS are proved without a store by
-/// `engram_graph::semantics::tests` (`a_replayed_keep_both_suppresses_the_question`,
-/// `a_caller_close_old_reapplies_silently_on_a_safety_relation`,
-/// `a_machine_close_old_never_replays`), which is where they belong; what is
-/// missing is one wiring, in one other lane's file.
+/// One correction against the blocked draft: `remember` does not emit
+/// `plan_notes`, so the replay is asserted where it is actually visible — the
+/// per-pair `resolution` on `data.conflicts`, which reads `replayed_close_old`
+/// rather than `conflicts_queued: 1`. A silent replay is still refused: the
+/// row says which decision was applied.
 #[test]
-#[ignore = "blocked: read-surfaces must route `facts resolve` through resolve_conflict_with_decision (D8) so a decision exists to replay"]
 fn a_resolved_question_is_never_asked_again() {
     let tmp = store();
     let first = remember_facts(
@@ -140,7 +138,13 @@ fn a_resolved_question_is_never_asked_again() {
         .to_string();
     run_json(
         &mut engram(tmp.path()),
-        &["facts", "resolve", &conflict_id, "--action", "keep-both"],
+        &[
+            "facts",
+            "resolve",
+            &conflict_id,
+            "--action",
+            "supersede-old",
+        ],
     );
 
     // Re-derive the same pair from a different memory. The caller answered
@@ -155,12 +159,55 @@ fn a_resolved_question_is_never_asked_again() {
         0,
         "a question the caller answered must not reopen: {again}"
     );
-    let notes = again["data"]["plan_notes"]
+    assert_eq!(
+        again["metadata"]["conflicts_queued"], 0,
+        "the answer is replayed, not re-asked: {again}"
+    );
+    let applied = again["data"]["conflicts"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     assert!(
-        notes.iter().any(|n| n["kind"] == "replay_applied"),
-        "a silent replay is indistinguishable from a dropped question: {again}"
+        !applied.is_empty()
+            && applied
+                .iter()
+                .all(|c| c["resolution"] == "replayed_close_old"),
+        "a silent replay is indistinguishable from a dropped question — each \
+         pair must name the decision it applied: {again}"
+    );
+}
+
+/// The other arm of the same claim: `keep-both` is a decision too. It used to
+/// write nothing at all, so the caller's answer lived only in a queue row's
+/// status and every re-derivation asked again.
+#[test]
+fn keep_both_is_an_answer_the_store_remembers() {
+    let tmp = store();
+    let first = remember_facts(
+        tmp.path(),
+        "One memo says Carol is at Acme, the next line says Beta Corp.",
+        CAROL,
+    );
+    let conflict_id = first["data"]["adjudication_needed"][0]["conflict_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resolved = run_json(
+        &mut engram(tmp.path()),
+        &["facts", "resolve", &conflict_id, "--action", "keep-both"],
+    );
+    assert!(
+        resolved["data"]["decision_id"].is_string(),
+        "keep-both must leave a decision behind: {resolved}"
+    );
+    remember_facts(
+        tmp.path(),
+        "Another note: Carol at Acme, then Beta Corp.",
+        CAROL,
+    );
+    assert_eq!(
+        open_conflicts(tmp.path())["data"]["total_open"],
+        0,
+        "both values stay live and the question stays answered"
     );
 }
