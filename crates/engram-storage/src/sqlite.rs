@@ -361,6 +361,15 @@ pub struct FactExportRow {
     pub close_authority: Option<String>,
 }
 
+/// What [`SqliteStore::import_fact_row`] did with one row. A bare `bool`
+/// could only say "landed"; the caller also has to be able to report that a
+/// close was refused on the way in [G2].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportedFactRow {
+    pub inserted: bool,
+    pub close_rejected: bool,
+}
+
 fn default_fact_type_str() -> String {
     "assertion".to_string()
 }
@@ -5575,7 +5584,32 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
-    pub fn import_fact_row(&self, row: &FactExportRow) -> Result<bool, StorageError> {
+    /// Import one fact row from an export file.
+    ///
+    /// [G2] This is the ONLY write path whose bytes a caller edits by hand,
+    /// so it is the only one that cannot trust its own input. Two things it
+    /// cannot re-derive get checked instead: an interval that ends before it
+    /// begins is refused outright, and a SAFETY relation closed by anything
+    /// but a person is imported OPEN with the close dropped and counted.
+    /// Everything else about the row is written as given.
+    pub fn import_fact_row(&self, row: &FactExportRow) -> Result<ImportedFactRow, StorageError> {
+        if crate::export_v3::interval_is_inverted(
+            row.valid_from.as_deref(),
+            row.valid_until.as_deref(),
+        ) {
+            return Err(crate::export_v3::inverted_interval_error(
+                &row.id,
+                row.valid_from.as_deref().unwrap_or(""),
+                row.valid_until.as_deref().unwrap_or(""),
+            ));
+        }
+        let closed = row.valid_until.is_some() || row.superseded_by.is_some();
+        let close_rejected = closed
+            && crate::export_v3::close_needs_person(&row.predicate, row.close_authority.as_deref());
+        // Dropping the close means dropping ALL of it: a row left with
+        // `superseded_by` set is not open under `is_open_fact`, and half a
+        // close is worse than either whole.
+        let keep = |v: &Option<String>| if close_rejected { None } else { v.clone() };
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO facts(id, source_memory_id, subject, subject_norm,
                 predicate, object, object_norm, confidence, created_at,
@@ -5594,22 +5628,25 @@ impl SqliteStore {
                 row.object_norm,
                 row.confidence,
                 row.created_at,
-                row.superseded_by,
-                row.superseded_at,
+                keep(&row.superseded_by),
+                keep(&row.superseded_at),
                 row.diary,
                 row.kb,
                 row.fact_type,
                 row.valid_from,
-                row.valid_until,
+                keep(&row.valid_until),
                 row.resolution,
                 row.source_kind,
                 row.confirmations,
-                row.closed_by,
-                row.close_reason,
-                row.close_authority,
+                keep(&row.closed_by),
+                keep(&row.close_reason),
+                keep(&row.close_authority),
             ],
         )?;
-        Ok(n > 0)
+        Ok(ImportedFactRow {
+            inserted: n > 0,
+            close_rejected,
+        })
     }
 
     pub fn embedding_profiles(

@@ -37,7 +37,7 @@ use crate::error::StorageError;
 use crate::journal::EventRow;
 use crate::sqlite::SqliteStore;
 use engram_core::events::EventKind;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RebuildReport {
@@ -109,11 +109,61 @@ pub fn skipped_tables() -> Vec<SkippedTable> {
     ]
 }
 
+/// Where a replayed event came from, and therefore how far it is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// This store's own journal. Whatever it says, this store did — and that
+    /// INCLUDES the v9 history the migration synthesized, where a relation
+    /// the registry has since promoted to `safety` was closed by the old
+    /// slot-LWW heuristic. Re-gating those on every rebuild would reopen
+    /// thousands of correctly-retired prescriptions, which is a rebuild that
+    /// edits history rather than replaying it.
+    OwnJournal,
+    /// An event out of an export file — bytes a caller can edit with `jq`.
+    /// The [G2] gate applies, exactly as it does to the row sections.
+    Imported,
+}
+
 /// Replay one event onto the projections. Raw SQL only — see rule 1.
 pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
+    apply_from(store, e, Origin::OwnJournal).map(|_| ())
+}
+
+/// [G2] Replay one event, returning the number of closes the safety gate
+/// refused (0 or 1). `Origin::OwnJournal` never refuses anything, so
+/// `admin rebuild` is unchanged.
+pub fn apply_from(
+    store: &SqliteStore,
+    e: &EventRow,
+    origin: Origin,
+) -> Result<usize, StorageError> {
+    let mut refused = 0usize;
     match e.kind {
         EventKind::FactObserved => {
             let id = e.payload_uuid("fact_id")?;
+            let mut valid_until = e.payload_opt_str("valid_until");
+            if origin == Origin::Imported {
+                let valid_from = e.payload_opt_str("valid_from");
+                if crate::export_v3::interval_is_inverted(
+                    valid_from.as_deref(),
+                    valid_until.as_deref(),
+                ) {
+                    return Err(crate::export_v3::inverted_interval_error(
+                        &id.to_string(),
+                        valid_from.as_deref().unwrap_or(""),
+                        valid_until.as_deref().unwrap_or(""),
+                    ));
+                }
+                // An observation carries no authority at all, so an imported
+                // one that arrives already CLOSED on a safety relation is a
+                // close nobody signed.
+                if valid_until.is_some()
+                    && crate::export_v3::close_needs_person(&e.payload_str("relation")?, None)
+                {
+                    valid_until = None;
+                    refused += 1;
+                }
+            }
             store.conn.execute(
                 "INSERT OR IGNORE INTO facts(id, source_memory_id, subject, subject_norm,
                         predicate, object, object_norm, confidence, created_at,
@@ -144,7 +194,7 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
                     e.payload_opt_str("fact_type")
                         .unwrap_or_else(|| "assertion".to_string()),
                     e.payload_opt_str("valid_from"),
-                    e.payload_opt_str("valid_until"),
+                    valid_until,
                     e.payload_opt_str("resolution"),
                     e.payload_opt_str("source_kind")
                         .unwrap_or_else(|| "agent_extracted".to_string()),
@@ -166,6 +216,37 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
         EventKind::FactIntervalClosed => {
             let id = e.payload_uuid("fact_id")?;
             let sets = e.payload_bool("sets_superseded_by");
+            if origin == Origin::Imported {
+                // The relation is not in the close payload — it is in the row
+                // the earlier `fact.observed` (or the file's row section)
+                // already landed.
+                let target: Option<(String, Option<String>)> = store
+                    .conn
+                    .query_row(
+                        "SELECT predicate, valid_from FROM facts WHERE id = ?1",
+                        params![id.to_string()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((predicate, valid_from)) = target {
+                    let until = e.payload_str("valid_until")?;
+                    if crate::export_v3::interval_is_inverted(valid_from.as_deref(), Some(&until)) {
+                        return Err(crate::export_v3::inverted_interval_error(
+                            &id.to_string(),
+                            valid_from.as_deref().unwrap_or(""),
+                            &until,
+                        ));
+                    }
+                    if crate::export_v3::close_needs_person(
+                        &predicate,
+                        Some(e.payload_str("authority")?).as_deref(),
+                    ) {
+                        // The event is kept — the journal records what the
+                        // file claimed — but the projection does not move.
+                        return Ok(1);
+                    }
+                }
+            }
             store.conn.execute(
                 "UPDATE facts
                     SET valid_until = ?1, close_reason = ?2, close_authority = ?3,
@@ -434,7 +515,7 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
         | EventKind::JobCompleted
         | EventKind::JobFailed => {}
     }
-    Ok(())
+    Ok(refused)
 }
 
 impl SqliteStore {
