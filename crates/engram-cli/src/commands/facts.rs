@@ -18,8 +18,8 @@
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_write::{
-    classify_pair, is_safety_slot, predicate_arity, write_fact_batch, Arity, Autonomy,
-    ClassifyMode, ConflictClass, FactBatch, FactExtractionMarker, FactWriteCtx, FactWriteOutcome,
+    classify_pair, is_safety_slot, predicate_arity, write_fact_batch, Autonomy, ClassifyMode,
+    ConflictClass, FactBatch, FactExtractionMarker, FactWriteCtx, FactWriteOutcome, LegacyArity,
     MemoryTime, Verdict,
 };
 use crate::output::{print_success, Metadata};
@@ -437,8 +437,8 @@ fn group_conflicts(
                 "subject": subject,
                 "predicate": predicate,
                 "arity": match predicate_arity(&canonical) {
-                    Arity::Single => "single",
-                    Arity::Multi => "multi",
+                    LegacyArity::Single => "single",
+                    LegacyArity::Multi => "multi",
                 },
                 "safety_slot": is_safety_slot(&canonical),
                 "conflict_count": members.len(),
@@ -590,10 +590,7 @@ pub fn triage(
                 ) && (is_safety_slot(&canonical_predicate(&new_f.predicate))
                     || is_safety_slot(&canonical_predicate(&old_f.predicate)))
                 {
-                    verdict = Verdict {
-                        class: ConflictClass::Queue,
-                        rule: "safety_slot",
-                    };
+                    verdict = Verdict::new(ConflictClass::Queue, "safety_slot");
                 }
                 // An earlier row in this run already superseded one of the two
                 // facts, so this pair has nothing left to decide — the snapshot
@@ -605,10 +602,7 @@ pub fn triage(
                 if !matches!(verdict.class, ConflictClass::Coexist)
                     && (settled_facts.contains(&new_f.id) || settled_facts.contains(&old_f.id))
                 {
-                    verdict = Verdict {
-                        class: ConflictClass::Settled,
-                        rule: "already_settled",
-                    };
+                    verdict = Verdict::new(ConflictClass::Settled, "already_settled");
                 }
                 if verdict.class == ConflictClass::Queue {
                     *kept_by_reason.entry(verdict.rule).or_insert(0) += 1;
@@ -702,7 +696,15 @@ pub fn triage(
     } else {
         resolved as f64 / scanned as f64
     };
-    let safety_kept = kept_by_reason.get("safety_slot").copied().unwrap_or(0);
+    // Both rules keep a pair BECAUSE it is safety-critical: `safety_slot` is
+    // the gate's downgrade, `safety_member_change` is a dose change the
+    // classifier queued outright. Counting only the first reported zero for
+    // exactly the sweep this number exists to describe.
+    let safety_kept = kept_by_reason.get("safety_slot").copied().unwrap_or(0)
+        + kept_by_reason
+            .get("safety_member_change")
+            .copied()
+            .unwrap_or(0);
 
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,

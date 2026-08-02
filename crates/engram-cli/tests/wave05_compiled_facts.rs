@@ -166,8 +166,14 @@ fn a_compiled_fact_is_dated_by_its_memory_not_by_the_compile_clock() {
 
 /// No path may auto-supersede an allergy, a medication, a diagnosis or a blood
 /// type. The compiler used to do exactly that, tagging it `exact_match`.
+///
+/// CLP-2 (spec-fact-semantics §5.41). The claim worth keeping is
+/// `historic_count == 0` — a compile never retires a safety fact — and it
+/// stays green. What changed is the QUEUED count: two different allergies do
+/// not contradict each other, so a compile that adds one asks nobody anything.
+/// The queued half of the guarantee moves to the dose-change fixture below.
 #[test]
-fn a_compiled_fact_never_retires_a_safety_slot() {
+fn a_compiled_fact_never_retires_a_safety_fact() {
     let tmp = isolated_home();
     seed_with_fact(
         &tmp,
@@ -188,8 +194,8 @@ fn a_compiled_fact_never_retires_a_safety_slot() {
     let compiled = compile_llm(&tmp, &script);
     assert_eq!(compiled["data"]["compile"]["llm_facts"], 1, "{compiled}");
     assert_eq!(
-        compiled["data"]["compile"]["llm_facts_queued"], 1,
-        "a contradiction the compiler refuses to settle must be reported, not silent"
+        compiled["data"]["compile"]["llm_facts_queued"], 0,
+        "a second allergy is an addition; asking about it is the storm, not the fix"
     );
 
     let shown = facts_show(&tmp, "Ana");
@@ -198,11 +204,45 @@ fn a_compiled_fact_never_retires_a_safety_slot() {
         shown["data"]["historic_count"], 0,
         "penicillin was retired by a compile — this is a medical incident, not a stale profile field"
     );
+    assert_eq!(open_conflicts(&tmp)["data"]["total_open"], 0);
+}
+
+/// The half of the old guarantee that is still a question: ONE medication at
+/// two doses. The compiler may not settle it, and it must say so.
+#[test]
+fn a_compiled_dose_change_is_queued_never_settled() {
+    let tmp = isolated_home();
+    seed_with_fact(
+        &tmp,
+        "Clinic intake notes for Ana were filed this morning.",
+        r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin 500 mg daily","confidence":1.0}]"#,
+    );
+    seed(
+        &tmp,
+        "The clinic chart says Ana now takes metformin 1000 mg daily.",
+        None,
+    );
+    let script = compiler_stub(&[facts_rule(
+        "metformin",
+        "Ana",
+        "takes_medication",
+        "metformin 1000 mg daily",
+    )]);
+    let compiled = compile_llm(&tmp, &script);
+    assert_eq!(compiled["data"]["compile"]["llm_facts"], 1, "{compiled}");
+    assert_eq!(
+        compiled["data"]["compile"]["llm_facts_queued"], 1,
+        "a contradiction the compiler refuses to settle must be reported, not silent"
+    );
+
+    let shown = facts_show(&tmp, "Ana");
+    assert_eq!(shown["data"]["active_count"], 2, "{shown}");
+    assert_eq!(shown["data"]["historic_count"], 0, "{shown}");
 
     let conflicts = open_conflicts(&tmp);
     assert_eq!(conflicts["data"]["total_open"], 1, "{conflicts}");
     assert_eq!(
-        conflicts["data"]["open_conflicts"][0]["triage"]["rule"], "safety_slot",
+        conflicts["data"]["open_conflicts"][0]["triage"]["rule"], "safety_member_change",
         "{conflicts}"
     );
 }

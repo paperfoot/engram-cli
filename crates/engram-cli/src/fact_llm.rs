@@ -15,6 +15,18 @@
 //!    silently calling OpenRouter.
 //! 3. `OPENROUTER_API_KEY` (env or `keys.openrouter` in config.toml).
 //! 4. Nothing — callers must then skip extraction loudly.
+//!
+//! A scripted triple may carry the two interval fields the real extractor now
+//! emits, so the seam covers a cessation without a network call:
+//!
+//! ```text
+//! {"subject":"Ana","predicate":"takes_medication","object":"metformin",
+//!  "valid_from":"2024-01-01","valid_until":"2026-06-01","state":"ended"}
+//! ```
+//!
+//! `state: "ended"` (or a cessation predicate such as `stopped_taking`) CLOSES
+//! the open interval instead of opening a second one — the difference between
+//! a stopped medication and a second medication, which is the whole point.
 
 use crate::error::CliError;
 use engram_llm::openrouter::OpenRouterClient;

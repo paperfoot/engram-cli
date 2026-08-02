@@ -870,8 +870,11 @@ async fn insert_llm_evidence(
             confidence: fact.confidence.unwrap_or(0.7).clamp(0.0, 1.0),
             fact_type: None,
             // The compiler extracts no date of its own, so the memory's is the
-            // only honest one (see `MemoryTime`).
+            // only honest one (see `MemoryTime`) — and it names no cessation,
+            // so `valid_until`/`state` take their defaults rather than
+            // asserting that a compiled claim ended.
             valid_from: None,
+            ..Default::default()
         };
         write_fact(ctx, &write_ctx, &ef, &cache, &mut outcome).await?;
     }
