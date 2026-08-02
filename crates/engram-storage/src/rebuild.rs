@@ -124,6 +124,44 @@ pub enum Origin {
     Imported,
 }
 
+/// The close a fact row is ALREADY carrying, read back before a replayed
+/// `fact.interval_closed` writes over it.
+struct CloseColumns {
+    valid_until: Option<String>,
+    reason: Option<String>,
+    authority: Option<String>,
+    closed_by: Option<String>,
+    superseded_by: Option<String>,
+    superseded_at: Option<String>,
+}
+
+impl CloseColumns {
+    /// Would replaying this close change the row?
+    ///
+    /// [G2] The gate refuses closes; a refusal it COUNTS is a refusal it will
+    /// eventually show the caller, so it must not count one where there was
+    /// nothing to refuse. That case is ordinary, not exotic: a legitimate
+    /// extracted cessation is born closed, so the file carries the same close
+    /// twice — once in the fact row, where the cessation exemption vets it,
+    /// and once in the `fact.interval_closed` event that recorded it. The
+    /// event arrives at a row that already says exactly what the event says.
+    /// Blocking it changes nothing, and reporting a rejected close on a
+    /// healthy round trip would be the store crying wolf.
+    fn would_move(&self, e: &EventRow, until: &str) -> Result<bool, StorageError> {
+        let closed_by = e.payload_opt_str("closed_by");
+        let superseded_at = e
+            .payload_opt_str("superseded_at")
+            .unwrap_or_else(|| until.to_string());
+        Ok(self.valid_until.as_deref() != Some(until)
+            || self.reason.as_deref() != Some(e.payload_str("reason")?.as_str())
+            || self.authority.as_deref() != Some(e.payload_str("authority")?.as_str())
+            || self.closed_by != closed_by
+            || (e.payload_bool("sets_superseded_by")
+                && (self.superseded_by != closed_by
+                    || self.superseded_at.as_deref() != Some(superseded_at.as_str()))))
+    }
+}
+
 /// Replay one event onto the projections. Raw SQL only — see rule 1.
 pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
     apply_from(store, e, Origin::OwnJournal).map(|_| ())
@@ -156,9 +194,23 @@ pub fn apply_from(
                 }
                 // An observation carries no authority at all, so an imported
                 // one that arrives already CLOSED on a safety relation is a
-                // close nobody signed.
+                // close nobody signed. It carries no `close_reason` either,
+                // which is why the cessation exemption cannot fire here: the
+                // payload has no way to say "this ENDED" as against "this was
+                // overruled", and the exemption is only for the first. The
+                // ask is read anyway rather than hard-coded to `None`, so a
+                // journal that later learns to carry it needs no edit here.
+                //
+                // Nothing legitimate is lost. This branch is `INSERT OR
+                // IGNORE`, the file's fact ROW for the same id landed before
+                // any event replayed, and that row is where a cessation
+                // proves itself. A file that reaches this line with a closed
+                // safety observation is one whose rows were removed and whose
+                // journal is the only thing still claiming the interval
+                // ended.
                 if valid_until.is_some()
-                    && !crate::export_v3::close_is_point(
+                    && !crate::export_v3::cessation_close_is_exempt(
+                        e.payload_opt_str("close_reason").as_deref(),
                         valid_from.as_deref(),
                         valid_until.as_deref(),
                     )
@@ -223,16 +275,32 @@ pub fn apply_from(
             if origin == Origin::Imported {
                 // The relation is not in the close payload — it is in the row
                 // the earlier `fact.observed` (or the file's row section)
-                // already landed.
-                let target: Option<(String, Option<String>)> = store
+                // already landed. The row's own close columns come back with
+                // it, for the "would this move anything?" question below.
+                let target: Option<(String, Option<String>, CloseColumns)> = store
                     .conn
                     .query_row(
-                        "SELECT predicate, valid_from FROM facts WHERE id = ?1",
+                        "SELECT predicate, valid_from, valid_until, close_reason,
+                                close_authority, closed_by, superseded_by, superseded_at
+                           FROM facts WHERE id = ?1",
                         params![id.to_string()],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                CloseColumns {
+                                    valid_until: r.get(2)?,
+                                    reason: r.get(3)?,
+                                    authority: r.get(4)?,
+                                    closed_by: r.get(5)?,
+                                    superseded_by: r.get(6)?,
+                                    superseded_at: r.get(7)?,
+                                },
+                            ))
+                        },
                     )
                     .optional()?;
-                if let Some((predicate, valid_from)) = target {
+                if let Some((predicate, valid_from, current)) = target {
                     let until = e.payload_str("valid_until")?;
                     if crate::export_v3::interval_is_inverted(valid_from.as_deref(), Some(&until)) {
                         return Err(crate::export_v3::inverted_interval_error(
@@ -241,11 +309,17 @@ pub fn apply_from(
                             &until,
                         ));
                     }
-                    if !crate::export_v3::close_is_point(valid_from.as_deref(), Some(&until))
-                        && crate::export_v3::close_needs_person(
-                            &predicate,
-                            Some(e.payload_str("authority")?).as_deref(),
-                        )
+                    // [G2] NO cessation exemption on this event, whatever
+                    // shape or reason it claims. `fact.interval_closed` closes
+                    // an interval that already exists, so it can never be the
+                    // born-closed cessation the exemption is for — and it is
+                    // exactly the forgery the exemption was letting through:
+                    // set `valid_until` to a live allergy's own `valid_from`
+                    // and a shape test reads the attack as a point.
+                    if crate::export_v3::close_needs_person(
+                        &predicate,
+                        Some(e.payload_str("authority")?).as_deref(),
+                    ) && current.would_move(e, &until)?
                     {
                         // The event is kept — the journal records what the
                         // file claimed — but the projection does not move.

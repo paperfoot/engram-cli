@@ -109,8 +109,8 @@ pub(crate) fn close_needs_person(predicate: &str, authority: Option<&str>) -> bo
         .unwrap_or(false)
 }
 
-/// [G2 + G1] A POINT interval is exempt from the rule above, and the
-/// exemption is the whole reason this function exists separately.
+/// [G2 + G1] The ONE close that is exempt from the rule above: a CESSATION
+/// born closed at a single instant.
 ///
 /// An extracted cessation — "Ana stopped metformin", from a model, not a
 /// person — is stored as a point interval born closed with `heuristic`
@@ -125,7 +125,24 @@ pub(crate) fn close_needs_person(predicate: &str, authority: Option<&str>) -> bo
 /// weak X leaves the prescription standing, which is the cautious answer. A
 /// point says "the only claim here is that it ended"; there is no earlier
 /// assertion to fall back to, and inventing one is the dangerous answer.
-pub(crate) fn close_is_point(from: Option<&str>, until: Option<&str>) -> bool {
+///
+/// The REASON is half the test, and leaving it out was a hole you could drive
+/// a file through. The shape alone proves nothing: `valid_until` set equal to
+/// an existing fact's own `valid_from` is a point too, and a forger who
+/// writes that over a live allergy — reason `superseded`, authority
+/// `heuristic` — was waved through by a test that only looked at the two
+/// timestamps. Only `stopped` names an ending. `superseded`, `corrected` and
+/// `retracted_source` all name a JUDGEMENT about a claim that was standing
+/// before the close arrived, so for those there IS an earlier assertion to
+/// fall back to and the ordinary safety rule is the right one.
+pub(crate) fn cessation_close_is_exempt(
+    reason: Option<&str>,
+    from: Option<&str>,
+    until: Option<&str>,
+) -> bool {
+    if reason != Some(engram_core::interval::CloseReason::Stopped.as_str()) {
+        return false;
+    }
     match (from, until) {
         (Some(f), Some(u)) => {
             let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
@@ -453,6 +470,60 @@ mod tests {
         (m.id, f.id)
     }
 
+    /// What the planner writes for "Ana stopped taking metformin" when there
+    /// is nothing open to close: a fact BORN closed at a single instant,
+    /// reason `stopped`, authority `heuristic`, and the pair queued for a
+    /// person. This row is the entire reason the cessation exemption exists.
+    fn seed_extracted_cessation(store: &SqliteStore) -> (Uuid, Uuid) {
+        let m = Memory {
+            id: Uuid::new_v4(),
+            content: "Ana stopped taking metformin.".into(),
+            created_at: chrono::Utc::now(),
+            event_time: None,
+            importance: 5,
+            emotional_weight: 0,
+            access_count: 0,
+            last_accessed: None,
+            stability: 1.0,
+            source: MemorySource::Manual,
+            diary: "default".into(),
+            valid_from: None,
+            valid_until: None,
+            tags: vec![],
+        };
+        store.insert_memory_with_kb(&m, "personal").unwrap();
+        let at = chrono::Utc::now();
+        let f = Fact {
+            id: Uuid::new_v4(),
+            source_memory_id: m.id,
+            subject: "Ana".into(),
+            subject_norm: "ana".into(),
+            predicate: "takes_medication".into(),
+            object: "metformin".into(),
+            object_norm: "metformin".into(),
+            confidence: 0.9,
+            created_at: at,
+            superseded_by: None,
+            superseded_at: None,
+            diary: "default".into(),
+            fact_type: FactType::Assertion,
+            valid_from: Some(at),
+            valid_until: None,
+            resolution: None,
+            source_kind: SourceKind::AgentExtracted,
+            confirmations: 0,
+            closed_by: None,
+            close_reason: None,
+            close_authority: None,
+            kb: "personal".into(),
+        };
+        store.insert_fact(&f).unwrap();
+        store
+            .close_fact_interval(f.id, at, "stopped", "heuristic", None, Some("cessation"))
+            .unwrap();
+        (m.id, f.id)
+    }
+
     fn facts_digest(store: &SqliteStore) -> Vec<String> {
         let mut rows: Vec<String> = store
             .list_facts(None, true, 100)
@@ -656,6 +727,115 @@ mod tests {
         );
     }
 
+    /// The other direction of the same gate, and the one the exemption is
+    /// FOR: an extracted cessation is born closed, so re-opening it would not
+    /// restore a prescription somebody retired — it would invent one, out of
+    /// a sentence that said the opposite. It must survive the round trip
+    /// closed, and it must not be reported as a refusal on the way through:
+    /// the file carries the close twice (row and event) and the second copy
+    /// asks for nothing the first did not already land.
+    #[test]
+    fn an_extracted_cessation_survives_a_round_trip_still_closed() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, stopped) = seed_extracted_cessation(&source);
+        let doc = source.export_v3(None).unwrap();
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(
+            report.close_authority_rejected, 0,
+            "nothing was refused; a count here would be the store crying wolf \
+             on a healthy file"
+        );
+        let f = target.get_fact(stopped).unwrap().unwrap();
+        assert!(
+            !engram_core::interval::is_open_fact(&f),
+            "re-opening a cessation manufactures an active prescription"
+        );
+        assert_eq!(f.close_reason.as_deref(), Some("stopped"));
+        assert_eq!(f.close_authority.as_deref(), Some("heuristic"));
+        assert_eq!(f.valid_until, f.valid_from, "and it is still a point");
+    }
+
+    /// The re-gate's blocker, in Rust. The exemption used to test only the
+    /// SHAPE, so a forger could close ANY live safety fact by setting
+    /// `valid_until` to that fact's own `valid_from` — reason `superseded`,
+    /// authority `heuristic` — and all three guards read the attack as a
+    /// cessation. A `fact.interval_closed` event closes an interval that
+    /// already exists, so it can never BE the born-closed case, and it gets
+    /// no exemption at all now.
+    #[test]
+    fn a_forged_point_close_event_cannot_retire_a_live_safety_fact() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        let mut doc = source.export_v3(None).unwrap();
+        // The row section is left honest — the allergy is OPEN in it — so
+        // this test cannot pass on the row gate.
+        let from = doc
+            .facts
+            .iter()
+            .find(|f| f.predicate == "allergic_to")
+            .and_then(|f| f.valid_from.clone())
+            .expect("the allergy has a start");
+        doc.events = vec![ExportEvent {
+            seq: 1,
+            id: "11111111-2222-4333-8444-555555555555".into(),
+            ts: "2026-08-02T04:00:00Z".into(),
+            actor: "forged-import".into(),
+            kind: "fact.interval_closed".into(),
+            subject_id: Some(allergy.to_string()),
+            kb: Some("personal".into()),
+            diary: Some("default".into()),
+            payload: serde_json::json!({
+                "fact_id": allergy.to_string(),
+                "valid_until": from,
+                "reason": "superseded",
+                "authority": "heuristic",
+                "sets_superseded_by": false,
+            }),
+        }];
+        doc.counts.events = 1;
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(report.close_authority_rejected, 1);
+        let f = target.get_fact(allergy).unwrap().unwrap();
+        assert!(
+            engram_core::interval::is_open_fact(&f),
+            "she is still allergic to penicillin"
+        );
+        assert_eq!(f.valid_until, None);
+        assert_eq!(f.close_authority, None);
+        assert_eq!(f.close_reason, None);
+    }
+
+    /// The row half of the same forgery. `superseded` says a claim that was
+    /// STANDING got overruled, which is precisely the case where re-opening
+    /// is the cautious answer — the shape it wears does not change that.
+    #[test]
+    fn a_forged_point_close_row_that_is_not_a_cessation_is_dropped() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        let mut doc = source.export_v3(None).unwrap();
+        doc.events.clear();
+        doc.counts.events = 0;
+        let row = doc
+            .facts
+            .iter_mut()
+            .find(|f| f.predicate == "allergic_to")
+            .expect("the export carries the allergy");
+        row.valid_until = row.valid_from.clone();
+        row.close_reason = Some("superseded".to_string());
+        row.close_authority = Some("heuristic".to_string());
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(report.close_authority_rejected, 1);
+        let f = target.get_fact(allergy).unwrap().unwrap();
+        assert!(engram_core::interval::is_open_fact(&f));
+        assert_eq!(f.valid_until, None);
+    }
+
     /// A negative-length interval is not a policy question — it is nonsense
     /// that `overlaps` and every reader downstream cannot answer. The file is
     /// refused whole rather than half-imported.
@@ -701,7 +881,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod point_exemption_tests {
+mod cessation_exemption_tests {
     use super::*;
 
     /// The cross-lane hazard the semantics lane flagged at merge: G1 stores an
@@ -709,21 +889,41 @@ mod point_exemption_tests {
     /// authority, and G2's close-dropping rule would have re-opened it on
     /// import — turning "Ana stopped metformin" into an active prescription.
     #[test]
-    fn a_point_close_on_a_safety_relation_survives_import() {
+    fn a_born_closed_cessation_on_a_safety_relation_survives_import() {
         let t = "2026-08-02T10:00:00Z";
         assert!(
-            close_is_point(Some(t), Some(t)),
-            "same instant on both ends is a point"
+            cessation_close_is_exempt(Some("stopped"), Some(t), Some(t)),
+            "one instant, reason `stopped`: the sentence said it ended"
         );
         // The rule itself still fires for this relation+authority …
         assert!(close_needs_person("takes_medication", Some("heuristic")));
-        // … and the exemption is what keeps the point from being re-opened.
-        // (Call sites AND these two conditions; see import_fact_row.)
+        // … and the exemption is what keeps the cessation from being
+        // re-opened. (Call sites AND these two conditions; see
+        // `import_fact_row`.)
+    }
+
+    /// The forgery the re-gate found: `valid_until` set to a live fact's own
+    /// `valid_from` is a point too, so a shape-only test read the attack as a
+    /// cessation. Only `stopped` claims an ending; every other reason
+    /// overrules a claim that was standing, and gets the ordinary rule.
+    #[test]
+    fn a_point_close_that_is_not_a_cessation_gets_no_exemption() {
+        let t = "2026-08-02T10:00:00Z";
+        for reason in ["superseded", "corrected", "retracted_source"] {
+            assert!(
+                !cessation_close_is_exempt(Some(reason), Some(t), Some(t)),
+                "`{reason}` at a single instant is still not a cessation"
+            );
+        }
+        // Nor does an unreasoned close, which is the shape a hand-edited file
+        // takes when the forger simply deletes the field.
+        assert!(!cessation_close_is_exempt(None, Some(t), Some(t)));
     }
 
     #[test]
     fn a_span_close_on_a_safety_relation_is_still_dropped() {
-        assert!(!close_is_point(
+        assert!(!cessation_close_is_exempt(
+            Some("stopped"),
             Some("2026-01-01T00:00:00Z"),
             Some("2026-08-02T10:00:00Z")
         ));
@@ -731,8 +931,12 @@ mod point_exemption_tests {
     }
 
     #[test]
-    fn an_open_interval_is_not_a_point() {
-        assert!(!close_is_point(Some("2026-01-01T00:00:00Z"), None));
-        assert!(!close_is_point(None, None));
+    fn an_open_interval_is_not_a_cessation() {
+        assert!(!cessation_close_is_exempt(
+            Some("stopped"),
+            Some("2026-01-01T00:00:00Z"),
+            None
+        ));
+        assert!(!cessation_close_is_exempt(Some("stopped"), None, None));
     }
 }
