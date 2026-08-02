@@ -5597,10 +5597,14 @@ impl SqliteStore {
             ));
         }
         let closed = row.valid_until.is_some() || row.superseded_by.is_some();
-        // A point interval is exempt: re-opening it would manufacture an
-        // ongoing prescription out of a sentence that said it ended.
+        // A born-closed CESSATION is exempt: re-opening it would manufacture
+        // an ongoing prescription out of a sentence that said it ended. The
+        // row has to say `stopped` to claim that — a point close reasoned
+        // `superseded` is a supersession wearing a cessation's shape, and it
+        // gets the ordinary rule.
         let close_rejected = closed
-            && !crate::export_v3::close_is_point(
+            && !crate::export_v3::cessation_close_is_exempt(
+                row.close_reason.as_deref(),
                 row.valid_from.as_deref(),
                 row.valid_until.as_deref(),
             )
