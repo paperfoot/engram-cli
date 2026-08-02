@@ -583,6 +583,10 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         ..Default::default()
     };
     meta.add("memory_id", memory.id.to_string());
+    // The typed handle beside the legacy id, so an agent can copy `handle`
+    // straight into `edit`/`forget` without having to know which kind of id it
+    // is holding.
+    meta.add("handle", crate::commands::memory::render_handle(memory.id));
     meta.add("chunks_stored", chunks_stored);
     if let Some(note) = &truncation_note {
         meta.add("embed_truncation_note", note.clone());
@@ -625,6 +629,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         ctx.format,
         json!({
             "id": memory.id,
+            "handle": crate::commands::memory::render_handle(memory.id),
             "stored": true,
             "chunks": chunks_stored,
             "embed_truncation_note": truncation_note,

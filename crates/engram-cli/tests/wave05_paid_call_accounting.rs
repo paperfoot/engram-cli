@@ -120,12 +120,15 @@ fn an_unknown_uuid_is_rejected_before_the_embedder_is_dialled() {
         .failure()
         .code(3);
     let err = parse_error(&assert.get_output().stderr);
-    assert_eq!(err["error"]["code"], "bad_input", "{err}");
+    // Same exit code, honest code string: wave 3 replaced the guessed
+    // "no memory found for id … (already deleted?)" with `not_found`, so an
+    // agent can branch on the kind of failure instead of reading prose.
+    assert_eq!(err["error"]["code"], "not_found", "{err}");
     assert!(
         err["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("no memory found"),
+            .contains(ABSENT),
         "{err}"
     );
 }
@@ -199,7 +202,7 @@ fn an_importance_only_edit_of_an_unknown_uuid_agrees_on_the_same_exit_code() {
         .code(3);
     assert_eq!(
         parse_error(&assert.get_output().stderr)["error"]["code"],
-        "bad_input"
+        "not_found"
     );
 }
 
