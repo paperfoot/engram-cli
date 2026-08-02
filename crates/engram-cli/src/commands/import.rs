@@ -87,6 +87,7 @@ fn import_v3(
     meta.add("replayed_events", report.events);
     meta.add("imported_memories", report.memories);
     meta.add("imported_chunks", report.chunks);
+    meta.add("safety_closes_refused", report.close_authority_rejected);
     Ok((
         json!({
             "format_version": 3,
@@ -94,6 +95,16 @@ fn import_v3(
                 "events": report.events,
                 "events_skipped_duplicate": report.events_skipped_duplicate,
                 "conflicts_skipped_orphan": report.conflicts_skipped_orphan,
+            },
+            // [G8] The closes this store declined to honour, on rows and
+            // replayed events alike. Counting them and saying nothing was the
+            // standing complaint: an import that quietly does less than the
+            // file asked leaves the caller believing a prescription is retired
+            // when the store still holds it open.
+            "safety_closes_refused": {
+                "count": report.close_authority_rejected,
+                "meaning": "facts on takes_medication / allergic_to / diagnosed_with imported OPEN; \
+                            a safety interval never arrives closed from outside a store",
             },
             // Same key, same meaning as v1/v2: rows this call actually
             // inserted. The journal is authoritative for everything it
@@ -184,6 +195,7 @@ fn import_v2(
     meta.add("imported_memories", counts.memories);
     meta.add("imported_chunks", counts.chunks);
     meta.add("genesis_events", counts.genesis_synthesized);
+    meta.add("safety_closes_refused", counts.close_authority_rejected);
     Ok((
         json!({
             "format_version": 2,
@@ -193,6 +205,12 @@ fn import_v2(
                 "memories": counts.memories,
                 "chunks": counts.chunks,
                 "facts": counts.facts,
+            },
+            // [G8] Same rule, same number, on the older format.
+            "safety_closes_refused": {
+                "count": counts.close_authority_rejected,
+                "meaning": "facts on takes_medication / allergic_to / diagnosed_with imported OPEN; \
+                            a safety interval never arrives closed from outside a store",
             },
             // A v2 file carries no history; this is the history synthesized for
             // it, so the restored store is rebuildable rather than frozen.

@@ -75,85 +75,50 @@ pub struct ImportV3Report {
     pub events_skipped_duplicate: usize,
     pub genesis_synthesized: usize,
     pub conflicts_skipped_orphan: usize,
-    /// [G2] Closes the file asked for and the store refused: a safety
-    /// relation retired by something other than a person. The row still
-    /// imports — OPEN.
+    /// [G8] Closes the file asked for and the store refused, on rows and on
+    /// replayed events alike: a safety interval never arrives closed from
+    /// outside. The fact still imports — OPEN — and `engram import` prints
+    /// this number, because a store that silently declines to do what a file
+    /// asked is a store whose backups quietly disagree with themselves.
     pub close_authority_rejected: usize,
 }
 
-/// [G2] The close authorities a PERSON can be behind. `may_close` allows
-/// exactly these on a safety relation; an import cannot re-derive the
-/// classification that produced the row, so it checks the authority instead.
-const PERSON_SUPPLIED_AUTHORITIES: [&str; 3] = ["explicit_end", "caller", "replayed_caller"];
-
-/// [G2] Does this imported close have to be dropped?
+/// [G8] Does an imported close have to be dropped?
 ///
-/// True when a SAFETY relation arrives closed by anything but a person —
-/// including by nothing at all, since a close no one can name an authority
-/// for is not a close this store will honour on an allergy or a
-/// prescription. Non-safety relations are unaffected: "Bruno moved out of
-/// Lisbon" still imports closed, whoever decided it.
+/// The whole test, and it takes ONE argument for a reason. Three gate passes
+/// each answered a forged import by consulting one more field of the file —
+/// first `close_authority`, then the interval shape, then `close_reason` —
+/// and each time the next forger simply wrote that field too. Every one of
+/// them is written by whoever wrote the file, so none of them is evidence.
+/// The relation is the only thing here the store decides for itself, through
+/// its own registry.
 ///
-/// The direction of the error is deliberate. Dropping a close leaves the
-/// interval OPEN, which is the same direction `may_close` already errs in:
-/// still-allergic, still-prescribed, and visible to the caller rather than
-/// silently retired by a file.
-pub(crate) fn close_needs_person(predicate: &str, authority: Option<&str>) -> bool {
-    if !engram_core::relations::is_safety_slot(&engram_core::relations::canonical_relation(
-        predicate,
-    )) {
-        return false;
-    }
-    !authority
-        .map(|a| PERSON_SUPPLIED_AUTHORITIES.contains(&a))
-        .unwrap_or(false)
+/// So: a fact on a SAFETY relation lands OPEN, whatever the file says about
+/// who closed it, why, or over what interval. Non-safety relations are
+/// untouched — "Bruno moved out of Lisbon" still imports closed, whoever
+/// decided it.
+///
+/// The direction of the error is the whole argument. Over-reporting an
+/// allergy or a prescription is survivable and visible: the reopened claim
+/// sits beside the real one and is already queued for adjudication. Under-
+/// reporting one is a medical incident. A store that imports "she stopped
+/// taking it" as "she is still taking it" is wrong in the direction a human
+/// notices and corrects; the reverse is wrong in the direction that kills
+/// someone. Fidelity loses to safety at a trust boundary.
+pub(crate) fn import_close_is_refused(predicate: &str) -> bool {
+    engram_core::relations::is_safety_slot(&engram_core::relations::canonical_relation(predicate))
 }
 
-/// [G2 + G1] The ONE close that is exempt from the rule above: a CESSATION
-/// born closed at a single instant.
-///
-/// An extracted cessation — "Ana stopped metformin", from a model, not a
-/// person — is stored as a point interval born closed with `heuristic`
-/// authority, and the pair is queued for a human. It asserts "this claim was
-/// recorded and is NOT ongoing". Run the close-dropping rule over it and the
-/// import re-opens it, which does not restore a prescription somebody
-/// retired: it MANUFACTURES an ongoing prescription nobody ever asserted,
-/// out of a sentence that said the opposite.
-///
-/// So the direction that is safe for a span is exactly wrong for a point.
-/// A span says "she was taking it, until X decided otherwise" — dropping a
-/// weak X leaves the prescription standing, which is the cautious answer. A
-/// point says "the only claim here is that it ended"; there is no earlier
-/// assertion to fall back to, and inventing one is the dangerous answer.
-///
-/// The REASON is half the test, and leaving it out was a hole you could drive
-/// a file through. The shape alone proves nothing: `valid_until` set equal to
-/// an existing fact's own `valid_from` is a point too, and a forger who
-/// writes that over a live allergy — reason `superseded`, authority
-/// `heuristic` — was waved through by a test that only looked at the two
-/// timestamps. Only `stopped` names an ending. `superseded`, `corrected` and
-/// `retracted_source` all name a JUDGEMENT about a claim that was standing
-/// before the close arrived, so for those there IS an earlier assertion to
-/// fall back to and the ordinary safety rule is the right one.
-pub(crate) fn cessation_close_is_exempt(
-    reason: Option<&str>,
-    from: Option<&str>,
-    until: Option<&str>,
-) -> bool {
-    if reason != Some(engram_core::interval::CloseReason::Stopped.as_str()) {
-        return false;
-    }
-    match (from, until) {
-        (Some(f), Some(u)) => {
-            let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
-            match (parse(f), parse(u)) {
-                (Some(f), Some(u)) => f == u,
-                // Unparsable but byte-identical is still the same instant.
-                _ => f == u,
-            }
-        }
-        _ => false,
-    }
+/// The five row sections of an export, travelling together because they always
+/// do. Their insertion order is a dependency order — kb, document, memory,
+/// chunk, fact — and a signature that takes them one by one is a signature a
+/// caller can get wrong.
+struct RowSections<'a> {
+    kbs: &'a [KbExportRow],
+    documents: &'a [DocumentExportRow],
+    memories: &'a [MemoryExportRow],
+    chunks: &'a [ChunkExportRow],
+    facts: &'a [FactExportRow],
 }
 
 /// [G2] A negative-length interval. Unreadable to `Interval::overlaps` and
@@ -237,12 +202,21 @@ impl SqliteStore {
     /// carry), then the event slice through the same `rebuild::apply`
     /// dispatcher, so import and `admin rebuild` cannot drift.
     ///
-    /// Facts appear in BOTH sections and the precedence is pinned: the rows
-    /// land first with `INSERT OR IGNORE` — they exist solely to carry
-    /// `embedding`/`embed_model`, which no event holds — and the replay is
-    /// then authoritative for everything else. Replay-then-rows loses the
-    /// interval closes; rows-then-replay without `OR IGNORE` aborts on
-    /// `facts.id`.
+    /// Facts appear in BOTH sections and the precedence is now absolute: any
+    /// fact the JOURNAL describes is built from the journal, and its row is
+    /// skipped. A `FactExportRow` carries no `embedding` — the reason the rows
+    /// were once said to be here — so for a v3 file it duplicates
+    /// `fact.observed` and nothing more.
+    ///
+    /// Landing both, rows first, under `INSERT OR IGNORE` meant the ROW won
+    /// every column and the event became a no-op. That is how a forged row
+    /// shadowed the authentic open observation sitting right beside it in the
+    /// same file, and it also broke invariant 3 in a quieter way: a store
+    /// imported that way disagreed with its own journal until the next
+    /// `admin rebuild` silently changed the facts back. Rows still land for
+    /// ids no event mentions — a truncated journal is not a reason to drop
+    /// data — and still land under `OR IGNORE`, since without it the store's
+    /// own pre-existing facts would abort the import on `facts.id`.
     pub fn import_v3(&self, doc: &ExportV3) -> Result<ImportV3Report, StorageError> {
         if doc.schema_version > CURRENT_VERSION {
             return Err(StorageError::Migration(format!(
@@ -251,14 +225,24 @@ impl SqliteStore {
                 doc.schema_version, CURRENT_VERSION
             )));
         }
+        let journalled: std::collections::HashSet<String> = doc
+            .events
+            .iter()
+            .filter(|e| e.kind == engram_core::events::EventKind::FactObserved.as_str())
+            .filter_map(|e| e.payload.get("fact_id").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .collect();
         self.with_tx(|s| {
             let mut report = ImportV3Report::default();
             s.import_v2_sections(
-                &doc.kbs,
-                &doc.documents,
-                &doc.memories,
-                &doc.chunks,
-                &doc.facts,
+                RowSections {
+                    kbs: &doc.kbs,
+                    documents: &doc.documents,
+                    memories: &doc.memories,
+                    chunks: &doc.chunks,
+                    facts: &doc.facts,
+                },
+                &journalled,
                 &mut report,
             )?;
             for e in &doc.events {
@@ -276,8 +260,15 @@ impl SqliteStore {
                     .map_err(|err| {
                         StorageError::MalformedRow(format!("event ts `{}`: {err}", e.ts))
                     })?;
+                // [G9] Stamped `Imported` HERE, by the code path doing the
+                // importing. `ExportEvent` has no origin field for the file to
+                // set, so no amount of editing makes a foreign event claim to
+                // be this store's own — which is what makes the refusal below
+                // survive every later `admin rebuild` instead of lasting until
+                // the next one.
                 let draft = crate::journal::EventDraft::new(kind, &e.actor, e.payload.clone())
-                    .scope(e.kb.as_deref(), e.diary.as_deref());
+                    .scope(e.kb.as_deref(), e.diary.as_deref())
+                    .origin(crate::journal::Origin::Imported);
                 let draft = match e
                     .subject_id
                     .as_deref()
@@ -296,8 +287,13 @@ impl SqliteStore {
                 let row = s
                     .event_by_id(id)?
                     .expect("just appended, inside this transaction");
-                match crate::rebuild::apply_from(s, &row, crate::rebuild::Origin::Imported) {
-                    Ok(refused) => report.close_authority_rejected += refused,
+                match crate::rebuild::apply(s, &row) {
+                    Ok(applied) => {
+                        report.close_authority_rejected += applied.closes_refused;
+                        // The journal builds the facts now, so this is where
+                        // `imported.facts` comes from for a v3 file.
+                        report.facts += applied.facts_inserted;
+                    }
                     Err(StorageError::NotFound(_))
                         if kind == engram_core::events::EventKind::ConflictOpened =>
                     {
@@ -315,6 +311,18 @@ impl SqliteStore {
     /// migration uses, so a v2 import and a migration produce identical
     /// journals for identical rows. Without this an imported store would be
     /// un-rebuildable and invariant 3 would fail on it.
+    ///
+    /// [G8] The rows land FIRST and the generator then reads them back, so a
+    /// safety close the file asked for has already been dropped by the time
+    /// genesis sees it: no `fact.interval_closed` is synthesized for a fact
+    /// this store decided to hold open. That ordering is what stops a v2 file
+    /// laundering a forged close into trusted history — the previous version
+    /// exempted the row, synthesized a close event from it, and the store then
+    /// held the forgery as something it had witnessed itself.
+    ///
+    /// [G9] Those synthesized events are stamped `Imported` all the same. They
+    /// describe rows that came out of a file; a rebuild re-gating them costs
+    /// nothing, because they already say what the gate would make them say.
     pub fn import_v2_with_genesis(
         &self,
         kbs: &[KbExportRow],
@@ -326,36 +334,52 @@ impl SqliteStore {
     ) -> Result<ImportV3Report, StorageError> {
         self.with_tx(|s| {
             let mut report = ImportV3Report::default();
-            s.import_v2_sections(kbs, documents, memories, chunks, facts, &mut report)?;
-            let counts = s.synthesize_genesis(actor)?;
+            // A v2 file carries no journal, so no row is described by one.
+            let journalled = std::collections::HashSet::new();
+            s.import_v2_sections(
+                RowSections {
+                    kbs,
+                    documents,
+                    memories,
+                    chunks,
+                    facts,
+                },
+                &journalled,
+                &mut report,
+            )?;
+            let counts = s.synthesize_genesis(actor, crate::journal::Origin::Imported)?;
             report.genesis_synthesized = counts.events;
             report.events = counts.events;
             Ok(report)
         })
     }
 
+    /// `journalled` names the fact ids the caller's event slice will observe;
+    /// those rows are skipped so the journal stays the single source of truth
+    /// for them. A v2 file has no journal, so it passes an empty set and every
+    /// row lands.
     fn import_v2_sections(
         &self,
-        kbs: &[KbExportRow],
-        documents: &[DocumentExportRow],
-        memories: &[MemoryExportRow],
-        chunks: &[ChunkExportRow],
-        facts: &[FactExportRow],
+        rows: RowSections<'_>,
+        journalled: &std::collections::HashSet<String>,
         report: &mut ImportV3Report,
     ) -> Result<(), StorageError> {
-        for row in kbs {
+        for row in rows.kbs {
             report.kbs += self.import_kb_row(row)? as usize;
         }
-        for row in documents {
+        for row in rows.documents {
             report.documents += self.import_document_row(row)? as usize;
         }
-        for row in memories {
+        for row in rows.memories {
             report.memories += self.import_memory_row(row)? as usize;
         }
-        for row in chunks {
+        for row in rows.chunks {
             report.chunks += self.import_chunk_row(row)? as usize;
         }
-        for row in facts {
+        for row in rows.facts {
+            if journalled.contains(&row.id) {
+                continue;
+            }
             let outcome = self.import_fact_row(row)?;
             report.facts += outcome.inserted as usize;
             report.close_authority_rejected += outcome.close_rejected as usize;
@@ -473,7 +497,8 @@ mod tests {
     /// What the planner writes for "Ana stopped taking metformin" when there
     /// is nothing open to close: a fact BORN closed at a single instant,
     /// reason `stopped`, authority `heuristic`, and the pair queued for a
-    /// person. This row is the entire reason the cessation exemption exists.
+    /// person. The write path still produces this shape; [G8] is about what
+    /// an IMPORT is allowed to conclude from a file wearing it.
     fn seed_extracted_cessation(store: &SqliteStore) -> (Uuid, Uuid) {
         let m = Memory {
             id: Uuid::new_v4(),
@@ -655,11 +680,17 @@ mod tests {
         assert!(engram_core::interval::is_open_fact(&f));
     }
 
-    /// The other half of the same rule: a close a PERSON is entitled to make
-    /// travels through an import intact. A gate that refused these would make
-    /// export/import lossy for every legitimately retired prescription.
+    /// [G8] The close that used to be the exception, now the rule. `caller` is
+    /// the strongest authority a close can carry — and it is still a string in
+    /// a file that anyone can type. The import drops it like any other, and
+    /// the store says so.
+    ///
+    /// This inverts a v2.2 test on purpose. The cost is real: a legitimately
+    /// retired prescription comes back OPEN in the restored store. That is the
+    /// trade the ruling makes explicitly, and it only bites on the direction
+    /// that a human notices and corrects.
     #[test]
-    fn an_imported_caller_close_on_a_safety_relation_is_honoured() {
+    fn even_an_imported_caller_close_on_a_safety_relation_is_dropped() {
         let (_tmp, _g, source) = temp_store();
         let (_m, allergy) = seed_allergy(&source);
         source
@@ -676,9 +707,39 @@ mod tests {
 
         let target = extra_store(&_tmp, "target");
         let report = target.import_v3(&doc).unwrap();
-        assert_eq!(report.close_authority_rejected, 0);
+        assert_eq!(
+            report.close_authority_rejected, 1,
+            "refusing quietly is what the standing advisory was about"
+        );
         let f = target.get_fact(allergy).unwrap().unwrap();
-        assert!(f.valid_until.is_some());
+        assert!(engram_core::interval::is_open_fact(&f));
+        assert_eq!(f.valid_until, None);
+        assert_eq!(f.close_authority, None);
+    }
+
+    /// A non-safety relation is untouched by all of this, which is the other
+    /// half of the ruling: only three relations pay the fidelity price.
+    #[test]
+    fn an_imported_close_on_an_ordinary_relation_is_honoured() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, lisbon, _porto) = seed(&source);
+        source
+            .close_fact_interval(
+                lisbon,
+                chrono::Utc::now(),
+                "corrected",
+                "caller",
+                None,
+                Some("caller"),
+            )
+            .unwrap();
+        let doc = source.export_v3(None).unwrap();
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(report.close_authority_rejected, 0);
+        let f = target.get_fact(lisbon).unwrap().unwrap();
+        assert!(f.valid_until.is_some(), "Bruno really did move out");
         assert_eq!(f.close_authority.as_deref(), Some("caller"));
     }
 
@@ -727,15 +788,20 @@ mod tests {
         );
     }
 
-    /// The other direction of the same gate, and the one the exemption is
-    /// FOR: an extracted cessation is born closed, so re-opening it would not
-    /// restore a prescription somebody retired — it would invent one, out of
-    /// a sentence that said the opposite. It must survive the round trip
-    /// closed, and it must not be reported as a refusal on the way through:
-    /// the file carries the close twice (row and event) and the second copy
-    /// asks for nothing the first did not already land.
+    /// [G8] The accepted cost, pinned so nobody re-derives the exemption from
+    /// first principles and reopens the hole.
+    ///
+    /// An extracted cessation is born closed, so importing it OPEN does invent
+    /// a claim: "Ana stopped metformin" restores as a metformin prescription
+    /// that reads active. The exemption existed to prevent exactly that — and
+    /// `reason: "stopped"` turned out to be one more string a forger types, so
+    /// the exemption was a door with the key taped to it.
+    ///
+    /// What is left is noise, not danger: the reopened cessation sits beside
+    /// the real claim as a duplicate, already queued for adjudication, and
+    /// the count below is the store telling the caller to go look.
     #[test]
-    fn an_extracted_cessation_survives_a_round_trip_still_closed() {
+    fn an_extracted_cessation_reopens_on_import_and_is_counted() {
         let (_tmp, _g, source) = temp_store();
         let (_m, stopped) = seed_extracted_cessation(&source);
         let doc = source.export_v3(None).unwrap();
@@ -743,27 +809,21 @@ mod tests {
         let target = extra_store(&_tmp, "target");
         let report = target.import_v3(&doc).unwrap();
         assert_eq!(
-            report.close_authority_rejected, 0,
-            "nothing was refused; a count here would be the store crying wolf \
-             on a healthy file"
+            report.close_authority_rejected, 1,
+            "the caller has to be told the store did less than the file asked"
         );
         let f = target.get_fact(stopped).unwrap().unwrap();
-        assert!(
-            !engram_core::interval::is_open_fact(&f),
-            "re-opening a cessation manufactures an active prescription"
-        );
-        assert_eq!(f.close_reason.as_deref(), Some("stopped"));
-        assert_eq!(f.close_authority.as_deref(), Some("heuristic"));
-        assert_eq!(f.valid_until, f.valid_from, "and it is still a point");
+        assert!(engram_core::interval::is_open_fact(&f));
+        assert_eq!(f.valid_until, None);
+        assert_eq!(f.close_reason, None);
+        assert_eq!(f.close_authority, None);
     }
 
-    /// The re-gate's blocker, in Rust. The exemption used to test only the
-    /// SHAPE, so a forger could close ANY live safety fact by setting
-    /// `valid_until` to that fact's own `valid_from` — reason `superseded`,
-    /// authority `heuristic` — and all three guards read the attack as a
-    /// cessation. A `fact.interval_closed` event closes an interval that
-    /// already exists, so it can never BE the born-closed case, and it gets
-    /// no exemption at all now.
+    /// The second gate's blocker, kept because it is still the cheapest
+    /// statement of the rule: a forger could close ANY live safety fact by
+    /// setting `valid_until` to that fact's own `valid_from`, and every guard
+    /// that read the interval's shape saw a cessation. Nothing reads the shape
+    /// now, so the attack has nothing left to imitate.
     #[test]
     fn a_forged_point_close_event_cannot_retire_a_live_safety_fact() {
         let (_tmp, _g, source) = temp_store();
@@ -866,6 +926,244 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // [G9] Events remember where they came from. Without this, refusing a
+    // close at import time is theatre: the refused event stays in the journal
+    // and the next `admin rebuild` applies it as the store's own history.
+    // -----------------------------------------------------------------
+
+    /// The third gate's blocker. Keep the honest open row and its authentic
+    /// `fact.observed`, append ONE attacker-controlled close, import (which
+    /// refuses it), then rebuild. The same bytes must be refused a second
+    /// time.
+    #[test]
+    fn a_refused_imported_close_is_refused_again_by_admin_rebuild() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        let mut doc = source.export_v3(None).unwrap();
+        let from = doc
+            .facts
+            .iter()
+            .find(|f| f.predicate == "allergic_to")
+            .and_then(|f| f.valid_from.clone())
+            .expect("the allergy has a start");
+        doc.events.push(ExportEvent {
+            seq: doc.events.len() as i64 + 1,
+            id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+            ts: "2026-08-02T06:00:00Z".into(),
+            actor: "forged-import".into(),
+            kind: "fact.interval_closed".into(),
+            subject_id: Some(allergy.to_string()),
+            kb: Some("personal".into()),
+            diary: Some("default".into()),
+            payload: serde_json::json!({
+                "fact_id": allergy.to_string(),
+                "valid_until": from,
+                "reason": "superseded",
+                "authority": "heuristic",
+                "sets_superseded_by": false,
+            }),
+        });
+        doc.counts.events = doc.events.len();
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(report.close_authority_rejected, 1);
+        assert!(engram_core::interval::is_open_fact(
+            &target.get_fact(allergy).unwrap().unwrap()
+        ));
+
+        // The event IS in the journal — the store records what it was handed —
+        // and it is stamped `imported`, so the replay reaches the same verdict.
+        let rebuilt = target.rebuild_projections(None, false).unwrap();
+        assert_eq!(
+            rebuilt.close_authority_rejected, 1,
+            "a rebuild that stayed silent here would look exactly like one \
+             that had honoured the forgery"
+        );
+        let f = target.get_fact(allergy).unwrap().unwrap();
+        assert!(
+            engram_core::interval::is_open_fact(&f),
+            "she is still allergic to penicillin, after the rebuild too"
+        );
+        assert_eq!(f.close_authority, None);
+    }
+
+    /// The legitimate path, which G9 must not break: a store's OWN cessation,
+    /// written through the gated write path, survives `admin rebuild` closed.
+    /// If this fails, the gate is no longer distinguishing origin — it is just
+    /// refusing everything.
+    #[test]
+    fn a_stores_own_cessation_survives_admin_rebuild_closed() {
+        let (_tmp, _g, store) = temp_store();
+        let (_m, stopped) = seed_extracted_cessation(&store);
+        let before = store.get_fact(stopped).unwrap().unwrap();
+        assert!(!engram_core::interval::is_open_fact(&before));
+
+        let report = store.rebuild_projections(None, false).unwrap();
+        assert_eq!(
+            report.close_authority_rejected, 0,
+            "nothing here came from a file"
+        );
+        let f = store.get_fact(stopped).unwrap().unwrap();
+        assert!(
+            !engram_core::interval::is_open_fact(&f),
+            "a rebuild replays this store's history, it does not re-litigate it"
+        );
+        assert_eq!(f.close_reason.as_deref(), Some("stopped"));
+        assert_eq!(f.close_authority.as_deref(), Some("heuristic"));
+        assert_eq!(f.valid_until, before.valid_until);
+    }
+
+    /// An export carries no origin field, so a file cannot claim to be the
+    /// store's own history. This is the property that makes G8 stick.
+    #[test]
+    fn an_export_file_cannot_declare_an_event_trusted() {
+        let (_tmp, _g, source) = temp_store();
+        seed_allergy(&source);
+        let doc = source.export_v3(None).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        for e in json["events"].as_array().expect("events travel") {
+            assert!(
+                e.get("origin").is_none(),
+                "an origin the file can set is an origin the forger sets: {e}"
+            );
+        }
+
+        let target = extra_store(&_tmp, "target");
+        target.import_v3(&doc).unwrap();
+        let imported: i64 = target
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE origin = 'own'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported, 0, "every imported event is stamped `imported`");
+    }
+
+    /// The row/event ordering trap the gate documented: rows land before
+    /// events and both used `INSERT OR IGNORE`, so a forged row silently won
+    /// every column and the authentic observation beside it became a no-op.
+    /// The journal is authoritative now, so the forged row never lands at all.
+    #[test]
+    fn a_forged_fact_row_cannot_shadow_its_own_authentic_event() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        let mut doc = source.export_v3(None).unwrap();
+        // Edit ONLY the redundant row, leaving the honest open `fact.observed`
+        // event untouched — and forge the OBJECT as well as the close, so the
+        // test fails if the row wins on any column rather than just this one.
+        let row = doc
+            .facts
+            .iter_mut()
+            .find(|f| f.predicate == "allergic_to")
+            .expect("the export carries the allergy");
+        row.valid_until = row.valid_from.clone();
+        row.close_reason = Some("stopped".to_string());
+        row.close_authority = Some("heuristic".to_string());
+        row.object = "aspirin".to_string();
+        row.object_norm = "aspirin".to_string();
+
+        let target = extra_store(&_tmp, "target");
+        target.import_v3(&doc).unwrap();
+        let f = target.get_fact(allergy).unwrap().unwrap();
+        assert!(engram_core::interval::is_open_fact(&f));
+        assert_eq!(
+            f.object, "penicillin",
+            "the journal said penicillin; the row section does not get a vote"
+        );
+
+        // And the store agrees with its own journal, which is the quieter half
+        // of the same bug: an import whose projections a rebuild would change.
+        let before = facts_digest(&target);
+        target.rebuild_projections(None, false).unwrap();
+        assert_eq!(facts_digest(&target), before);
+    }
+
+    /// A fact row the journal does NOT describe still lands — a truncated
+    /// journal is not a reason to drop data — and still meets the [G8] gate.
+    #[test]
+    fn a_fact_row_with_no_event_still_imports_and_is_still_gated() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        let mut doc = source.export_v3(None).unwrap();
+        doc.events.clear();
+        doc.counts.events = 0;
+        let row = doc
+            .facts
+            .iter_mut()
+            .find(|f| f.predicate == "allergic_to")
+            .unwrap();
+        row.valid_until = Some("2099-01-01T00:00:00Z".to_string());
+        row.close_reason = Some("stopped".to_string());
+        row.close_authority = Some("caller".to_string());
+
+        let target = extra_store(&_tmp, "target");
+        let report = target.import_v3(&doc).unwrap();
+        assert_eq!(report.facts, 1, "the orphan row is not dropped");
+        assert_eq!(report.close_authority_rejected, 1);
+        assert!(engram_core::interval::is_open_fact(
+            &target.get_fact(allergy).unwrap().unwrap()
+        ));
+    }
+
+    /// [G8] The v2 path. A forged row used to be exempted, then
+    /// `synthesize_genesis` turned it into journal history the store believed
+    /// it had witnessed. Rows land first, so the gate runs before genesis sees
+    /// anything — and no close event is synthesized for a fact held open.
+    #[test]
+    fn a_forged_v2_cessation_row_synthesizes_no_close_event() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, allergy) = seed_allergy(&source);
+        let mut facts = source.export_facts(None).unwrap();
+        let row = facts
+            .iter_mut()
+            .find(|f| f.predicate == "allergic_to")
+            .unwrap();
+        row.valid_until = row.valid_from.clone();
+        row.close_reason = Some("stopped".to_string());
+        row.close_authority = Some("heuristic".to_string());
+
+        let target = extra_store(&_tmp, "target");
+        let report = target
+            .import_v2_with_genesis(
+                &source.export_kbs(None).unwrap(),
+                &source.export_documents(None).unwrap(),
+                &source.export_memories(None).unwrap(),
+                &source.export_chunks(None).unwrap(),
+                &facts,
+                "import:v2",
+            )
+            .unwrap();
+        assert_eq!(report.close_authority_rejected, 1);
+
+        let synthesized: i64 = target
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                  WHERE kind = 'fact.interval_closed'
+                    AND json_extract(payload, '$.fact_id') = ?1",
+                rusqlite::params![allergy.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            synthesized, 0,
+            "genesis reads the rows the gate already opened"
+        );
+        assert!(engram_core::interval::is_open_fact(
+            &target.get_fact(allergy).unwrap().unwrap()
+        ));
+
+        target.rebuild_projections(None, false).unwrap();
+        assert!(
+            engram_core::interval::is_open_fact(&target.get_fact(allergy).unwrap().unwrap()),
+            "and the rebuild cannot resurrect a close nobody journaled"
+        );
+    }
+
     #[test]
     fn a_future_schema_version_is_refused() {
         let (_tmp, _g, store) = temp_store();
@@ -881,62 +1179,43 @@ mod tests {
 }
 
 #[cfg(test)]
-mod cessation_exemption_tests {
+mod import_close_rule_tests {
     use super::*;
 
-    /// The cross-lane hazard the semantics lane flagged at merge: G1 stores an
-    /// EXTRACTED cessation as a point interval born closed with `heuristic`
-    /// authority, and G2's close-dropping rule would have re-opened it on
-    /// import — turning "Ana stopped metformin" into an active prescription.
+    /// [G8] The rule takes one argument, and these are the tests that keep it
+    /// that way. Three gate passes each answered a forgery by consulting one
+    /// more field of the file; the fix was to consult none of them.
     #[test]
-    fn a_born_closed_cessation_on_a_safety_relation_survives_import() {
-        let t = "2026-08-02T10:00:00Z";
-        assert!(
-            cessation_close_is_exempt(Some("stopped"), Some(t), Some(t)),
-            "one instant, reason `stopped`: the sentence said it ended"
-        );
-        // The rule itself still fires for this relation+authority …
-        assert!(close_needs_person("takes_medication", Some("heuristic")));
-        // … and the exemption is what keeps the cessation from being
-        // re-opened. (Call sites AND these two conditions; see
-        // `import_fact_row`.)
-    }
-
-    /// The forgery the re-gate found: `valid_until` set to a live fact's own
-    /// `valid_from` is a point too, so a shape-only test read the attack as a
-    /// cessation. Only `stopped` claims an ending; every other reason
-    /// overrules a claim that was standing, and gets the ordinary rule.
-    #[test]
-    fn a_point_close_that_is_not_a_cessation_gets_no_exemption() {
-        let t = "2026-08-02T10:00:00Z";
-        for reason in ["superseded", "corrected", "retracted_source"] {
+    fn every_safety_relation_lands_open_whatever_the_file_says() {
+        for relation in ["takes_medication", "allergic_to", "diagnosed_with"] {
             assert!(
-                !cessation_close_is_exempt(Some(reason), Some(t), Some(t)),
-                "`{reason}` at a single instant is still not a cessation"
+                import_close_is_refused(relation),
+                "`{relation}` is a safety slot, so an imported close never lands"
             );
         }
-        // Nor does an unreasoned close, which is the shape a hand-edited file
-        // takes when the forger simply deletes the field.
-        assert!(!cessation_close_is_exempt(None, Some(t), Some(t)));
     }
 
+    /// The three fields that used to be evidence are not arguments any more,
+    /// which is the point — this test exists to make deleting them from the
+    /// signature a deliberate act rather than an accident someone reverts.
     #[test]
-    fn a_span_close_on_a_safety_relation_is_still_dropped() {
-        assert!(!cessation_close_is_exempt(
-            Some("stopped"),
-            Some("2026-01-01T00:00:00Z"),
-            Some("2026-08-02T10:00:00Z")
-        ));
-        assert!(close_needs_person("takes_medication", Some("heuristic")));
+    fn an_ordinary_relation_still_imports_closed() {
+        for relation in ["lives_in", "works_at", "owns"] {
+            assert!(
+                !import_close_is_refused(relation),
+                "`{relation}` is not a safety slot; Bruno really did move out \
+                 of Lisbon"
+            );
+        }
     }
 
+    /// The registry decides what a safety slot is, and it canonicalises
+    /// aliases first, so a file cannot dodge the rule by spelling the relation
+    /// the other way.
     #[test]
-    fn an_open_interval_is_not_a_cessation() {
-        assert!(!cessation_close_is_exempt(
-            Some("stopped"),
-            Some("2026-01-01T00:00:00Z"),
-            None
-        ));
-        assert!(!cessation_close_is_exempt(Some("stopped"), None, None));
+    fn an_alias_of_a_safety_relation_is_still_a_safety_relation() {
+        let canonical = engram_core::relations::canonical_relation("takes_medication");
+        assert!(engram_core::relations::is_safety_slot(&canonical));
+        assert!(import_close_is_refused("Takes_Medication"));
     }
 }

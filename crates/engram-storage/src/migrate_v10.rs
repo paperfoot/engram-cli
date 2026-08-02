@@ -177,7 +177,10 @@ impl SqliteStore {
         report.facts_backfilled = backfilled;
         report.intervals_closed = closed;
 
-        let genesis = self.synthesize_genesis(ACTOR_MIGRATION_V10)?;
+        // [G9] The migration's genesis IS this store's own past, rewritten
+        // into events. Stamping it `Imported` would re-gate every close the
+        // store made before v10 on its next rebuild.
+        let genesis = self.synthesize_genesis(ACTOR_MIGRATION_V10, crate::journal::Origin::Own)?;
         report.genesis_events = genesis.events;
         report.derivations_backfilled = genesis.derivations;
 
@@ -300,7 +303,16 @@ impl SqliteStore {
     /// import and a v9 migration produce identical journals for identical
     /// rows. Order matters: it is the replay order, and `admin rebuild`
     /// depends on it.
-    pub(crate) fn synthesize_genesis(&self, actor: &str) -> Result<GenesisCounts, StorageError> {
+    ///
+    /// [G9] The two callers differ in exactly one thing, and it is the only
+    /// thing they SHOULD differ in: a migration synthesizes this store's own
+    /// past (`Origin::Own`), a v2 import synthesizes a past it was handed in a
+    /// file (`Origin::Imported`). Same events, same ids, different trust.
+    pub(crate) fn synthesize_genesis(
+        &self,
+        actor: &str,
+        origin: crate::journal::Origin,
+    ) -> Result<GenesisCounts, StorageError> {
         let mut events = 0usize;
 
         // 1. memory.written, oldest first.
@@ -338,7 +350,8 @@ impl SqliteStore {
                     true,
                 ),
             )
-            .scope(Some(&m.kb), Some(&m.diary));
+            .scope(Some(&m.kb), Some(&m.diary))
+            .origin(origin);
             let draft = match Uuid::parse_str(&m.id) {
                 Ok(u) => draft.subject(u),
                 Err(_) => draft,
@@ -397,7 +410,8 @@ impl SqliteStore {
                     true,
                 ),
             )
-            .scope(Some(&kb), Some(&diary));
+            .scope(Some(&kb), Some(&diary))
+            .origin(origin);
             let draft = match Uuid::parse_str(memory_id) {
                 Ok(u) => draft.subject(u),
                 Err(_) => draft,
@@ -443,6 +457,7 @@ impl SqliteStore {
                 payload::fact_observed(&fact, true),
             )
             .scope(Some(&seed.kb), Some(&seed.diary))
+            .origin(origin)
             .subject(fid);
             if self
                 .append_event_with_identity(
@@ -481,6 +496,7 @@ impl SqliteStore {
                 ),
             )
             .scope(Some(&seed.kb), Some(&seed.diary))
+            .origin(origin)
             .subject(fid);
             if self
                 .append_event_with_identity(

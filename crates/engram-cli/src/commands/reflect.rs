@@ -471,6 +471,7 @@ mod tests {
             kb: Some("default".to_string()),
             diary: Some("default".to_string()),
             payload,
+            origin: engram_storage::Origin::Own,
         }
     }
 

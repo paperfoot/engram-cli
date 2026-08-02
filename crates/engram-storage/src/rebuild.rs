@@ -34,7 +34,7 @@
 //!    so on every run.
 
 use crate::error::StorageError;
-use crate::journal::EventRow;
+use crate::journal::{EventRow, Origin};
 use crate::sqlite::SqliteStore;
 use engram_core::events::EventKind;
 use rusqlite::{params, OptionalExtension};
@@ -53,6 +53,11 @@ pub struct RebuildReport {
     pub lessons: i64,
     pub conflicts_skipped_orphan: usize,
     pub conflicts_preserved_orphan: usize,
+    /// [G8 + G9] Closes refused while replaying events this store did not
+    /// write. Non-zero means the journal still carries an imported close the
+    /// projections decline to honour — every rebuild from here on will refuse
+    /// it again, and report the same number.
+    pub close_authority_rejected: usize,
     pub embeddings_restored: usize,
     pub skipped: Vec<SkippedTable>,
 }
@@ -109,21 +114,6 @@ pub fn skipped_tables() -> Vec<SkippedTable> {
     ]
 }
 
-/// Where a replayed event came from, and therefore how far it is trusted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    /// This store's own journal. Whatever it says, this store did — and that
-    /// INCLUDES the v9 history the migration synthesized, where a relation
-    /// the registry has since promoted to `safety` was closed by the old
-    /// slot-LWW heuristic. Re-gating those on every rebuild would reopen
-    /// thousands of correctly-retired prescriptions, which is a rebuild that
-    /// edits history rather than replaying it.
-    OwnJournal,
-    /// An event out of an export file — bytes a caller can edit with `jq`.
-    /// The [G2] gate applies, exactly as it does to the row sections.
-    Imported,
-}
-
 /// The close a fact row is ALREADY carrying, read back before a replayed
 /// `fact.interval_closed` writes over it.
 struct CloseColumns {
@@ -138,15 +128,18 @@ struct CloseColumns {
 impl CloseColumns {
     /// Would replaying this close change the row?
     ///
-    /// [G2] The gate refuses closes; a refusal it COUNTS is a refusal it will
-    /// eventually show the caller, so it must not count one where there was
-    /// nothing to refuse. That case is ordinary, not exotic: a legitimate
-    /// extracted cessation is born closed, so the file carries the same close
-    /// twice — once in the fact row, where the cessation exemption vets it,
-    /// and once in the `fact.interval_closed` event that recorded it. The
-    /// event arrives at a row that already says exactly what the event says.
-    /// Blocking it changes nothing, and reporting a rejected close on a
-    /// healthy round trip would be the store crying wolf.
+    /// [G8] The gate refuses closes; a refusal it COUNTS is a refusal it will
+    /// show the caller, so it must not count one where there was nothing to
+    /// refuse. That happens whenever an import lands on a store that already
+    /// holds the same fact closed the same way — a re-import of a backup, a
+    /// merge of two slices of one history. The event arrives at a row that
+    /// already says exactly what the event says; blocking it changes nothing,
+    /// and reporting a rejected close on a healthy round trip is the store
+    /// crying wolf.
+    ///
+    /// Every column read here is the STORE's, not the file's. The file cannot
+    /// arrange for this to answer `false`: a safety row it sent arrived open,
+    /// so a close it also sent always moves something.
     fn would_move(&self, e: &EventRow, until: &str) -> Result<bool, StorageError> {
         let closed_by = e.payload_opt_str("closed_by");
         let superseded_at = e
@@ -162,20 +155,30 @@ impl CloseColumns {
     }
 }
 
-/// Replay one event onto the projections. Raw SQL only — see rule 1.
-pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
-    apply_from(store, e, Origin::OwnJournal).map(|_| ())
+/// What replaying one event did, beyond the projection write itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Applied {
+    /// [G8] Closes the safety gate refused: 0 or 1.
+    pub closes_refused: usize,
+    /// Fact rows this event created. Only `fact.observed` inserts one, and
+    /// only when the id was not already in the store — which is how an import
+    /// counts the facts its JOURNAL built, now that the row section no longer
+    /// builds them.
+    pub facts_inserted: usize,
 }
 
-/// [G2] Replay one event, returning the number of closes the safety gate
-/// refused (0 or 1). `Origin::OwnJournal` never refuses anything, so
-/// `admin rebuild` is unchanged.
-pub fn apply_from(
-    store: &SqliteStore,
-    e: &EventRow,
-    origin: Origin,
-) -> Result<usize, StorageError> {
-    let mut refused = 0usize;
+/// Replay one event onto the projections. Raw SQL only — see rule 1.
+///
+/// [G9] The trust decision reads `e.origin`, the event's OWN column, and
+/// there is deliberately no way for a caller to pass a different answer. The
+/// previous shape took the origin as an argument, which meant import passed
+/// `Imported`, refused the close, kept the refused event in the journal — and
+/// `admin rebuild` then re-read the identical bytes, passed `OwnJournal`
+/// because that is all a rebuild ever passed, and applied the close as this
+/// store's own history. One argument was the whole laundering machine.
+pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<Applied, StorageError> {
+    let origin = e.origin;
+    let mut applied = Applied::default();
     match e.kind {
         EventKind::FactObserved => {
             let id = e.payload_uuid("fact_id")?;
@@ -192,35 +195,24 @@ pub fn apply_from(
                         valid_until.as_deref().unwrap_or(""),
                     ));
                 }
-                // An observation carries no authority at all, so an imported
-                // one that arrives already CLOSED on a safety relation is a
-                // close nobody signed. It carries no `close_reason` either,
-                // which is why the cessation exemption cannot fire here: the
-                // payload has no way to say "this ENDED" as against "this was
-                // overruled", and the exemption is only for the first. The
-                // ask is read anyway rather than hard-coded to `None`, so a
-                // journal that later learns to carry it needs no edit here.
+                // [G8] A safety observation lands OPEN. The relation is the
+                // only thing consulted — the payload's `close_reason` was the
+                // third field a forger learned to write, and reading it here
+                // let a hand-edited `fact.observed` close a live allergy with
+                // both reason and authority NULL.
                 //
-                // Nothing legitimate is lost. This branch is `INSERT OR
-                // IGNORE`, the file's fact ROW for the same id landed before
-                // any event replayed, and that row is where a cessation
-                // proves itself. A file that reaches this line with a closed
-                // safety observation is one whose rows were removed and whose
-                // journal is the only thing still claiming the interval
-                // ended.
+                // The rest of the close is already NULL in the INSERT below
+                // (`closed_by`, `superseded_by`, `superseded_at`,
+                // `close_reason`, `close_authority`), so dropping
+                // `valid_until` drops the whole thing rather than half of it.
                 if valid_until.is_some()
-                    && !crate::export_v3::cessation_close_is_exempt(
-                        e.payload_opt_str("close_reason").as_deref(),
-                        valid_from.as_deref(),
-                        valid_until.as_deref(),
-                    )
-                    && crate::export_v3::close_needs_person(&e.payload_str("relation")?, None)
+                    && crate::export_v3::import_close_is_refused(&e.payload_str("relation")?)
                 {
                     valid_until = None;
-                    refused += 1;
+                    applied.closes_refused += 1;
                 }
             }
-            store.conn.execute(
+            applied.facts_inserted = store.conn.execute(
                 "INSERT OR IGNORE INTO facts(id, source_memory_id, subject, subject_norm,
                         predicate, object, object_norm, confidence, created_at,
                         superseded_by, superseded_at, diary, fact_type, valid_from,
@@ -309,21 +301,21 @@ pub fn apply_from(
                             &until,
                         ));
                     }
-                    // [G2] NO cessation exemption on this event, whatever
-                    // shape or reason it claims. `fact.interval_closed` closes
-                    // an interval that already exists, so it can never be the
-                    // born-closed cessation the exemption is for — and it is
-                    // exactly the forgery the exemption was letting through:
-                    // set `valid_until` to a live allergy's own `valid_from`
-                    // and a shape test reads the attack as a point.
-                    if crate::export_v3::close_needs_person(
-                        &predicate,
-                        Some(e.payload_str("authority")?).as_deref(),
-                    ) && current.would_move(e, &until)?
+                    // [G8] Safety relation, so the close does not land — no
+                    // matter what authority, reason or shape the payload
+                    // claims for it. `predicate` comes from the row already in
+                    // the store, and `would_move` compares against that row's
+                    // own columns; nothing in this decision is read from the
+                    // file.
+                    if crate::export_v3::import_close_is_refused(&predicate)
+                        && current.would_move(e, &until)?
                     {
                         // The event is kept — the journal records what the
                         // file claimed — but the projection does not move.
-                        return Ok(1);
+                        return Ok(Applied {
+                            closes_refused: 1,
+                            facts_inserted: 0,
+                        });
                     }
                 }
             }
@@ -599,7 +591,7 @@ pub fn apply_from(
         | EventKind::JobCompleted
         | EventKind::JobFailed => {}
     }
-    Ok(refused)
+    Ok(applied)
 }
 
 impl SqliteStore {
@@ -741,7 +733,14 @@ impl SqliteStore {
                 }
             }
             match apply(self, &event) {
-                Ok(()) => report.events_replayed += 1,
+                Ok(applied) => {
+                    report.events_replayed += 1;
+                    // [G8 + G9] An imported event is re-gated on EVERY replay,
+                    // so a rebuild can refuse a close the same way the import
+                    // did. Saying so is the point: silence here would look
+                    // exactly like a rebuild that had honoured the file.
+                    report.close_authority_rejected += applied.closes_refused;
+                }
                 Err(StorageError::NotFound(_)) if event.kind == EventKind::ConflictOpened => {
                     report.conflicts_skipped_orphan += 1;
                 }

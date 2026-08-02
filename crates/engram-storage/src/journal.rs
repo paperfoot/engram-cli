@@ -50,12 +50,60 @@ CREATE TABLE IF NOT EXISTS events (
     subject_id TEXT,
     kb         TEXT,
     diary      TEXT,
-    payload    TEXT NOT NULL
+    payload    TEXT NOT NULL,
+    origin     TEXT NOT NULL DEFAULT 'own'
 );
 CREATE INDEX IF NOT EXISTS idx_events_subject ON events(subject_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_kind    ON events(kind, seq);
 CREATE INDEX IF NOT EXISTS idx_events_kb_seq  ON events(kb, seq);
 "#;
+
+/// [G9] Where an event came from, and therefore how far a replay trusts it.
+///
+/// This is a COLUMN, not a parameter, because trust has to survive the
+/// transaction that established it. Import used to pass "untrusted" down the
+/// call stack, refuse the close, and keep the refused event in the journal —
+/// at which point the next `admin rebuild` read the same bytes with nothing
+/// left to say they came from a file, applied them as this store's own
+/// history, and made the refusal theatre.
+///
+/// The value is decided by the code path that appends, never read from an
+/// export file: [`ExportEvent`](crate::ExportEvent) carries no origin field,
+/// so `Own` is un-forgeable by anything a caller can edit with `jq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Origin {
+    /// This store's own journal — a live write through the gated path, or the
+    /// history the v9 migration synthesized from this store's own rows.
+    /// Whatever it says, this store did, and that INCLUDES a v9 close made by
+    /// the old slot-LWW heuristic on a relation since promoted to `safety`.
+    /// Re-gating those on every rebuild would reopen thousands of correctly
+    /// retired prescriptions: a rebuild that edits history rather than
+    /// replaying it.
+    #[default]
+    Own,
+    /// Out of an export file — bytes a caller edits by hand. The [G8] import
+    /// gate applies on EVERY replay, not just the first.
+    Imported,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Own => "own",
+            Origin::Imported => "imported",
+        }
+    }
+
+    /// Anything this binary does not recognise reads as `Imported`. An origin
+    /// a newer engram wrote, or one a hand-edited database carries, is exactly
+    /// the case where the untrusted answer is the safe one.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "own" => Origin::Own,
+            _ => Origin::Imported,
+        }
+    }
+}
 
 /// An event about to be appended. Built through [`EventDraft::new`] so
 /// `actor` can never be forgotten by a projection writer.
@@ -67,6 +115,9 @@ pub struct EventDraft {
     pub diary: Option<String>,
     pub actor: String,
     pub payload: Value,
+    /// [G9] Defaults to `Own`: every live write path is this store's own, and
+    /// the two import paths say otherwise explicitly.
+    pub origin: Origin,
 }
 
 impl EventDraft {
@@ -78,6 +129,7 @@ impl EventDraft {
             diary: None,
             actor: actor.into(),
             payload,
+            origin: Origin::Own,
         }
     }
 
@@ -89,6 +141,13 @@ impl EventDraft {
     pub fn scope(mut self, kb: Option<&str>, diary: Option<&str>) -> Self {
         self.kb = kb.map(|s| s.to_string());
         self.diary = diary.map(|s| s.to_string());
+        self
+    }
+
+    /// [G9] Mark this event as arriving from outside. Only the import paths
+    /// call it.
+    pub fn origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
         self
     }
 }
@@ -105,6 +164,10 @@ pub struct EventRow {
     pub kb: Option<String>,
     pub diary: Option<String>,
     pub payload: Value,
+    /// [G9] Read back from the row, so every replay of this event — import,
+    /// `admin rebuild`, and any rebuild after that — reaches the same verdict
+    /// about how far to trust it.
+    pub origin: Origin,
 }
 
 impl EventRow {
@@ -199,6 +262,7 @@ fn parse_event_row(r: &rusqlite::Row) -> Result<EventRow, StorageError> {
     let kind_str: String = r.get(4)?;
     let subject: Option<String> = r.get(5)?;
     let payload_str: String = r.get(8)?;
+    let origin_str: String = r.get(9)?;
     // An unparseable kind is an error, never a silent skip: a skipped event
     // is a projection that quietly diverges from its own journal.
     let kind = EventKind::parse(&kind_str)
@@ -216,10 +280,11 @@ fn parse_event_row(r: &rusqlite::Row) -> Result<EventRow, StorageError> {
         kb: r.get(6)?,
         diary: r.get(7)?,
         payload: serde_json::from_str(&payload_str)?,
+        origin: Origin::parse(&origin_str),
     })
 }
 
-const EVENT_COLUMNS: &str = "seq, id, ts, actor, kind, subject_id, kb, diary, payload";
+const EVENT_COLUMNS: &str = "seq, id, ts, actor, kind, subject_id, kb, diary, payload, origin";
 
 impl SqliteStore {
     /// Append inside the caller's OPEN transaction. Never opens one itself:
@@ -264,8 +329,9 @@ impl SqliteStore {
         draft: &EventDraft,
     ) -> Result<Option<i64>, StorageError> {
         let n = self.conn.execute(
-            "INSERT OR IGNORE INTO events(id, ts, actor, kind, subject_id, kb, diary, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR IGNORE INTO events(id, ts, actor, kind, subject_id, kb, diary, payload,
+                    origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id.to_string(),
                 ts.to_rfc3339(),
@@ -275,6 +341,9 @@ impl SqliteStore {
                 draft.kb,
                 draft.diary,
                 canonical_json(&draft.payload),
+                // [G9] From the draft the CALLER built, which means from the
+                // code path that appends — never from the file's bytes.
+                draft.origin.as_str(),
             ],
         )?;
         if n == 0 {
@@ -342,6 +411,20 @@ impl SqliteStore {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?)
+    }
+
+    /// v12 → v13 [G9]. One additive column: `events.origin`.
+    ///
+    /// Additive-only, so per D25 it takes no `VACUUM INTO` backup — that rule
+    /// exists for migrations that rewrite rows, and this one rewrites nothing.
+    /// The `DEFAULT 'own'` backfills every existing row to `Own`, which is the
+    /// truthful answer: before this column existed, `import_v3` was the only
+    /// writer of foreign events and the safety gate had already run over them
+    /// once. Stamping that history `imported` instead would re-gate a store's
+    /// whole past on its next rebuild and reopen closes it made itself.
+    pub(crate) fn migrate_v13(&self) -> Result<(), StorageError> {
+        self.add_column_if_missing("events", "origin", "TEXT NOT NULL DEFAULT 'own'")?;
+        Ok(())
     }
 }
 

@@ -867,7 +867,7 @@ const MEMORY_CONSTRAINS_DERIVED: &str = "(
     )
 )";
 
-pub const CURRENT_VERSION: i32 = 12;
+pub const CURRENT_VERSION: i32 = 13;
 
 /// A fact still asserts something only while BOTH are true: no successor took
 /// its slot, and its own interval has not been closed. `close_reason='stopped'`
@@ -1086,6 +1086,11 @@ impl SqliteStore {
             // prior value a bad backfill could destroy.
             if current < 12 {
                 s.migrate_v12()?;
+            }
+            // v13 likewise: one column on `events` with a DEFAULT that fills
+            // itself, no backfill pass and no row rewrite (D25) [G9].
+            if current < 13 {
+                s.migrate_v13()?;
             }
             if current != CURRENT_VERSION {
                 s.conn.execute(
@@ -5589,12 +5594,12 @@ impl SqliteStore {
 
     /// Import one fact row from an export file.
     ///
-    /// [G2] This is the ONLY write path whose bytes a caller edits by hand,
-    /// so it is the only one that cannot trust its own input. Two things it
-    /// cannot re-derive get checked instead: an interval that ends before it
-    /// begins is refused outright, and a SAFETY relation closed by anything
-    /// but a person is imported OPEN with the close dropped and counted.
-    /// Everything else about the row is written as given.
+    /// [G8] This is one of the two write paths whose bytes a caller edits by
+    /// hand, so it is one of the two that cannot trust its own input. Two
+    /// things it cannot re-derive get checked instead: an interval that ends
+    /// before it begins is refused outright, and a SAFETY relation lands OPEN
+    /// with its close dropped and counted. Everything else about the row is
+    /// written as given.
     pub fn import_fact_row(&self, row: &FactExportRow) -> Result<ImportedFactRow, StorageError> {
         if crate::export_v3::interval_is_inverted(
             row.valid_from.as_deref(),
@@ -5607,18 +5612,10 @@ impl SqliteStore {
             ));
         }
         let closed = row.valid_until.is_some() || row.superseded_by.is_some();
-        // A born-closed CESSATION is exempt: re-opening it would manufacture
-        // an ongoing prescription out of a sentence that said it ended. The
-        // row has to say `stopped` to claim that — a point close reasoned
-        // `superseded` is a supersession wearing a cessation's shape, and it
-        // gets the ordinary rule.
-        let close_rejected = closed
-            && !crate::export_v3::cessation_close_is_exempt(
-                row.close_reason.as_deref(),
-                row.valid_from.as_deref(),
-                row.valid_until.as_deref(),
-            )
-            && crate::export_v3::close_needs_person(&row.predicate, row.close_authority.as_deref());
+        // No field of the row is consulted beyond the fact that it claims a
+        // close at all: not the authority, not the reason, not the shape. The
+        // relation decides, and the registry decides the relation.
+        let close_rejected = closed && crate::export_v3::import_close_is_refused(&row.predicate);
         // Dropping the close means dropping ALL of it: a row left with
         // `superseded_by` set is not open under `is_open_fact`, and half a
         // close is worse than either whole.
@@ -5658,7 +5655,12 @@ impl SqliteStore {
         )?;
         Ok(ImportedFactRow {
             inserted: n > 0,
-            close_rejected,
+            // `INSERT OR IGNORE` means an id already in the store makes this
+            // whole statement a no-op, and a refusal that moved nothing is a
+            // refusal that must not be reported. The store cried wolf here
+            // before: re-importing the same backup twice counted every safety
+            // close again, on a second run that changed not one row.
+            close_rejected: close_rejected && n > 0,
         })
     }
 
