@@ -121,9 +121,15 @@ fn a_repeated_coexistence_never_becomes_a_question() {
 ///
 /// One correction against the blocked draft: `remember` does not emit
 /// `plan_notes`, so the replay is asserted where it is actually visible — the
-/// per-pair `resolution` on `data.conflicts`, which reads `replayed_close_old`
-/// rather than `conflicts_queued: 1`. A silent replay is still refused: the
-/// row says which decision was applied.
+/// per-pair `resolution` on `data.conflicts`, rather than
+/// `conflicts_queued: 1`. A silent replay is still refused: the row says which
+/// decision was applied.
+///
+/// WHICH `replayed_*` tag lands is not pinned, and that is G3. The tag names
+/// what happened to THIS pair, and a re-derivation decides for itself which of
+/// the two values it emits first — so the same ruling reads `close_old` in one
+/// orientation and `reject_new` in the other. What must not move is the
+/// OUTCOME: the caller retired Acme, so Acme stays retired either way.
 #[test]
 fn a_resolved_question_is_never_asked_again() {
     let tmp = store();
@@ -169,11 +175,21 @@ fn a_resolved_question_is_never_asked_again() {
         .unwrap_or_default();
     assert!(
         !applied.is_empty()
-            && applied
-                .iter()
-                .all(|c| c["resolution"] == "replayed_close_old"),
+            && applied.iter().all(|c| c["resolution"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("replayed_"))),
         "a silent replay is indistinguishable from a dropped question — each \
          pair must name the decision it applied: {again}"
+    );
+    let employers: Vec<String> = current_facts(tmp.path(), "Carol")
+        .iter()
+        .filter_map(|f| f["object"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        employers,
+        vec!["Beta Corp"],
+        "the caller retired Acme; a replay applies that answer, never its \
+         mirror image: {again}"
     );
 }
 

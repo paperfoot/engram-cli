@@ -508,9 +508,11 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // caller-supplied batch deliberately carries no marker — the extractor
     // has not seen the memory — and stays pending until a backfill runs real
     // extraction over it; dedup absorbs the re-supplied triples.
+    let marker_hash = engram_core::keys::content_hash(&content);
     let marker = status.extraction_ran().then_some(FactExtractionMarker {
         model: extraction_model.as_deref(),
         source: "remember",
+        content_hash: &marker_hash,
     });
     let mut outcome = FactWriteOutcome::default();
     let mut caller_batch_committed = false;
