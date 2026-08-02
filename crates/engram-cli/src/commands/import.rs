@@ -1,9 +1,20 @@
 //! `engram import <file>` — restore a store from an export JSON file.
 //!
-//! Understands two formats:
-//! - **v2** (current): full-fidelity restore of KBs, documents, memories,
-//!   chunks (embeddings included, no re-embedding needed), and facts.
-//! - **v1** (legacy): memories-only exports. Content is re-chunked through the
+//! Understands three formats:
+//! - **v3** (current): the journal plus the v2 sections. The events are
+//!   REPLAYED through the same dispatcher `admin rebuild` uses, so an imported
+//!   store carries its own history — every interval close, every conflict,
+//!   every decision a person made — instead of only the conclusions. Chunk
+//!   embeddings ride in the `chunks` section because replay cannot re-embed
+//!   without paying a provider.
+//! - **v2**: full-fidelity restore of KBs, documents, memories,
+//!   chunks (embeddings included, no re-embedding needed), and facts. A v2 file
+//!   has no journal, so one is SYNTHESIZED from the rows it does carry, by the
+//!   same generator the v9→v10 migration uses — a store restored without a
+//!   journal cannot be rebuilt or audited.
+//! - **v1** (legacy): memories-only exports. Each memory goes in through
+//!   `insert_memory`, which journals its own `memory.written`, so a legacy
+//!   restore lands with a journal too. Content is re-chunked through the
 //!   same policy `remember` uses, so a legacy restore cannot smuggle in the
 //!   degenerate fragments the floor exists to stop. Chunks land WITHOUT
 //!   embeddings by design; run `engram reindex --all` afterwards to restore
@@ -45,11 +56,68 @@ pub fn run(ctx: &AppContext, path: PathBuf) -> Result<(), CliError> {
     let version = body.get("version").and_then(|v| v.as_i64()).unwrap_or(1);
 
     let (data, meta) = match version {
+        3 => import_v3(ctx, &body)?,
         2 => import_v2(ctx, &body)?,
+        // An un-versioned legacy file is still accepted.
         _ => import_v1(ctx, &body)?,
     };
     print_success(ctx.format, data, meta, |data| println!("{}", data));
     Ok(())
+}
+
+/// The v3 path: hand the whole document to storage and report what it did.
+///
+/// Deliberately NOT a hand-rolled pipeline. Shape validation, the refusal of a
+/// file written by a newer schema, event-id preservation and the replay order
+/// all live in `import_v3`, so a CLI import and a daemon import accept and
+/// reject exactly the same files. A local re-validation here would be a second
+/// opinion, and two opinions about what a valid backup is means one of them is
+/// wrong in the field.
+fn import_v3(
+    ctx: &AppContext,
+    body: &serde_json::Value,
+) -> Result<(serde_json::Value, Metadata), CliError> {
+    let doc: engram_storage::ExportV3 = serde_json::from_value(body.clone())
+        .map_err(|e| CliError::BadInput(format!("malformed v3 export file: {e}")))?;
+    let report = ctx.store.import_v3(&doc)?;
+
+    let mut meta = Metadata::default();
+    meta.add("format_version", 3);
+    meta.add("schema_version", doc.schema_version);
+    meta.add("replayed_events", report.events);
+    meta.add("imported_memories", report.memories);
+    meta.add("imported_chunks", report.chunks);
+    Ok((
+        json!({
+            "format_version": 3,
+            "replayed": {
+                "events": report.events,
+                "events_skipped_duplicate": report.events_skipped_duplicate,
+                "conflicts_skipped_orphan": report.conflicts_skipped_orphan,
+            },
+            // Same key, same meaning as v1/v2: rows this call actually
+            // inserted. The journal is authoritative for everything it
+            // carries; these sections carry what it does not (embeddings,
+            // documents, KB registrations).
+            "imported": {
+                "kbs": report.kbs,
+                "documents": report.documents,
+                "memories": report.memories,
+                "chunks": report.chunks,
+                "facts": report.facts,
+            },
+            "skipped_existing": {
+                "kbs": doc.kbs.len().saturating_sub(report.kbs),
+                "documents": doc.documents.len().saturating_sub(report.documents),
+                "memories": doc.memories.len().saturating_sub(report.memories),
+                "chunks": doc.chunks.len().saturating_sub(report.chunks),
+                "facts": doc.facts.len().saturating_sub(report.facts),
+                "events": report.events_skipped_duplicate,
+            },
+            "next_step": "run `engram compile --kb <name> --all` to regenerate derived claims/entities/wiki",
+        }),
+        meta,
+    ))
 }
 
 fn import_v2(
@@ -96,34 +164,26 @@ fn import_v2(
         }
     }
 
-    // Insert in dependency order (kb → document → memory → chunk → fact)
-    // inside one transaction so a malformed file cannot leave a half-restored
-    // store. Existing rows are kept (INSERT OR IGNORE), so import is
-    // idempotent and safe to re-run.
-    let counts = ctx.store.with_tx(|store| {
-        let mut c = ImportCounts::default();
-        for row in &kbs {
-            c.kbs += store.import_kb_row(row)? as usize;
-        }
-        for row in &documents {
-            c.documents += store.import_document_row(row)? as usize;
-        }
-        for row in &memories {
-            c.memories += store.import_memory_row(row)? as usize;
-        }
-        for row in &chunks {
-            c.chunks += store.import_chunk_row(row)? as usize;
-        }
-        for row in &facts {
-            c.facts += store.import_fact_row(row)? as usize;
-        }
-        Ok(c)
-    })?;
+    // Rows in dependency order (kb → document → memory → chunk → fact) AND the
+    // synthesized journal, in ONE storage call and therefore one transaction.
+    // Genesis has to be generated from the same rows in the same transaction —
+    // a separate pass could disagree with what actually landed, and the store
+    // would then rebuild into something the file never described. Existing rows
+    // are kept (INSERT OR IGNORE), so import is idempotent and safe to re-run.
+    let counts = ctx.store.import_v2_with_genesis(
+        &kbs,
+        &documents,
+        &memories,
+        &chunks,
+        &facts,
+        IMPORT_ACTOR,
+    )?;
 
     let mut meta = Metadata::default();
     meta.add("format_version", 2);
     meta.add("imported_memories", counts.memories);
     meta.add("imported_chunks", counts.chunks);
+    meta.add("genesis_events", counts.genesis_synthesized);
     Ok((
         json!({
             "format_version": 2,
@@ -134,6 +194,9 @@ fn import_v2(
                 "chunks": counts.chunks,
                 "facts": counts.facts,
             },
+            // A v2 file carries no history; this is the history synthesized for
+            // it, so the restored store is rebuildable rather than frozen.
+            "genesis_events": counts.genesis_synthesized,
             "skipped_existing": {
                 "kbs": kbs.len() - counts.kbs,
                 "documents": documents.len() - counts.documents,
@@ -147,14 +210,10 @@ fn import_v2(
     ))
 }
 
-#[derive(Default)]
-struct ImportCounts {
-    kbs: usize,
-    documents: usize,
-    memories: usize,
-    chunks: usize,
-    facts: usize,
-}
+/// Who the synthesized genesis events are attributed to. Not `cli:<diary>`: a
+/// v2 restore is not a diary writing memories, and an audit reading the journal
+/// must be able to tell a synthesized past from a lived one.
+const IMPORT_ACTOR: &str = "import:v2";
 
 fn section<T: serde::de::DeserializeOwned>(
     body: &serde_json::Value,

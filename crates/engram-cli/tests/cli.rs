@@ -961,7 +961,8 @@ fn export_returns_envelope_with_count() {
         .clone();
     let v = parse_stdout(&out);
     assert_eq!(v["status"], "success");
-    assert_eq!(v["data"]["version"], 2);
+    // v3: the journal slice plus every v2 section, still under its old name.
+    assert_eq!(v["data"]["version"], 3);
     assert!(v["data"]["counts"]["memories"].is_number());
     assert!(v["data"]["chunks"].is_array());
     assert!(v["data"]["kbs"].is_array());
@@ -1013,7 +1014,9 @@ fn import_from_export_roundtrip() {
         .clone();
     let iv = parse_stdout(&import_out);
     assert_eq!(iv["status"], "success");
-    assert_eq!(iv["data"]["format_version"], 2);
+    // The export is v3 now, so the round trip replays a journal; `imported`
+    // keeps its name and its meaning for the rows the journal does not carry.
+    assert_eq!(iv["data"]["format_version"], 3);
     assert!(iv["data"]["imported"]["memories"].as_u64().unwrap() >= 1);
     // v2 round-trip carries the chunks + embeddings, so dense search works
     // without re-embedding.
