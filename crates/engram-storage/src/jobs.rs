@@ -578,6 +578,18 @@ impl SqliteStore {
         Ok(n)
     }
 
+    /// Test seam: run one statement against this connection.
+    ///
+    /// It exists to CONSTRUCT the shapes an older binary could leave behind —
+    /// two live compile rows for one KB, a store without the wave-4 index —
+    /// which by definition no supported code path can produce. Nothing in the
+    /// product calls it.
+    #[doc(hidden)]
+    pub fn conn_free_for_test(&self, sql: &str) -> Result<(), StorageError> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
     /// Test seam: point both sides of a conflict row at ONE fact.
     ///
     /// A 0.3.x store can legitimately hold such a row, and the old resolve

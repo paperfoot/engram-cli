@@ -120,15 +120,24 @@ fn request(
     // otherwise hang here for minutes on retry backoff instead of failing.
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     let body = body.unwrap_or("");
-    // The daemon reads the whole request with a single read(), so headers and
-    // body go out in one write.
-    let req = format!(
+    // Head and body in TWO writes, with a flush between.
+    //
+    // This used to be one write with a comment saying the daemon reads the
+    // whole request in a single `read()` — which was true, and was the defect:
+    // a body that arrived in a second segment was truncated and blamed on the
+    // caller's JSON. The parity suite is not allowed to be the reason that
+    // never showed up, so it now sends the way a real client does.
+    let head = format!(
         "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\n\
-         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+         content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(req.as_bytes())?;
+    stream.write_all(head.as_bytes())?;
     stream.flush()?;
+    if !body.is_empty() {
+        stream.write_all(body.as_bytes())?;
+        stream.flush()?;
+    }
     let mut raw = String::new();
     stream.read_to_string(&mut raw)?;
     let status: u16 = raw
