@@ -52,6 +52,13 @@ pub fn rebuild(
         "events_replayed": report.events_replayed,
         "events_skipped_deleted_kb": report.events_skipped_deleted_kb,
         "conflicts_skipped_orphan": report.conflicts_skipped_orphan,
+        // Preserved, not skipped: rows whose facts are gone cannot be
+        // recreated from the journal, so the rebuild leaves them where they
+        // are. Reporting only the skip count read as "we dropped these".
+        "conflicts_preserved_orphan": report.conflicts_preserved_orphan,
+        // Orientation the replay recovered for decisions whose own event
+        // predates v12 and therefore cannot carry it.
+        "decisions_reoriented": report.decisions_reoriented,
         // [G8 + G9] Closes refused while replaying events this store did not
         // write. A rebuild that quietly declines to do what its own journal
         // asks, and reports the same numbers as one that complied, is the

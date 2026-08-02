@@ -38,6 +38,16 @@ one it just created, so no prior value is at risk.
   intervals (`close_reason: "corrected"`, authority `caller`) and the response
   says so: `facts_invalidated`, `facts_invalidated_ids`, `reextraction`.
   Adjudication history survives edits; `admin rebuild` can prove it.
+- **Import never honours a close on a safety relation.** A `takes_medication`,
+  `allergic_to` or `diagnosed_with` fact in an imported file (v1/v2/v3, rows or
+  events) lands OPEN; the close is dropped whole and counted as
+  `safety_closes_refused`. No field of the file decides this — authority,
+  reason and interval shape are all written by whoever wrote the file, and
+  three review passes each forged the field the previous fix consulted. The
+  error direction is deliberate: over-reporting a prescription is visible and
+  survivable, under-reporting one is not. A store's OWN journal is unaffected —
+  events now record their origin (schema v13), so a rebuild cannot launder an
+  imported claim into trusted history.
 - `export` writes format version 3 (a journal slice — lossless, including
   retracted memories, decisions and the conflict queue). v2 and v1 files still
   import; a v2 import synthesizes genesis events.

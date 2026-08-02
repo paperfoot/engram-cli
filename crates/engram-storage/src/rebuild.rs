@@ -53,6 +53,9 @@ pub struct RebuildReport {
     pub lessons: i64,
     pub conflicts_skipped_orphan: usize,
     pub conflicts_preserved_orphan: usize,
+    /// Decisions whose orientation the replay recovered from a surviving
+    /// conflict row, because their pre-v12 event could not carry it.
+    pub decisions_reoriented: usize,
     /// [G8 + G9] Closes refused while replaying events this store did not
     /// write. Non-zero means the journal still carries an imported close the
     /// projections decline to honour — every rebuild from here on will refuse
@@ -760,6 +763,14 @@ impl SqliteStore {
                  ON fact_conflict_queue(kb, decision_key)
                  WHERE status='open' AND decision_key IS NOT NULL",
         )?;
+
+        // A pre-v12 `decision.recorded` event carries no `loser_object_norm`,
+        // so replaying one drops the orientation the v12 migration recovered
+        // from the conflict row — measured: after_upgrade=acme, after_rebuild=
+        // NULL. Direction stays SAFE either way (an unoriented decision queues
+        // rather than guessing, G10), but discarding recovered work on every
+        // rebuild is silent regression, so the replay re-derives it here.
+        report.decisions_reoriented = self.backfill_decision_orientation()?;
 
         report.facts = self.count_rows("facts", kb)?;
         report.conflicts = self.count_rows("fact_conflict_queue", kb)?;

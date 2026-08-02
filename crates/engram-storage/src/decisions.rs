@@ -916,7 +916,10 @@ mod tests {
         drop(store);
 
         let store = SqliteStore::open(tmp.path().join("db.sqlite")).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 12);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::sqlite::CURRENT_VERSION
+        );
         assert_eq!(
             store
                 .lookup_decision("personal", &k)
