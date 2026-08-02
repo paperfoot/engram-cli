@@ -220,15 +220,27 @@ impl Core {
     /// through `AppContext::with_store_tx`, which arms a real runtime guard in
     /// every profile — a `debug_assert` would be stripped in exactly the
     /// builds users install.
-    pub async fn write<T, F>(&self, op: &'static str, f: F) -> Result<T, CliError>
+    ///
+    /// Not an `async fn`: the queueing happens when `write` is CALLED, not
+    /// when the returned future is first polled. That is what makes the
+    /// cancellation sentence above true rather than aspirational — an `async
+    /// fn` body does not run until it is polled, so a caller that built the
+    /// future and dropped it would have queued nothing at all.
+    pub fn write<T, F>(
+        &self,
+        op: &'static str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<T, CliError>> + Send
     where
         F: FnOnce(&WriteCtx<'_>) -> Result<T, CliError> + Send + 'static,
         T: Send + 'static,
     {
-        let rx = self.enqueue(op, f)?;
-        rx.await.map_err(|_| {
-            CliError::Transient("the writer thread dropped a queued write".to_string())
-        })?
+        let queued = self.enqueue(op, f);
+        async move {
+            queued?.await.map_err(|_| {
+                CliError::Transient("the writer thread dropped a queued write".to_string())
+            })?
+        }
     }
 
     /// Blocking form, for synchronous call sites. Identical semantics.

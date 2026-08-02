@@ -578,6 +578,25 @@ impl SqliteStore {
         Ok(n)
     }
 
+    /// Test seam: point both sides of a conflict row at ONE fact.
+    ///
+    /// A 0.3.x store can legitimately hold such a row, and the old resolve
+    /// would happily supersede that fact by itself. There is no supported way
+    /// to construct it through the write path, which is exactly why the guard
+    /// needs a way to be tested.
+    #[doc(hidden)]
+    pub fn point_conflict_at_one_fact_for_test(
+        &self,
+        conflict_id: Uuid,
+        fact_id: Uuid,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE fact_conflict_queue SET new_fact_id = ?1, old_fact_id = ?1 WHERE id = ?2",
+            params![fact_id.to_string(), conflict_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn request_cancel(&self, id: Uuid) -> Result<bool, StorageError> {
         let changed = self.conn.execute(
             "UPDATE compile_jobs SET cancel_requested = 1, updated_at = ?1

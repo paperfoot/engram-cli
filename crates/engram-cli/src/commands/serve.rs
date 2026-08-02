@@ -850,6 +850,10 @@ async fn overloaded(mut stream: TcpStream) {
         )
         .await;
     }
+    // Closing hard while the client is still writing its request sends an RST
+    // that destroys the refusal we just queued, and the caller sees a reset
+    // instead of the reason. Read and discard a bounded amount first.
+    drain_briefly(&mut stream).await;
 }
 
 async fn write_response(
@@ -1007,7 +1011,10 @@ mod tests {
 
     #[test]
     fn header_end_accepts_bare_lf() {
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\nbody"), Some((14, 4)));
+        assert_eq!(
+            find_header_end(b"GET / HTTP/1.1\r\n\r\nbody"),
+            Some((14, 4))
+        );
         assert_eq!(
             find_header_end(b"POST / HTTP/1.1\r\nhost: x\r\n\r\n{}"),
             Some((24, 4))

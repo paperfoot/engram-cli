@@ -88,30 +88,6 @@ fn resolve_in_tx(w: &WriteCtx<'_>, req: ResolveRequest) -> Result<ResolveApplied
         ResolveAction::KeepBoth => (None, &new_f),
     };
 
-    if let Some(closing) = closing {
-        // The degenerate `new_fact_id == old_fact_id` row lands here too: a
-        // fact cannot supersede itself.
-        if would_cycle(store, closing.id, survivor.id)? {
-            return Err(CliError::BadInput(format!(
-                "resolving conflict {id} this way would create a supersession cycle: fact \
-                 {} already leads back to {} — run `engram doctor --integrity` if the chain \
-                 itself looks wrong",
-                survivor.id, closing.id
-            )));
-        }
-        // The interval safety gate, unmodified. A caller decision IS
-        // `CloseAuthority::Caller`, so this permits far more than the write
-        // path does; what it still refuses is a relation whose registry entry
-        // says no authority may close it this way.
-        let spec = relation_spec(&canonical_relation(&closing.predicate));
-        let authority = CloseAuthority::Caller {
-            actor: req.actor.clone(),
-        };
-        if let CloseVerdict::Refuse { reason } = may_close(&spec, &authority) {
-            return Err(CliError::BadInput(reason.to_string()));
-        }
-    }
-
     // The key the DECISION is filed under. Prefer the one the queue row
     // recorded — the write path and the migration both computed it — and
     // recompute only for a pre-wave-3 row that has none.
@@ -163,6 +139,34 @@ fn resolve_in_tx(w: &WriteCtx<'_>, req: ResolveRequest) -> Result<ResolveApplied
                 },
             }
         })?;
+
+    // The refusals that belong ABOVE storage, after the claim so that a lost
+    // race is reported as a lost race and not as whatever the winner's write
+    // happened to make impossible. Either refusal rolls the claim back with
+    // the rest of the transaction.
+    if let Some(closing) = closing {
+        // The degenerate `new_fact_id == old_fact_id` row lands here too: a
+        // fact cannot supersede itself.
+        if would_cycle(store, closing.id, survivor.id)? {
+            return Err(CliError::BadInput(format!(
+                "resolving conflict {id} this way would create a supersession cycle: fact \
+                 {} already leads back to {} — run `engram doctor --integrity` if the chain \
+                 itself looks wrong",
+                survivor.id, closing.id
+            )));
+        }
+        // The interval safety gate, unmodified. A caller decision IS
+        // `CloseAuthority::Caller`, so this permits far more than the write
+        // path does; what it still refuses is a relation whose registry entry
+        // says no authority may close it this way.
+        let spec = relation_spec(&canonical_relation(&closing.predicate));
+        let authority = CloseAuthority::Caller {
+            actor: req.actor.clone(),
+        };
+        if let CloseVerdict::Refuse { reason } = may_close(&spec, &authority) {
+            return Err(CliError::BadInput(reason.to_string()));
+        }
+    }
 
     // Apply. `supersede_fact_with` closes the interval and appends
     // `fact.interval_closed` — this lane appends nothing on top of it (D8), so
