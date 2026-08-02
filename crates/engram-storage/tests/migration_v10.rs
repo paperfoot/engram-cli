@@ -105,6 +105,16 @@ fn the_fixture_is_a_v9_store_carrying_every_case_the_migration_must_handle() {
         ),
         2
     );
+
+    // A fact re-asserted seven times. Every other fixture fact has zero
+    // confirmations, and a digest that only ever compares 0 to 0 cannot
+    // notice a rebuild that resets the count — which is exactly what the
+    // release gate found.
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM facts WHERE confirmations = 7"),
+        1,
+        "without a nonzero count the confirmations column is untested"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -541,13 +551,15 @@ fn projection_digest(db: &PathBuf) -> Vec<String> {
               || '|' || COALESCE(superseded_at,'') || '|' || kb || '|' || diary
               || '|' || fact_type || '|' || confirmations
            FROM facts ORDER BY id",
+        // EVERY queue row, orphans included. The old digest filtered rows
+        // whose facts are absent and so could not see the rebuild deleting
+        // them — the exclusion was the reason blocker 4 shipped.
         "SELECT id || '|' || new_fact_id || '|' || old_fact_id || '|' || status
               || '|' || kb || '|' || diary || '|' || detector
               || '|' || COALESCE(suggested,'') || '|' || COALESCE(decision_key,'')
               || '|' || COALESCE(member_key,'') || '|' || COALESCE(registry_version,'')
+              || '|' || COALESCE(resolved_at,'') || '|' || COALESCE(resolved_by,'')
            FROM fact_conflict_queue q
-          WHERE EXISTS (SELECT 1 FROM facts f WHERE f.id = q.new_fact_id)
-            AND EXISTS (SELECT 1 FROM facts f WHERE f.id = q.old_fact_id)
           ORDER BY id",
         "SELECT id || '|' || kb || '|' || decision_key || '|' || verdict
               || '|' || authority || '|' || subject_norm || '|' || relation
@@ -581,9 +593,11 @@ fn rebuild_reproduces_the_projection_from_the_journal_alone() {
         before,
         "the projection must come back identical, or the journal is not the source of truth"
     );
-    // The orphaned queue rows are the ONE place a rebuild is knowingly not
-    // identical, and it says so rather than aborting or silently dropping them.
+    // The orphaned queue rows are the ONE place the JOURNAL cannot reproduce
+    // the projection, so the rebuild leaves those rows where they are and
+    // says so: two events unreplayable, two rows preserved.
     assert_eq!(report.conflicts_skipped_orphan, 2);
+    assert_eq!(report.conflicts_preserved_orphan, 2);
     assert!(report
         .skipped
         .iter()
@@ -591,6 +605,90 @@ fn rebuild_reproduces_the_projection_from_the_journal_alone() {
     assert!(report.skipped.iter().any(|s| s.table == "chunks"));
     assert!(report.skipped.iter().any(|s| s.table == "claims"));
     assert!(report.skipped.iter().any(|s| s.table == "entities"));
+}
+
+/// Blocker 4 / ruling G4. The fixture's two orphans are the shape a real
+/// store holds ~15k of: questions whose facts were deleted by the v0.3 write
+/// path, migrated with their history intact. A rebuild that deletes the queue
+/// wholesale and then cannot recreate them destroys the only surviving record
+/// that they were ever asked.
+#[test]
+fn rebuild_preserves_orphan_conflict_rows_it_cannot_recreate() {
+    let (_tmp, db) = restore_v9();
+    let store = migrate(&db);
+    const ORPHANS: [&str; 2] = [
+        "dddddddd-0000-4000-8000-000000000002", // open
+        "dddddddd-0000-4000-8000-000000000003", // resolved
+    ];
+    let queue_before = count(&db, "SELECT COUNT(*) FROM fact_conflict_queue");
+    for id in ORPHANS {
+        assert_eq!(
+            count(
+                &db,
+                &format!("SELECT COUNT(*) FROM fact_conflict_queue WHERE id = '{id}'")
+            ),
+            1,
+            "the migration must carry {id} over"
+        );
+    }
+
+    let report = store.rebuild_projections(None, false).unwrap();
+    assert_eq!(report.conflicts_preserved_orphan, 2);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM fact_conflict_queue"),
+        queue_before,
+        "a rebuild must not shrink the queue by the rows it cannot rebuild"
+    );
+    for id in ORPHANS {
+        assert_eq!(
+            count(
+                &db,
+                &format!("SELECT COUNT(*) FROM fact_conflict_queue WHERE id = '{id}'")
+            ),
+            1,
+            "rebuild deleted orphan {id} and could not put it back"
+        );
+    }
+    assert_eq!(
+        one(
+            &db,
+            "SELECT status FROM fact_conflict_queue
+              WHERE id = 'dddddddd-0000-4000-8000-000000000003'"
+        ),
+        "resolved",
+        "a preserved orphan keeps its answer, not just its row"
+    );
+    // …and a second rebuild is still a no-op: preservation must not double.
+    let again = store.rebuild_projections(None, false).unwrap();
+    assert_eq!(again.conflicts_preserved_orphan, 2);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM fact_conflict_queue"),
+        queue_before
+    );
+}
+
+/// Blocker 5 / ruling G5. `confirmations` is a trust signal earned over
+/// months of re-assertion; a rebuild that silently returns it to zero has
+/// downgraded the store's own confidence in what it knows.
+#[test]
+fn rebuild_preserves_historical_confirmation_counts() {
+    let (_tmp, db) = restore_v9();
+    let store = migrate(&db);
+    const RE_ASSERTED: &str = "53684213-b628-41a0-9fee-372ec4a20bb0";
+    let counted = |db: &PathBuf| {
+        count(
+            db,
+            &format!("SELECT confirmations FROM facts WHERE id = '{RE_ASSERTED}'"),
+        )
+    };
+    assert_eq!(counted(&db), 7, "the migration must carry the count over");
+
+    store.rebuild_projections(None, false).unwrap();
+    assert_eq!(
+        counted(&db),
+        7,
+        "the journal has to carry the count, or a rebuild resets it to zero"
+    );
 }
 
 #[test]

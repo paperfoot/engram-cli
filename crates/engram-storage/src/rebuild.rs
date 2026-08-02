@@ -22,10 +22,16 @@
 //! 2. **`facts.kb` comes from the event's `kb` column**, never from a subquery
 //!    over `memories`. Re-running that subquery at replay time silently
 //!    re-homes every fact whose source memory later moved between KBs.
-//! 3. **An orphaned queue row is skipped and counted, not inserted.** The
-//!    queue's two FKs to `facts` are `ON DELETE CASCADE`, and a plain INSERT
-//!    of a row whose facts are gone aborts the whole rebuild. This is the one
-//!    place a rebuild is knowingly not byte-identical, and it says so.
+//! 3. **An orphaned queue row is PRESERVED, not deleted and not inserted.**
+//!    The queue's two FKs to `facts` are `ON DELETE CASCADE`, so a plain
+//!    INSERT of a row whose facts are gone aborts the whole rebuild — its
+//!    `conflict.opened` therefore cannot replay. Deleting the row first and
+//!    then declining to recreate it destroys migrated history the journal
+//!    never held; so the delete skips those rows and the report names both
+//!    numbers: `conflicts_skipped_orphan` events unreplayable,
+//!    `conflicts_preserved_orphan` rows left in place. This is the one place
+//!    a rebuild is knowingly not a pure function of the journal, and it says
+//!    so on every run.
 
 use crate::error::StorageError;
 use crate::journal::EventRow;
@@ -46,6 +52,7 @@ pub struct RebuildReport {
     pub extraction_markers: i64,
     pub lessons: i64,
     pub conflicts_skipped_orphan: usize,
+    pub conflicts_preserved_orphan: usize,
     pub embeddings_restored: usize,
     pub skipped: Vec<SkippedTable>,
 }
@@ -73,6 +80,11 @@ pub fn skipped_tables() -> Vec<SkippedTable> {
             table: "facts.embedding",
             reason: "a 768-float blob has no business in a JSON event payload; preserved across \
                      the rebuild rather than replayed",
+        },
+        SkippedTable {
+            table: "fact_conflict_queue.orphans",
+            reason: "a question whose facts are gone cannot be replayed; preserved in place \
+                     rather than deleted, and counted in conflicts_preserved_orphan",
         },
         SkippedTable {
             table: "claims",
@@ -109,7 +121,7 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
                         valid_until, resolution, source_kind, confirmations,
                         closed_by, close_reason, close_authority, kb)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11, ?12,
-                         ?13, ?14, ?15, 0, NULL, NULL, NULL, ?16)",
+                         ?13, ?14, ?15, ?16, NULL, NULL, NULL, ?17)",
                 params![
                     id.to_string(),
                     e.payload_str("source_memory_id")?,
@@ -136,6 +148,16 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<(), StorageError> {
                     e.payload_opt_str("resolution"),
                     e.payload_opt_str("source_kind")
                         .unwrap_or_else(|| "agent_extracted".to_string()),
+                    // [G5] The count the observation was made WITH. A live
+                    // insert says 0 and the `fact.confirmed` events below add
+                    // to it; a migrated row says what the v9 store had
+                    // already counted, because nothing replays those. Events
+                    // written before this field defaulted to zero, which is
+                    // what they meant.
+                    e.payload
+                        .get("confirmations")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
                     // Rule 2.
                     e.kb.clone().unwrap_or_else(|| "default".to_string()),
                 ],
@@ -481,8 +503,26 @@ impl SqliteStore {
         // whose pair straddles the boundary — a scoped rebuild that quietly
         // deletes another KB's questions is the same class of defect this lane
         // exists to fix.
+        //
+        // Rule 3 [G4]: an ORPHAN — a row whose facts are already gone — is
+        // not deleted, because the replay cannot put it back. The v0.3 write
+        // path deleted facts and the FK cascade took ~14.5k questions with
+        // them; the migration rescued what was left, and a rebuild that drops
+        // the survivors finishes the job the bug started. Preserve in place,
+        // count, and say so.
+        report.conflicts_preserved_orphan = self.conn.query_row(
+            "SELECT COUNT(*) FROM fact_conflict_queue q
+              WHERE (?1 IS NULL OR q.kb = ?1)
+                AND (NOT EXISTS (SELECT 1 FROM facts f WHERE f.id = q.new_fact_id)
+                     OR NOT EXISTS (SELECT 1 FROM facts f WHERE f.id = q.old_fact_id))",
+            params![kb],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
         self.conn.execute(
-            "DELETE FROM fact_conflict_queue WHERE (?1 IS NULL OR kb = ?1)",
+            "DELETE FROM fact_conflict_queue
+              WHERE (?1 IS NULL OR kb = ?1)
+                AND EXISTS (SELECT 1 FROM facts f WHERE f.id = new_fact_id)
+                AND EXISTS (SELECT 1 FROM facts f WHERE f.id = old_fact_id)",
             params![kb],
         )?;
         self.conn.execute(

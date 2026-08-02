@@ -452,6 +452,13 @@ pub mod payload {
         );
         m.insert("source_kind".into(), json!(f.source_kind.as_str()));
         m.insert("resolution".into(), json!(f.resolution));
+        // [G5] The count travels with the observation. A live insert carries
+        // 0 and later `fact.confirmed` events add to it; a MIGRATED row
+        // carries the whole history the v9 store had already earned, because
+        // there are no synthetic confirmations to replay. Without this field
+        // a rebuild returns every count to zero and quietly downgrades the
+        // store's confidence in what it knows.
+        m.insert("confirmations".into(), json!(f.confirmations));
         if genesis {
             m.insert("genesis".into(), json!(true));
         }
