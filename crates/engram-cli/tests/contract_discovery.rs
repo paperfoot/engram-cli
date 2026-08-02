@@ -37,6 +37,55 @@ fn help_and_version_open_no_store() {
     }
 }
 
+/// Three things must agree about which release this is, and until the gate
+/// caught it they did not: the binary shipped 0.3.1 while the CHANGELOG's top
+/// entry described 0.4.0. "The version command succeeded" is not a version
+/// test — an agent asked to report which engram it is talking to needs the
+/// answer to be true, and a store migrated by a binary that misreports its own
+/// version is a support case nobody can reconstruct.
+#[test]
+fn the_binary_the_manifest_and_the_changelog_name_the_same_release() {
+    let sb = Sandbox::new();
+    let pkg = env!("CARGO_PKG_VERSION");
+
+    let out = sb.cmd().arg("--version").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("engram {pkg}"),
+        "`engram --version` disagrees with the package version"
+    );
+
+    assert_eq!(
+        manifest(&sb)["version"],
+        pkg,
+        "agent-info reports a different version than the binary was built as"
+    );
+
+    assert_eq!(
+        top_changelog_version(),
+        pkg,
+        "the CHANGELOG's newest entry is not the version this binary claims"
+    );
+}
+
+/// The version in the first `## ` heading of the CHANGELOG, e.g. `0.4.0` from
+/// `## 0.4.0 — UNRELEASED (branch arch/v0.4)`.
+fn top_changelog_version() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../CHANGELOG.md");
+    let text = std::fs::read_to_string(&path).expect("CHANGELOG.md");
+    let heading = text
+        .lines()
+        .find(|l| l.starts_with("## "))
+        .expect("the CHANGELOG has a release heading");
+    heading
+        .trim_start_matches("## ")
+        .split_whitespace()
+        .next()
+        .expect("the heading names a version")
+        .to_string()
+}
+
 /// A typo must not create a database, and must not exit 2 — our own table
 /// reads 2 as "your setup is broken", which sent agents to `config check`
 /// for a mistyped flag.
