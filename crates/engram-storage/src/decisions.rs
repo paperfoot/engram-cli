@@ -118,7 +118,25 @@ impl SqliteStore {
     /// `IS NULL`, and so there is no prior value for a bad backfill to destroy.
     pub(crate) fn migrate_v12(&self) -> Result<(), StorageError> {
         self.add_column_if_missing("fact_decisions", "loser_object_norm", "TEXT")?;
-        self.conn.execute(
+        self.backfill_decision_orientation()?;
+        Ok(())
+    }
+
+    /// Write down which value each unoriented directional decision retired,
+    /// read from the conflict row it answered. Returns the number of rows it
+    /// could orient.
+    ///
+    /// Idempotent and per-row: `IS NULL` means it never overwrites a recorded
+    /// orientation, and a row whose evidence is gone is skipped rather than
+    /// guessed at. Separated from [`SqliteStore::migrate_v12`] because the
+    /// migration is not the only place that loses this column — `admin
+    /// rebuild` deletes `fact_decisions` and replays `decision.recorded`, and
+    /// an event written before schema v12 carries no `loser_object_norm`, so a
+    /// rebuilt store drops back to NULL. That is safe in direction (those pairs
+    /// queue rather than reversing [G10]) but it discards work the store had
+    /// already done, and this is the call that would put it back.
+    pub(crate) fn backfill_decision_orientation(&self) -> Result<usize, StorageError> {
+        let n = self.conn.execute(
             "UPDATE fact_decisions
                 SET loser_object_norm = (
                     SELECT f.object_norm
@@ -134,7 +152,7 @@ impl SqliteStore {
                 AND verdict IN ('close_old', 'reject_new')",
             [],
         )?;
-        Ok(())
+        Ok(n)
     }
 
     /// Append `decision.recorded` and insert the projection row, in one
@@ -908,6 +926,11 @@ mod tests {
                 .as_deref(),
             Some("lisbon"),
             "the conflict row named the loser; the migration had to read it"
+        );
+        assert_eq!(
+            store.backfill_decision_orientation().unwrap(),
+            0,
+            "the sweep is idempotent: a second pass has nothing left to orient"
         );
 
         // The cascade that used to erase the orientation. `kb delete` removes
