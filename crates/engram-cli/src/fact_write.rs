@@ -246,6 +246,7 @@ fn resolve_valid_from(
 fn resolve_valid_until(
     ef: &ExtractedFact,
     valid_from: Option<DateTime<Utc>>,
+    state: ObservationState,
 ) -> (Option<DateTime<Utc>>, Option<PlanNote>) {
     let supplied = ef
         .valid_until
@@ -263,14 +264,22 @@ fn resolve_valid_until(
             }),
         );
     };
-    if let Some(from) = valid_from {
-        if parsed < from {
-            return (
-                None,
-                Some(PlanNote::ValidUntilBeforeValidFrom {
-                    raw: truncate_for_report(raw),
-                }),
-            );
+    // The ordering check applies to an assertion that carries its own window.
+    // A CESSATION has no window of its own — "she stopped taking it in June"
+    // says nothing about when she started, so its `valid_from` is only the
+    // date the store heard about it, and comparing the two would throw away
+    // every end date older than the memory reporting it. The interval that
+    // actually closes is clamped against ITS own start at close time.
+    if state == ObservationState::Ongoing {
+        if let Some(from) = valid_from {
+            if parsed < from {
+                return (
+                    None,
+                    Some(PlanNote::ValidUntilBeforeValidFrom {
+                        raw: truncate_for_report(raw),
+                    }),
+                );
+            }
         }
     }
     (Some(parsed), None)
@@ -672,7 +681,7 @@ fn build_observation(
             .date_warnings
             .push(warning.to_json(&subject, &relation));
     }
-    let (valid_until, until_note) = resolve_valid_until(ef, valid_from);
+    let (valid_until, until_note) = resolve_valid_until(ef, valid_from, state);
     if let Some(note) = until_note {
         outcome.plan_notes.push(note.to_json(&subject, &relation));
     }
@@ -905,10 +914,14 @@ fn apply_plan(
     embedding: Option<&[f32]>,
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), CliError> {
-    let inserted = plan
-        .insert
-        .as_ref()
-        .map(|_| observation.to_fact(Utc::now()));
+    // The PLAN owns the interval, not the observation: a cessation with
+    // nothing to close is dated from the end it states, not from the memory
+    // that reported it.
+    let inserted = plan.insert.as_ref().map(|planned| {
+        let mut fact = observation.to_fact(Utc::now());
+        fact.valid_from = Some(planned.interval.from);
+        fact
+    });
     if let (Some(fact), Some(planned)) = (inserted.as_ref(), plan.insert.as_ref()) {
         ctx.store.insert_fact(fact)?;
         if let (Some(emb), Some(embedder)) = (embedding, w.embedder) {
@@ -1222,7 +1235,8 @@ mod tests {
     #[test]
     fn a_readable_end_date_closes_the_interval() {
         let ef = ending("takes_medication", "metformin", Some("2026-06-01"));
-        let (until, note) = resolve_valid_until(&ef, Some(moment("2026-01-01")));
+        let (until, note) =
+            resolve_valid_until(&ef, Some(moment("2026-01-01")), ObservationState::Ongoing);
         assert_eq!(until.unwrap(), moment("2026-06-01"));
         assert!(note.is_none());
         assert!(ef.says_ended());
@@ -1233,7 +1247,8 @@ mod tests {
         // A guessed end date closes an interval that is still running — the
         // safety failure, arriving through the date parser.
         let ef = ending("takes_medication", "metformin", Some("some time last year"));
-        let (until, note) = resolve_valid_until(&ef, Some(moment("2026-01-01")));
+        let (until, note) =
+            resolve_valid_until(&ef, Some(moment("2026-01-01")), ObservationState::Ongoing);
         assert_eq!(until, None);
         assert!(matches!(note, Some(PlanNote::UnreadableValidUntil { .. })));
     }
@@ -1241,7 +1256,8 @@ mod tests {
     #[test]
     fn an_end_before_the_start_is_dropped_not_stored_backwards() {
         let ef = ending("lives_in", "Lisbon", Some("2019-01-01"));
-        let (until, note) = resolve_valid_until(&ef, Some(moment("2026-01-01")));
+        let (until, note) =
+            resolve_valid_until(&ef, Some(moment("2026-01-01")), ObservationState::Ongoing);
         assert_eq!(until, None);
         assert!(matches!(
             note,
@@ -1252,7 +1268,8 @@ mod tests {
     #[test]
     fn no_end_date_is_not_a_warning() {
         let ef = extracted("lives_in", "Lisbon", None);
-        let (until, note) = resolve_valid_until(&ef, Some(moment("2026-01-01")));
+        let (until, note) =
+            resolve_valid_until(&ef, Some(moment("2026-01-01")), ObservationState::Ongoing);
         assert_eq!(until, None);
         assert!(note.is_none());
         assert!(!ef.says_ended(), "silence is not a cessation");

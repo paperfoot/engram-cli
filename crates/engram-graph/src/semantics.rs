@@ -994,7 +994,14 @@ pub fn plan_write(
         id: observation.fact_id,
         fact_type: observation.fact_type,
         interval: observation.interval,
-        close: None,
+        // "Elias lived in London FROM 2015 UNTIL 2020" opens an interval that
+        // is already closed. The row is born, then closed, so the journal
+        // records an end the text stated rather than a row that arrives mute
+        // and dead.
+        close: observation
+            .interval
+            .until
+            .map(|_| (CloseReason::Stopped, CloseAuthority::ExplicitEnd)),
     });
 
     for old in siblings.iter().filter(|f| f.id != observation.fact_id) {
@@ -1066,16 +1073,18 @@ fn plan_cessation(observation: &Observation, siblings: &[Fact], plan: &mut Write
         closed_any = true;
     }
     if !closed_any {
-        let open = Interval {
-            from: observation.interval.from,
-            until: None,
-        };
+        // The utterance gives an END and no beginning, so the honest interval
+        // is a POINT at the stated end: the store knows the state held up to
+        // then and nothing about when it started. Dating it from the memory
+        // instead would clamp the close forward to "now" and record a
+        // medication that ended today.
+        let from = observation.interval.from.min(end_at);
         plan.insert = Some(PlannedFact {
             id: observation.fact_id,
             fact_type: observation.fact_type,
             interval: Interval {
-                from: observation.interval.from,
-                until: Some(close_at(&open, end_at)),
+                from,
+                until: Some(end_at),
             },
             close: Some((CloseReason::Stopped, CloseAuthority::ExplicitEnd)),
         });
