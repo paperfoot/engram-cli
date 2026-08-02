@@ -804,6 +804,39 @@ pub fn triage(
                     }
                     continue;
                 }
+                // Claim BEFORE any mutation (final-review finding 1): the
+                // queue row is the lock, and `engine/resolve.rs` already
+                // learned this order the hard way. A caller's `facts resolve`
+                // that lands between our snapshot and this write WINS — the
+                // sweep must never touch the facts of a question somebody just
+                // answered. `Ok(None)` is a lost claim: skip the pair, count
+                // it, and let the next listing show whatever the winner did.
+                if !dry_run {
+                    let key = match row.decision_key.clone() {
+                        Some(k) if !k.is_empty() => k,
+                        _ => SemanticKey::for_pair(&FactView::of(new_f), &FactView::of(old_f))
+                            .encode(),
+                    };
+                    let claimed = store.resolve_conflict_with_decision(
+                        row.id,
+                        &row.kb,
+                        &row.diary,
+                        &key,
+                        triage_decision(&verdict).as_str(),
+                        "machine",
+                        "triage",
+                        Some(&format!(
+                            "auto: {} ({})",
+                            verdict.rule,
+                            class_name(verdict.class)
+                        )),
+                        SEMANTIC_KEY_VERSION,
+                    )?;
+                    if claimed.is_none() {
+                        *kept_by_reason.entry("lost_claim").or_insert(0) += 1;
+                        continue;
+                    }
+                }
                 if resolved_samples.len() < 5 {
                     resolved_samples.push(triage_sample(row, new_f, old_f, &verdict));
                 }
@@ -848,33 +881,6 @@ pub fn triage(
                             }
                         }
                     }
-                }
-                if !dry_run {
-                    // A sweep that resolves a question and records nothing has
-                    // to ask it again on the next re-derivation. Every triage
-                    // resolution is `authority = machine`, and only its
-                    // `keep_both` verdicts bind a later write — the ledger's
-                    // own precedence rule, not this file's.
-                    let key = match row.decision_key.clone() {
-                        Some(k) if !k.is_empty() => k,
-                        _ => SemanticKey::for_pair(&FactView::of(new_f), &FactView::of(old_f))
-                            .encode(),
-                    };
-                    store.resolve_conflict_with_decision(
-                        row.id,
-                        &row.kb,
-                        &row.diary,
-                        &key,
-                        triage_decision(&verdict).as_str(),
-                        "machine",
-                        "triage",
-                        Some(&format!(
-                            "auto: {} ({})",
-                            verdict.rule,
-                            class_name(verdict.class)
-                        )),
-                        SEMANTIC_KEY_VERSION,
-                    )?;
                 }
             }
             Ok(())

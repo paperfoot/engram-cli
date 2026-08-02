@@ -151,9 +151,15 @@ struct FactSeed {
 
 impl SqliteStore {
     /// The whole v9→v10 step, inside the caller's migration transaction.
-    pub(crate) fn migrate_v10(&self) -> Result<MigrationV10Report, StorageError> {
+    pub(crate) fn migrate_v10(
+        &self,
+        backup_path: Option<PathBuf>,
+    ) -> Result<MigrationV10Report, StorageError> {
         let started = std::time::Instant::now();
-        let mut report = MigrationV10Report::default();
+        let mut report = MigrationV10Report {
+            backup_path,
+            ..Default::default()
+        };
 
         self.v10_ddl()?;
         let (backfilled, closed) = self.v10_interval_backfill()?;

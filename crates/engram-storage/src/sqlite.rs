@@ -930,12 +930,16 @@ impl SqliteStore {
         // INTO cannot run inside one. Only for a store that already exists and
         // is behind — a fresh store has nothing to back up, and an up-to-date
         // one must not pay for a copy on every CLI invocation.
+        let mut backup_path = None;
         if let Some(v) = store.try_schema_version()? {
             if v < 10 && store.path != Path::new(":memory:") {
-                crate::backup::vacuum_into_backup(&store.conn, &store.path)?;
+                // Captured, not discarded: the migration log records where
+                // the rollback file went (final-review finding 5) — a backup
+                // an operator cannot find is a backup that does not exist.
+                backup_path = Some(crate::backup::vacuum_into_backup(&store.conn, &store.path)?);
             }
         }
-        store.migrate()?;
+        store.migrate(backup_path)?;
         Ok(store)
     }
 
@@ -946,7 +950,7 @@ impl SqliteStore {
             conn,
             path: PathBuf::from(":memory:"),
         };
-        store.migrate()?;
+        store.migrate(None)?;
         Ok(store)
     }
 
@@ -999,7 +1003,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn migrate(&self) -> Result<(), StorageError> {
+    fn migrate(&self, backup_path: Option<PathBuf>) -> Result<(), StorageError> {
         // Fast read-only path: an up-to-date database needs no DDL and no
         // version stamp. This keeps `open()` write-free for concurrent
         // daemon + CLI access.
@@ -1058,7 +1062,7 @@ impl SqliteStore {
                 s.migrate_v9()?;
             }
             if current < 10 {
-                s.migrate_v10()?;
+                s.migrate_v10(backup_path.clone())?;
             }
             // v11 is additive-only (D25): a new table and two indexes, no
             // backfill and no row rewrite, so it takes no `VACUUM INTO`
@@ -3178,11 +3182,19 @@ impl SqliteStore {
                     .collect()
             };
             for id in stale {
+                // `caller`, not `explicit_end` (final-review finding 2): this
+                // sweep completes a retraction a person already ordered — it
+                // holds the forget-caller's authority, not text evidence. An
+                // `explicit_end` stamp here would let a machine sweep close
+                // safety intervals with an authority it never had.
                 if self.close_fact_interval(
                     id,
                     chrono::Utc::now(),
                     CloseReason::RetractedSource.as_str(),
-                    CloseAuthority::ExplicitEnd.as_str(),
+                    CloseAuthority::Caller {
+                        actor: "repair".to_string(),
+                    }
+                    .as_str(),
                     None,
                     None,
                 )? {

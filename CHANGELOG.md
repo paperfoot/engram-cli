@@ -14,6 +14,16 @@ migration writes a `VACUUM INTO` backup beside the store before touching a row.
   `{"deleted": false}`, so a typo was indistinguishable from a successful
   retraction. `deleted` keeps its meaning; `already_retracted` disambiguates
   the idempotent case.
+- `forget` no longer erases the memory's facts. Like `edit`, it closes them
+  as intervals (`close_reason: "retracted_source"`, authority `caller`) and
+  reports `facts_closed`/`facts_closed_ids`. A script that asserted facts
+  vanished after `deleted: true` will find them present-but-closed; `facts
+  list` labels them `[closed: retracted_source]` and excludes them from
+  active reads.
+- `kb delete --confirm` remains a hard delete of the KB's projections (its
+  journal events survive). It is the one deliberately destructive KB-level
+  command and is documented as such rather than journalled — the append-only
+  guarantees apply to memory- and fact-level operations.
 - `edit --content` no longer deletes the memory's facts. They close as
   intervals (`close_reason: "corrected"`, authority `caller`) and the response
   says so: `facts_invalidated`, `facts_invalidated_ids`, `reextraction`.
