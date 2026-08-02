@@ -933,9 +933,223 @@ fn the_duplicate_content_path_stamps_the_same_source_kind() {
     let rows = facts(dir.path());
     assert_eq!(rows, vec![("Ana".to_string(), "user_stated".to_string())]);
 }
+
 // ---------------------------------------------------------------------------
-// Isolation guard
+// W7 — export v3 carries the journal, and import replays it
 // ---------------------------------------------------------------------------
+
+fn export_to_file(dir: &Path, file: &Path) -> Value {
+    let v = run_json(&mut engram(dir), &["export"]);
+    std::fs::write(file, serde_json::to_vec(&v["data"]).unwrap()).expect("export written");
+    v
+}
+
+#[test]
+fn export_emits_version_3_with_a_journal_slice_and_every_v2_section() {
+    let dir = store();
+    seed_with_facts(dir.path(), "Ana moved to Lisbon.", ANA_LISBON);
+    let v = run_json(&mut engram(dir.path()), &["export"]);
+    let data = &v["data"];
+    assert_eq!(data["version"], 3);
+    assert!(data["schema_version"].as_i64().unwrap() >= 10);
+    let events = data["events"].as_array().expect("a journal slice");
+    assert!(!events.is_empty());
+    assert_eq!(data["counts"]["events"], events.len());
+    // A v2 consumer still finds everything where it left it.
+    for section in ["kbs", "documents", "memories", "chunks", "facts"] {
+        assert!(data[section].is_array(), "missing {section}");
+    }
+    assert!(data["chunks"][0]["embedding_b64"].is_string());
+}
+
+#[test]
+fn export_then_import_round_trips_into_an_empty_store() {
+    let source = store();
+    let id = seed_with_facts(source.path(), "Ana moved to Lisbon.", TWO_FACTS);
+    let file = source.path().join("backup.json");
+    export_to_file(source.path(), &file);
+
+    let target = store();
+    let v = run_json(
+        &mut engram(target.path()),
+        &["import", file.to_str().unwrap()],
+    );
+    assert_eq!(v["data"]["format_version"], 3);
+    assert!(v["data"]["replayed"]["events"].as_u64().unwrap() > 0);
+    assert!(v["data"]["imported"]["chunks"].as_u64().unwrap() >= 1);
+
+    let before = open(source.path());
+    let after = open(target.path());
+    let mut a: Vec<Uuid> = before
+        .list_facts(None, true, 50)
+        .unwrap()
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    let mut b: Vec<Uuid> = after
+        .list_facts(None, true, 50)
+        .unwrap()
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "the same facts, with the same ids");
+    // The vectors came across, so recall works without a reindex.
+    assert_eq!(after.chunks_for_memory(uuid(&id)).unwrap().len(), 1);
+    let recalled = run_json(
+        &mut engram(target.path()),
+        &["recall", "Lisbon", "--kb", "*"],
+    );
+    assert_eq!(recalled["status"], "success");
+}
+
+#[test]
+#[ignore = "blocked on storage-journal: export_memories filters `deleted = 0` (sqlite.rs:5350) while \
+            export_facts still carries the intervals forget closed, so importing a store that has \
+            ever been forgotten from fails on the facts.source_memory_id FK. Needs `deleted` in \
+            MemoryExportRow + an export that carries retracted rows — a storage schema change, not \
+            a CLI one. Reported as WR-11."]
+fn a_round_trip_preserves_closed_intervals() {
+    let source = store();
+    let id = seed_with_facts(source.path(), "Ana moved to Lisbon.", ANA_LISBON);
+    run_json(&mut engram(source.path()), &["forget", &id, "--confirm"]);
+    let file = source.path().join("backup.json");
+    export_to_file(source.path(), &file);
+
+    let target = store();
+    run_json(
+        &mut engram(target.path()),
+        &["import", file.to_str().unwrap()],
+    );
+    let f = &open(target.path()).list_facts(None, true, 50).unwrap()[0];
+    assert!(f.valid_until.is_some(), "a closed interval crossed intact");
+    assert_eq!(f.close_reason.as_deref(), Some("retracted_source"));
+}
+
+#[test]
+fn importing_the_same_v3_file_twice_adds_nothing() {
+    let source = store();
+    seed_with_facts(source.path(), "Ana moved to Lisbon.", ANA_LISBON);
+    let file = source.path().join("backup.json");
+    export_to_file(source.path(), &file);
+
+    let target = store();
+    run_json(
+        &mut engram(target.path()),
+        &["import", file.to_str().unwrap()],
+    );
+    let events = open(target.path()).count_events().unwrap();
+    let facts_before = open(target.path())
+        .list_facts(None, true, 50)
+        .unwrap()
+        .len();
+
+    let second = run_json(
+        &mut engram(target.path()),
+        &["import", file.to_str().unwrap()],
+    );
+    assert_eq!(second["data"]["replayed"]["events"], 0);
+    assert!(
+        second["data"]["skipped_existing"]["events"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(open(target.path()).count_events().unwrap(), events);
+    assert_eq!(
+        open(target.path())
+            .list_facts(None, true, 50)
+            .unwrap()
+            .len(),
+        facts_before
+    );
+}
+
+#[test]
+fn importing_a_v2_file_synthesizes_a_journal() {
+    // A v2 file has no events. A store restored without a journal cannot be
+    // rebuilt or audited, so one is synthesized from the rows it does carry.
+    let source = store();
+    seed_with_facts(source.path(), "Ana moved to Lisbon.", ANA_LISBON);
+    let v = run_json(&mut engram(source.path()), &["export"]);
+    let mut body = v["data"].clone();
+    body["version"] = serde_json::json!(2);
+    body.as_object_mut().unwrap().remove("events");
+    let file = source.path().join("v2.json");
+    std::fs::write(&file, serde_json::to_vec(&body).unwrap()).unwrap();
+
+    let target = store();
+    let imported = run_json(
+        &mut engram(target.path()),
+        &["import", file.to_str().unwrap()],
+    );
+    assert_eq!(imported["data"]["format_version"], 2);
+    assert!(imported["data"]["genesis_events"].as_u64().unwrap() > 0);
+    assert!(open(target.path()).count_events().unwrap() > 0);
+}
+
+#[test]
+fn importing_a_v1_file_still_works() {
+    let dir = store();
+    let legacy = serde_json::json!({
+        "version": 1,
+        "memories": [{
+            "id": Uuid::new_v4().to_string(),
+            "content": "A legacy memory, long enough to chunk into something real.",
+            "created_at": "2026-01-01T00:00:00Z",
+            "event_time": null,
+            "importance": 5,
+            "emotional_weight": 0,
+            "access_count": 0,
+            "last_accessed": null,
+            "stability": 1.0,
+            "source": "manual",
+            "diary": "default",
+            "valid_from": null,
+            "valid_until": null,
+            "tags": []
+        }]
+    });
+    let file = dir.path().join("v1.json");
+    std::fs::write(&file, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    let v = run_json(&mut engram(dir.path()), &["import", file.to_str().unwrap()]);
+    assert_eq!(v["data"]["format_version"], 1);
+    assert_eq!(v["data"]["imported"], 1);
+    // `insert_memory` journals its own `memory.written`, so even the legacy
+    // path lands with a history.
+    assert!(open(dir.path()).count_events().unwrap() > 0);
+}
+
+#[test]
+fn a_malformed_slice_is_rejected_and_changes_nothing() {
+    let source = store();
+    seed_with_facts(source.path(), "Ana moved to Lisbon.", ANA_LISBON);
+    let v = run_json(&mut engram(source.path()), &["export"]);
+    let mut body = v["data"].clone();
+    body["events"][0]["ts"] = serde_json::json!("the day before yesterday");
+    let file = source.path().join("broken.json");
+    std::fs::write(&file, serde_json::to_vec(&body).unwrap()).unwrap();
+
+    let target = store();
+    // Storage rejects it — uniformly, so a daemon import refuses the same file.
+    let err = run_err(
+        &mut engram(target.path()),
+        &["import", file.to_str().unwrap()],
+        3,
+    );
+    assert!(
+        ["bad_input", "malformed_json"]
+            .contains(&err["error"]["code"].as_str().unwrap_or_default()),
+        "{err}"
+    );
+    assert_eq!(open(target.path()).count_events().unwrap(), 0);
+    assert!(open(target.path())
+        .list_facts(None, true, 10)
+        .unwrap()
+        .is_empty());
+}
 
 #[test]
 fn the_store_under_test_is_the_temp_dir() {
