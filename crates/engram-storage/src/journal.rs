@@ -542,12 +542,18 @@ pub mod payload {
     /// `collapsed_into` is additive and set only by the migration's
     /// duplicate-key collapse, so `status='superseded_question'` is
     /// rebuildable rather than inferred from note text.
+    ///
+    /// `loser_object_norm` is what makes a decision replayable in the right
+    /// DIRECTION [G3]. It is dropped when absent, so a `keep_both` and a
+    /// pre-v12 genesis event carry no key at all rather than a null that reads
+    /// like a recorded "nothing".
     #[allow(clippy::too_many_arguments)]
     pub fn decision_recorded(
         decision_id: Uuid,
         semantic_key: &str,
         key_version: &str,
         verdict: &str,
+        loser_object_norm: Option<&str>,
         authority: &str,
         conflict_id: Option<Uuid>,
         note: Option<&str>,
@@ -563,6 +569,7 @@ pub mod payload {
         m.insert("semantic_key".into(), json!(semantic_key));
         m.insert("key_version".into(), json!(key_version));
         m.insert("verdict".into(), json!(verdict));
+        m.insert("loser_object_norm".into(), json!(loser_object_norm));
         m.insert("authority".into(), json!(authority));
         m.insert(
             "conflict_id".into(),

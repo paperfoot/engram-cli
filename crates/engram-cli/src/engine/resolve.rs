@@ -100,6 +100,12 @@ fn resolve_in_tx(w: &WriteCtx<'_>, req: ResolveRequest) -> Result<ResolveApplied
         ResolveAction::RejectNew => DecisionVerdict::RejectNew,
         ResolveAction::KeepBoth => DecisionVerdict::KeepBoth,
     };
+    // WHICH value this ruling retires [G3], recorded on the decision itself.
+    // The queue row knows it too, but the queue row is destructible — a `kb
+    // delete` cascades it through the fact foreign keys and leaves the decision
+    // behind — and a decision that has outlived its orientation replays on pair
+    // order, which is how the caller's kept dose became the closed one.
+    let loser = closing.map(|f| f.object_norm.clone());
 
     // THE CLAIM. A conditional `UPDATE … WHERE status='open'` inside this
     // transaction: `None` means somebody else adjudicated first, and the loser
@@ -111,6 +117,7 @@ fn resolve_in_tx(w: &WriteCtx<'_>, req: ResolveRequest) -> Result<ResolveApplied
             &row.diary,
             &key,
             verdict.as_str(),
+            loser.as_deref(),
             "caller",
             &req.actor,
             req.note.as_deref(),

@@ -987,9 +987,10 @@ fn record_losing(
     }
 }
 
-/// `replay` against a pair spelled (new, old) in that order.
+/// `replay` against a pair spelled (new, old) in that order, on `lives_in` —
+/// an ordinary relation. The safety cases spell their own call.
 fn replayed(prior: &DecisionRecord, current: Verdict, new: &str, old: &str) -> ReplayOutcome {
-    replay(prior, current, new, old)
+    replay(prior, current, new, old, false)
 }
 
 fn applied(outcome: ReplayOutcome) -> Option<(ConflictClass, &'static str)> {
@@ -1070,6 +1071,69 @@ fn a_decision_whose_loser_is_on_neither_side_does_not_replay() {
     assert_eq!(
         replayed(&close, queued, "porto", "lisbon"),
         ReplayOutcome::Unmatched
+    );
+}
+
+/// The blocker, at the layer that decides it. A decision with no recorded
+/// loser and no conflict row left to recover one from knows only that SOMETHING
+/// lost. On a medication that is not enough to close an interval with.
+#[test]
+fn an_unprovable_orientation_never_retires_a_safety_value() {
+    let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
+    for verdict in [DecisionVerdict::CloseOld, DecisionVerdict::RejectNew] {
+        let orphaned = record(verdict, DecisionAuthority::Caller);
+        assert_eq!(
+            replay(
+                &orphaned,
+                queued,
+                "metformin 1000 mg",
+                "metformin 500 mg",
+                true
+            ),
+            ReplayOutcome::Directionless,
+            "pair order is not evidence of which dose the caller retired"
+        );
+        // Off a safety relation the legacy row still replays positionally:
+        // re-asking about every city a pre-v12 store ever settled would be a
+        // worse trade than repeating the old convention.
+        assert!(matches!(
+            replay(&orphaned, queued, "porto", "lisbon", false),
+            ReplayOutcome::Applied(_)
+        ));
+    }
+}
+
+/// …and the recorded loser is what buys the safety pair its replay back. The
+/// same reversed pair that queues above binds here, in the direction the caller
+/// chose rather than the one the re-derivation happened to emit.
+#[test]
+fn a_recorded_loser_replays_on_a_safety_relation_in_either_order() {
+    let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
+    let close = record_losing(
+        DecisionVerdict::CloseOld,
+        DecisionAuthority::Caller,
+        "metformin 500 mg",
+    );
+    assert_eq!(
+        applied(replay(
+            &close,
+            queued,
+            "metformin 1000 mg",
+            "metformin 500 mg",
+            true
+        )),
+        Some((ConflictClass::SupersedeOld, "replayed_close_old"))
+    );
+    assert_eq!(
+        applied(replay(
+            &close,
+            queued,
+            "metformin 500 mg",
+            "metformin 1000 mg",
+            true
+        )),
+        Some((ConflictClass::SupersedeNew, "replayed_reject_new")),
+        "reversed derivation, same retired dose"
     );
 }
 
@@ -1159,9 +1223,14 @@ fn a_caller_close_old_reapplies_silently_on_a_safety_relation() {
     let p = plan(&observation, std::slice::from_ref(&old));
     assert_eq!(p.queue.len(), 1);
 
+    let key = SemanticKey::for_pair(&FactView::of(&new), &FactView::of(&old)).encode();
     let decided: HashMap<String, DecisionRecord> = [(
-        SemanticKey::for_pair(&FactView::of(&new), &FactView::of(&old)).encode(),
-        record(DecisionVerdict::CloseOld, DecisionAuthority::Caller),
+        key.clone(),
+        record_losing(
+            DecisionVerdict::CloseOld,
+            DecisionAuthority::Caller,
+            "metformin 500 mg",
+        ),
     )]
     .into_iter()
     .collect();
@@ -1181,6 +1250,29 @@ fn a_caller_close_old_reapplies_silently_on_a_safety_relation() {
         matches!(p.closes[0].authority, CloseAuthority::ReplayedCaller { .. }),
         "a replayed CALLER decision is what entitles a safety close"
     );
+
+    // The SAME ruling with no recorded loser and no conflict row left to
+    // recover one from closes nothing. Pair order is not a proof of who lost,
+    // and on a dose it is the difference between 500 mg and 1000 mg.
+    let orphaned: HashMap<String, DecisionRecord> = [(
+        key,
+        record(DecisionVerdict::CloseOld, DecisionAuthority::Caller),
+    )]
+    .into_iter()
+    .collect();
+    let prior = |k: &SemanticKey| Ok(orphaned.get(&k.encode()).cloned());
+    let p = plan_write(
+        &observation,
+        std::slice::from_ref(&old),
+        &[],
+        ClassifyMode::Write,
+        &prior,
+    )
+    .unwrap();
+    assert!(p.closes.is_empty());
+    assert!(p.replays.is_empty());
+    assert_eq!(p.queue.len(), 1);
+    assert_eq!(p.queue[0].verdict.rule, "replay_orientation_unknown");
 }
 
 /// BLOCKER 3, as the gate reproduced it. Carol is queued on Acme vs Beta

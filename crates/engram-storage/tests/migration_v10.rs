@@ -213,6 +213,15 @@ fn a_v9_store_migrates_to_v10_with_every_object() {
             "fact_conflict_queue.{col} missing"
         );
     }
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM pragma_table_info('fact_decisions')
+              WHERE name = 'loser_object_norm'"
+        ),
+        1,
+        "the v12 column must exist however the store reached the current version"
+    );
     for idx in [
         "idx_facts_open_interval",
         "idx_facts_relation",
@@ -393,6 +402,41 @@ fn resolved_queue_rows_become_decisions_with_inferred_verdicts() {
         ),
         0
     );
+    // G3. The v9 supersession pointers already say WHICH value lost, so the
+    // migrated decisions arrive oriented — a legacy ruling should not depend
+    // forever on a queue row that a later `kb delete` can cascade away.
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM fact_decisions d
+              WHERE d.verdict IN ('close_old','reject_new')
+                AND d.loser_object_norm IS NULL"
+        ),
+        0,
+        "a directional decision with no recorded loser replays on pair order"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM fact_decisions d
+               JOIN fact_conflict_queue q ON q.id = d.conflict_id
+               JOIN facts f ON f.id = CASE d.verdict WHEN 'close_old'
+                                      THEN q.old_fact_id ELSE q.new_fact_id END
+              WHERE d.verdict IN ('close_old','reject_new')
+                AND d.loser_object_norm <> f.object_norm"
+        ),
+        0,
+        "the recorded loser must be the value the verdict retired"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM fact_decisions
+              WHERE verdict IN ('keep_both','void') AND loser_object_norm IS NOT NULL"
+        ),
+        0,
+        "a verdict that retires nothing must record nothing"
+    );
 }
 
 #[test]
@@ -561,9 +605,14 @@ fn projection_digest(db: &PathBuf) -> Vec<String> {
               || '|' || COALESCE(resolved_at,'') || '|' || COALESCE(resolved_by,'')
            FROM fact_conflict_queue q
           ORDER BY id",
+        // `loser_object_norm` is in the digest because it is the one column a
+        // rebuild cannot re-derive: the queue row it was taken from may be
+        // gone by then, so the event has to carry it or the orientation is
+        // lost on the next `admin rebuild` [G3].
         "SELECT id || '|' || kb || '|' || decision_key || '|' || verdict
               || '|' || authority || '|' || subject_norm || '|' || relation
               || '|' || pair_hash || '|' || COALESCE(conflict_id,'')
+              || '|' || COALESCE(loser_object_norm,'')
            FROM fact_decisions ORDER BY id",
         "SELECT content_hash || '|' || extractor_id || '|' || memory_id || '|' || fact_count
            FROM derivations ORDER BY content_hash, extractor_id",

@@ -29,6 +29,13 @@ pub struct DecisionRow {
     pub relation: String,
     pub pair_hash: String,
     pub verdict: String,
+    /// The `object_norm` of the value this verdict RETIRED [G3]. The semantic
+    /// key names the QUESTION and sorts its object pair, so it cannot say which
+    /// side lost; without this column a replay onto a re-derived pair falls
+    /// back to pair ORDER, and a reversed derivation retires the value the
+    /// caller kept. `None` on a `keep_both`/`void` (nothing lost) and on any
+    /// row written before schema v12.
+    pub loser_object_norm: Option<String>,
     pub authority: String,
     pub actor: String,
     pub note: Option<String>,
@@ -50,7 +57,8 @@ pub enum InsertOutcome {
 }
 
 const DECISION_COLUMNS: &str = "id, kb, diary, decision_key, subject_norm, relation, pair_hash,
-     verdict, authority, actor, note, conflict_id, event_id, key_version, decided_at";
+     verdict, authority, actor, note, conflict_id, event_id, key_version, decided_at,
+     loser_object_norm";
 
 fn parse_decision_row(r: &rusqlite::Row) -> rusqlite::Result<DecisionRow> {
     let id: String = r.get(0)?;
@@ -75,12 +83,32 @@ fn parse_decision_row(r: &rusqlite::Row) -> rusqlite::Result<DecisionRow> {
         decided_at: DateTime::parse_from_rfc3339(&decided_at)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or(DateTime::UNIX_EPOCH),
+        // Last on purpose: appended by the v12 ALTER, so it sits after
+        // `decided_at` in `PRAGMA table_info` order and in this SELECT.
+        loser_object_norm: r.get(15)?,
     })
 }
 
 impl SqliteStore {
+    /// v11 → v12. One additive column: `fact_decisions.loser_object_norm`.
+    ///
+    /// Additive-only, so per D25 it takes no `VACUUM INTO` backup — that rule
+    /// exists for migrations that rewrite rows, and this one rewrites nothing.
+    /// The rows already in the table stay `NULL`, which reads as NOT RECORDED
+    /// rather than "no loser"; `engram-graph` recovers those from the conflict
+    /// row they answered, and refuses to guess when it cannot.
+    pub(crate) fn migrate_v12(&self) -> Result<(), StorageError> {
+        self.add_column_if_missing("fact_decisions", "loser_object_norm", "TEXT")?;
+        Ok(())
+    }
+
     /// Append `decision.recorded` and insert the projection row, in one
     /// transaction. The event id is internal; the decision id comes back.
+    ///
+    /// `loser_object_norm` is the value this verdict retires [G3] — the
+    /// `object_norm` of the fact that closes, `None` when nothing closes. It
+    /// goes into the event as well as the row, so `admin rebuild` restores an
+    /// orientation instead of dropping back to pair order.
     ///
     /// A malformed key is `MalformedRow`, never three silently blank columns:
     /// a decision that cannot be decomposed cannot be looked up either, and a
@@ -92,6 +120,7 @@ impl SqliteStore {
         diary: &str,
         key_encoded: &str,
         verdict: &str,
+        loser_object_norm: Option<&str>,
         authority: &str,
         actor: &str,
         note: Option<&str>,
@@ -116,6 +145,7 @@ impl SqliteStore {
                         key_encoded,
                         key_version,
                         verdict,
+                        loser_object_norm,
                         authority,
                         conflict_id,
                         note,
@@ -133,8 +163,8 @@ impl SqliteStore {
             s.conn.execute(
                 "INSERT INTO fact_decisions(id, kb, diary, decision_key, subject_norm, relation,
                         pair_hash, verdict, authority, actor, note, conflict_id, event_id,
-                        key_version, decided_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        key_version, decided_at, loser_object_norm)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     id.to_string(),
                     kb,
@@ -151,6 +181,7 @@ impl SqliteStore {
                     event_id.to_string(),
                     key_version,
                     decided_at.to_rfc3339(),
+                    loser_object_norm,
                 ],
             )?;
             Ok(id)
@@ -218,6 +249,9 @@ impl SqliteStore {
     /// success it did not perform. The old `facts resolve` path was
     /// non-transactional and ignored the claim boolean, so two racing resolves
     /// superseded both facts and both reported success.
+    ///
+    /// `loser_object_norm` [G3] is the caller's: the queue row names two facts,
+    /// and only the caller knows which of them its `verdict` retires.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve_conflict_with_decision(
         &self,
@@ -226,6 +260,7 @@ impl SqliteStore {
         diary: &str,
         key_encoded: &str,
         verdict: &str,
+        loser_object_norm: Option<&str>,
         authority: &str,
         actor: &str,
         note: Option<&str>,
@@ -252,6 +287,7 @@ impl SqliteStore {
                 diary,
                 key_encoded,
                 verdict,
+                loser_object_norm,
                 authority,
                 actor,
                 note,
@@ -316,6 +352,7 @@ mod tests {
                 "default",
                 &k,
                 "close_old",
+                Some("lisbon"),
                 "caller",
                 "cli:default",
                 Some("user confirmed the move"),
@@ -329,6 +366,7 @@ mod tests {
                 "default",
                 &k,
                 "keep_both",
+                None,
                 "machine",
                 "triage",
                 None,
@@ -357,6 +395,7 @@ mod tests {
                 "default",
                 &k,
                 "void",
+                None,
                 "machine",
                 "migration",
                 None,
@@ -397,6 +436,7 @@ mod tests {
                 "default",
                 "not-a-key",
                 "close_old",
+                Some("lisbon"),
                 "caller",
                 "cli:default",
                 None,
@@ -617,6 +657,7 @@ mod tests {
                 "default",
                 &k,
                 "close_old",
+                Some("lisbon"),
                 "caller",
                 "cli:default",
                 Some("user confirmed"),
@@ -634,6 +675,7 @@ mod tests {
                 "default",
                 &k,
                 "reject_new",
+                Some("porto"),
                 "caller",
                 "cli:other",
                 None,
@@ -734,6 +776,7 @@ mod tests {
                 "default",
                 &k,
                 "close_old",
+                Some("lisbon"),
                 "caller",
                 "cli:default",
                 Some("user confirmed"),

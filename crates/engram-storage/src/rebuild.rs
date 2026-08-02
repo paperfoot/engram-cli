@@ -382,8 +382,8 @@ pub fn apply_from(
             store.conn.execute(
                 "INSERT OR IGNORE INTO fact_decisions(id, kb, diary, decision_key, subject_norm,
                         relation, pair_hash, verdict, authority, actor, note, conflict_id,
-                        event_id, key_version, decided_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        event_id, key_version, decided_at, loser_object_norm)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     id.to_string(),
                     e.payload_opt_str("kb")
@@ -407,6 +407,10 @@ pub fn apply_from(
                         .unwrap_or_else(|| engram_core::keys::SEMANTIC_KEY_VERSION.to_string()),
                     e.payload_opt_str("decided_at")
                         .unwrap_or_else(|| e.ts.to_rfc3339()),
+                    // Absent on every pre-v12 event, and absent is the honest
+                    // answer: the rebuild restores NOT RECORDED rather than
+                    // inventing a side [G3].
+                    e.payload_opt_str("loser_object_norm"),
                 ],
             )?;
             if let Some(cid) = e.payload_opt_str("conflict_id") {
