@@ -56,6 +56,10 @@ pub const CONFIDENCE_GAP: f32 = 0.3;
 /// the same slot phrased two ways ("lives_in" vs "home_base_is").
 pub const PARAPHRASE_SIMILARITY: f32 = 0.88;
 
+/// The heuristic rule a cessation the EXTRACTOR claimed is closed under, and
+/// the queued verdict's rule name when the safety gate refuses that close.
+pub const EXTRACTOR_CESSATION: &str = "extractor_cessation";
+
 /// Canonical relations that are explicitly set-valued. The DEFAULT for an
 /// unknown relation is also set-valued — this list documents the ones that
 /// dominate a personal store (networking, family, events) and pins them in a
@@ -437,12 +441,15 @@ pub fn safety_gate(v: Verdict, new: &FactView<'_>, old: &FactView<'_>) -> Verdic
     }
 }
 
-/// The rules whose queued verdict means "nobody could order these values".
+/// The rules whose queued verdict means the caller has to look at the pair
+/// themselves — either nobody could order the values, or the store holds an
+/// answer it cannot map onto them.
 const UNORDERABLE_RULES: &[&str] = &[
     "same_source_contradiction",
     "comparable_values",
     "paraphrase_slot",
     "immutable_attribute_disagreement",
+    "replay_loser_unmatched",
 ];
 
 /// What the CALLER should be told to do. Never `supersede-old` on a safety
@@ -626,10 +633,19 @@ pub struct DecisionRecord {
     pub id: Uuid,
     pub key: SemanticKey,
     pub verdict: DecisionVerdict,
+    /// The `object_norm` of the value this decision RETIRED [G3]. The semantic
+    /// key identifies the QUESTION and is deliberately pair-order-insensitive;
+    /// this field identifies the ANSWER. `None` = a legacy row, or a verdict
+    /// with no loser (`keep_both`, `void`).
+    pub loser_object_norm: Option<String>,
     pub authority: DecisionAuthority,
     pub actor: String,
     pub decided_at: DateTime<Utc>,
     pub note: Option<String>,
+    /// The queue row this decision answered, when it answered one. Carried so
+    /// a pre-G3 decision's orientation can still be recovered from the pair it
+    /// was taken on.
+    pub conflict_id: Option<Uuid>,
     pub key_version: String,
 }
 
@@ -645,10 +661,20 @@ impl DecisionRecord {
                 object_pair_hash: r.pair_hash,
             },
             verdict: DecisionVerdict::parse(&r.verdict),
+            // G3's storage half — a `loser_object_norm` column on
+            // `fact_decisions`, written by `record_decision` — lands in the
+            // storage lane; this line becomes `r.loser_object_norm` the moment
+            // it does. Until then, and forever for the rows written before it,
+            // `binding_decision` recovers the orientation from the queue row
+            // (see `recover_loser`). `None` means NOT RECORDED, never "no
+            // loser": `replay` reads it as a legacy row and keeps the v0.4.0
+            // behaviour rather than guessing.
+            loser_object_norm: None,
             authority: DecisionAuthority::parse(&r.authority),
             actor: r.actor,
             decided_at: r.decided_at,
             note: r.note,
+            conflict_id: r.conflict_id,
             key_version: r.key_version,
         }
     }
@@ -667,19 +693,76 @@ pub trait DecisionLedger {
     ) -> Result<Option<DecisionRecord>, StorageError>;
 }
 
-/// The one-line adapter over the landed `lookup_decision`, whose query already
+/// The adapter over the landed `lookup_decision`, whose query already
 /// implements the precedence (newest caller row, else newest machine row;
-/// `void` never selected).
+/// `void` never selected), plus the orientation recovery a pre-G3 row needs.
 impl DecisionLedger for SqliteStore {
     fn binding_decision(
         &self,
         kb: &str,
         key: &SemanticKey,
     ) -> Result<Option<DecisionRecord>, StorageError> {
-        Ok(self
-            .lookup_decision(kb, &key.encode())?
-            .map(DecisionRecord::from_row))
+        let Some(row) = self.lookup_decision(kb, &key.encode())? else {
+            return Ok(None);
+        };
+        let mut record = DecisionRecord::from_row(row);
+        if record.loser_object_norm.is_none() {
+            record.loser_object_norm = recover_loser(self, &record)?;
+        }
+        Ok(Some(record))
     }
+}
+
+/// WHICH value a decision retired, recovered from the queue row it answered.
+///
+/// `fact_decisions` carried no orientation before G3 and the semantic key
+/// cannot supply one — it hashes the object pair in sorted order because it
+/// names the QUESTION. The conflict row knows: a `close_old` retired its
+/// `old_fact_id`, a `reject_new` its `new_fact_id`. Reading it here means a
+/// ruling taken before the column existed still lands on the value the caller
+/// actually rejected, instead of on whichever side of the pair happens to
+/// arrive second in the next re-derivation.
+///
+/// Every absence answers `None` — no conflict id, a cascaded queue row, a
+/// deleted fact — and `None` replays exactly as v0.4.0-rc1 did. Recovery is
+/// best effort; it never invents an orientation.
+fn recover_loser(
+    store: &SqliteStore,
+    record: &DecisionRecord,
+) -> Result<Option<String>, StorageError> {
+    if !matches!(
+        record.verdict,
+        DecisionVerdict::CloseOld | DecisionVerdict::RejectNew
+    ) {
+        return Ok(None);
+    }
+    let Some(conflict_id) = record.conflict_id else {
+        return Ok(None);
+    };
+    let Some(conflict) = store.get_fact_conflict(conflict_id)? else {
+        return Ok(None);
+    };
+    let loser = match record.verdict {
+        DecisionVerdict::CloseOld => conflict.old_fact_id,
+        _ => conflict.new_fact_id,
+    };
+    Ok(store.get_fact(loser)?.map(|f| f.object_norm))
+}
+
+/// What a prior decision does to a freshly classified pair — three answers,
+/// because two conflated the one that matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// The prior decision binds this pair; apply this verdict instead of
+    /// asking again.
+    Applied(Verdict),
+    /// No prior decision applies here; the classifier's verdict stands.
+    NotBinding,
+    /// A decision exists for this key, and it names a value NEITHER side of
+    /// this pair holds — it answered a different question. The pair queues:
+    /// applying it in either direction would be a coin toss with an audit
+    /// trail.
+    Unmatched,
 }
 
 /// What a prior decision does to a freshly classified pair.
@@ -693,34 +776,76 @@ impl DecisionLedger for SqliteStore {
 /// were settled by `facts triage` under the old rules, and those rows must
 /// never be able to retire a fact a second time.
 ///
+/// DIRECTION [G3]. `CloseOld` and `RejectNew` name a side of a pair, and the
+/// semantic key does not: it sorts the object pair because it identifies the
+/// question. So a re-derivation that emits the two values in the opposite
+/// order used to map "close the old one" onto the fact the caller had KEPT —
+/// the caller decided Acme loses, the store closed Beta. The recorded loser is
+/// what makes the verdict travel with the value instead of with the slot.
+///
 /// `current` is read for one reason: a decision that would change nothing is
 /// not replayed, so a settled or absorbed pair does not accumulate
 /// `decision.replayed` events describing a no-op.
-pub fn replay(prior: &DecisionRecord, current: Verdict) -> Option<Verdict> {
+pub fn replay(
+    prior: &DecisionRecord,
+    current: Verdict,
+    new_object_norm: &str,
+    old_object_norm: &str,
+) -> ReplayOutcome {
     if matches!(
         current.class,
         ConflictClass::Settled | ConflictClass::Duplicate
     ) {
-        return None;
+        return ReplayOutcome::NotBinding;
     }
-    let binding = match (prior.authority, prior.verdict) {
-        (_, DecisionVerdict::Void) => return None,
-        (DecisionAuthority::Machine, DecisionVerdict::KeepBoth)
-        | (DecisionAuthority::Caller, DecisionVerdict::KeepBoth) => {
-            Verdict::new(ConflictClass::Coexist, "replayed_keep_both")
+    match (prior.authority, prior.verdict) {
+        (_, DecisionVerdict::Void) => ReplayOutcome::NotBinding,
+        (_, DecisionVerdict::KeepBoth) => {
+            // Keep-both closes nothing, so it has no orientation to get wrong
+            // — and replaying it onto a pair that already coexists would only
+            // log a no-op.
+            if current.class == ConflictClass::Coexist {
+                ReplayOutcome::NotBinding
+            } else {
+                ReplayOutcome::Applied(Verdict::new(ConflictClass::Coexist, "replayed_keep_both"))
+            }
         }
-        (DecisionAuthority::Machine, _) => return None,
-        (DecisionAuthority::Caller, DecisionVerdict::CloseOld) => {
-            Verdict::new(ConflictClass::SupersedeOld, "replayed_close_old")
+        (DecisionAuthority::Machine, _) => ReplayOutcome::NotBinding,
+        (DecisionAuthority::Caller, verdict) => {
+            replay_directional(prior, verdict, new_object_norm, old_object_norm)
         }
-        (DecisionAuthority::Caller, DecisionVerdict::RejectNew) => {
-            Verdict::new(ConflictClass::SupersedeNew, "replayed_reject_new")
-        }
+    }
+}
+
+/// The half of [`replay`] that has a side to get wrong.
+fn replay_directional(
+    prior: &DecisionRecord,
+    verdict: DecisionVerdict,
+    new_object_norm: &str,
+    old_object_norm: &str,
+) -> ReplayOutcome {
+    let close_old = Verdict::new(ConflictClass::SupersedeOld, "replayed_close_old");
+    let reject_new = Verdict::new(ConflictClass::SupersedeNew, "replayed_reject_new");
+    let Some(loser) = prior.loser_object_norm.as_deref() else {
+        // A row from before the ledger recorded which value lost, and whose
+        // queue row is gone too. It replays in the orientation it was stored
+        // in — the pre-G3 behaviour — because inventing one would be worse
+        // than repeating one.
+        return ReplayOutcome::Applied(match verdict {
+            DecisionVerdict::CloseOld => close_old,
+            _ => reject_new,
+        });
     };
-    if binding.class == current.class && current.class == ConflictClass::Coexist {
-        return None;
+    // The verdict is not consulted past this point ON PURPOSE: the loser IS
+    // the answer, and "which of these two rows is the old one" is exactly the
+    // fact that changed between the two derivations.
+    if loser == old_object_norm {
+        ReplayOutcome::Applied(close_old)
+    } else if loser == new_object_norm {
+        ReplayOutcome::Applied(reject_new)
+    } else {
+        ReplayOutcome::Unmatched
     }
-    Some(binding)
 }
 
 // ===========================================================================
@@ -815,6 +940,39 @@ impl Observation {
     /// store learned of it.
     fn end_instant(&self) -> DateTime<Utc> {
         self.interval.until.unwrap_or(self.interval.from)
+    }
+}
+
+/// WHO is entitled to end an interval this observation says ended [G1].
+///
+/// `ExplicitEnd` means THE SOURCE ITSELF SAID SO, and only a person can be
+/// that source: a `--facts-json` triple the caller asserted, or a value they
+/// confirmed. The extraction model's `state: "ended"` token arrives in the
+/// same field with none of the standing — it is a HINT — and v0.4.0-rc1 read
+/// the two as one thing, so a model that hallucinated "ended" over "Ana
+/// confirms she is still taking metformin" retired the prescription with
+/// `close_authority: explicit_end`.
+///
+/// An extracted cessation is therefore a `Heuristic`, which `may_close`
+/// refuses on a safety relation (the pair becomes a question a person answers)
+/// and allows everywhere else — so "Bruno moved out of Lisbon" still closes
+/// the interval it names.
+pub fn end_authority(source_kind: SourceKind) -> CloseAuthority {
+    match source_kind {
+        SourceKind::UserStated | SourceKind::UserConfirmed => CloseAuthority::ExplicitEnd,
+        _ => CloseAuthority::Heuristic {
+            rule: EXTRACTOR_CESSATION,
+        },
+    }
+}
+
+/// The audit tag an ending writes into `facts.resolution`, DERIVED from the
+/// authority so the tag can never claim standing the close did not have. The
+/// applier used to hard-code `explicit_end` at both close sites.
+pub fn end_resolution_tag(authority: &CloseAuthority) -> &'static str {
+    match authority {
+        CloseAuthority::Heuristic { rule } => rule,
+        other => other.as_str(),
     }
 }
 
@@ -972,7 +1130,7 @@ pub fn plan_write(
     let mut plan = WritePlan::default();
 
     if observation.state == ObservationState::Ended {
-        plan_cessation(observation, siblings, &mut plan);
+        plan_cessation(observation, siblings, &new_view, &mut plan);
         return Ok(plan);
     }
 
@@ -1001,7 +1159,7 @@ pub fn plan_write(
         close: observation
             .interval
             .until
-            .map(|_| (CloseReason::Stopped, CloseAuthority::ExplicitEnd)),
+            .map(|_| (CloseReason::Stopped, end_authority(observation.source_kind))),
     });
 
     for old in siblings.iter().filter(|f| f.id != observation.fact_id) {
@@ -1041,13 +1199,28 @@ pub fn plan_write(
     Ok(plan)
 }
 
-/// "stopped taking X" closes every open interval whose member matches. If
-/// nothing is open, a pre-closed interval is recorded and the caller is told —
-/// the utterance does claim the person once took X, and a row the store can
-/// show you beats a statement it silently dropped.
-fn plan_cessation(observation: &Observation, siblings: &[Fact], plan: &mut WritePlan) {
+/// "stopped taking X" closes every open interval whose member matches — IF the
+/// ending carries authority to close them. If nothing is open, a pre-closed
+/// interval is recorded and the caller is told: the utterance does claim the
+/// person once took X, and a row the store can show you beats a statement it
+/// silently dropped.
+///
+/// The gate is the whole reason this is not a two-line loop. `end_authority`
+/// says who is speaking, and a `Heuristic` ending — an extraction model's
+/// `state: "ended"` — is REFUSED on a safety relation. A refusal is not a
+/// silent skip: the claim is still recorded as a point interval, and the pair
+/// becomes the question a person answers.
+fn plan_cessation(
+    observation: &Observation,
+    siblings: &[Fact],
+    new_view: &FactView<'_>,
+    plan: &mut WritePlan,
+) {
     let end_at = observation.end_instant();
+    let authority = end_authority(observation.source_kind);
+    let tag = end_resolution_tag(&authority);
     let mut closed_any = false;
+    let mut refused: Vec<&Fact> = Vec::new();
     for old in siblings.iter().filter(|f| f.id != observation.fact_id) {
         if !is_open_fact(old) {
             continue;
@@ -1056,19 +1229,20 @@ fn plan_cessation(observation: &Observation, siblings: &[Fact], plan: &mut Write
         if old_view.member != observation.member {
             continue;
         }
-        // The gate still runs. An explicit end is authorizing evidence on
-        // every relation, so this always passes today — and it is the one
-        // funnel, so a future authority cannot bypass it by arriving here.
-        if may_close(&old_view.spec, &CloseAuthority::ExplicitEnd) != CloseVerdict::Allow {
+        // THE ONE FUNNEL. A person's explicit end is authorizing evidence on
+        // every relation; a model's is not, and the gate is where that stops
+        // being a comment.
+        if may_close(&old_view.spec, &authority) != CloseVerdict::Allow {
+            refused.push(old);
             continue;
         }
         plan.closes.push(PlannedClose {
             fact_id: old.id,
             at: close_at(&old_view.interval, end_at),
             reason: CloseReason::Stopped,
-            authority: CloseAuthority::ExplicitEnd,
+            authority: authority.clone(),
             closed_by: None,
-            resolution_tag: "explicit_end",
+            resolution_tag: tag,
         });
         closed_any = true;
     }
@@ -1086,11 +1260,37 @@ fn plan_cessation(observation: &Observation, siblings: &[Fact], plan: &mut Write
                 from,
                 until: Some(end_at),
             },
-            close: Some((CloseReason::Stopped, CloseAuthority::ExplicitEnd)),
+            close: Some((CloseReason::Stopped, authority.clone())),
         });
-        plan.notes.push(PlanNote::EndWithoutOpenInterval {
-            member: observation.member.clone(),
-        });
+    }
+    if refused.is_empty() {
+        if !closed_any {
+            plan.notes.push(PlanNote::EndWithoutOpenInterval {
+                member: observation.member.clone(),
+            });
+        }
+        return;
+    }
+    // Something IS open — the ending simply had no standing to close it, so
+    // `end_without_open_interval` would be a lie. The caller gets the pair
+    // instead, and `suggested_action` answers `requires_context` because only
+    // a safety relation can reach this line.
+    for old in refused {
+        let old_view = FactView::of(old);
+        let key = SemanticKey::for_pair(new_view, &old_view);
+        plan.queue.push(planned_conflict(
+            observation,
+            new_view,
+            &old_view,
+            Verdict::escalated(
+                ConflictClass::Queue,
+                EXTRACTOR_CESSATION,
+                ConflictClass::SupersedeOld,
+            ),
+            "cessation",
+            None,
+            key,
+        ));
     }
 }
 
@@ -1111,8 +1311,13 @@ fn dispatch(
     // Replay runs BEFORE a conflict row is opened. A failed lookup aborts the
     // write rather than degrading to "nobody has decided this".
     let (verdict, replayed) = match prior(&key)? {
-        Some(record) => match replay(&record, verdict) {
-            Some(applied) => {
+        Some(record) => match replay(
+            &record,
+            verdict,
+            &new_view.fact.object_norm,
+            &old_view.fact.object_norm,
+        ) {
+            ReplayOutcome::Applied(applied) => {
                 plan.replays.push(PlannedReplay {
                     decision_id: record.id,
                     key: key.clone(),
@@ -1128,7 +1333,14 @@ fn dispatch(
                 });
                 (applied, Some(record.decided_at))
             }
-            None => (verdict, None),
+            ReplayOutcome::NotBinding => (verdict, None),
+            // No `PlannedReplay` and no `replay_applied` note: nothing was
+            // replayed. The classifier's own close is withdrawn too — a stored
+            // answer we cannot map is a reason to ask, not to act.
+            ReplayOutcome::Unmatched => (
+                Verdict::new(ConflictClass::Queue, "replay_loser_unmatched"),
+                None,
+            ),
         },
         None => (verdict, None),
     };

@@ -87,6 +87,26 @@ fn observation_of(f: &Fact) -> Observation {
     }
 }
 
+/// A cessation THE PERSON stated — a `--facts-json` triple, or a value they
+/// confirmed. Only this provenance carries `CloseAuthority::ExplicitEnd` [G1],
+/// so every fixture that means "the text said it ended" has to say so.
+fn stated_end(f: &Fact, until: &str) -> Observation {
+    let mut o = observation_of(f);
+    o.fact_id = Uuid::new_v4();
+    o.source_kind = SourceKind::UserStated;
+    o.state = ObservationState::Ended;
+    o.interval.until = Some(ts(until));
+    o
+}
+
+/// The same utterance, arriving from the EXTRACTION MODEL instead.
+fn extracted_end(f: &Fact, until: &str) -> Observation {
+    Observation {
+        source_kind: SourceKind::AgentExtracted,
+        ..stated_end(f, until)
+    }
+}
+
 /// No prior decisions at all — the common case, and the one that must not
 /// need a store.
 fn no_decisions(_: &SemanticKey) -> Result<Option<DecisionRecord>, StorageError> {
@@ -515,12 +535,11 @@ fn strict_autonomy_escalates_heuristic_closes_but_not_explicit_ends() {
 
     // An explicit end is the TEXT speaking, and strict never promised to
     // disbelieve the text.
-    let mut ended = observation_of(&lisbon);
+    let mut ended = stated_end(&lisbon, "2020-01-01");
+    ended.fact_id = lisbon.id;
     ended.autonomy = Autonomy::Strict;
-    ended.state = ObservationState::Ended;
     ended.object_norm = "london".into();
     ended.member = member_identity("lives_in", "london");
-    ended.interval.until = Some(ts("2020-01-01"));
     let p = plan(&ended, std::slice::from_ref(&london));
     assert_eq!(p.closes.len(), 1, "{p:?}");
     assert_eq!(p.closes[0].authority, CloseAuthority::ExplicitEnd);
@@ -716,10 +735,7 @@ fn allowed_actions_are_never_narrowed_only_the_advice_is() {
 #[test]
 fn an_explicit_end_closes_the_open_interval_and_opens_nothing() {
     let taking = stored("Ana", "takes_medication", "metformin 500 mg", "2024-01-01");
-    let mut ended = observation_of(&taking);
-    ended.fact_id = Uuid::new_v4();
-    ended.state = ObservationState::Ended;
-    ended.interval.until = Some(ts("2026-06-01"));
+    let ended = stated_end(&taking, "2026-06-01");
     let p = plan(&ended, std::slice::from_ref(&taking));
     assert_eq!(p.closes.len(), 1);
     assert_eq!(p.closes[0].fact_id, taking.id);
@@ -756,14 +772,107 @@ fn an_end_with_no_open_interval_is_reported_not_invented() {
 fn a_cessation_closes_only_the_member_it_names() {
     let metformin = stored("Ana", "takes_medication", "metformin 500 mg", "2024-01-01");
     let rapamycin = stored("Ana", "takes_medication", "rapamycin 6 mg", "2024-01-01");
-    let mut ended = observation_of(&metformin);
-    ended.fact_id = Uuid::new_v4();
-    ended.state = ObservationState::Ended;
+    let mut ended = stated_end(&metformin, "2026-06-01");
+    ended.interval.until = None;
     let p = plan(&ended, &[metformin.clone(), rapamycin.clone()]);
     assert_eq!(p.closes.len(), 1);
     assert_eq!(
         p.closes[0].fact_id, metformin.id,
         "stopping one drug must not stop the other"
+    );
+}
+
+/// BLOCKER 1, at the layer that decides it [G1]. The model returns
+/// `state: "ended"` for a memory whose text says the opposite. Nothing about
+/// the token can be checked from here — so the AUTHORITY it carries is what
+/// has to be right.
+#[test]
+fn an_extracted_cessation_cannot_close_a_safety_interval() {
+    let taking = stored("Ana", "takes_medication", "metformin", "2024-01-01");
+    let hallucinated = extracted_end(&taking, "2026-06-01");
+    let p = plan(&hallucinated, std::slice::from_ref(&taking));
+    assert!(
+        p.closes.is_empty(),
+        "a model's `ended` token must not retire a prescription: {p:?}"
+    );
+    assert_eq!(p.queue.len(), 1, "the refusal becomes a question: {p:?}");
+    assert_eq!(p.queue[0].old_fact_id, taking.id);
+    assert_eq!(p.queue[0].verdict.rule, EXTRACTOR_CESSATION);
+    assert_eq!(
+        p.queue[0].suggested, "requires_context",
+        "nobody but the person can settle whether the drug stopped"
+    );
+    // The claim is still recorded — as a point interval that asserts nothing
+    // ongoing — so the caller can see what the extractor said.
+    let inserted = p.insert.clone().expect("the claim leaves a trace");
+    assert_eq!(inserted.interval.until, Some(ts("2026-06-01")));
+    assert_eq!(
+        inserted.close.map(|(_, a)| a),
+        Some(CloseAuthority::Heuristic {
+            rule: EXTRACTOR_CESSATION
+        }),
+        "the row may not claim an authority the extractor did not have"
+    );
+    assert!(
+        !p.notes
+            .iter()
+            .any(|n| matches!(n, PlanNote::EndWithoutOpenInterval { .. })),
+        "there WAS an open interval; it was refused, not missing: {p:?}"
+    );
+}
+
+/// The other half of G1: refusing every extracted ending would break the
+/// ordinary case the interval model exists for.
+#[test]
+fn an_extracted_cessation_still_closes_a_non_safety_interval() {
+    let lisbon = stored("Bruno", "lives_in", "Lisbon", "2020-01-01");
+    let moved = extracted_end(&lisbon, "2026-06-01");
+    let p = plan(&moved, std::slice::from_ref(&lisbon));
+    assert_eq!(p.closes.len(), 1, "{p:?}");
+    assert_eq!(p.closes[0].fact_id, lisbon.id);
+    assert_eq!(
+        p.closes[0].authority,
+        CloseAuthority::Heuristic {
+            rule: EXTRACTOR_CESSATION
+        },
+        "allowed, but recorded for what it is"
+    );
+    assert_eq!(p.closes[0].resolution_tag, EXTRACTOR_CESSATION);
+    assert!(p.queue.is_empty());
+}
+
+/// A caller's own triple keeps the standing it always had.
+#[test]
+fn a_caller_stated_cessation_still_closes_a_safety_interval() {
+    let taking = stored("Ana", "takes_medication", "metformin", "2024-01-01");
+    for kind in [SourceKind::UserStated, SourceKind::UserConfirmed] {
+        let mut ended = stated_end(&taking, "2026-06-01");
+        ended.source_kind = kind;
+        let p = plan(&ended, std::slice::from_ref(&taking));
+        assert_eq!(p.closes.len(), 1, "{kind:?}: {p:?}");
+        assert_eq!(p.closes[0].authority, CloseAuthority::ExplicitEnd);
+        assert_eq!(p.closes[0].resolution_tag, "explicit_end");
+        assert!(p.queue.is_empty());
+    }
+}
+
+/// The same forgery through the OTHER door: an extracted assertion that
+/// carries its own `valid_until` is born closed, and the row it writes must
+/// not stamp itself `explicit_end` either.
+#[test]
+fn an_extracted_window_is_born_closed_under_its_own_authority() {
+    let taking = stored("Ana", "takes_medication", "metformin", "2024-01-01");
+    let mut windowed = observation_of(&taking);
+    windowed.fact_id = Uuid::new_v4();
+    windowed.object_norm = "rapamycin".into();
+    windowed.member = member_identity("takes_medication", "rapamycin");
+    windowed.interval.until = Some(ts("2026-06-01"));
+    let p = plan(&windowed, &[]);
+    assert_eq!(
+        p.insert.and_then(|i| i.close).map(|(_, a)| a),
+        Some(CloseAuthority::Heuristic {
+            rule: EXTRACTOR_CESSATION
+        })
     );
 }
 
@@ -854,11 +963,39 @@ fn record(verdict: DecisionVerdict, authority: DecisionAuthority) -> DecisionRec
             object_pair_hash: keys::object_pair_hash("lisbon", "porto"),
         },
         verdict,
+        // A legacy row: no orientation recorded, so it replays as v0.4.0-rc1
+        // did. The directional cases pin their own loser.
+        loser_object_norm: None,
         authority,
         actor: "cli:default".into(),
         decided_at: ts("2026-05-01"),
         note: None,
+        conflict_id: None,
         key_version: SEMANTIC_KEY_VERSION.to_string(),
+    }
+}
+
+/// The same record, with the value the caller RETIRED written down [G3].
+fn record_losing(
+    verdict: DecisionVerdict,
+    authority: DecisionAuthority,
+    loser: &str,
+) -> DecisionRecord {
+    DecisionRecord {
+        loser_object_norm: Some(loser.to_string()),
+        ..record(verdict, authority)
+    }
+}
+
+/// `replay` against a pair spelled (new, old) in that order.
+fn replayed(prior: &DecisionRecord, current: Verdict, new: &str, old: &str) -> ReplayOutcome {
+    replay(prior, current, new, old)
+}
+
+fn applied(outcome: ReplayOutcome) -> Option<(ConflictClass, &'static str)> {
+    match outcome {
+        ReplayOutcome::Applied(v) => Some((v.class, v.rule)),
+        _ => None,
     }
 }
 
@@ -867,18 +1004,72 @@ fn a_caller_decision_binds_in_every_direction() {
     let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
     let keep = record(DecisionVerdict::KeepBoth, DecisionAuthority::Caller);
     assert_eq!(
-        replay(&keep, queued).map(|v| (v.class, v.rule)),
+        applied(replayed(&keep, queued, "porto", "lisbon")),
         Some((ConflictClass::Coexist, "replayed_keep_both"))
     );
     let close = record(DecisionVerdict::CloseOld, DecisionAuthority::Caller);
     assert_eq!(
-        replay(&close, queued).map(|v| (v.class, v.rule)),
+        applied(replayed(&close, queued, "porto", "lisbon")),
         Some((ConflictClass::SupersedeOld, "replayed_close_old"))
     );
     let reject = record(DecisionVerdict::RejectNew, DecisionAuthority::Caller);
     assert_eq!(
-        replay(&reject, queued).map(|v| (v.class, v.rule)),
+        applied(replayed(&reject, queued, "porto", "lisbon")),
         Some((ConflictClass::SupersedeNew, "replayed_reject_new"))
+    );
+}
+
+/// G3, at the layer that decides it. The caller retired `lisbon`; the pair
+/// then arrives with `lisbon` as the INCOMING value, and the verdict has to
+/// travel with the value rather than with the slot.
+#[test]
+fn a_caller_decision_follows_the_value_it_retired_not_the_pair_order() {
+    let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
+    let close = record_losing(
+        DecisionVerdict::CloseOld,
+        DecisionAuthority::Caller,
+        "lisbon",
+    );
+    assert_eq!(
+        applied(replayed(&close, queued, "porto", "lisbon")),
+        Some((ConflictClass::SupersedeOld, "replayed_close_old")),
+        "same orientation as the decision: the old row is still the loser"
+    );
+    assert_eq!(
+        applied(replayed(&close, queued, "lisbon", "porto")),
+        Some((ConflictClass::SupersedeNew, "replayed_reject_new")),
+        "reversed: the loser arrived as the NEW fact, so the verdict flips"
+    );
+    // A `reject_new` is the same rule read from the other end.
+    let reject = record_losing(
+        DecisionVerdict::RejectNew,
+        DecisionAuthority::Caller,
+        "porto",
+    );
+    assert_eq!(
+        applied(replayed(&reject, queued, "porto", "lisbon")),
+        Some((ConflictClass::SupersedeNew, "replayed_reject_new"))
+    );
+    assert_eq!(
+        applied(replayed(&reject, queued, "lisbon", "porto")),
+        Some((ConflictClass::SupersedeOld, "replayed_close_old"))
+    );
+}
+
+/// A key collision, or a re-derivation whose objects changed spelling: the
+/// stored answer names a value neither side holds. Guessing a direction here
+/// is how a caller's ruling lands on a fact they never saw.
+#[test]
+fn a_decision_whose_loser_is_on_neither_side_does_not_replay() {
+    let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
+    let close = record_losing(
+        DecisionVerdict::CloseOld,
+        DecisionAuthority::Caller,
+        "braga",
+    );
+    assert_eq!(
+        replayed(&close, queued, "porto", "lisbon"),
+        ReplayOutcome::Unmatched
     );
 }
 
@@ -887,8 +1078,13 @@ fn a_machine_close_old_never_replays() {
     let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
     for verdict in [DecisionVerdict::CloseOld, DecisionVerdict::RejectNew] {
         assert_eq!(
-            replay(&record(verdict, DecisionAuthority::Machine), queued),
-            None,
+            replayed(
+                &record_losing(verdict, DecisionAuthority::Machine, "lisbon"),
+                queued,
+                "porto",
+                "lisbon"
+            ),
+            ReplayOutcome::NotBinding,
             "a stale machine supersession must not retire a fact a second time"
         );
     }
@@ -897,11 +1093,16 @@ fn a_machine_close_old_never_replays() {
 #[test]
 fn a_machine_keep_both_does_replay() {
     let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
-    let v = replay(
+    let v = replayed(
         &record(DecisionVerdict::KeepBoth, DecisionAuthority::Machine),
         queued,
+        "porto",
+        "lisbon",
     );
-    assert_eq!(v.map(|v| v.class), Some(ConflictClass::Coexist));
+    assert_eq!(
+        applied(v).map(|(class, _)| class),
+        Some(ConflictClass::Coexist)
+    );
 }
 
 #[test]
@@ -909,8 +1110,13 @@ fn a_void_decision_is_history_not_a_verdict() {
     let queued = Verdict::new(ConflictClass::Queue, "comparable_values");
     for authority in [DecisionAuthority::Caller, DecisionAuthority::Machine] {
         assert_eq!(
-            replay(&record(DecisionVerdict::Void, authority), queued),
-            None
+            replayed(
+                &record(DecisionVerdict::Void, authority),
+                queued,
+                "porto",
+                "lisbon"
+            ),
+            ReplayOutcome::NotBinding
         );
     }
 }
@@ -975,6 +1181,102 @@ fn a_caller_close_old_reapplies_silently_on_a_safety_relation() {
         matches!(p.closes[0].authority, CloseAuthority::ReplayedCaller { .. }),
         "a replayed CALLER decision is what entitles a safety close"
     );
+}
+
+/// BLOCKER 3, as the gate reproduced it. Carol is queued on Acme vs Beta
+/// Corp, the caller answers `supersede-old` (Acme loses, Beta stands), and the
+/// text is then re-derived with the two employers named in the other order.
+/// Directionless replay mapped "close the old one" onto Beta and left Acme
+/// open — the exact opposite of what the caller decided.
+#[test]
+fn a_replayed_decision_survives_the_pair_arriving_reversed() {
+    let acme = stored("Carol", "works_at", "Acme", "2026-01-01");
+    let mut beta = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
+    beta.source_memory_id = acme.source_memory_id;
+    let decided: HashMap<String, DecisionRecord> = [(
+        SemanticKey::for_pair(&FactView::of(&beta), &FactView::of(&acme)).encode(),
+        record_losing(DecisionVerdict::CloseOld, DecisionAuthority::Caller, "acme"),
+    )]
+    .into_iter()
+    .collect();
+    let prior = |k: &SemanticKey| Ok(decided.get(&k.encode()).cloned());
+
+    // Re-derivation, reversed: Beta Corp is stored first, so ACME is now the
+    // incoming fact and Beta is "the old one".
+    let observation = observation_of(&acme);
+    let p = plan_write(
+        &observation,
+        std::slice::from_ref(&beta),
+        &[],
+        ClassifyMode::Write,
+        &prior,
+    )
+    .unwrap();
+    assert_eq!(p.closes.len(), 1, "{p:?}");
+    assert_eq!(
+        p.closes[0].fact_id, acme.id,
+        "the caller retired Acme; a reversed re-derivation must not retire Beta instead"
+    );
+    assert_eq!(p.replays.len(), 1);
+    assert!(p.queue.is_empty());
+}
+
+/// …and the same ledger row, on the orientation it was taken in, still does
+/// what it always did.
+#[test]
+fn a_replayed_decision_keeps_its_meaning_when_the_pair_is_not_reversed() {
+    let acme = stored("Carol", "works_at", "Acme", "2026-01-01");
+    let mut beta = stored("Carol", "works_at", "Beta Corp", "2026-01-01");
+    beta.source_memory_id = acme.source_memory_id;
+    let decided: HashMap<String, DecisionRecord> = [(
+        SemanticKey::for_pair(&FactView::of(&beta), &FactView::of(&acme)).encode(),
+        record_losing(DecisionVerdict::CloseOld, DecisionAuthority::Caller, "acme"),
+    )]
+    .into_iter()
+    .collect();
+    let prior = |k: &SemanticKey| Ok(decided.get(&k.encode()).cloned());
+    let p = plan_write(
+        &observation_of(&beta),
+        std::slice::from_ref(&acme),
+        &[],
+        ClassifyMode::Write,
+        &prior,
+    )
+    .unwrap();
+    assert_eq!(p.closes.len(), 1, "{p:?}");
+    assert_eq!(p.closes[0].fact_id, acme.id);
+}
+
+/// A stored answer that names neither value is not an answer to THIS pair, so
+/// the classifier's own close is withdrawn and the caller is asked.
+#[test]
+fn an_unmappable_decision_queues_instead_of_closing() {
+    let london = stored("Elias", "lives_in", "London", "2015-06-01");
+    let lisbon = stored("Elias", "lives_in", "Lisbon", "2024-02-01");
+    let decided: HashMap<String, DecisionRecord> = [(
+        SemanticKey::for_pair(&FactView::of(&lisbon), &FactView::of(&london)).encode(),
+        record_losing(
+            DecisionVerdict::CloseOld,
+            DecisionAuthority::Caller,
+            "braga",
+        ),
+    )]
+    .into_iter()
+    .collect();
+    let prior = |k: &SemanticKey| Ok(decided.get(&k.encode()).cloned());
+    let p = plan_write(
+        &observation_of(&lisbon),
+        std::slice::from_ref(&london),
+        &[],
+        ClassifyMode::Write,
+        &prior,
+    )
+    .unwrap();
+    assert!(p.closes.is_empty(), "{p:?}");
+    assert!(p.replays.is_empty(), "nothing was replayed");
+    assert_eq!(p.queue.len(), 1);
+    assert_eq!(p.queue[0].verdict.rule, "replay_loser_unmatched");
+    assert_eq!(p.queue[0].suggested, "requires_context");
 }
 
 #[test]

@@ -43,9 +43,9 @@ use engram_graph::facts::{
 };
 use engram_graph::gate::{novelty_gate, GateDecision};
 use engram_graph::semantics::{
-    classify_mode_for, compile_resolution, plan_write, DecisionLedger, Observation,
-    ObservationState, PlanNote, PlannedClose, PlannedConflict, SemanticKey, UnknownAutonomy,
-    WritePlan,
+    classify_mode_for, compile_resolution, end_resolution_tag, plan_write, DecisionLedger,
+    Observation, ObservationState, PlanNote, PlannedClose, PlannedConflict, SemanticKey,
+    UnknownAutonomy, WritePlan,
 };
 use engram_llm::ChatLlm;
 use serde_json::json;
@@ -930,16 +930,20 @@ fn apply_plan(
         }
         outcome.added += 1;
         // A cessation with nothing open to close is born and then closed, so
-        // the journal carries a reason instead of a mute pre-dead row.
+        // the journal carries a reason instead of a mute pre-dead row. The
+        // audit tag comes from the AUTHORITY, never from a literal: the row
+        // used to stamp itself `explicit_end` even when an extraction model
+        // was the only thing claiming the interval had ended [G1].
         if let Some((reason, authority)) = &planned.close {
             let at = planned.interval.until.unwrap_or(planned.interval.from);
+            let tag = resolution_tag(w.source_kind, end_resolution_tag(authority));
             ctx.store.close_fact_interval(
                 fact.id,
                 at,
                 reason.as_str(),
                 authority.as_str(),
                 None,
-                Some("explicit_end"),
+                Some(tag),
             )?;
         }
     } else if plan.absorbed.is_some() {
