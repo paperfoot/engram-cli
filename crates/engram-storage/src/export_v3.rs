@@ -497,7 +497,8 @@ mod tests {
     /// What the planner writes for "Ana stopped taking metformin" when there
     /// is nothing open to close: a fact BORN closed at a single instant,
     /// reason `stopped`, authority `heuristic`, and the pair queued for a
-    /// person. This row is the entire reason the cessation exemption exists.
+    /// person. The write path still produces this shape; [G8] is about what
+    /// an IMPORT is allowed to conclude from a file wearing it.
     fn seed_extracted_cessation(store: &SqliteStore) -> (Uuid, Uuid) {
         let m = Memory {
             id: Uuid::new_v4(),
@@ -818,13 +819,11 @@ mod tests {
         assert_eq!(f.close_authority, None);
     }
 
-    /// The re-gate's blocker, in Rust. The exemption used to test only the
-    /// SHAPE, so a forger could close ANY live safety fact by setting
-    /// `valid_until` to that fact's own `valid_from` — reason `superseded`,
-    /// authority `heuristic` — and all three guards read the attack as a
-    /// cessation. A `fact.interval_closed` event closes an interval that
-    /// already exists, so it can never BE the born-closed case, and it gets
-    /// no exemption at all now.
+    /// The second gate's blocker, kept because it is still the cheapest
+    /// statement of the rule: a forger could close ANY live safety fact by
+    /// setting `valid_until` to that fact's own `valid_from`, and every guard
+    /// that read the interval's shape saw a cessation. Nothing reads the shape
+    /// now, so the attack has nothing left to imitate.
     #[test]
     fn a_forged_point_close_event_cannot_retire_a_live_safety_fact() {
         let (_tmp, _g, source) = temp_store();
