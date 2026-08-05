@@ -37,10 +37,9 @@ impl AppContext {
 
     fn open_at(format: OutputFormat, quiet: bool, db: PathBuf) -> Result<Self, CliError> {
         let store = SqliteStore::open(&db)?;
-        // At store-open time, not on the first write: `engram jobs list` is a
-        // read-only command that selects the wave-4 columns, and it must not
-        // be the thing that discovers they were never added.
-        store.ensure_jobs_schema()?;
+        // The wave-4 jobs columns are ensured inside `SqliteStore::open`
+        // itself — an invariant every reader depends on (the diary-isolation
+        // gate reads `compile_jobs.kind`) cannot live in call-site discipline.
         let core = Core::new(db, crate::engine::default_actor());
         Ok(Self {
             format,

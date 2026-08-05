@@ -857,11 +857,18 @@ CREATE TABLE IF NOT EXISTS fact_extraction_log (
 /// longer one. A NULL `deleted_at` (deletion time unknown) compares against a
 /// far-future sentinel, so it can never be proven purged — the v8 migration
 /// backfills it precisely to avoid gating legacy stores forever.
+/// `j.kind = 'compile'` is the predicate that keeps this proof a proof:
+/// `compile_jobs` grew into a generic jobs table with a `kind` column, and
+/// only a COMPILE rebuilds the derived layer. Without the predicate, any
+/// completed job — a fact backfill, anything added later — newer than the
+/// deletion "proved" the purge, and a diary-scoped recall could resume
+/// serving wiki/entity text paraphrasing another diary's deleted memory.
 const MEMORY_CONSTRAINS_DERIVED: &str = "(
     m.deleted = 0
     OR NOT EXISTS (
         SELECT 1 FROM compile_jobs j
         WHERE j.kb = m.kb
+          AND j.kind = 'compile'
           AND j.status = 'completed'
           AND j.created_at > COALESCE(m.deleted_at, '9999-12-31T23:59:59.999999999+00:00')
     )
@@ -949,6 +956,13 @@ impl SqliteStore {
             }
         }
         store.migrate(backup_path)?;
+        // Part of opening, not a caller convention. The wave-4 jobs columns
+        // used to be ensured by whoever opened the store (AppContext, the
+        // daemon engine) — until `MEMORY_CONSTRAINS_DERIVED` grew a
+        // `j.kind = 'compile'` predicate and every path that had skipped the
+        // convention (bench, ad-hoc tools) broke at query time. An invariant
+        // every reader depends on cannot live in call-site discipline.
+        store.ensure_jobs_schema()?;
         Ok(store)
     }
 
@@ -960,6 +974,9 @@ impl SqliteStore {
             path: PathBuf::from(":memory:"),
         };
         store.migrate(None)?;
+        // Same invariant as `open`: a store you can query is a store whose
+        // jobs columns exist.
+        store.ensure_jobs_schema()?;
         Ok(store)
     }
 
@@ -7056,6 +7073,60 @@ mod tests {
         let mixed = store.kbs_with_memories_outside_diary("work").unwrap();
         assert!(mixed.contains("shared"));
         assert!(!mixed.contains("solo"), "single-diary KB cannot leak");
+    }
+
+    #[test]
+    fn a_completed_non_compile_job_is_not_proof_of_purge() {
+        // `compile_jobs` is a generic jobs table with a `kind` column, and
+        // only a COMPILE clears and rebuilds the derived layer. Before the
+        // `j.kind = 'compile'` predicate, ANY completed job newer than a
+        // deletion — a fact backfill, say — "proved" the purge, and a recall
+        // scoped to another diary resumed seeing wiki/entity text
+        // paraphrasing the deleted private memory. `compile_pressure` learned
+        // this lesson already; the privacy gate must hold it too.
+        use crate::jobs::{NewJob, SubmitOutcome};
+        use std::time::Duration;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let (private_id, _) = seeded_memory(&store, "shared", "private", "Therapy appointment.");
+        seeded_memory(&store, "shared", "work", "Quarterly numbers.");
+
+        store.soft_delete_memory(private_id).unwrap();
+        // `created_at > deleted_at` is a strict string compare; make sure the
+        // job rows are stamped measurably later than the deletion.
+        std::thread::sleep(Duration::from_millis(2));
+
+        let run = |kind: &str| {
+            let SubmitOutcome::Submitted(id) = store
+                .submit_job(&NewJob {
+                    kind,
+                    kb: "shared",
+                    params: serde_json::json!({}),
+                    actor: "test",
+                })
+                .expect("submit")
+            else {
+                panic!("fresh submit");
+            };
+            assert!(store.claim_job(id, "w", Duration::from_secs(60)).unwrap());
+            assert!(store
+                .finish_job(id, "w", "completed", None, &serde_json::json!({}))
+                .unwrap());
+        };
+
+        run("fact_backfill");
+        let mixed = store.kbs_with_memories_outside_diary("work").unwrap();
+        assert!(
+            mixed.contains("shared"),
+            "a completed non-compile job must not un-gate the KB"
+        );
+
+        run("compile");
+        let mixed = store.kbs_with_memories_outside_diary("work").unwrap();
+        assert!(
+            !mixed.contains("shared"),
+            "a compile completed after the deletion is the real purge proof"
+        );
     }
 
     #[test]

@@ -64,9 +64,7 @@ impl Store {
     }
 
     pub fn open(&self) -> engram_storage::SqliteStore {
-        let s = engram_storage::SqliteStore::open(self.db()).expect("open store");
-        s.ensure_jobs_schema().expect("jobs schema");
-        s
+        engram_storage::SqliteStore::open(self.db()).expect("open store")
     }
 }
 

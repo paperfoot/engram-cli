@@ -441,7 +441,6 @@ impl Core {
             return Ok(h);
         }
         let store = SqliteStore::open(&self.inner.db_path)?;
-        store.ensure_jobs_schema()?;
         let (tx, rx) = sync_channel::<WriteTask>(WRITE_QUEUE_CAPACITY);
         let alive = Arc::new(AtomicBool::new(true));
         let thread_alive = alive.clone();
