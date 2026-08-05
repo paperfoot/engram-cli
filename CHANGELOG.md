@@ -1,15 +1,17 @@
 # Changelog
 
-## 0.4.0 — UNRELEASED (branch arch/v0.4)
+## 0.4.0 — 2026-08-05
 
 The five-move rebuild of the write/mutate/adjudicate layer, from the 2026-08-01
 agent-experience audit: an append-only journal as source of truth, bi-temporal
 interval facts, decision replay, a single-writer core with jobs, and a generated
-contract. Schema v9 → v12 (v10 journal + intervals, v11 lessons, v12 decision
-orientation); the v10 migration writes a `VACUUM INTO` backup beside the store
-before touching a row. v11 is additive-only. v12 adds one column and backfills
-it, and takes no backup for a narrower reason: the only column it writes is the
-one it just created, so no prior value is at risk.
+contract. Schema v9 → v13 (v10 journal + intervals, v11 lessons, v12 decision
+orientation, v13 event origin); the v10 migration writes a `VACUUM INTO` backup
+beside the store before touching a row. v11 is additive-only. v12 adds one
+column and backfills it, and takes no backup for a narrower reason: the only
+column it writes is the one it just created, so no prior value is at risk. v13
+stamps every journal event with its origin (`own` vs `imported`) so a rebuild
+cannot launder an imported claim into trusted history.
 
 ### Breaking for agents/scripts
 
@@ -117,6 +119,24 @@ one it just created, so no prior value is at risk.
   skill.md and JSON Schema, with contract tests that fail the build when docs
   and binary drift (they caught two drifts during this build's own
   integration).
+
+### Fixed
+
+- `state` paging can no longer hide a relation: every relation open at as-of
+  appears on every page with its true `open_count`; only `values` page.
+  `values: []` beside a non-zero `open_count` means "on a later page", never
+  "none" — previously `--limit` could return an answer with no
+  `takes_medication` group at all while two medications were open.
+- `state <subject> --relation R` on a resolved subject with no data for `R`
+  answers `absence.reason: no_open_values` instead of `subject_not_found`
+  (which it reported while simultaneously listing the subject as a
+  near-miss at score 1.0). "No allergy data" and "no such person" are
+  different answers.
+- Cross-diary privacy: a completed non-compile job (e.g. a fact backfill) no
+  longer counts as proof that a deleted memory has been compiled out of the
+  derived layer. Only a completed `compile` un-gates a KB; the jobs schema is
+  now ensured inside `SqliteStore::open` itself so every reader sees the
+  columns the gate depends on.
 
 ## 0.3.1 — 2026-07-28
 - Failover hardening from the post-release code review (15 findings, all fixed):
