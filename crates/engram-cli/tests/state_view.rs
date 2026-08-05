@@ -352,6 +352,127 @@ fn totals_are_not_page_sizes_and_the_cursor_pages_without_gaps() {
 }
 
 #[test]
+fn paging_never_hides_a_relation() {
+    // The v0.5-agenda defect class: with one allergy and two medications,
+    // `--limit 1` used to build groups from the PAGE, so the medication group
+    // vanished entirely and an agent reading `state[]` concluded "no
+    // medications known" — about a safety slot. Every open relation must
+    // appear on every page; only the values inside it are paged.
+    let dir = store();
+    remember_facts(
+        dir.path(),
+        "personal",
+        "Ada is allergic to penicillin.",
+        r#"[{"subject":"Ada Example","predicate":"allergic_to","object":"penicillin",
+             "valid_from":"2024-01-01","confidence":0.9}]"#,
+    );
+    remember_facts(
+        dir.path(),
+        "personal",
+        "Ada takes empagliflozin.",
+        &med("Ada Example", "empagliflozin", "2024-03-01"),
+    );
+    remember_facts(
+        dir.path(),
+        "personal",
+        "Ada takes metformin.",
+        &med("Ada Example", "metformin", "2024-01-01"),
+    );
+
+    let v = state(dir.path(), "Ada Example", &["--limit", "1"]);
+    assert_eq!(v["data"]["total"], json!(3));
+    assert_eq!(v["data"]["returned"], json!(1));
+    let groups = v["data"]["state"].as_array().expect("groups");
+    let relations: Vec<&str> = groups
+        .iter()
+        .map(|g| g["relation"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        relations,
+        vec!["allergic_to", "takes_medication"],
+        "a relation whose facts fell past the limit must still appear: {v}"
+    );
+    let meds = &groups[1];
+    assert_eq!(
+        meds["open_count"],
+        json!(2),
+        "open_count is the true count, not the page size: {v}"
+    );
+    assert_eq!(
+        meds["values"].as_array().map(|a| a.len()),
+        Some(0),
+        "values page out; the group does not: {v}"
+    );
+    assert_eq!(v["data"]["verdict"], json!("results"));
+}
+
+#[test]
+fn open_count_survives_paging_within_one_relation() {
+    let dir = store();
+    remember_facts(
+        dir.path(),
+        "personal",
+        "Ada takes empagliflozin.",
+        &med("Ada Example", "empagliflozin", "2024-03-01"),
+    );
+    remember_facts(
+        dir.path(),
+        "personal",
+        "Ada takes metformin.",
+        &med("Ada Example", "metformin", "2024-01-01"),
+    );
+    let v = state(
+        dir.path(),
+        "Ada Example",
+        &["--relation", "takes_medication", "--limit", "1"],
+    );
+    let groups = v["data"]["state"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1, "{v}");
+    assert_eq!(
+        groups[0]["open_count"],
+        json!(2),
+        "one value shown, two open — the count must say two: {v}"
+    );
+    assert_eq!(groups[0]["values"].as_array().map(|a| a.len()), Some(1));
+}
+
+#[test]
+fn a_known_subject_with_no_data_for_a_relation_is_not_unknown() {
+    // The naive-agent wall: `state ada --relation allergic_to` on a store
+    // that KNOWS ada (two medications) used to answer `subject_not_found` —
+    // while listing ada in nearest_subjects at 1.0. "No allergy data" and
+    // "no such person" are different answers.
+    let dir = store();
+    remember_facts(
+        dir.path(),
+        "personal",
+        "Ada takes metformin.",
+        &med("Ada Example", "metformin", "2024-01-01"),
+    );
+    let v = state(
+        dir.path(),
+        "Ada Example",
+        &["--relation", "allergic_to"],
+    );
+    assert_eq!(v["data"]["verdict"], json!("no_match"));
+    assert_eq!(v["data"]["resolved_from"], json!("exact"));
+    let absence = &v["data"]["absence"];
+    assert_eq!(
+        absence["reason"],
+        json!("no_open_values"),
+        "a resolved subject is never subject_not_found: {v}"
+    );
+    assert!(
+        absence["top_score"].is_null() && absence["threshold"].is_null(),
+        "no cutoff rejected anything — scores here would be fabricated: {v}"
+    );
+    assert!(
+        absence["nearest_subjects"].as_array().is_none_or(|n| n.is_empty()),
+        "'did you mean ada' under an answer about ada argues with itself: {v}"
+    );
+}
+
+#[test]
 fn an_unknown_subject_is_a_certificate_not_an_error() {
     let dir = store();
     remember_facts(

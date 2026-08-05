@@ -96,6 +96,7 @@ pub const ABSENCE_REASON: &[&str] = &[
     "no_candidate_matched",
     "trimmed_by_layer_budget",
     "subject_not_found",
+    "no_open_values",
 ];
 
 /// Jobs are a v0.4 surface, so the states a caller may see are pinned here
@@ -1703,7 +1704,7 @@ const STATE_DATA: &[FieldSpec] = &[
     FieldSpec {
         name: "state",
         ty: Ty::Array(&Ty::Object),
-        doc: "OPEN intervals only, grouped by relation. Each group carries `arity_class`, `safety`, `mutability`, `temporality`, `value_domain`, `open_count` and its `open_questions`; each value carries `handle`, `confidence`, the `confidence_basis` that sums to it, and `provenance` (memory → chunk → document, with `observed_at` and a `snippet`)",
+        doc: "OPEN intervals only, grouped by relation. EVERY relation open at as-of appears, even under --limit — only `values` are paged, so `open_count` is the true count and `values: []` beside a non-zero `open_count` means 'on a later page', never 'none'. Each group carries `arity_class`, `safety`, `mutability`, `temporality`, `value_domain`, `open_count` and its `open_questions`; each value carries `handle`, `confidence`, the `confidence_basis` that sums to it, and `provenance` (memory → chunk → document, with `observed_at` and a `snippet`)",
         always: true,
     },
     FieldSpec {
@@ -1727,7 +1728,7 @@ const STATE_DATA: &[FieldSpec] = &[
     FieldSpec {
         name: "absence",
         ty: Ty::Object,
-        doc: "present ONLY on `no_match`, with `reason: subject_not_found` and the nearest subjects",
+        doc: "present ONLY on `no_match`. `reason: subject_not_found` (no such subject — with scores and the nearest subjects) vs `reason: no_open_values` (subject RESOLVED, but nothing open in this scope/relation/as-of) — 'no allergy data for ada' and 'no such person as ada' are different answers",
         always: false,
     },
     FieldSpec {

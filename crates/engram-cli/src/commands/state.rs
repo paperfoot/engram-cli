@@ -156,6 +156,12 @@ pub struct StateValue {
 pub struct RelationGroup {
     pub relation: String,
     pub spec: RelationSpec,
+    /// How many open values this relation holds at `as_of` — counted over the
+    /// WHOLE current set, never over the page. Under `--limit` the paged
+    /// `values` may be a subset (or empty); this number never shrinks with
+    /// them, because "open_count: 1" over a store holding two open medications
+    /// is the envelope lying about a safety slot.
+    pub open_count: usize,
     pub values: Vec<StateValue>,
     pub open_questions: Vec<Value>,
     /// Closed intervals of this relation that no open value inherited, under
@@ -628,6 +634,40 @@ pub fn compile_state(ctx: &AppContext, args: &StateArgs) -> Result<StateView, Cl
         Some(raw) => read_surface::decode_cursor(raw, &key)?,
         None => 0,
     };
+
+    // GROUPS COME FROM THE WHOLE CURRENT SET; only VALUES are paged. Paging
+    // runs over facts, so a group skeleton built from the page would silently
+    // drop every relation whose facts fell past the limit — `state ada
+    // --limit 1` answering "penicillin allergy" with no medication group at
+    // all is an agent reading "no medications known". Every relation open at
+    // `as_of` therefore always appears, carrying its true `open_count`; a
+    // relation whose values all fell on a later page shows `values: []`
+    // beside a non-zero `open_count`, which is a page marker, not an absence.
+    let mut groups: Vec<RelationGroup> = Vec::new();
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
+    for f in &current {
+        let canonical = canonical_relation(&f.predicate);
+        match index.get(&canonical) {
+            Some(i) => groups[*i].open_count += 1,
+            None => {
+                index.insert(canonical.clone(), groups.len());
+                let group_questions: Vec<Value> = questions
+                    .iter()
+                    .filter(|q| q["relation"] == json!(canonical))
+                    .cloned()
+                    .collect();
+                groups.push(RelationGroup {
+                    spec: relation_spec(&canonical),
+                    relation: canonical,
+                    open_count: 1,
+                    values: Vec::new(),
+                    open_questions: group_questions,
+                    history: Vec::new(),
+                });
+            }
+        }
+    }
+
     let page: Vec<Fact> = current
         .into_iter()
         .skip(offset)
@@ -656,10 +696,8 @@ pub fn compile_state(ctx: &AppContext, args: &StateArgs) -> Result<StateView, Cl
         }
     }
 
-    // BTreeMap keyed by the sort rank keeps grouping stable without a second
-    // sort: the facts arrived ordered, and groups inherit that order.
-    let mut groups: Vec<RelationGroup> = Vec::new();
-    let mut index: BTreeMap<String, usize> = BTreeMap::new();
+    // Fill the paged values into their skeletons. Every paged fact's relation
+    // is already in `index` because the page is a subset of `current`.
     let mut attached: HashSet<Uuid> = HashSet::new();
     for f in page {
         let canonical = canonical_relation(&f.predicate);
@@ -683,24 +721,8 @@ pub fn compile_state(ctx: &AppContext, args: &StateArgs) -> Result<StateView, Cl
             history: own_history,
             fact: f,
         };
-        match index.get(&canonical) {
-            Some(i) => groups[*i].values.push(value),
-            None => {
-                index.insert(canonical.clone(), groups.len());
-                let group_questions: Vec<Value> = questions
-                    .iter()
-                    .filter(|q| q["relation"] == json!(canonical))
-                    .cloned()
-                    .collect();
-                groups.push(RelationGroup {
-                    relation: canonical,
-                    spec,
-                    values: vec![value],
-                    open_questions: group_questions,
-                    history: Vec::new(),
-                });
-            }
-        }
+        let i = index[&canonical];
+        groups[i].values.push(value);
     }
 
     // Closed intervals that no open value inherited — a medication with no
@@ -722,6 +744,7 @@ pub fn compile_state(ctx: &AppContext, args: &StateArgs) -> Result<StateView, Cl
                         groups.push(RelationGroup {
                             relation: canonical,
                             spec,
+                            open_count: 0,
                             values: Vec::new(),
                             open_questions: Vec::new(),
                             history: vec![f.clone()],
@@ -740,23 +763,36 @@ pub fn compile_state(ctx: &AppContext, args: &StateArgs) -> Result<StateView, Cl
     }
 
     // A fuzzy answer is about a DIFFERENT NAME than the caller typed, so the
-    // near-miss list ships with results too, not only with an absence.
-    let want_nearest =
-        groups.is_empty() || matches!(resolved_from, SubjectResolution::Fuzzy { .. });
+    // near-miss list ships with results too, not only with an absence. A
+    // RESOLVED subject with no open values gets no near-miss list at all:
+    // "did you mean ada (1.00)" under an answer about ada is the certificate
+    // arguing with itself.
+    let subject_known = !matches!(resolved_from, SubjectResolution::Raw);
+    let want_nearest = matches!(resolved_from, SubjectResolution::Fuzzy { .. })
+        || (groups.is_empty() && !subject_known);
     let nearest = if want_nearest {
         nearest_subjects(ctx, diary_filter, kb_filter, &normalize(&args.subject), 5)?
     } else {
         Vec::new()
     };
+    // "No allergy data for ada" and "no such person as ada" must never be the
+    // same answer: the first is a fact about the store, the second about the
+    // question. Resolution already told us which one this is — `Raw` means no
+    // exact, alias or fuzzy branch matched any fact-bearing subject.
     let absence = if groups.is_empty() {
-        Some(
+        Some(if subject_known {
+            // No fabricated scores: nothing was rejected by a cutoff here —
+            // the subject MATCHED and simply holds nothing open in this
+            // scope, for this relation, at this as-of.
+            Absence::new("no_open_values", scanned_kbs.clone(), 0)
+        } else {
             Absence::new("subject_not_found", scanned_kbs.clone(), 0)
                 .with_scores(
                     nearest.first().map(|n| n.score as f32),
                     Some(FUZZY_THRESHOLD as f32),
                 )
-                .with_nearest(nearest.clone()),
-        )
+                .with_nearest(nearest.clone())
+        })
     } else {
         None
     };
@@ -791,7 +827,7 @@ impl StateView {
                     "mutability": mutability_str(&g.spec),
                     "temporality": temporality_str(&g.spec),
                     "value_domain": value_domain_str(&g.spec),
-                    "open_count": g.values.len(),
+                    "open_count": g.open_count,
                     "values": g.values.iter().map(|v| json!({
                         "handle": read_surface::handle(HandleKind::Fact, v.fact.id),
                         "id": v.fact.id.to_string(),
@@ -898,6 +934,11 @@ pub fn run(ctx: &AppContext, args: StateArgs) -> Result<(), CliError> {
                 ""
             };
             println!("  {}{}", group["relation"].as_str().unwrap_or(""), safety);
+            let shown = group["values"].as_array().map(|v| v.len()).unwrap_or(0);
+            let open = group["open_count"].as_u64().unwrap_or(0) as usize;
+            if shown < open {
+                println!("    ({shown} of {open} open values on this page — follow the cursor)");
+            }
             for v in group["values"].as_array().cloned().unwrap_or_default() {
                 println!(
                     "    {}  (conf={:.2}, since {})",
