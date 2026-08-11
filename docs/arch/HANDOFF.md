@@ -165,6 +165,7 @@ and carried its index with it, leaving the live table **unindexed**).
 | `docs/arch/agent-era-findings.md` | what Anthropic's current guidance implies for engram |
 | `docs/arch/v05-agenda.md` | the four deep design reviews, synthesized |
 | `docs/arch/field-report-deltas.md` | 2026-08-11 field-report dispositions + the 80/20 execution order |
+| `docs/arch/next-cycle-plan.md` | step-level plan for the post-0.4.1 cycle (tracks A–E) |
 | `docs/arch/review-*.md` | every gate and review report |
 | `CHANGELOG.md` | 0.4.0 breaking changes, agent-facing |
 
