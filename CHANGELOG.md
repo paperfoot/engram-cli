@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 — 2026-08-05
+## 0.4.0 — 2026-08-11
 
 The five-move rebuild of the write/mutate/adjudicate layer, from the 2026-08-01
 agent-experience audit: an append-only journal as source of truth, bi-temporal
