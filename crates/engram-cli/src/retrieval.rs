@@ -807,22 +807,30 @@ where
         kbs
     };
     notes.include_expired = params.filters.include_expired;
-    let (expired_memories, expired_kbs): (HashSet<Uuid>, HashSet<String>) =
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+    // TWO quarantines, TWO opt-outs (gate round 3):
+    // - Live expired content is a validity state; `--include-expired` lifts
+    //   its withholding at both the chunk and the derived-KB level.
+    // - FORGOTTEN expired content is a retraction. `forget` leaves derived
+    //   aggregates in place until recompile, so KBs holding a forgotten
+    //   expired memory that no compile has run over since stay confined
+    //   REGARDLESS of the flag: "show me expired" must never mean "show me
+    //   retracted".
+    // Derived candidates (claims, wiki, entities, relations) are rewrites/
+    // aggregates with no per-item memory provenance at recall time, so
+    // KB-level confinement is the only sound test — same shape as diary
+    // isolation, reported the same loud way.
+    let quarantined_kbs = store.kbs_with_quarantined_expired_memories(&now_rfc3339)?;
+    let (expired_memories, mut expired_kbs): (HashSet<Uuid>, HashSet<String>) =
         if params.filters.include_expired {
             (HashSet::new(), HashSet::new())
         } else {
-            let now = chrono::Utc::now().to_rfc3339();
             (
-                store.expired_memory_ids(&now)?,
-                // Derived candidates (claims, wiki, entities, relations) are
-                // rewrites/aggregates with no per-item memory provenance at
-                // recall time, so the only sound expiry confinement is
-                // KB-level — a KB with no expired live memories can only have
-                // derived content built from unexpired ones. Same shape as
-                // diary isolation, reported the same loud way.
-                store.kbs_with_expired_memories(&now)?,
+                store.expired_memory_ids(&now_rfc3339)?,
+                store.kbs_with_expired_memories(&now_rfc3339)?,
             )
         };
+    expired_kbs.extend(quarantined_kbs.iter().cloned());
     // Distinct memories actually withheld, across every path that can
     // surface one (dense below, lexical later — FTS reaches chunks without
     // embeddings, so it needs its own filter).
@@ -913,59 +921,31 @@ where
 
     let fts_q = build_fts_query(params.query);
     if !fts_q.is_empty() && params.mode != RecallMode::Wiki {
-        // REFILL, not a fixed overfetch: FTS applies its limit before the
-        // expiry filter runs, so any fixed multiplier can still let expired
-        // high-ranking hits starve valid lower-ranked ones (a rerank_top_n=1
-        // pool behind three expired hits, reproduced). Double the fetch until
-        // the post-filter pool is full or FTS is exhausted, with a hard cap
-        // as a runaway guard. `ranked_run` truncates back to rerank_top_n.
+        // The expiry cutoff is applied IN SQL, before the LIMIT: a
+        // client-side refill has a cap, and any cap is a deterministic
+        // starvation boundary (257 expired hits beat a 256 cap — gate
+        // round 3). Only the temporal window still filters client-side, so
+        // the refill loop below exists solely for `allowed_chunks`.
+        let expiry_cutoff = (!params.filters.include_expired).then_some(now_rfc3339.as_str());
         let refill_cap = params.rerank_top_n.saturating_mul(16).max(256);
         let mut fts_limit = params.rerank_top_n.max(1);
         let lexical = loop {
-            let mut hits = match store.fts_search_scoped(&fts_q, kb, diary, fts_limit) {
-                Ok(hits) => hits,
-                Err(e) => {
-                    // Don't silently degrade to dense-only: a malformed FTS
-                    // query or SQL error is worth surfacing, but must not
-                    // abort the whole recall, so warn and continue with an
-                    // empty lexical run.
-                    tracing::warn!("lexical (FTS) search failed, continuing without it: {e}");
-                    break Vec::new();
-                }
-            };
+            let mut hits =
+                match store.fts_search_scoped_filtered(&fts_q, kb, diary, fts_limit, expiry_cutoff)
+                {
+                    Ok(hits) => hits,
+                    Err(e) => {
+                        // Don't silently degrade to dense-only: a malformed FTS
+                        // query or SQL error is worth surfacing, but must not
+                        // abort the whole recall, so warn and continue with an
+                        // empty lexical run.
+                        tracing::warn!("lexical (FTS) search failed, continuing without it: {e}");
+                        break Vec::new();
+                    }
+                };
             let exhausted = hits.len() < fts_limit;
             if let Some(allowed) = &allowed_chunks {
                 hits.retain(|(id, _)| allowed.contains(id));
-            }
-            // Expired-memory filter, lexical leg: FTS queries the whole
-            // table, so it can surface chunks of expired memories (including
-            // chunks with no embedding record, which the dense-path filter
-            // above never saw). A chunk already in `chunk_index` survived
-            // the dense-path filter; only the rest need their parent
-            // resolved. An unresolvable chunk is kept — over-filtering on a
-            // lookup miss would be a silent loss.
-            if !expired_memories.is_empty() {
-                let unresolved: Vec<Uuid> = hits
-                    .iter()
-                    .map(|(id, _)| *id)
-                    .filter(|id| !chunk_index.contains_key(id))
-                    .collect();
-                if !unresolved.is_empty() {
-                    let parents = store.memory_ids_for_chunks(&unresolved)?;
-                    hits.retain(|(id, _)| {
-                        if chunk_index.contains_key(id) {
-                            return true;
-                        }
-                        match parents.get(id) {
-                            Some(m) if expired_memories.contains(m) => {
-                                expired_withheld.insert(*m);
-                                false
-                            }
-                            _ => true,
-                        }
-                    });
-                    notes.expired_excluded = expired_withheld.len();
-                }
             }
             if hits.len() >= params.rerank_top_n || exhausted || fts_limit >= refill_cap {
                 break hits;

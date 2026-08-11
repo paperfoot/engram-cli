@@ -265,6 +265,26 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // --allow-duplicate if you truly want a second copy.
     if !allow_duplicate {
         if let Some(existing) = ctx.store.find_duplicate_memory(&kb, &diary, &content)? {
+            // VALIDATION BEFORE ANY PERSISTENCE. `--valid-until` on identical
+            // content expires the EXISTING copy — the natural way to expire
+            // content already stored — and the impossible-interval check runs
+            // against the STORED row's event time (never overridable by this
+            // invocation's --event-time: the stored row is the one being
+            // expired), BEFORE the caller-facts batch below can commit. A
+            // rejected command must reject whole: exit 3 with one fact
+            // already persisted is a half-write behind an error (gate
+            // round 3).
+            let stored_times = ctx.store.memory_times(existing)?;
+            if let Some(vu) = valid_until {
+                if let Some(et) = stored_times.and_then(|(event, _)| event).or(event_time) {
+                    if vu < et {
+                        return Err(CliError::BadInput(format!(
+                            "--valid-until ({vu}) is before the memory's event time \
+                             ({et}): the memory would expire before it happened"
+                        )));
+                    }
+                }
+            }
             // The CONTENT is already stored; the caller's triples may not be.
             // A `remember --facts-json` whose batch failed is retried with the
             // identical command, and returning here would report success while
@@ -305,27 +325,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 }
                 caller_batch_committed = true;
             }
-            // `--valid-until` on identical content expires the EXISTING copy:
-            // re-remembering with an expiry is the natural way to expire
-            // content that is already stored, and silently dropping the flag
-            // here left no way to do that at all. The impossible-interval
-            // check runs against the STORED row's event time, not only this
-            // invocation's — the invariant enforced for new memories must
-            // not be bypassable through dedup (re-gate finding 4).
+            // Validated above, before anything persisted; apply it now.
             let mut validity_updated = false;
             if let Some(vu) = valid_until {
-                let (stored_event, _) = ctx
-                    .store
-                    .memory_times(existing)?
-                    .unwrap_or((None, chrono::DateTime::UNIX_EPOCH));
-                if let Some(et) = event_time.or(stored_event) {
-                    if vu < et {
-                        return Err(CliError::BadInput(format!(
-                            "--valid-until ({vu}) is before the memory's event time \
-                             ({et}): the memory would expire before it happened"
-                        )));
-                    }
-                }
                 validity_updated = ctx.store.set_memory_valid_until(existing, vu)?;
             }
             let facts_source_kind = facts_source_kind(caller_batch_committed, false);

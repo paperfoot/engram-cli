@@ -264,9 +264,13 @@ fn dedup_expiry_is_idempotent() {
     );
 }
 
-/// Expired high-ranking lexical hits must not starve the pool: with three
-/// expired matches ahead of one current one and a pool of one, the current
-/// memory is still found (re-gate finding 8: refill, not fixed overfetch).
+/// Expired high-ranking hits must not starve a pool of one: with three
+/// expired matches beside one current one and `--rerank-top-n 1`, the
+/// current memory is still found. The decisive lexical-leg pin (arbitrary
+/// expired counts vs a pool of one, dense leg out of the picture) lives in
+/// the storage unit test `fts_expiry_filter_runs_before_the_limit` — the
+/// cutoff runs in FTS SQL before the LIMIT, so it cannot starve at any
+/// count.
 #[test]
 fn expired_hits_cannot_starve_a_small_lexical_pool() {
     let home = tempfile::tempdir().unwrap();
@@ -290,6 +294,89 @@ fn expired_hits_cannot_starve_a_small_lexical_pool() {
     assert!(
         contents.iter().any(|c| c.contains("CURRENT_TARGET")),
         "expired hits starved the lexical pool: {contents:?}"
+    );
+}
+
+/// `--include-expired` lifts the validity withholding, and ONLY that: a
+/// FORGOTTEN expired memory whose derived artifacts have not been recompiled
+/// away stays quarantined — "show me expired" is not "show me retracted"
+/// (gate round 3, High).
+#[test]
+fn include_expired_does_not_expose_forgotten_derived_content() {
+    let home = tempfile::tempdir().unwrap();
+    let v = run_json(
+        &home,
+        &[
+            "remember",
+            "the quokkavault window has closed",
+            "--valid-until",
+            "2020-01-01",
+        ],
+    );
+    let id = v["data"]["id"].as_str().expect("memory id").to_string();
+    engram_in(&home)
+        .args(["compile", "--kb", "default", "--all"])
+        .arg("--json")
+        .assert()
+        .success();
+    engram_in(&home)
+        .args(["forget", &id, "--confirm"])
+        .arg("--json")
+        .assert()
+        .success();
+    // The forgotten sentence must not come back through wiki/entity/relation
+    // projections even when the caller opts into expired content.
+    let v = run_json(
+        &home,
+        &[
+            "recall",
+            "quokkavault",
+            "--mode",
+            "explore",
+            "--include-expired",
+        ],
+    );
+    assert!(
+        !result_contents(&v)
+            .iter()
+            .any(|c| c.contains("window has closed")),
+        "forgotten content exposed via --include-expired: {:?}",
+        result_contents(&v)
+    );
+}
+
+/// A rejected dedup must reject WHOLE: an impossible --valid-until beside a
+/// --facts-json batch exits 3 with zero facts persisted (gate round 3,
+/// High — validation precedes all persistence).
+#[test]
+fn rejected_dedup_persists_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    run_json(
+        &home,
+        &[
+            "remember",
+            "the quokkavault permit",
+            "--event-time",
+            "2025-01-01",
+        ],
+    );
+    engram_in(&home)
+        .args([
+            "remember",
+            "the quokkavault permit",
+            "--valid-until",
+            "2020-06-01",
+            "--facts-json",
+            r#"[{"subject":"permit","predicate":"status","object":"active"}]"#,
+        ])
+        .arg("--json")
+        .assert()
+        .failure();
+    let v = run_json(&home, &["facts", "list"]);
+    assert_eq!(
+        v["data"]["total"], 0,
+        "a rejected dedup persisted facts: {}",
+        v["data"]
     );
 }
 

@@ -2805,59 +2805,61 @@ impl SqliteStore {
         diary: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(Uuid, f32)>, StorageError> {
-        let sql = match (kb, diary) {
-            (Some(_), Some(_)) => {
-                "SELECT c.id, -bm25(chunks_fts)
-                 FROM chunks_fts
-                 JOIN chunks c ON c.rowid = chunks_fts.rowid
-                 JOIN memories m ON m.id = c.memory_id
-                 WHERE chunks_fts MATCH ?1 AND m.deleted = 0 AND m.kb = ?2 AND m.diary = ?3
-                 ORDER BY bm25(chunks_fts)
-                 LIMIT ?4"
-            }
-            (Some(_), None) => {
-                "SELECT c.id, -bm25(chunks_fts)
-                 FROM chunks_fts
-                 JOIN chunks c ON c.rowid = chunks_fts.rowid
-                 JOIN memories m ON m.id = c.memory_id
-                 WHERE chunks_fts MATCH ?1 AND m.deleted = 0 AND m.kb = ?2
-                 ORDER BY bm25(chunks_fts)
-                 LIMIT ?3"
-            }
-            (None, Some(_)) => {
-                "SELECT c.id, -bm25(chunks_fts)
-                 FROM chunks_fts
-                 JOIN chunks c ON c.rowid = chunks_fts.rowid
-                 JOIN memories m ON m.id = c.memory_id
-                 WHERE chunks_fts MATCH ?1 AND m.deleted = 0 AND m.diary = ?2
-                 ORDER BY bm25(chunks_fts)
-                 LIMIT ?3"
-            }
-            (None, None) => {
-                "SELECT c.id, -bm25(chunks_fts)
-                 FROM chunks_fts
-                 JOIN chunks c ON c.rowid = chunks_fts.rowid
-                 JOIN memories m ON m.id = c.memory_id
-                 WHERE chunks_fts MATCH ?1 AND m.deleted = 0
-                 ORDER BY bm25(chunks_fts)
-                 LIMIT ?2"
-            }
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = match (kb, diary) {
-            (Some(k), Some(d)) => stmt
-                .query_map(params![query, k, d, limit as i64], parse_id_score_row)?
-                .collect::<Result<Vec<_>, _>>()?,
-            (Some(k), None) => stmt
-                .query_map(params![query, k, limit as i64], parse_id_score_row)?
-                .collect::<Result<Vec<_>, _>>()?,
-            (None, Some(d)) => stmt
-                .query_map(params![query, d, limit as i64], parse_id_score_row)?
-                .collect::<Result<Vec<_>, _>>()?,
-            (None, None) => stmt
-                .query_map(params![query, limit as i64], parse_id_score_row)?
-                .collect::<Result<Vec<_>, _>>()?,
-        };
+        self.fts_search_scoped_filtered(query, kb, diary, limit, None)
+    }
+
+    /// `fts_search_scoped` with an optional expiry cutoff applied IN SQL.
+    ///
+    /// When `expired_before` is set (RFC3339 UTC "now"), chunks of live
+    /// memories whose `valid_until` has passed are excluded before the LIMIT,
+    /// so expired high-ranking hits can never starve the pool no matter how
+    /// many there are — a client-side refill loop has a cap, and any cap is a
+    /// deterministic starvation boundary (gate round 3). Same `datetime()`
+    /// normalization as `expired_memory_ids`.
+    pub fn fts_search_scoped_filtered(
+        &self,
+        query: &str,
+        kb: Option<&str>,
+        diary: Option<&str>,
+        limit: usize,
+        expired_before: Option<&str>,
+    ) -> Result<Vec<(Uuid, f32)>, StorageError> {
+        let mut sql = String::from(
+            "SELECT c.id, -bm25(chunks_fts)
+             FROM chunks_fts
+             JOIN chunks c ON c.rowid = chunks_fts.rowid
+             JOIN memories m ON m.id = c.memory_id
+             WHERE chunks_fts MATCH ?1 AND m.deleted = 0",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
+        if let Some(k) = kb {
+            binds.push(Box::new(k.to_string()));
+            sql.push_str(&format!(" AND m.kb = ?{}", binds.len()));
+        }
+        if let Some(d) = diary {
+            binds.push(Box::new(d.to_string()));
+            sql.push_str(&format!(" AND m.diary = ?{}", binds.len()));
+        }
+        if let Some(now) = expired_before {
+            binds.push(Box::new(now.to_string()));
+            sql.push_str(&format!(
+                " AND NOT (m.valid_until IS NOT NULL \
+                   AND datetime(m.valid_until) < datetime(?{}))",
+                binds.len()
+            ));
+        }
+        binds.push(Box::new(limit as i64));
+        sql.push_str(&format!(
+            " ORDER BY bm25(chunks_fts) LIMIT ?{}",
+            binds.len()
+        ));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+                parse_id_score_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows
             .into_iter()
             .filter_map(|(id_str, score)| Uuid::parse_str(&id_str).ok().map(|id| (id, score)))
@@ -4182,7 +4184,7 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// KBs whose derived layer may still carry expired content.
+    /// KBs whose derived layer may still carry LIVE expired content.
     ///
     /// The expiry analog of `kbs_with_memories_outside_diary`: derived
     /// artifacts (claims, wiki pages, entities, relations) are rewrites and
@@ -4191,23 +4193,50 @@ impl SqliteStore {
     /// derived-constraining memories can only have derived content built
     /// from unexpired ones. Same normalization rule as `expired_memory_ids`.
     ///
-    /// `MEMORY_CONSTRAINS_DERIVED`, not `deleted = 0`: a FORGOTTEN expired
-    /// memory keeps constraining this gate until a compile has completed
-    /// after its deletion, because `forget` deliberately leaves wiki/entity/
-    /// relation aggregates in place until recompile — with a bare liveness
-    /// test, forgetting the expired source REPUBLISHED its content through
-    /// the derived layer (re-gate finding 1).
+    /// This set is LIFTED by `--include-expired`. Its sibling below is not:
+    /// the two are separate quarantines with separate opt-outs, and the flag
+    /// that says "show me expired content" must not also mean "show me
+    /// FORGOTTEN content" (gate round 3).
     pub fn kbs_with_expired_memories(
         &self,
         now: &str,
     ) -> Result<std::collections::HashSet<String>, StorageError> {
-        let sql = format!(
-            "SELECT DISTINCT m.kb FROM memories m
-             WHERE m.valid_until IS NOT NULL
+        let sql = "SELECT DISTINCT m.kb FROM memories m
+             WHERE m.deleted = 0 AND m.valid_until IS NOT NULL
+               AND datetime(m.valid_until) < datetime(?1)";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// KBs whose derived layer may still carry FORGOTTEN expired content.
+    ///
+    /// `forget` closes the memory but deliberately leaves wiki/entity/
+    /// relation aggregates in place until recompile, so a forgotten expired
+    /// memory's text can survive in the derived layer. This quarantine holds
+    /// until a compile completes after the deletion (the second arm of
+    /// `MEMORY_CONSTRAINS_DERIVED`) and is NEVER lifted by
+    /// `--include-expired` — expired is a validity state the caller may opt
+    /// into seeing; forgotten is a retraction they may not.
+    pub fn kbs_with_quarantined_expired_memories(
+        &self,
+        now: &str,
+    ) -> Result<std::collections::HashSet<String>, StorageError> {
+        let sql = "SELECT DISTINCT m.kb FROM memories m
+             WHERE m.deleted = 1 AND m.valid_until IS NOT NULL
                AND datetime(m.valid_until) < datetime(?1)
-               AND {MEMORY_CONSTRAINS_DERIVED}"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
+               AND NOT EXISTS (
+                   SELECT 1 FROM compile_jobs j
+                   WHERE j.kb = m.kb
+                     AND j.kind = 'compile'
+                     AND j.status = 'completed'
+                     AND j.created_at > COALESCE(m.deleted_at, '9999-12-31T23:59:59.999999999+00:00')
+               )";
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
         let mut out = std::collections::HashSet::new();
         for row in rows {
@@ -6720,6 +6749,59 @@ mod tests {
         let hits = store.fts_search("rapamycin", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, chunk_id);
+    }
+
+    /// The expiry cutoff runs IN SQL, before the LIMIT: 300 higher-ranked
+    /// expired matches cannot starve a pool of one, because they are excluded
+    /// before the pool is cut. A client-side refill loop has a cap, and any
+    /// cap is a deterministic starvation boundary (gate round 3).
+    #[test]
+    fn fts_expiry_filter_runs_before_the_limit() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        for i in 0..300 {
+            let mut m = fact(&format!("expired filler {i}"));
+            m.valid_until = Some(now - chrono::Duration::days(1));
+            store.insert_memory(&m).unwrap();
+            store
+                .insert_chunk(
+                    Uuid::new_v4(),
+                    m.id,
+                    // Repeat the term so bm25 ranks every filler above the
+                    // one-mention target.
+                    "starval starval starval expired filler",
+                    0,
+                    None,
+                )
+                .unwrap();
+        }
+        let target = fact("current target");
+        store.insert_memory(&target).unwrap();
+        let target_chunk = Uuid::new_v4();
+        store
+            .insert_chunk(
+                target_chunk,
+                target.id,
+                "starval current target row",
+                0,
+                None,
+            )
+            .unwrap();
+
+        // Unfiltered, a pool of one holds only an expired filler.
+        let unfiltered = store
+            .fts_search_scoped_filtered("starval", None, None, 1, None)
+            .unwrap();
+        assert_eq!(unfiltered.len(), 1);
+        assert_ne!(unfiltered[0].0, target_chunk);
+
+        // Filtered, the same pool of one holds the current target: no count
+        // of expired hits can consume it.
+        let filtered = store
+            .fts_search_scoped_filtered("starval", None, None, 1, Some(&now.to_rfc3339()))
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, target_chunk);
     }
 
     #[test]
