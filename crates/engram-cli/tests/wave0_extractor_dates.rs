@@ -15,6 +15,7 @@ use serde_json::Value;
 fn engram_in(home: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("engram").expect("binary built");
     cmd.env("ENGRAM_BENCH_FORCE_STUB", "1");
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env("HOME", home);
     cmd.env("XDG_CONFIG_HOME", home.join(".config"));
     cmd.env("XDG_DATA_HOME", home.join(".local/share"));

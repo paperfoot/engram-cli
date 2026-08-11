@@ -23,6 +23,10 @@ use std::path::Path;
 /// Point a spawned binary's data/config/cache at `home` (same idiom as
 /// tests/cli.rs: `directories` honors XDG_* on Linux and HOME on macOS).
 fn point_at_home(cmd: &mut Command, home: &Path) {
+    // A developer's exported ENGRAM_STORE outranks HOME/XDG (cli.rs documents
+    // the precedence), so without this line the temp-HOME isolation below is
+    // bypassed and mutator tests run against the REAL store.
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env("HOME", home);
     cmd.env("XDG_CONFIG_HOME", home.join(".config"));
     cmd.env("XDG_DATA_HOME", home.join(".local/share"));
@@ -78,6 +82,7 @@ fn start_daemon(home: &Path, extra_env: &[(&str, &str)]) -> Daemon {
 fn try_start_daemon(home: &Path, extra_env: &[(&str, &str)]) -> Option<Daemon> {
     let port = free_port();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_engram"));
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))

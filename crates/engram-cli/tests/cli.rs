@@ -13,6 +13,10 @@ use std::path::PathBuf;
 /// Point a spawned binary's data/config/cache at `home`.
 /// The `directories` crate honors XDG_* on Linux and HOME on macOS.
 fn point_at_home(cmd: &mut Command, home: &std::path::Path) {
+    // A developer's exported ENGRAM_STORE outranks HOME/XDG (cli.rs documents
+    // the precedence), so without this line the temp-HOME isolation below is
+    // bypassed and mutator tests run against the REAL store.
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env("HOME", home);
     cmd.env("XDG_CONFIG_HOME", home.join(".config"));
     cmd.env("XDG_DATA_HOME", home.join(".local/share"));
@@ -373,6 +377,7 @@ fn remember_then_recall_roundtrip() {
     .success();
 
     let mut cmd2 = engram();
+    cmd2.env_remove("ENGRAM_STORE");
     cmd2.env("HOME", tmp.path());
     cmd2.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     cmd2.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -404,6 +409,7 @@ fn recall_refuses_mixed_embedding_metadata() {
         .success();
 
     let mut cmd2 = Command::cargo_bin("engram").expect("binary built");
+    cmd2.env_remove("ENGRAM_STORE");
     cmd2.env("HOME", tmp.path());
     cmd2.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     cmd2.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -454,6 +460,7 @@ fn kb_ingest_compile_entities_flow() {
     .unwrap();
 
     let mut ingest_cmd = engram();
+    ingest_cmd.env_remove("ENGRAM_STORE");
     ingest_cmd.env("HOME", tmp.path());
     ingest_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     ingest_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -474,6 +481,7 @@ fn kb_ingest_compile_entities_flow() {
         .success();
 
     let mut entities_cmd = engram();
+    entities_cmd.env_remove("ENGRAM_STORE");
     entities_cmd.env("HOME", tmp.path());
     entities_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     entities_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -503,6 +511,7 @@ fn kb_delete_removes_recallable_memories_in_that_kb() {
         .success();
 
     let mut remember_cmd = engram();
+    remember_cmd.env_remove("ENGRAM_STORE");
     remember_cmd.env("HOME", tmp.path());
     remember_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     remember_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -520,6 +529,7 @@ fn kb_delete_removes_recallable_memories_in_that_kb() {
         .success();
 
     let mut delete_cmd = engram();
+    delete_cmd.env_remove("ENGRAM_STORE");
     delete_cmd.env("HOME", tmp.path());
     delete_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     delete_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -530,6 +540,7 @@ fn kb_delete_removes_recallable_memories_in_that_kb() {
         .success();
 
     let mut recall_cmd = engram();
+    recall_cmd.env_remove("ENGRAM_STORE");
     recall_cmd.env("HOME", tmp.path());
     recall_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     recall_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -805,6 +816,7 @@ fn documents_jobs_budget_and_scientific_bench_work() {
         .success();
 
     let mut docs_cmd = engram();
+    docs_cmd.env_remove("ENGRAM_STORE");
     docs_cmd.env("HOME", tmp.path());
     docs_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     docs_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -821,6 +833,7 @@ fn documents_jobs_budget_and_scientific_bench_work() {
     assert_eq!(docs["data"]["documents"].as_array().unwrap().len(), 1);
 
     let mut compile_cmd = engram();
+    compile_cmd.env_remove("ENGRAM_STORE");
     compile_cmd.env("HOME", tmp.path());
     compile_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     compile_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -831,6 +844,7 @@ fn documents_jobs_budget_and_scientific_bench_work() {
         .success();
 
     let mut jobs_cmd = engram();
+    jobs_cmd.env_remove("ENGRAM_STORE");
     jobs_cmd.env("HOME", tmp.path());
     jobs_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     jobs_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -846,6 +860,7 @@ fn documents_jobs_budget_and_scientific_bench_work() {
     assert!(!jobs["data"]["jobs"].as_array().unwrap().is_empty());
 
     let mut budget_cmd = engram();
+    budget_cmd.env_remove("ENGRAM_STORE");
     budget_cmd.env("HOME", tmp.path());
     budget_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     budget_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -980,6 +995,7 @@ fn import_from_export_roundtrip() {
     .success();
 
     let mut cmd2 = engram();
+    cmd2.env_remove("ENGRAM_STORE");
     cmd2.env("HOME", tmp.path());
     cmd2.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     cmd2.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1000,6 +1016,7 @@ fn import_from_export_roundtrip() {
 
     let fresh = tempfile::tempdir().unwrap();
     let mut cmd3 = engram();
+    cmd3.env_remove("ENGRAM_STORE");
     cmd3.env("HOME", fresh.path());
     cmd3.env("XDG_CONFIG_HOME", fresh.path().join(".config"));
     cmd3.env("XDG_DATA_HOME", fresh.path().join(".local/share"));
@@ -1129,6 +1146,7 @@ fn ingest_same_source_path_is_idempotent() {
         .success();
 
     let mut ingest2 = engram();
+    ingest2.env_remove("ENGRAM_STORE");
     ingest2.env("HOME", tmp.path());
     ingest2.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     ingest2.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1154,6 +1172,7 @@ fn ingest_same_source_path_is_idempotent() {
     assert_eq!(v["data"]["skipped_existing"], 1);
 
     let mut show = engram();
+    show.env_remove("ENGRAM_STORE");
     show.env("HOME", tmp.path());
     show.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     show.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1195,6 +1214,7 @@ fn document_delete_clears_derived_entities() {
         .success();
 
     let mut docs = engram();
+    docs.env_remove("ENGRAM_STORE");
     docs.env("HOME", tmp.path());
     docs.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     docs.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1210,6 +1230,7 @@ fn document_delete_clears_derived_entities() {
     let document_id = docs_json["data"]["documents"][0]["id"].as_str().unwrap();
 
     let mut delete = engram();
+    delete.env_remove("ENGRAM_STORE");
     delete.env("HOME", tmp.path());
     delete.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     delete.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1223,6 +1244,7 @@ fn document_delete_clears_derived_entities() {
     // knowledge; entity aggregates go stale until the next compile.
     // A fresh compile over the (now empty) KB must clear them.
     let mut compile = engram();
+    compile.env_remove("ENGRAM_STORE");
     compile.env("HOME", tmp.path());
     compile.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     compile.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1233,6 +1255,7 @@ fn document_delete_clears_derived_entities() {
         .success();
 
     let mut entities = engram();
+    entities.env_remove("ENGRAM_STORE");
     entities.env("HOME", tmp.path());
     entities.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     entities.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1287,6 +1310,7 @@ fn memory_aliases_roundtrip_and_skip_extraction_loudly_without_a_key() {
     assert!(note.contains("facts backfill"), "actionable note: {note}");
 
     let mut search = engram();
+    search.env_remove("ENGRAM_STORE");
     search.env("HOME", tmp.path());
     search.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     search.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1365,6 +1389,7 @@ fn directory_ingest_dry_run_and_include_are_selective() {
         .ends_with("keep.md"));
 
     let mut ingest = engram();
+    ingest.env_remove("ENGRAM_STORE");
     ingest.env("HOME", tmp.path());
     ingest.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     ingest.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1389,6 +1414,7 @@ fn directory_ingest_dry_run_and_include_are_selective() {
     assert_eq!(result["data"]["memories_created"], 1);
 
     let mut docs = engram();
+    docs.env_remove("ENGRAM_STORE");
     docs.env("HOME", tmp.path());
     docs.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     docs.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1444,6 +1470,7 @@ fn directory_ingest_uses_configured_scope_defaults() {
         .success();
 
     let mut set_max = engram();
+    set_max.env_remove("ENGRAM_STORE");
     set_max.env("HOME", tmp.path());
     set_max.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     set_max.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1454,6 +1481,7 @@ fn directory_ingest_uses_configured_scope_defaults() {
         .success();
 
     let mut ingest = engram();
+    ingest.env_remove("ENGRAM_STORE");
     ingest.env("HOME", tmp.path());
     ingest.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     ingest.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1478,6 +1506,7 @@ fn directory_ingest_uses_configured_scope_defaults() {
     assert_eq!(result["data"]["memories_created"], 1);
 
     let mut docs = engram();
+    docs.env_remove("ENGRAM_STORE");
     docs.env("HOME", tmp.path());
     docs.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     docs.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1500,6 +1529,7 @@ fn directory_ingest_uses_configured_scope_defaults() {
 /// Helper: run a recall with extra args in an existing isolated home.
 fn recall_in(home: &std::path::Path, args: &[&str]) -> Value {
     let mut cmd = engram();
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env("HOME", home);
     cmd.env("XDG_CONFIG_HOME", home.join(".config"));
     cmd.env("XDG_DATA_HOME", home.join(".local/share"));
@@ -1576,6 +1606,7 @@ fn recall_cloud_profile_without_key_errors_not_silent_stub() {
     let mut cmd = Command::cargo_bin("engram").expect("binary built");
     cmd.env_remove("ENGRAM_BENCH_FORCE_STUB");
     cmd.env_remove("GEMINI_API_KEY");
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env("HOME", tmp.path());
     cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1599,6 +1630,7 @@ fn recall_offline_profile_without_key_works() {
     let mut cmd = Command::cargo_bin("engram").expect("binary built");
     cmd.env_remove("ENGRAM_BENCH_FORCE_STUB");
     cmd.env_remove("GEMINI_API_KEY");
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env("HOME", tmp.path());
     cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1623,6 +1655,7 @@ fn remember_dedups_identical_content() {
 
     // Second identical remember → deduplicated, not stored again.
     let mut c2 = engram();
+    c2.env_remove("ENGRAM_STORE");
     c2.env("HOME", tmp.path());
     c2.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     c2.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1641,6 +1674,7 @@ fn remember_dedups_identical_content() {
 
     // --allow-duplicate forces a second row.
     let mut c3 = engram();
+    c3.env_remove("ENGRAM_STORE");
     c3.env("HOME", tmp.path());
     c3.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
     c3.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
@@ -1675,6 +1709,7 @@ fn budget_gate_blocks_over_cap_spend() {
             "GEMINI_API_KEY",
             "fake-key-not-used-because-budget-blocks-first",
         );
+        c.env_remove("ENGRAM_STORE");
         c.env("HOME", tmp.path());
         c.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
         c.env("XDG_DATA_HOME", tmp.path().join(".local/share"));

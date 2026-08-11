@@ -37,6 +37,10 @@ fn leaky_extraction_script() -> String {
 /// crate honors XDG_* on Linux and HOME on macOS; a test that forgets one of
 /// these reads and WRITES the developer's real memory store.
 fn point_at_home(cmd: &mut Command, home: &std::path::Path) {
+    // A developer's exported ENGRAM_STORE outranks HOME/XDG (cli.rs documents
+    // the precedence), so without this line the temp-HOME isolation below is
+    // bypassed and mutator tests run against the REAL store.
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env("HOME", home);
     cmd.env("XDG_CONFIG_HOME", home.join(".config"));
     cmd.env("XDG_DATA_HOME", home.join(".local/share"));

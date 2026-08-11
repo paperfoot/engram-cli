@@ -20,6 +20,10 @@ use assert_cmd::Command;
 use serde_json::Value;
 
 fn point_at_home(cmd: &mut Command, home: &std::path::Path) {
+    // A developer's exported ENGRAM_STORE outranks HOME/XDG (cli.rs documents
+    // the precedence), so without this line the temp-HOME isolation below is
+    // bypassed and mutator tests run against the REAL store.
+    cmd.env_remove("ENGRAM_STORE");
     cmd.env_remove("GEMINI_API_KEY");
     cmd.env_remove("COHERE_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
