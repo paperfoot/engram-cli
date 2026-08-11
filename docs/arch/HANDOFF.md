@@ -12,8 +12,8 @@ is verified against the tree, not recalled.
 | Tests | **1213 passed, 0 failed** |
 | Schema on branch | **v13** |
 | **Published** | **0.4.1 on crates.io (all 10 crates) + brew tap formula**, 2026-08-11, after a GO from six independent gate rounds. A **0.4.0** also exists on crates.io: published from `2373a91` (2026-08-05) by an earlier session that never updated this doc — it predates expiry/purity/index/harness work, is coherent, unyanked, and the tap never pointed at it. |
-| **Installed binary** | **still 0.3.1** — untouched; the 0.4.1 install verification ran from a scratchpad `--root`, never PATH |
-| **Boris's live store** | **still schema v9** — never migrated, never written to. TWO migration rehearsals on full copies passed (v9→v13, counts identical, backup written, index healed). `brew upgrade engram` + any `engram` command migrates it ONE-WAY; recommend `cp -R` of the store dir first anyway. |
+| **Installed binary** | **0.4.1** (cargo-installed, 2026-08-11, on explicit approval) |
+| **Boris's live store** | **schema v13** — migrated 2026-08-11 after two rehearsals; counts intact (1557 memories / 4794 facts), quick_check ok, entity index healed. Backups: manual `…engram.pre-0.4.1-backup-202608110829` (full dir copy) + automatic `db.sqlite.pre-v10-backup.20260811073038` beside the store. Agent skill refreshed in all four skill directories (old copies archived in the session scratchpad). |
 
 **Update this table when you publish or install. The stale "nothing published"
 claim here is exactly what burned the 0.4.0 version number.**
