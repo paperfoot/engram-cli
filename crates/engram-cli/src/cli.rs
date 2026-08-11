@@ -308,6 +308,10 @@ Examples:
         /// Permit comparing chunks embedded with different metadata.
         #[arg(long)]
         allow_mixed_embeddings: bool,
+        /// Search memories whose `valid_until` has already passed. Same flag
+        /// as `recall --include-expired`.
+        #[arg(long)]
+        include_expired: bool,
     },
 
     /// Inspect compile/daemon jobs.

@@ -118,7 +118,9 @@ fn future_valid_until_is_not_withheld() {
     );
     let v = run_json(&home, &["recall", "quokkavault"]);
     assert!(
-        result_contents(&v).iter().any(|c| c.contains("valid for years")),
+        result_contents(&v)
+            .iter()
+            .any(|c| c.contains("valid for years")),
         "future-dated memory must be found"
     );
     assert!(
@@ -147,17 +149,26 @@ fn all_expired_scope_is_distinguishable_from_empty_scope() {
     assert_eq!(result_contents(&v).len(), 0);
     let expiry = &v["data"]["metadata"]["expiry"];
     assert_eq!(expiry["expired_memories_excluded"], 1);
-    // The receipt still counts the expired chunk as in-scope.
-    let considered = v["data"]["scope"]["chunks_considered"]
-        .as_u64()
-        .or_else(|| v["data"]["metadata"]["chunks_considered"].as_u64())
-        .or_else(|| v["data"]["absence"]["chunks_considered"].as_u64());
-    if let Some(considered) = considered {
-        assert!(
-            considered >= 1,
-            "an all-expired scope must not read as empty (considered = {considered})"
-        );
-    }
+    // The absence certificate must say WHY: `all_candidates_expired`, not
+    // `no_candidate_matched` — the content exists and --include-expired
+    // reaches it. Selling validity withholding as search absence is the H9
+    // failure class this feature must not reintroduce.
+    assert_eq!(v["data"]["verdict"], "no_match");
+    assert_eq!(
+        v["data"]["absence"]["reason"], "all_candidates_expired",
+        "absence: {}",
+        v["data"]["absence"]
+    );
+    // And the receipt still counts the expired chunk as in-scope: "the scope
+    // held content, all of it expired" is a different claim from "empty".
+    assert!(
+        v["data"]["absence"]["searched_chunks"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "an all-expired scope must not read as empty: {}",
+        v["data"]["absence"]
+    );
 }
 
 /// `memory search` shares recall's pipeline and must share the gate.

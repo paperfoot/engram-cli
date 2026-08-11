@@ -75,17 +75,28 @@ cannot launder an imported claim into trusted history.
   records when content stops being true (a bare date holds through the END of
   that UTC day, matching `recall --until`); once that instant passes, `recall`,
   `memory search`, `research` and the daemon endpoints withhold the memory from
-  every retrieval path. The withholding is never silent: `metadata.expiry`
-  reports `expired_memories_excluded`, and `--include-expired`
-  (`include_expired` over HTTP) reaches expired memories again. Scope receipts
-  still count expired chunks as in-scope — an all-expired scope answers "scope
-  held content, all expired", not "scope was empty"; expiry is a validity
-  claim, not an absence claim. A `--valid-until` earlier than `--event-time`
-  is rejected: the memory would expire before it happened.
+  every retrieval path — raw chunks (dense and lexical) by exact memory, and
+  derived candidates (claims, wiki pages, entities, relations) by KB
+  confinement: a derived row is a rewrite/aggregate that may paraphrase an
+  expired memory, so any KB holding an expired live memory has its derived
+  candidates withheld too, the same shape as diary isolation. The withholding
+  is never silent: `metadata.expiry` reports `expired_memories_excluded` and
+  `excluded_derived_candidates`, and `--include-expired` (`include_expired`
+  over HTTP; also on `research`) reaches everything again. An all-expired
+  scope answers `absence.reason: all_candidates_expired`, never
+  `no_candidate_matched` — expiry is a validity claim, not an absence claim.
+  Re-remembering identical content with `--valid-until` expires the EXISTING
+  copy (`valid_until_updated: true`) instead of silently dropping the flag.
+  A `--valid-until` earlier than `--event-time` is rejected: the memory would
+  expire before it happened. Expiry comparison normalizes timezone offsets
+  (`datetime()`, not TEXT ordering), so imported non-UTC timestamps expire at
+  the correct instant.
 - `--json` output purity pinned by contract tests: exactly one JSON object on
   stdout on success; on failure stdout stays empty and stderr carries one JSON
   error object (when piped) whose `error.exit_code` matches the process exit
   code; tracing/diagnostics never reach stdout even under `RUST_LOG=debug`.
+  Streaming surfaces are the documented exception: `jobs watch` emits NDJSON —
+  one JSON object per line, one line per state change.
 - Typed id handles (`mem:`/`chunk:`/`fact:`/`conflict:`/…) accepted by every
   mutator; bare UUIDs stay valid everywhere. A chunk id fed to `edit`/`forget`
   resolves to its memory (`resolved_from` says so); a wrong-kind id names the

@@ -209,6 +209,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             top_k,
             profile,
             allow_mixed_embeddings,
+            include_expired,
         } => {
             commands::research::run(
                 &ctx,
@@ -219,6 +220,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 top_k,
                 profile,
                 allow_mixed_embeddings,
+                include_expired,
             )
             .await
         }

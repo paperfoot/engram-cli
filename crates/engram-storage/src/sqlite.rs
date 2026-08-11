@@ -990,22 +990,32 @@ impl SqliteStore {
     /// kind-scoped reads (gate-4 M7). Check-then-repair keeps `open()`
     /// write-free once healed.
     fn repair_entity_kind_index(&self) -> Result<(), StorageError> {
-        let on_live: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT tbl_name FROM sqlite_master
-                 WHERE type = 'index' AND name = 'idx_entities_kind'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if on_live.as_deref() != Some("entities") {
-            self.conn.execute_batch(
-                "DROP INDEX IF EXISTS idx_entities_kind;
-                 CREATE INDEX idx_entities_kind ON entities(kind);",
-            )?;
+        let index_table = |s: &Self| -> Result<Option<String>, StorageError> {
+            Ok(s.conn
+                .query_row(
+                    "SELECT tbl_name FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_entities_kind'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        };
+        if index_table(self)?.as_deref() == Some("entities") {
+            return Ok(());
         }
-        Ok(())
+        // Concurrent openers can both see the legacy index; the re-check runs
+        // inside the transaction and the CREATE is IF NOT EXISTS, so the
+        // loser of the race becomes a no-op instead of "index already exists"
+        // (reproduced: 9 failures in 2,000 concurrent opens without this).
+        self.with_tx(|s| {
+            if index_table(s)?.as_deref() != Some("entities") {
+                s.conn.execute_batch(
+                    "DROP INDEX IF EXISTS idx_entities_kind;
+                     CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(kind);",
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Run `f` inside a single SQLite transaction. If a transaction is
@@ -1985,15 +1995,23 @@ impl SqliteStore {
 
     /// Ids of live memories whose validity window has closed strictly before
     /// `now` (RFC3339 UTC). Recall withholds these by default and reports the
-    /// count; `--include-expired` opts back in. TEXT comparison, the same
-    /// convention as the since/until bounds above.
+    /// count; `--include-expired` opts back in.
+    ///
+    /// `datetime()` on both sides, NOT raw TEXT comparison: `remember` always
+    /// writes normalized UTC, but import passes `valid_until` strings through
+    /// unchanged, and a non-normalized offset breaks lexical ordering —
+    /// `'…T15:00:00+14:00' < '…T02:00:00+00:00'` is false as TEXT while the
+    /// instant is already past. `datetime()` normalizes to UTC before
+    /// comparing; a value it cannot parse becomes NULL and never expires,
+    /// which errs toward returning content rather than hiding it.
     pub fn expired_memory_ids(
         &self,
         now: &str,
     ) -> Result<std::collections::HashSet<Uuid>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM memories
-             WHERE deleted = 0 AND valid_until IS NOT NULL AND valid_until < ?1",
+             WHERE deleted = 0 AND valid_until IS NOT NULL
+               AND datetime(valid_until) < datetime(?1)",
         )?;
         let rows = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
         let mut out = std::collections::HashSet::new();
@@ -2273,6 +2291,50 @@ impl SqliteStore {
                 &crate::journal::EventDraft::new(kind, crate::journal::cli_actor(&diary), payload)
                     .scope(kb.as_deref(), Some(&diary))
                     .subject(memory_id),
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Set (or move) a live memory's `valid_until`. The dedup path uses this:
+    /// re-remembering identical content WITH `--valid-until` must expire the
+    /// existing copy, or there is no way to expire content that already
+    /// exists without editing it. Journalled as `MemoryMetaChanged`.
+    /// Returns false when the memory is missing or deleted.
+    pub fn set_memory_valid_until(
+        &self,
+        memory_id: Uuid,
+        valid_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        self.with_tx(|s| {
+            let diary: Option<String> = s
+                .conn
+                .query_row(
+                    "SELECT diary FROM memories WHERE id = ?1 AND deleted = 0",
+                    params![memory_id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(diary) = diary else {
+                return Ok(false);
+            };
+            let vu = valid_until.to_rfc3339();
+            let changed = s.conn.execute(
+                "UPDATE memories SET valid_until = ?1 WHERE id = ?2 AND deleted = 0",
+                params![vu, memory_id.to_string()],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let kb = s.kb_for_memory(memory_id)?;
+            s.append_event(
+                &crate::journal::EventDraft::new(
+                    engram_core::events::EventKind::MemoryMetaChanged,
+                    crate::journal::cli_actor(&diary),
+                    crate::journal::payload::memory_validity_changed(memory_id, &vu),
+                )
+                .scope(kb.as_deref(), Some(&diary))
+                .subject(memory_id),
             )?;
             Ok(true)
         })
@@ -4104,6 +4166,31 @@ impl SqliteStore {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![diary], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// KBs holding at least one live memory whose `valid_until` has passed.
+    ///
+    /// The expiry analog of `kbs_with_memories_outside_diary`: derived
+    /// artifacts (claims, wiki pages, entities, relations) are rewrites and
+    /// aggregates with no per-item memory provenance at recall time, so the
+    /// only sound confinement is KB-level — a KB with no expired live
+    /// memories can only have derived content built from unexpired ones.
+    /// Same normalization rule as `expired_memory_ids`.
+    pub fn kbs_with_expired_memories(
+        &self,
+        now: &str,
+    ) -> Result<std::collections::HashSet<String>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT kb FROM memories
+             WHERE deleted = 0 AND valid_until IS NOT NULL
+               AND datetime(valid_until) < datetime(?1)",
+        )?;
+        let rows = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
         let mut out = std::collections::HashSet::new();
         for row in rows {
             out.insert(row?);

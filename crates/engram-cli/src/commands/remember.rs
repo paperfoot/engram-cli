@@ -305,10 +305,21 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 }
                 caller_batch_committed = true;
             }
+            // `--valid-until` on identical content expires the EXISTING copy:
+            // re-remembering with an expiry is the natural way to expire
+            // content that is already stored, and silently dropping the flag
+            // here left no way to do that at all.
+            let mut validity_updated = false;
+            if let Some(vu) = valid_until {
+                validity_updated = ctx.store.set_memory_valid_until(existing, vu)?;
+            }
             let facts_source_kind = facts_source_kind(caller_batch_committed, false);
             let mut meta = Metadata::default();
             meta.add("deduplicated", true);
             meta.add("existing_id", existing.to_string());
+            if validity_updated {
+                meta.add("valid_until_updated", true);
+            }
             // The dedup path answers with SOMEONE ELSE'S id, which is exactly
             // where a bare uuid is most likely to be copied into the next
             // command — so it carries the typed handle too.
@@ -322,6 +333,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     "handle": crate::commands::memory::render_handle(existing),
                     "stored": false,
                     "deduplicated": true,
+                    "valid_until_updated": validity_updated,
                     "kb": kb,
                     "facts_added": outcome.added,
                     "facts_source_kind": facts_source_kind,

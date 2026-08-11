@@ -476,6 +476,17 @@ pub mod payload {
         drop_nulls(m)
     }
 
+    /// Validity metadata changed (the dedup path applying `--valid-until` to
+    /// the existing copy). Same event kind as other metadata changes; rebuild
+    /// treats memory events as provenance, so an extra payload field is
+    /// harmless to old readers.
+    pub fn memory_validity_changed(memory_id: Uuid, valid_until: &str) -> Value {
+        let mut m = Map::new();
+        m.insert("memory_id".into(), json!(memory_id.to_string()));
+        m.insert("valid_until".into(), json!(valid_until));
+        drop_nulls(m)
+    }
+
     pub fn memory_retracted(memory_id: Uuid, reason: Option<&str>) -> Value {
         let mut m = Map::new();
         m.insert("memory_id".into(), json!(memory_id.to_string()));

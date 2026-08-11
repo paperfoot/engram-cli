@@ -22,6 +22,7 @@ pub async fn run(
     top_k: usize,
     profile: String,
     allow_mixed_embeddings: bool,
+    include_expired: bool,
 ) -> Result<(), CliError> {
     if query.trim().is_empty() {
         return Err(CliError::BadInput("query cannot be empty".into()));
@@ -46,8 +47,8 @@ pub async fn run(
         since: None,
         until: None,
         // Research assembles evidence for synthesis; an expired memory is not
-        // evidence of current state. Same default as recall.
-        include_expired: false,
+        // evidence of current state. Same default and same flag as recall.
+        include_expired,
     };
     let params = HybridParams {
         query: &query,
@@ -76,6 +77,7 @@ pub async fn run(
     )
     .await?;
     let results = outcome.results;
+    let notes = outcome.notes;
     let stats = outcome.stats;
 
     let query_tokens = estimated_tokens(&query);
@@ -224,6 +226,8 @@ pub async fn run(
                 "embed_dims": backends.embed_dims,
                 "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
+                "diary_isolation": notes.diary_isolation_json(),
+                "expiry": notes.expiry_json(),
             }
     }) else {
         unreachable!("json! object literal");

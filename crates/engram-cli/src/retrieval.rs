@@ -562,6 +562,12 @@ pub struct RecallNotes {
     /// Distinct memories withheld because their `valid_until` has passed.
     /// Zero when nothing was expired OR when `--include-expired` was set.
     pub expired_excluded: usize,
+    /// Derived candidates (claim, wiki, entity, relation) withheld because
+    /// their KB holds at least one expired live memory. Derived content is a
+    /// rewrite/aggregate with no per-item memory provenance at recall time,
+    /// so KB-level confinement is the only sound test — the same shape as
+    /// diary isolation.
+    pub expired_derived_excluded: BTreeMap<&'static str, usize>,
     /// True when expired memories were admitted on request.
     pub include_expired: bool,
 }
@@ -575,6 +581,12 @@ impl RecallNotes {
 
     fn exclude_temporal(&mut self, source: &'static str) {
         self.temporal_excluded.insert(source);
+    }
+
+    fn exclude_expired_derived(&mut self, source: &'static str, count: usize) {
+        if count > 0 {
+            *self.expired_derived_excluded.entry(source).or_insert(0) += count;
+        }
     }
 
     /// JSON for response metadata, or `None` when no window was requested.
@@ -602,14 +614,26 @@ impl RecallNotes {
     /// ("this memory's stated window has closed"), NOT absence — see gate-4
     /// H9: an expired-and-withheld memory may still be the only record.
     pub fn expiry_json(&self) -> Option<serde_json::Value> {
-        if self.expired_excluded == 0 && !self.include_expired {
+        if self.expired_excluded == 0
+            && self.expired_derived_excluded.is_empty()
+            && !self.include_expired
+        {
             return None;
         }
+        let derived: serde_json::Map<String, serde_json::Value> = self
+            .expired_derived_excluded
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), serde_json::json!(v)))
+            .collect();
         Some(serde_json::json!({
             "expired_memories_excluded": self.expired_excluded,
+            "excluded_derived_candidates": derived,
             "include_expired": self.include_expired,
             "reason": "these memories carry a valid_until that has passed; \
-                       rerun with --include-expired to search them",
+                       derived candidates (claims, wiki, entities, relations) \
+                       from KBs holding expired memories are withheld with \
+                       them because they may paraphrase expired content; \
+                       rerun with --include-expired to search everything",
         }))
     }
 
@@ -783,11 +807,22 @@ where
         kbs
     };
     notes.include_expired = params.filters.include_expired;
-    let expired_memories: HashSet<Uuid> = if params.filters.include_expired {
-        HashSet::new()
-    } else {
-        store.expired_memory_ids(&chrono::Utc::now().to_rfc3339())?
-    };
+    let (expired_memories, expired_kbs): (HashSet<Uuid>, HashSet<String>) =
+        if params.filters.include_expired {
+            (HashSet::new(), HashSet::new())
+        } else {
+            let now = chrono::Utc::now().to_rfc3339();
+            (
+                store.expired_memory_ids(&now)?,
+                // Derived candidates (claims, wiki, entities, relations) are
+                // rewrites/aggregates with no per-item memory provenance at
+                // recall time, so the only sound expiry confinement is
+                // KB-level — a KB with no expired live memories can only have
+                // derived content built from unexpired ones. Same shape as
+                // diary isolation, reported the same loud way.
+                store.kbs_with_expired_memories(&now)?,
+            )
+        };
     // Distinct memories actually withheld, across every path that can
     // surface one (dense below, lexical later — FTS reaches chunks without
     // embeddings, so it needs its own filter).
@@ -846,9 +881,11 @@ where
     // matched" and the read surface reports it as one.
     let mut stats = RecallStats {
         // Pre-expiry scope (see the validity-window block above): "how much
-        // the scope held" and "how much of it was searchable" are kept
-        // distinguishable via notes.expired_excluded.
+        // the scope held" and "how much of it was searchable" are BOTH
+        // reported, so an all-expired scope answers `all_candidates_expired`
+        // instead of masquerading as `no_candidate_matched`.
         chunks_considered: chunks_in_scope,
+        chunks_searchable: chunks.len(),
         kbs_searched: kbs_in_scope,
         ..RecallStats::default()
     };
@@ -876,7 +913,16 @@ where
 
     let fts_q = build_fts_query(params.query);
     if !fts_q.is_empty() && params.mode != RecallMode::Wiki {
-        let mut lexical = match store.fts_search_scoped(&fts_q, kb, diary, params.rerank_top_n) {
+        // Overfetch when expiry can remove hits: FTS applies its limit before
+        // the expiry filter runs, so expired high-ranking hits could consume
+        // the whole pool and starve valid lower-ranked ones. `ranked_run`
+        // truncates back to rerank_top_n after filtering.
+        let fts_limit = if expired_memories.is_empty() {
+            params.rerank_top_n
+        } else {
+            params.rerank_top_n * 2
+        };
+        let mut lexical = match store.fts_search_scoped(&fts_q, kb, diary, fts_limit) {
             Ok(hits) => hits,
             Err(e) => {
                 // Don't silently degrade to dense-only: a malformed FTS query or
@@ -949,8 +995,17 @@ where
             claims.retain(|(id, _)| visible.contains(id));
             notes.exclude("claim", before - claims.len());
         }
+        // Expiry confinement (see the validity-window block above): a claim
+        // is a compiler/LLM rewrite that may paraphrase an expired memory,
+        // and a KB holding any expired memory cannot prove its claims free of
+        // them. Withheld and counted, like every other exclusion here.
+        let mut expired_claims = 0usize;
         for (id, _) in &claims {
             if let Some(claim) = store.get_claim(*id)? {
+                if expired_kbs.contains(&claim.kb) {
+                    expired_claims += 1;
+                    continue;
+                }
                 // Claims found via their own FTS index are a distinct
                 // provenance from raw-chunk lexical hits.
                 let parent_chunk = claim.citations.iter().find_map(|c| c.chunk_id);
@@ -966,6 +1021,8 @@ where
                 );
             }
         }
+        notes.exclude_expired_derived("claim", expired_claims);
+        claims.retain(|(id, _)| candidate_records.contains_key(id));
         let claim_run = ranked_run(&claims, RetrievalSource::Claim, params.rerank_top_n);
         mark_sources(&mut source_map, &claim_run);
         runs.push(claim_run);
@@ -993,6 +1050,7 @@ where
         // pages get contiguous ranks in the fused run.
         let mut kept_wiki: Vec<(Uuid, f32)> = Vec::with_capacity(wiki_hits.len());
         let mut wiki_excluded = 0usize;
+        let mut wiki_expired = 0usize;
         for (id, score) in wiki_hits {
             let Some(page) = store.get_wiki_page_by_id(id)? else {
                 continue;
@@ -1002,6 +1060,12 @@ where
                 .is_some_and(|mixed| mixed.contains(&page.kb))
             {
                 wiki_excluded += 1;
+                continue;
+            }
+            // Expiry confinement: a wiki page is a synthesis over its whole
+            // KB and may paraphrase an expired memory.
+            if expired_kbs.contains(&page.kb) {
+                wiki_expired += 1;
                 continue;
             }
             candidate_records.insert(
@@ -1017,6 +1081,7 @@ where
             kept_wiki.push((id, score));
         }
         notes.exclude("wiki", wiki_excluded);
+        notes.exclude_expired_derived("wiki", wiki_expired);
         let wiki_run = ranked_run(&kept_wiki, RetrievalSource::Wiki, params.rerank_top_n);
         mark_sources(&mut source_map, &wiki_run);
         runs.push(wiki_run);
@@ -1030,6 +1095,7 @@ where
         params.graph_hops,
         temporal_active,
         mixed_diary_kbs.as_ref(),
+        &expired_kbs,
         &mut CandidateSink {
             records: &mut candidate_records,
             sources: &mut source_map,
@@ -1350,6 +1416,7 @@ fn add_entity_and_graph_candidates(
     graph_hops: u8,
     temporal_active: bool,
     mixed_diary_kbs: Option<&HashSet<String>>,
+    expired_kbs: &HashSet<String>,
     sink: &mut CandidateSink<'_>,
 ) -> Result<(), crate::error::CliError> {
     // Raw mode is chunks-only by definition. Every other mode runs entity and
@@ -1387,6 +1454,8 @@ fn add_entity_and_graph_candidates(
     let mut graph_scored = Vec::new();
     let mut seen_entities: HashSet<Uuid> = HashSet::new();
     let mut excluded = 0usize;
+    let mut expired_entities = 0usize;
+    let mut expired_relations = 0usize;
     for name in entity_names {
         for entity in store.find_entities(kb, &name, ENTITY_MATCHES_PER_TERM)? {
             if !seen_entities.insert(entity.id) {
@@ -1397,6 +1466,12 @@ fn add_entity_and_graph_candidates(
             // nothing but the requested diary's memories.
             if mixed_diary_kbs.is_some_and(|mixed| mixed.contains(&entity.kb)) {
                 excluded += 1;
+                continue;
+            }
+            // Expiry confinement: an entity row aggregates mentions across
+            // its KB's chunks, expired ones included.
+            if expired_kbs.contains(&entity.kb) {
+                expired_entities += 1;
                 continue;
             }
             sink.records.insert(
@@ -1424,6 +1499,11 @@ fn add_entity_and_graph_candidates(
             if mode == RecallMode::Explore {
                 let hops = graph_hops.clamp(1, 3);
                 for rel in store.graph_neighbors(&entity.kb, &entity.canonical_name, hops)? {
+                    // Expiry confinement, same reasoning as the entity row.
+                    if expired_kbs.contains(&rel.kb) {
+                        expired_relations += 1;
+                        continue;
+                    }
                     sink.records.insert(
                         rel.id,
                         CandidateRecord {
@@ -1443,6 +1523,10 @@ fn add_entity_and_graph_candidates(
         }
     }
     sink.notes.exclude("entity", excluded);
+    sink.notes
+        .exclude_expired_derived("entity", expired_entities);
+    sink.notes
+        .exclude_expired_derived("relation", expired_relations);
     // Highest mention count first: `find_entities` orders within a term, but
     // candidates from different terms/KBs still have to be ranked against
     // each other before the fused run is built.

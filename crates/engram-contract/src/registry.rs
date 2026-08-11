@@ -93,6 +93,10 @@ pub const ABSENCE_REASON: &[&str] = &[
     "no_chunks_in_scope",
     "filtered_by_window",
     "filtered_by_diary",
+    // The scope held content but every candidate's valid_until has passed.
+    // NOT `no_candidate_matched`: the content exists and --include-expired
+    // reaches it — validity withholding is not search absence.
+    "all_candidates_expired",
     "no_candidate_matched",
     "trimmed_by_layer_budget",
     "subject_not_found",
@@ -504,6 +508,15 @@ const RECALL_FLAGS: &[FlagSpec] = &[
         required: false,
         doc: "latest event_time: RFC3339, or YYYY-MM-DD meaning the END of that UTC day, so `--since D --until D` is all of day D",
     },
+    FlagSpec {
+        name: "include_expired",
+        cli_long: "include-expired",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "search memories whose valid_until has passed; by default they are withheld from every retrieval path and counted in metadata.expiry",
+    },
 ];
 
 const RECALL_DATA: &[FieldSpec] = &[
@@ -601,6 +614,12 @@ const RECALL_METADATA: &[FieldSpec] = &[
         always: false,
     },
     FieldSpec {
+        name: "expiry",
+        ty: Ty::Object,
+        doc: "only when expiry changed the answer: { expired_memories_excluded, excluded_derived_candidates, include_expired, reason }. Memories past their valid_until are withheld by default; derived candidates from KBs holding expired memories are withheld with them",
+        always: false,
+    },
+    FieldSpec {
         name: "scope",
         ty: Ty::Object,
         doc: "what the read actually looked at: { kbs, diary, origin, chunks_considered }",
@@ -653,6 +672,15 @@ const REMEMBER_FLAGS: &[FlagSpec] = &[
         default: None,
         required: false,
         doc: "RFC3339 or YYYY-MM-DD (midnight UTC); when the content actually happened. Set it for anything dated — without it the memory is findable by content only, never by time",
+    },
+    FlagSpec {
+        name: "valid_until",
+        cli_long: "valid-until",
+        aliases: &[],
+        ty: Ty::Str,
+        default: None,
+        required: false,
+        doc: "RFC3339, or YYYY-MM-DD meaning the END of that UTC day; when this memory STOPS being true. After that instant default recall withholds it (metadata.expiry reports the count; --include-expired reaches it). On identical existing content the expiry is applied to the stored copy (valid_until_updated). Rejected if earlier than --event-time",
     },
     FlagSpec {
         name: "no_extract_facts",
@@ -1067,6 +1095,15 @@ const MEMORY_SEARCH_FLAGS: &[FlagSpec] = &[
         default: None,
         required: false,
         doc: "latest event_time: RFC3339, or YYYY-MM-DD meaning the END of that UTC day",
+    },
+    FlagSpec {
+        name: "include_expired",
+        cli_long: "include-expired",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "same contract as `recall --include-expired`",
     },
 ];
 

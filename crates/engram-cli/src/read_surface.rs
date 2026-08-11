@@ -261,8 +261,13 @@ pub fn suggested_action_overridden(row_suggested: Option<&str>, emitted: &str) -
 /// same response.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RecallStats {
-    /// Chunks the dense pass actually scored, after diary/kb/window filtering.
+    /// Chunks in scope after diary/kb/window filtering, BEFORE the expiry
+    /// filter — "how much the scope held".
     pub chunks_considered: usize,
+    /// Chunks the ranking could actually search — `chunks_considered` minus
+    /// the chunks of expired memories. Equal to `chunks_considered` when
+    /// nothing was expired or `--include-expired` was set.
+    pub chunks_searchable: usize,
     /// Candidates that entered fusion, from every source.
     pub candidates_fused: usize,
     /// Best fused score BEFORE any truncation. `None` when the pool was empty.
@@ -293,6 +298,13 @@ pub fn absence_reason(stats: &RecallStats, req: RequestShape) -> &'static str {
             return "filtered_by_diary";
         }
         return "no_chunks_in_scope";
+    }
+    // The scope held content but ALL of it was withheld as expired. This must
+    // not read as `no_candidate_matched`: validity withholding is not search
+    // absence (gate-4 H9) — the content exists and `--include-expired`
+    // reaches it.
+    if stats.chunks_searchable == 0 {
+        return "all_candidates_expired";
     }
     if stats.candidates_fused == 0 {
         return "no_candidate_matched";
@@ -441,14 +453,27 @@ mod tests {
         );
         let scored = RecallStats {
             chunks_considered: 10,
+            chunks_searchable: 10,
             ..Default::default()
         };
         assert_eq!(
             absence_reason(&scored, RequestShape::default()),
             "no_candidate_matched"
         );
+        // The scope held content but every chunk of it was expired: the
+        // reason must say so, not claim the search found nothing similar.
+        let all_expired = RecallStats {
+            chunks_considered: 10,
+            chunks_searchable: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            absence_reason(&all_expired, RequestShape::default()),
+            "all_candidates_expired"
+        );
         let fused = RecallStats {
             chunks_considered: 10,
+            chunks_searchable: 10,
             candidates_fused: 4,
             top_score: Some(0.7),
             ..Default::default()
@@ -463,6 +488,7 @@ mod tests {
     fn absence_never_fabricates_a_threshold() {
         let stats = RecallStats {
             chunks_considered: 3,
+            chunks_searchable: 3,
             candidates_fused: 2,
             top_score: Some(0.41),
             kbs_searched: vec!["work".into()],

@@ -1705,8 +1705,9 @@ async fn research_body(store: &SqliteStore, body: &str) -> Result<serde_json::Va
             since: None,
             until: None,
             // Research assembles evidence for synthesis; expired memories are
-            // not evidence of current state. Same default as CLI research.
-            include_expired: false,
+            // not evidence of current state. Same default and same request
+            // field as CLI research.
+            include_expired: req.include_expired.unwrap_or(false),
         },
         mode: RecallMode::Explore,
         graph_hops: 2,
@@ -1791,7 +1792,8 @@ async fn research_body(store: &SqliteStore, body: &str) -> Result<serde_json::Va
                 "reranker": backends.reranker_label,
                 "candidates_considered": rerank_candidates,
                 "diary_isolation": notes.diary_isolation_json(),
-                "temporal_scope": notes.temporal_scope_json()
+                "temporal_scope": notes.temporal_scope_json(),
+                "expiry": notes.expiry_json()
             }
         }
     });
@@ -1944,7 +1946,8 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
                 "kb": scope.label(),
                 "kb_scope": scope.origin.as_str(),
                 "diary_isolation": notes.diary_isolation_json(),
-                "temporal_scope": notes.temporal_scope_json()
+                "temporal_scope": notes.temporal_scope_json(),
+                "expiry": notes.expiry_json()
             }
         }
     });
@@ -2153,6 +2156,8 @@ struct ResearchRequest {
     top_k: Option<usize>,
     rerank_top_n: Option<usize>,
     allow_mixed_embeddings: Option<bool>,
+    /// Same contract as `research --include-expired` (CLI/daemon parity).
+    include_expired: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
