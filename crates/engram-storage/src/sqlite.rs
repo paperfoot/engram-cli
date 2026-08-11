@@ -2300,24 +2300,33 @@ impl SqliteStore {
     /// re-remembering identical content WITH `--valid-until` must expire the
     /// existing copy, or there is no way to expire content that already
     /// exists without editing it. Journalled as `MemoryMetaChanged`.
-    /// Returns false when the memory is missing or deleted.
+    /// Returns false when the memory is missing or deleted — or when the
+    /// value is already this instant: an idempotent retry must not append a
+    /// second identical event or claim a second update.
     pub fn set_memory_valid_until(
         &self,
         memory_id: Uuid,
         valid_until: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, StorageError> {
         self.with_tx(|s| {
-            let diary: Option<String> = s
+            let row: Option<(String, Option<String>)> = s
                 .conn
                 .query_row(
-                    "SELECT diary FROM memories WHERE id = ?1 AND deleted = 0",
+                    "SELECT diary, valid_until FROM memories WHERE id = ?1 AND deleted = 0",
                     params![memory_id.to_string()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let Some(diary) = diary else {
+            let Some((diary, current)) = row else {
                 return Ok(false);
             };
+            if current
+                .as_deref()
+                .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
+                .is_some_and(|c| c.with_timezone(&chrono::Utc) == valid_until)
+            {
+                return Ok(false);
+            }
             let vu = valid_until.to_rfc3339();
             let changed = s.conn.execute(
                 "UPDATE memories SET valid_until = ?1 WHERE id = ?2 AND deleted = 0",
@@ -4173,23 +4182,32 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// KBs holding at least one live memory whose `valid_until` has passed.
+    /// KBs whose derived layer may still carry expired content.
     ///
     /// The expiry analog of `kbs_with_memories_outside_diary`: derived
     /// artifacts (claims, wiki pages, entities, relations) are rewrites and
     /// aggregates with no per-item memory provenance at recall time, so the
-    /// only sound confinement is KB-level — a KB with no expired live
-    /// memories can only have derived content built from unexpired ones.
-    /// Same normalization rule as `expired_memory_ids`.
+    /// only sound confinement is KB-level — a KB with no expired
+    /// derived-constraining memories can only have derived content built
+    /// from unexpired ones. Same normalization rule as `expired_memory_ids`.
+    ///
+    /// `MEMORY_CONSTRAINS_DERIVED`, not `deleted = 0`: a FORGOTTEN expired
+    /// memory keeps constraining this gate until a compile has completed
+    /// after its deletion, because `forget` deliberately leaves wiki/entity/
+    /// relation aggregates in place until recompile — with a bare liveness
+    /// test, forgetting the expired source REPUBLISHED its content through
+    /// the derived layer (re-gate finding 1).
     pub fn kbs_with_expired_memories(
         &self,
         now: &str,
     ) -> Result<std::collections::HashSet<String>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT kb FROM memories
-             WHERE deleted = 0 AND valid_until IS NOT NULL
-               AND datetime(valid_until) < datetime(?1)",
-        )?;
+        let sql = format!(
+            "SELECT DISTINCT m.kb FROM memories m
+             WHERE m.valid_until IS NOT NULL
+               AND datetime(m.valid_until) < datetime(?1)
+               AND {MEMORY_CONSTRAINS_DERIVED}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
         let mut out = std::collections::HashSet::new();
         for row in rows {

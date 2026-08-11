@@ -170,6 +170,15 @@ pub async fn run(
     meta.add("kb", if all_kbs { "*" } else { kb.as_str() });
     meta.add("results", results_json.len());
     meta.add("cited_results", cited);
+    // The same three withholding notes recall's envelope carries, in the
+    // same place — a research caller reads `.metadata.expiry` exactly like a
+    // recall caller, not a research-only location (re-gate finding 3).
+    if let Some(isolation) = notes.diary_isolation_json() {
+        meta.add("diary_isolation", isolation);
+    }
+    if let Some(expiry) = notes.expiry_json() {
+        meta.add("expiry", expiry);
+    }
     meta.command_alias("research");
     let searched_kbs = if all_kbs {
         if stats.kbs_searched.is_empty() {

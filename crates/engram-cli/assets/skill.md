@@ -3,7 +3,7 @@ name: engram
 description: Personal, business, and project memory for AI agents — durable facts, decisions, relationships, competitor/market intel, and project context. Use BEFORE answering to recall prior facts/decisions, and AFTER learning something durable to remember it. This is for PERSONAL/BUSINESS knowledge, NOT scientific-paper corpora — for research literature (papers, neuromodulation/medical corpora) use the superlibrary skill instead. Shell out to `engram` for hybrid semantic + keyword retrieval. Run `engram agent-info` once to discover every command.
 compatibility: Requires the `engram` CLI on PATH. Works with Claude Code, Codex, Gemini CLI, and Agent Skills compatible clients.
 metadata:
-  schema_hash: "8ea5249578f15c9796b08ad2fcef466a"
+  schema_hash: "6358c34071a05c5da2d47ad0576c2bc2"
   contract_version: "contract@1"
   homepage: "https://github.com/paperfoot/engram-cli"
   package: "engram-skill.zip"
@@ -36,7 +36,7 @@ Reads and listings answer three things beyond their rows:
 
 - `returned` / `total` / `cursor` — `returned` is this page, **`total` is the whole scope**. Report `total` to a user; feed `cursor` back verbatim for the next page. (`count` is a legacy alias for `returned`.)
 - `verdict` — `results` or `no_match`. This is the authoritative absence signal.
-- `absence` — present only on `no_match`: `{ searched_kbs, searched_chunks, reason, top_score?, threshold? }`. `reason` distinguishes *nothing is stored* from *you searched the wrong namespace*: `no_chunks_in_scope`, `filtered_by_window`, `filtered_by_diary`, `no_candidate_matched`, `trimmed_by_layer_budget`, `subject_not_found`. `threshold` and `top_score` are **absent** when no cutoff ran — never a fabricated `0`.
+- `absence` — present only on `no_match`: `{ searched_kbs, searched_chunks, reason, top_score?, threshold? }`. `reason` distinguishes *nothing is stored* from *you searched the wrong namespace*: `no_chunks_in_scope`, `filtered_by_window`, `filtered_by_diary`, `all_candidates_expired`, `no_candidate_matched`, `trimmed_by_layer_budget`, `subject_not_found`. `all_candidates_expired` means the scope held content whose `valid_until` has passed — rerun with `--include-expired` to search it; it is a validity claim, not proof of absence. `threshold` and `top_score` are **absent** when no cutoff ran — never a fabricated `0`.
 
 `metadata.scope` says what was actually looked at: `{ kbs, diary, origin }`, plus `chunks_considered` on surfaces that score chunks (omitted, never `0`, on those that don't). Every hit carries `provenance` — `chunk_id`, `memory_id`, `document_id`, `kb`, `diary`, `derived_from`, `observed_at`, `snippet` — with nulls preserved.
 

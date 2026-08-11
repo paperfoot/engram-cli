@@ -193,6 +193,106 @@ fn memory_search_honors_expiry_too() {
     assert_eq!(result_contents(&v).len(), 1);
 }
 
+/// Forgetting the expired source must not REPUBLISH it: `forget` leaves
+/// wiki/entity/relation aggregates in place until recompile, so the KB gate
+/// has to keep constraining on the forgotten expired memory until a compile
+/// has completed after its deletion (re-gate finding 1).
+#[test]
+fn forgetting_an_expired_memory_does_not_republish_it_through_derived_layers() {
+    let home = tempfile::tempdir().unwrap();
+    let v = run_json(
+        &home,
+        &[
+            "remember",
+            "the quokkavault window has closed",
+            "--valid-until",
+            "2020-01-01",
+        ],
+    );
+    let id = v["data"]["id"].as_str().expect("memory id").to_string();
+    // Compile so derived aggregates exist, then forget the source.
+    engram_in(&home)
+        .args(["compile", "--kb", "default", "--all"])
+        .arg("--json")
+        .assert()
+        .success();
+    engram_in(&home)
+        .args(["forget", &id, "--confirm"])
+        .arg("--json")
+        .assert()
+        .success();
+    // Before any recompile, explore-mode recall must not serve the forgotten
+    // expired content back through wiki/entity/relation projections.
+    let v = run_json(&home, &["recall", "quokkavault", "--mode", "explore"]);
+    assert_eq!(
+        result_contents(&v).len(),
+        0,
+        "forgotten expired content leaked through derived layers: {:?}",
+        result_contents(&v)
+    );
+}
+
+/// Applying the same `--valid-until` to identical content twice: the second
+/// call is a no-op that says so — no second journal event, no false
+/// "updated" claim.
+#[test]
+fn dedup_expiry_is_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    run_json(&home, &["remember", "the quokkavault permit"]);
+    let v = run_json(
+        &home,
+        &[
+            "remember",
+            "the quokkavault permit",
+            "--valid-until",
+            "2999-06-01",
+        ],
+    );
+    assert_eq!(v["data"]["valid_until_updated"], true);
+    let v = run_json(
+        &home,
+        &[
+            "remember",
+            "the quokkavault permit",
+            "--valid-until",
+            "2999-06-01",
+        ],
+    );
+    assert_eq!(
+        v["data"]["valid_until_updated"], false,
+        "an unchanged expiry must not report a second update"
+    );
+}
+
+/// Expired high-ranking lexical hits must not starve the pool: with three
+/// expired matches ahead of one current one and a pool of one, the current
+/// memory is still found (re-gate finding 8: refill, not fixed overfetch).
+#[test]
+fn expired_hits_cannot_starve_a_small_lexical_pool() {
+    let home = tempfile::tempdir().unwrap();
+    for i in 1..=3 {
+        run_json(
+            &home,
+            &[
+                "remember",
+                &format!("starval starval starval expired filler number {i}"),
+                "--valid-until",
+                "2020-01-01",
+            ],
+        );
+    }
+    run_json(&home, &["remember", "starval CURRENT_TARGET row"]);
+    let v = run_json(
+        &home,
+        &["recall", "starval", "--mode", "raw", "--rerank-top-n", "1"],
+    );
+    let contents = result_contents(&v);
+    assert!(
+        contents.iter().any(|c| c.contains("CURRENT_TARGET")),
+        "expired hits starved the lexical pool: {contents:?}"
+    );
+}
+
 /// Strictness: a typo'd `--valid-until` is a hard error, never a silent
 /// "no expiry".
 #[test]

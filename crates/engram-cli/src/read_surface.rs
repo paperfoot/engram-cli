@@ -302,8 +302,11 @@ pub fn absence_reason(stats: &RecallStats, req: RequestShape) -> &'static str {
     // The scope held content but ALL of it was withheld as expired. This must
     // not read as `no_candidate_matched`: validity withholding is not search
     // absence (gate-4 H9) — the content exists and `--include-expired`
-    // reaches it.
-    if stats.chunks_searchable == 0 {
+    // reaches it. It requires BOTH gates empty: `chunks_searchable` counts
+    // only embedding-bearing chunks, so an FTS-only current chunk can still
+    // fuse a candidate — and if anything fused, "everything was expired" is
+    // a false certificate (re-gate finding 2).
+    if stats.chunks_searchable == 0 && stats.candidates_fused == 0 {
         return "all_candidates_expired";
     }
     if stats.candidates_fused == 0 {
@@ -470,6 +473,20 @@ mod tests {
         assert_eq!(
             absence_reason(&all_expired, RequestShape::default()),
             "all_candidates_expired"
+        );
+        // But NOT when something fused anyway: `chunks_searchable` counts
+        // only embedding-bearing chunks, and an FTS-only current chunk can
+        // still produce a candidate. "Everything was expired" would then be
+        // a false certificate.
+        let expired_but_fused = RecallStats {
+            chunks_considered: 10,
+            chunks_searchable: 0,
+            candidates_fused: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            absence_reason(&expired_but_fused, RequestShape::default()),
+            "trimmed_by_layer_budget"
         );
         let fused = RecallStats {
             chunks_considered: 10,

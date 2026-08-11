@@ -913,55 +913,65 @@ where
 
     let fts_q = build_fts_query(params.query);
     if !fts_q.is_empty() && params.mode != RecallMode::Wiki {
-        // Overfetch when expiry can remove hits: FTS applies its limit before
-        // the expiry filter runs, so expired high-ranking hits could consume
-        // the whole pool and starve valid lower-ranked ones. `ranked_run`
-        // truncates back to rerank_top_n after filtering.
-        let fts_limit = if expired_memories.is_empty() {
-            params.rerank_top_n
-        } else {
-            params.rerank_top_n * 2
-        };
-        let mut lexical = match store.fts_search_scoped(&fts_q, kb, diary, fts_limit) {
-            Ok(hits) => hits,
-            Err(e) => {
-                // Don't silently degrade to dense-only: a malformed FTS query or
-                // SQL error is worth surfacing, but must not abort the whole
-                // recall, so warn and continue with an empty lexical run.
-                tracing::warn!("lexical (FTS) search failed, continuing without it: {e}");
-                Vec::new()
+        // REFILL, not a fixed overfetch: FTS applies its limit before the
+        // expiry filter runs, so any fixed multiplier can still let expired
+        // high-ranking hits starve valid lower-ranked ones (a rerank_top_n=1
+        // pool behind three expired hits, reproduced). Double the fetch until
+        // the post-filter pool is full or FTS is exhausted, with a hard cap
+        // as a runaway guard. `ranked_run` truncates back to rerank_top_n.
+        let refill_cap = params.rerank_top_n.saturating_mul(16).max(256);
+        let mut fts_limit = params.rerank_top_n.max(1);
+        let lexical = loop {
+            let mut hits = match store.fts_search_scoped(&fts_q, kb, diary, fts_limit) {
+                Ok(hits) => hits,
+                Err(e) => {
+                    // Don't silently degrade to dense-only: a malformed FTS
+                    // query or SQL error is worth surfacing, but must not
+                    // abort the whole recall, so warn and continue with an
+                    // empty lexical run.
+                    tracing::warn!("lexical (FTS) search failed, continuing without it: {e}");
+                    break Vec::new();
+                }
+            };
+            let exhausted = hits.len() < fts_limit;
+            if let Some(allowed) = &allowed_chunks {
+                hits.retain(|(id, _)| allowed.contains(id));
             }
-        };
-        if let Some(allowed) = &allowed_chunks {
-            lexical.retain(|(id, _)| allowed.contains(id));
-        }
-        // Expired-memory filter, lexical leg: FTS queries the whole table, so
-        // it can surface chunks of expired memories (including chunks with no
-        // embedding record, which the dense-path filter above never saw).
-        // A chunk already in `chunk_index` survived the dense-path filter;
-        // only the rest need their parent resolved. An unresolvable chunk is
-        // kept — over-filtering on a lookup miss would be a silent loss.
-        if !expired_memories.is_empty() {
-            let unresolved: Vec<Uuid> = lexical
-                .iter()
-                .map(|(id, _)| *id)
-                .filter(|id| !chunk_index.contains_key(id))
-                .collect();
-            if !unresolved.is_empty() {
-                let parents = store.memory_ids_for_chunks(&unresolved)?;
-                lexical.retain(|(id, _)| {
-                    chunk_index.contains_key(id)
-                        || parents.get(id).map_or(true, |m| {
-                            let expired = expired_memories.contains(m);
-                            if expired {
+            // Expired-memory filter, lexical leg: FTS queries the whole
+            // table, so it can surface chunks of expired memories (including
+            // chunks with no embedding record, which the dense-path filter
+            // above never saw). A chunk already in `chunk_index` survived
+            // the dense-path filter; only the rest need their parent
+            // resolved. An unresolvable chunk is kept — over-filtering on a
+            // lookup miss would be a silent loss.
+            if !expired_memories.is_empty() {
+                let unresolved: Vec<Uuid> = hits
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .filter(|id| !chunk_index.contains_key(id))
+                    .collect();
+                if !unresolved.is_empty() {
+                    let parents = store.memory_ids_for_chunks(&unresolved)?;
+                    hits.retain(|(id, _)| {
+                        if chunk_index.contains_key(id) {
+                            return true;
+                        }
+                        match parents.get(id) {
+                            Some(m) if expired_memories.contains(m) => {
                                 expired_withheld.insert(*m);
+                                false
                             }
-                            !expired
-                        })
-                });
-                notes.expired_excluded = expired_withheld.len();
+                            _ => true,
+                        }
+                    });
+                    notes.expired_excluded = expired_withheld.len();
+                }
             }
-        }
+            if hits.len() >= params.rerank_top_n || exhausted || fts_limit >= refill_cap {
+                break hits;
+            }
+            fts_limit = (fts_limit * 2).min(refill_cap);
+        };
         // Chunk content/citations for lexical-only hits are resolved lazily for
         // the rerank pool (see resolve_candidate), not here — so we don't do a
         // per-hit chunk fetch for candidates that fusion will discard.
@@ -1469,9 +1479,19 @@ fn add_entity_and_graph_candidates(
                 continue;
             }
             // Expiry confinement: an entity row aggregates mentions across
-            // its KB's chunks, expired ones included.
+            // its KB's chunks, expired ones included. Skipping the entity
+            // also suppresses its graph expansion, so in Explore mode the
+            // relations that would have been walked are counted too — the
+            // metadata must name every source it withheld, not just the
+            // first link in the chain.
             if expired_kbs.contains(&entity.kb) {
                 expired_entities += 1;
+                if mode == RecallMode::Explore {
+                    let hops = graph_hops.clamp(1, 3);
+                    expired_relations += store
+                        .graph_neighbors(&entity.kb, &entity.canonical_name, hops)?
+                        .len();
+                }
                 continue;
             }
             sink.records.insert(

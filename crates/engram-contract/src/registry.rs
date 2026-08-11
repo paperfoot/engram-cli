@@ -752,6 +752,12 @@ const REMEMBER_DATA: &[FieldSpec] = &[
         always: true,
     },
     FieldSpec {
+        name: "valid_until_updated",
+        ty: Ty::Bool,
+        doc: "dedup path only: true when --valid-until was applied to the EXISTING copy (an unchanged value reports false and appends no event)",
+        always: false,
+    },
+    FieldSpec {
         name: "chunks",
         ty: Ty::Int,
         doc: "chunks written for this memory",
