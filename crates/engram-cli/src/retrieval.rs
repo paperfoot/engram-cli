@@ -643,12 +643,20 @@ impl RecallNotes {
             "expired_memories_excluded": self.expired_excluded,
             "excluded_derived_candidates": to_map(&self.expired_derived_excluded),
             "include_expired": self.include_expired,
-            "reason": "these memories carry a valid_until that has passed; \
-                       derived candidates (claims, wiki, entities, relations) \
-                       from KBs holding expired memories are withheld with \
-                       them because they may paraphrase expired content; \
-                       rerun with --include-expired to search them",
         });
+        // The live-expiry remedy appears ONLY when live expiry withheld
+        // something: on a retraction-only response, telling the caller to
+        // rerun with --include-expired prescribes a door that flag cannot
+        // open (gate round 5).
+        if self.expired_excluded > 0 || !self.expired_derived_excluded.is_empty() {
+            out["reason"] = serde_json::json!(
+                "these memories carry a valid_until that has passed; \
+                 derived candidates (claims, wiki, entities, relations) \
+                 from KBs holding expired memories are withheld with \
+                 them because they may paraphrase expired content; \
+                 rerun with --include-expired to search them"
+            );
+        }
         // Retraction quarantine is a DIFFERENT claim with a DIFFERENT remedy:
         // --include-expired cannot reach it (and must not — forgotten is not
         // a validity state). Only reported when it actually withheld
