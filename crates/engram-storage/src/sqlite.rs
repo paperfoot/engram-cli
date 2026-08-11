@@ -2842,9 +2842,14 @@ impl SqliteStore {
         }
         if let Some(now) = expired_before {
             binds.push(Box::new(now.to_string()));
+            // COALESCE, because `datetime()` on an unparseable value is NULL
+            // and `NOT NULL` is NULL — which SQLite EXCLUDES. Unparseable
+            // must mean "not expired" (err toward returning content), the
+            // same rule `expired_memory_ids` documents; without the COALESCE
+            // a malformed imported timestamp silently vanished from lexical
+            // search (gate round 4).
             sql.push_str(&format!(
-                " AND NOT (m.valid_until IS NOT NULL \
-                   AND datetime(m.valid_until) < datetime(?{}))",
+                " AND NOT COALESCE(datetime(m.valid_until) < datetime(?{}), 0)",
                 binds.len()
             ));
         }
@@ -4211,6 +4216,41 @@ impl SqliteStore {
             out.insert(row?);
         }
         Ok(out)
+    }
+
+    /// How many live, chunk-bearing memories in this recall scope are past
+    /// their `valid_until`. The number `metadata.expiry` reports: computed
+    /// directly, not by counting what the candidate stream happened to
+    /// surface — the SQL-side FTS filter excludes expired rows before the
+    /// retrieval loop ever sees them, and an exclusion the counter cannot
+    /// see is a silent one (gate round 4).
+    pub fn count_expired_memories_in_scope(
+        &self,
+        now: &str,
+        kb: Option<&str>,
+        diary: Option<&str>,
+    ) -> Result<usize, StorageError> {
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM memories m
+             WHERE m.deleted = 0 AND m.valid_until IS NOT NULL
+               AND datetime(m.valid_until) < datetime(?1)
+               AND EXISTS (SELECT 1 FROM chunks c WHERE c.memory_id = m.id)",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now.to_string())];
+        if let Some(k) = kb {
+            binds.push(Box::new(k.to_string()));
+            sql.push_str(&format!(" AND m.kb = ?{}", binds.len()));
+        }
+        if let Some(d) = diary {
+            binds.push(Box::new(d.to_string()));
+            sql.push_str(&format!(" AND m.diary = ?{}", binds.len()));
+        }
+        let n: i64 = self.conn.query_row(
+            &sql,
+            rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// KBs whose derived layer may still carry FORGOTTEN expired content.
@@ -6802,6 +6842,65 @@ mod tests {
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, target_chunk);
+    }
+
+    /// An unparseable `valid_until` (imports pass timestamps through
+    /// unvalidated) means NOT expired: the row must stay lexically findable.
+    /// Without the COALESCE, `datetime('not-a-date')` is NULL, `NOT NULL` is
+    /// NULL, and SQLite silently excluded the row (gate round 4).
+    #[test]
+    fn fts_expiry_filter_keeps_rows_with_unparseable_valid_until() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = fact("imported with a broken timestamp");
+        store.insert_memory(&m).unwrap();
+        let chunk = Uuid::new_v4();
+        store
+            .insert_chunk(chunk, m.id, "starval imported row", 0, None)
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE memories SET valid_until = 'not-a-date'", [])
+            .unwrap();
+        let hits = store
+            .fts_search_scoped_filtered("starval", None, None, 10, Some(&Utc::now().to_rfc3339()))
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "unparseable valid_until must mean NOT expired"
+        );
+        assert_eq!(hits[0].0, chunk);
+    }
+
+    /// The reported expiry count is computed against the scope, not against
+    /// what the candidate stream surfaced — an expired memory whose only
+    /// chunk has no embedding is filtered in FTS SQL and would otherwise be
+    /// excluded silently (gate round 4).
+    #[test]
+    fn expired_scope_count_sees_unembedded_chunks() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut expired = fact("expired, lexical-only");
+        expired.valid_until = Some(now - chrono::Duration::days(1));
+        store.insert_memory_with_kb(&expired, "scoped").unwrap();
+        store
+            .insert_chunk(Uuid::new_v4(), expired.id, "some text", 0, None)
+            .unwrap();
+        let mut chunkless = fact("expired but chunkless");
+        chunkless.valid_until = Some(now - chrono::Duration::days(1));
+        store.insert_memory_with_kb(&chunkless, "scoped").unwrap();
+
+        let n = store
+            .count_expired_memories_in_scope(&now.to_rfc3339(), Some("scoped"), None)
+            .unwrap();
+        // The chunk-bearing expired memory counts; the chunkless one cannot
+        // have been withheld from any search and does not.
+        assert_eq!(n, 1);
+        // Scope respected: a different KB sees nothing.
+        let other = store
+            .count_expired_memories_in_scope(&now.to_rfc3339(), Some("elsewhere"), None)
+            .unwrap();
+        assert_eq!(other, 0);
     }
 
     #[test]
