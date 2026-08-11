@@ -1,6 +1,61 @@
 # Changelog
 
-## 0.4.0 — 2026-08-11
+## 0.4.1 — 2026-08-11
+
+The first field-driven refinement round on top of 0.4.0, gated by six
+independent review passes: memory expiry as a system property, the `--json`
+purity contract, and two repairs 0.4.0 shipped without.
+
+### Added
+
+- Memory expiry, enforced at recall. `remember --valid-until <RFC3339|YYYY-MM-DD>`
+  records when content stops being true (a bare date holds through the END of
+  that UTC day, matching `recall --until`); once that instant passes, `recall`,
+  `memory search`, `research` and the daemon endpoints withhold the memory from
+  every retrieval path — raw chunks (dense and lexical, the lexical cutoff
+  applied in FTS SQL before the limit so expired hits can never starve the
+  pool), and derived candidates (claims, wiki pages, entities, relations) by KB
+  confinement: a derived row is a rewrite/aggregate that may paraphrase an
+  expired memory, so any KB holding an expired live memory has its derived
+  candidates withheld too, the same shape as diary isolation. The withholding
+  is never silent: `metadata.expiry` reports `expired_memories_excluded`
+  (counted against the scope, so exclusions only SQL saw are still reported)
+  and `excluded_derived_candidates`, and `--include-expired` (`include_expired`
+  over HTTP; also on `research`) reaches expired content again. What the flag
+  does NOT reach: derived artifacts of a FORGOTTEN expired memory that no
+  compile has run over since its deletion — retraction is not a validity
+  state; those report separately as `retracted_derived_candidates` with their
+  own remedy (run `compile`). An all-expired scope answers
+  `absence.reason: all_candidates_expired`, never `no_candidate_matched` —
+  expiry is a validity claim, not an absence claim. Re-remembering identical
+  content with `--valid-until` expires the EXISTING copy
+  (`valid_until_updated: true`; idempotent, validated against the stored
+  event time, and a rejected write persists nothing). A `--valid-until`
+  earlier than the event time is rejected: the memory would expire before it
+  happened. Expiry comparison normalizes timezone offsets (`datetime()`, not
+  TEXT ordering) and treats an unparseable timestamp as NOT expired — always
+  erring toward returning content.
+- `--json` output purity pinned by contract tests: exactly one JSON object on
+  stdout on success; on failure stdout stays empty and stderr carries one JSON
+  error object (when piped) whose `error.exit_code` matches the process exit
+  code; tracing/diagnostics never reach stdout even under `RUST_LOG=debug`.
+  Streaming surfaces are the documented exception: `jobs watch` emits NDJSON —
+  one JSON object per line, one line per state change.
+
+### Fixed
+
+- The live `entities` table gets its kind index back. The v2 migration renamed
+  `entities` to `entities_v1_global` and SQLite carried `idx_entities_kind`
+  with it, so the `CREATE INDEX IF NOT EXISTS` on the new table was a silent
+  no-op — every store since, fresh or migrated, ran kind-scoped entity reads
+  as table scans. `open()` now heals the index transactionally (write-free
+  once healed, safe under concurrent openers).
+- Test harnesses can no longer reach a developer's real store through an
+  exported `ENGRAM_STORE`: every integration harness now strips the variable
+  before spawning the binary, verified by running the whole suite under a
+  canary value.
+
+## 0.4.0 — 2026-08-05
 
 The five-move rebuild of the write/mutate/adjudicate layer, from the 2026-08-01
 agent-experience audit: an append-only journal as source of truth, bi-temporal
@@ -71,32 +126,6 @@ cannot launder an imported claim into trusted history.
 
 ### Added
 
-- Memory expiry, enforced at recall. `remember --valid-until <RFC3339|YYYY-MM-DD>`
-  records when content stops being true (a bare date holds through the END of
-  that UTC day, matching `recall --until`); once that instant passes, `recall`,
-  `memory search`, `research` and the daemon endpoints withhold the memory from
-  every retrieval path — raw chunks (dense and lexical) by exact memory, and
-  derived candidates (claims, wiki pages, entities, relations) by KB
-  confinement: a derived row is a rewrite/aggregate that may paraphrase an
-  expired memory, so any KB holding an expired live memory has its derived
-  candidates withheld too, the same shape as diary isolation. The withholding
-  is never silent: `metadata.expiry` reports `expired_memories_excluded` and
-  `excluded_derived_candidates`, and `--include-expired` (`include_expired`
-  over HTTP; also on `research`) reaches everything again. An all-expired
-  scope answers `absence.reason: all_candidates_expired`, never
-  `no_candidate_matched` — expiry is a validity claim, not an absence claim.
-  Re-remembering identical content with `--valid-until` expires the EXISTING
-  copy (`valid_until_updated: true`) instead of silently dropping the flag.
-  A `--valid-until` earlier than `--event-time` is rejected: the memory would
-  expire before it happened. Expiry comparison normalizes timezone offsets
-  (`datetime()`, not TEXT ordering), so imported non-UTC timestamps expire at
-  the correct instant.
-- `--json` output purity pinned by contract tests: exactly one JSON object on
-  stdout on success; on failure stdout stays empty and stderr carries one JSON
-  error object (when piped) whose `error.exit_code` matches the process exit
-  code; tracing/diagnostics never reach stdout even under `RUST_LOG=debug`.
-  Streaming surfaces are the documented exception: `jobs watch` emits NDJSON —
-  one JSON object per line, one line per state change.
 - Typed id handles (`mem:`/`chunk:`/`fact:`/`conflict:`/…) accepted by every
   mutator; bare UUIDs stay valid everywhere. A chunk id fed to `edit`/`forget`
   resolves to its memory (`resolved_from` says so); a wrong-kind id names the
@@ -163,12 +192,6 @@ cannot launder an imported claim into trusted history.
   derived layer. Only a completed `compile` un-gates a KB; the jobs schema is
   now ensured inside `SqliteStore::open` itself so every reader sees the
   columns the gate depends on.
-- The live `entities` table gets its kind index back. The v2 migration renamed
-  `entities` to `entities_v1_global` and SQLite carried `idx_entities_kind`
-  with it, so the `CREATE INDEX IF NOT EXISTS` on the new table was a silent
-  no-op — every store since, fresh or migrated, ran kind-scoped entity reads
-  as table scans. `open()` now heals the index (check-then-repair, write-free
-  once healed).
 
 ## 0.3.1 — 2026-07-28
 - Failover hardening from the post-release code review (15 findings, all fixed):
