@@ -83,6 +83,13 @@ lines removable (~31%), 12 tables, six read verbs → two.
 
 ### Priority order (this supersedes the earlier v0.5 agenda)
 
+> **2026-08-11 update:** a three-week external field report (0.3.1, heavy multi-agent
+> use) independently reproduced the same failure classes and added one new capability
+> (document sync). The execution sequence is now the **80/20 order in
+> `field-report-deltas.md`** — the four priorities below stand, but the cheap items
+> (the two `state` bugs, priorities 2–3, `--json` purity, expiry-at-recall) land first
+> because they are hours, not days.
+
 **1. Invert fact extraction.** Boris's insight and the highest-leverage change: engram pays
 `gemini-3.5-flash-lite` via OpenRouter to re-read text a *frontier model just wrote*. The caller
 is the LLM. Make caller-supplied facts the default path (`--facts-json` already exists with full
@@ -148,6 +155,7 @@ and carried its index with it, leaving the live table **unindexed**).
 | `docs/arch/ux/` | four naive-agent usability runs |
 | `docs/arch/agent-era-findings.md` | what Anthropic's current guidance implies for engram |
 | `docs/arch/v05-agenda.md` | the four deep design reviews, synthesized |
+| `docs/arch/field-report-deltas.md` | 2026-08-11 field-report dispositions + the 80/20 execution order |
 | `docs/arch/review-*.md` | every gate and review report |
 | `CHANGELOG.md` | 0.4.0 breaking changes, agent-facing |
 
