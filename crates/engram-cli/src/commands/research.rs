@@ -45,6 +45,9 @@ pub async fn run(
         kb: if all_kbs { None } else { Some(kb.clone()) },
         since: None,
         until: None,
+        // Research assembles evidence for synthesis; an expired memory is not
+        // evidence of current state. Same default as recall.
+        include_expired: false,
     };
     let params = HybridParams {
         query: &query,

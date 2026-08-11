@@ -53,6 +53,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             no_extract_facts,
             extract_facts,
             event_time,
+            valid_until,
             allow_duplicate,
             autonomy,
             facts_json,
@@ -72,6 +73,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                     autonomy,
                     facts_json,
                     event_time,
+                    valid_until,
                     offline,
                 },
             )
@@ -91,6 +93,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             allow_mixed_embeddings,
             since,
             until,
+            include_expired,
         } => {
             commands::recall::run(
                 &ctx,
@@ -108,6 +111,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                     allow_mixed_embeddings,
                     since,
                     until,
+                    include_expired,
                     alias: "recall",
                 },
             )
@@ -348,6 +352,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 no_extract_facts,
                 extract_facts,
                 event_time,
+                valid_until,
                 autonomy,
                 facts_json,
                 allow_duplicate,
@@ -367,6 +372,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                         autonomy,
                         facts_json,
                         event_time,
+                        valid_until,
                         offline,
                     },
                 )
@@ -382,6 +388,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 diary,
                 since,
                 until,
+                include_expired,
             } => {
                 // One code path with `recall`, one envelope, one set of
                 // fields. The defaults that still differ (layer, rerank depth,
@@ -403,6 +410,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                         allow_mixed_embeddings: false,
                         since,
                         until,
+                        include_expired,
                         alias: "memory search",
                     },
                 )

@@ -40,6 +40,8 @@ pub struct RecallArgs {
     pub allow_mixed_embeddings: bool,
     pub since: Option<String>,
     pub until: Option<String>,
+    /// `--include-expired`: admit memories whose `valid_until` has passed.
+    pub include_expired: bool,
     /// Which spelling the caller used, reported as `metadata.command_alias`
     /// (blessed by D2). It changes NO behaviour; it makes a transcript
     /// traceable to the surface that produced it.
@@ -66,6 +68,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         allow_mixed_embeddings,
         since,
         until,
+        include_expired,
         alias,
     } = args;
     if query.trim().is_empty() {
@@ -98,6 +101,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         kb: scope.kb.clone(),
         since: since_dt,
         until: until_dt,
+        include_expired,
     };
     let params = HybridParams {
         query: &query,
@@ -277,6 +281,12 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     if let Some(temporal) = notes.temporal_scope_json() {
         meta.add("temporal_scope", temporal);
     }
+    // And for validity: expired memories are withheld by default, and the
+    // withholding is always visible ("N memories expired; --include-expired
+    // reaches them"), never a silent thinning of results.
+    if let Some(expiry) = notes.expiry_json() {
+        meta.add("expiry", expiry);
+    }
     meta.add(
         "retriever",
         if backends.cloud_embedder {
@@ -367,7 +377,8 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             "kb": scope.label(),
             "kb_scope": scope.origin.as_str(),
             "diary_isolation": notes.diary_isolation_json(),
-            "temporal_scope": notes.temporal_scope_json()
+            "temporal_scope": notes.temporal_scope_json(),
+            "expiry": notes.expiry_json()
         }
     }) else {
         unreachable!("json! object literal");

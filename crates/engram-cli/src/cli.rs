@@ -80,6 +80,15 @@ pub enum Command {
         #[arg(long)]
         event_time: Option<String>,
 
+        /// When this memory STOPS being true: RFC3339, or YYYY-MM-DD meaning
+        /// the END of that UTC day ("--valid-until 2026-08-11" holds through
+        /// the 11th). After that instant, default `recall` withholds the
+        /// memory and reports it under `metadata.expiry`;
+        /// `recall --include-expired` still reaches it. Use for content with
+        /// a natural end date — an event window, an offer, a deadline.
+        #[arg(long)]
+        valid_until: Option<String>,
+
         /// Store even if identical content already exists in this kb/diary.
         /// By default an exact duplicate is a no-op (no second embedding).
         #[arg(long)]
@@ -174,6 +183,12 @@ pub enum Command {
         /// day D.
         #[arg(long)]
         until: Option<String>,
+
+        /// Search memories whose `valid_until` has already passed. By default
+        /// expired memories are withheld from every retrieval path and the
+        /// count is reported under `metadata.expiry` — never dropped silently.
+        #[arg(long)]
+        include_expired: bool,
     },
 
     /// Ingest a file or directory into the memory store.
@@ -710,6 +725,10 @@ pub enum MemoryCommand {
         /// (midnight UTC). Drives `recall --since/--until`.
         #[arg(long)]
         event_time: Option<String>,
+        /// When this memory STOPS being true: RFC3339, or YYYY-MM-DD meaning
+        /// the END of that UTC day. Same flag as `remember --valid-until`.
+        #[arg(long)]
+        valid_until: Option<String>,
         /// Conflict-resolution authority: assisted (default) | full | strict.
         /// See `remember --help`.
         #[arg(long, default_value = "assisted")]
@@ -755,6 +774,10 @@ pub enum MemoryCommand {
         /// UTC day). Same window semantics as `recall --until`.
         #[arg(long)]
         until: Option<String>,
+        /// Search memories whose `valid_until` has already passed. Same flag
+        /// as `recall --include-expired`.
+        #[arg(long)]
+        include_expired: bool,
     },
     /// Update a memory by UUID.
     Update {

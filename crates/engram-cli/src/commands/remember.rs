@@ -59,6 +59,10 @@ pub struct RememberArgs {
     pub facts_json: Option<String>,
     /// `--event-time`: when the content actually happened.
     pub event_time: Option<String>,
+    /// `--valid-until`: when this memory stops being true. A bare date means
+    /// the END of that UTC day. Default recall withholds the memory after
+    /// this instant (`--include-expired` reaches it again).
+    pub valid_until: Option<String>,
     /// `--offline`: embed with the deterministic stub instead of Gemini.
     pub offline: bool,
 }
@@ -186,11 +190,35 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         autonomy,
         facts_json,
         event_time,
+        valid_until,
         offline,
     } = args;
     let autonomy = Autonomy::parse(&autonomy)?;
     crate::commands::validate_diary_for_write(&diary)?;
     let event_time = parse_event_time(&event_time)?;
+    // A bare date means the END of that UTC day: "--valid-until 2026-08-11"
+    // holds through the 11th, matching `recall --until`. Strict like
+    // `--event-time`: a typo must not silently become "no expiry".
+    let valid_until = match valid_until.as_deref() {
+        None => None,
+        Some(s) => Some(
+            engram_core::temporal::parse_bound(s, engram_core::temporal::DayBound::End)
+                .ok_or_else(|| {
+                    CliError::BadInput(format!(
+                        "--valid-until '{s}' is not a date: expected RFC3339 \
+                         (2026-03-01T09:30:00Z) or YYYY-MM-DD"
+                    ))
+                })?,
+        ),
+    };
+    if let (Some(vu), Some(et)) = (valid_until, event_time) {
+        if vu < et {
+            return Err(CliError::BadInput(format!(
+                "--valid-until ({vu}) is before --event-time ({et}): the memory \
+                 would expire before it happened"
+            )));
+        }
+    }
     if content.trim().is_empty() {
         return Err(CliError::BadInput("content cannot be empty".into()));
     }
@@ -337,7 +365,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         // facts close this window later. Keeps the temporal model populated
         // instead of leaving valid_from perpetually NULL.
         valid_from: Some(event_time.unwrap_or(now)),
-        valid_until: None,
+        valid_until,
         tags,
     };
 

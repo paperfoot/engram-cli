@@ -1704,6 +1704,9 @@ async fn research_body(store: &SqliteStore, body: &str) -> Result<serde_json::Va
             kb: kb_filter.clone(),
             since: None,
             until: None,
+            // Research assembles evidence for synthesis; expired memories are
+            // not evidence of current state. Same default as CLI research.
+            include_expired: false,
         },
         mode: RecallMode::Explore,
         graph_hops: 2,
@@ -1843,6 +1846,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
             kb: scope.kb.clone(),
             since,
             until,
+            include_expired: req.include_expired.unwrap_or(false),
         },
         mode,
         graph_hops: req.graph_hops.unwrap_or(1),
@@ -2136,6 +2140,8 @@ struct RecallRequest {
     allow_mixed_embeddings: Option<bool>,
     since: Option<String>,
     until: Option<String>,
+    /// Same contract as `recall --include-expired` (CLI/daemon parity).
+    include_expired: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -71,6 +71,21 @@ cannot launder an imported claim into trusted history.
 
 ### Added
 
+- Memory expiry, enforced at recall. `remember --valid-until <RFC3339|YYYY-MM-DD>`
+  records when content stops being true (a bare date holds through the END of
+  that UTC day, matching `recall --until`); once that instant passes, `recall`,
+  `memory search`, `research` and the daemon endpoints withhold the memory from
+  every retrieval path. The withholding is never silent: `metadata.expiry`
+  reports `expired_memories_excluded`, and `--include-expired`
+  (`include_expired` over HTTP) reaches expired memories again. Scope receipts
+  still count expired chunks as in-scope — an all-expired scope answers "scope
+  held content, all expired", not "scope was empty"; expiry is a validity
+  claim, not an absence claim. A `--valid-until` earlier than `--event-time`
+  is rejected: the memory would expire before it happened.
+- `--json` output purity pinned by contract tests: exactly one JSON object on
+  stdout on success; on failure stdout stays empty and stderr carries one JSON
+  error object (when piped) whose `error.exit_code` matches the process exit
+  code; tracing/diagnostics never reach stdout even under `RUST_LOG=debug`.
 - Typed id handles (`mem:`/`chunk:`/`fact:`/`conflict:`/…) accepted by every
   mutator; bare UUIDs stay valid everywhere. A chunk id fed to `edit`/`forget`
   resolves to its memory (`resolved_from` says so); a wrong-kind id names the
@@ -137,6 +152,12 @@ cannot launder an imported claim into trusted history.
   derived layer. Only a completed `compile` un-gates a KB; the jobs schema is
   now ensured inside `SqliteStore::open` itself so every reader sees the
   columns the gate depends on.
+- The live `entities` table gets its kind index back. The v2 migration renamed
+  `entities` to `entities_v1_global` and SQLite carried `idx_entities_kind`
+  with it, so the `CREATE INDEX IF NOT EXISTS` on the new table was a silent
+  no-op — every store since, fresh or migrated, ran kind-scoped entity reads
+  as table scans. `open()` now heals the index (check-then-repair, write-free
+  once healed).
 
 ## 0.3.1 — 2026-07-28
 - Failover hardening from the post-release code review (15 findings, all fixed):

@@ -963,6 +963,7 @@ impl SqliteStore {
         // convention (bench, ad-hoc tools) broke at query time. An invariant
         // every reader depends on cannot live in call-site discipline.
         store.ensure_jobs_schema()?;
+        store.repair_entity_kind_index()?;
         Ok(store)
     }
 
@@ -977,7 +978,34 @@ impl SqliteStore {
         // Same invariant as `open`: a store you can query is a store whose
         // jobs columns exist.
         store.ensure_jobs_schema()?;
+        store.repair_entity_kind_index()?;
         Ok(store)
+    }
+
+    /// Heal the entity kind index that migration v2 silently lost. v1 created
+    /// `idx_entities_kind` on `entities`; v2 renamed that table to
+    /// `entities_v1_global`, and SQLite carried the named index with it, so
+    /// v2's `CREATE INDEX IF NOT EXISTS` was a no-op — every store since,
+    /// fresh or migrated, has its live `entities` table scanning on
+    /// kind-scoped reads (gate-4 M7). Check-then-repair keeps `open()`
+    /// write-free once healed.
+    fn repair_entity_kind_index(&self) -> Result<(), StorageError> {
+        let on_live: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT tbl_name FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_entities_kind'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if on_live.as_deref() != Some("entities") {
+            self.conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_entities_kind;
+                 CREATE INDEX idx_entities_kind ON entities(kind);",
+            )?;
+        }
+        Ok(())
     }
 
     /// Run `f` inside a single SQLite transaction. If a transaction is
@@ -1953,6 +1981,28 @@ impl SqliteStore {
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Ids of live memories whose validity window has closed strictly before
+    /// `now` (RFC3339 UTC). Recall withholds these by default and reports the
+    /// count; `--include-expired` opts back in. TEXT comparison, the same
+    /// convention as the since/until bounds above.
+    pub fn expired_memory_ids(
+        &self,
+        now: &str,
+    ) -> Result<std::collections::HashSet<Uuid>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM memories
+             WHERE deleted = 0 AND valid_until IS NOT NULL AND valid_until < ?1",
+        )?;
+        let rows = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            if let Ok(id) = Uuid::parse_str(&row?) {
+                out.insert(id);
+            }
+        }
+        Ok(out)
     }
 
     pub fn list_chunks_for_kb(&self, kb: &str) -> Result<Vec<ChunkRecord>, StorageError> {
@@ -6081,6 +6131,59 @@ mod tests {
 
     /// Writing to a KB must register it, or the memory is stored somewhere
     /// `kb list` cannot see. This is the invariant that older builds broke.
+    /// Migration v2 renamed `entities` and SQLite carried `idx_entities_kind`
+    /// to the renamed table, leaving the live table scanning on kind reads
+    /// (gate-4 M7). Open must heal it — on every store, fresh included,
+    /// because fresh stores run the same v1→v2 chain and lose it the same way.
+    #[test]
+    fn entity_kind_index_lives_on_the_live_entities_table() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let tbl: String = store
+            .conn
+            .query_row(
+                "SELECT tbl_name FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_entities_kind'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tbl, "entities");
+        // Healing an already-healed store must be a no-op, not an error.
+        store.repair_entity_kind_index().unwrap();
+    }
+
+    /// `expired_memory_ids` returns exactly the live memories whose
+    /// `valid_until` has passed: not the unexpired, not the future-dated,
+    /// not the deleted.
+    #[test]
+    fn expired_memory_ids_returns_only_live_past_expiries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        let mut expired = fact("turbulent event window, over yesterday");
+        expired.valid_until = Some(now - chrono::Duration::days(1));
+        let mut current = fact("window still open tomorrow");
+        current.valid_until = Some(now + chrono::Duration::days(1));
+        let open_ended = fact("no expiry at all");
+        let mut deleted = fact("expired but deleted");
+        deleted.valid_until = Some(now - chrono::Duration::days(2));
+
+        for m in [&expired, &current, &open_ended, &deleted] {
+            store.insert_memory_with_kb(m, "default").unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET deleted = 1 WHERE id = ?1",
+                params![deleted.id.to_string()],
+            )
+            .unwrap();
+
+        let ids = store.expired_memory_ids(&now.to_rfc3339()).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&expired.id));
+    }
+
     #[test]
     fn writing_a_memory_registers_its_kb() {
         let store = SqliteStore::open_in_memory().unwrap();

@@ -32,6 +32,12 @@ pub struct Filters {
     /// and are actually applied to the candidate set (previously discarded).
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    /// Admit memories whose `valid_until` has already passed. Default false:
+    /// a memory that declares its own end date ("offer runs until March 1")
+    /// is wrong the day after, and stale-outranking-fresh was the #1
+    /// field-reported failure. The exclusion is counted and reported in
+    /// `RecallNotes`, never silent.
+    pub include_expired: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,6 +559,11 @@ pub struct RecallNotes {
     pub until: Option<String>,
     /// Retrieval sources skipped because a temporal window was active.
     pub temporal_excluded: BTreeSet<&'static str>,
+    /// Distinct memories withheld because their `valid_until` has passed.
+    /// Zero when nothing was expired OR when `--include-expired` was set.
+    pub expired_excluded: usize,
+    /// True when expired memories were admitted on request.
+    pub include_expired: bool,
 }
 
 impl RecallNotes {
@@ -581,6 +592,24 @@ impl RecallNotes {
             "reason": "derived content (claims, wiki pages, entities, relations) has no \
                        event time of its own, so it cannot be placed inside or outside the \
                        requested window; only raw memory chunks are searched",
+        }))
+    }
+
+    /// JSON for response metadata, or `None` when expiry changed nothing.
+    ///
+    /// Same contract as the other two: a memory the pipeline deliberately
+    /// withheld is reported, never dropped in silence. This reports validity
+    /// ("this memory's stated window has closed"), NOT absence — see gate-4
+    /// H9: an expired-and-withheld memory may still be the only record.
+    pub fn expiry_json(&self) -> Option<serde_json::Value> {
+        if self.expired_excluded == 0 && !self.include_expired {
+            return None;
+        }
+        Some(serde_json::json!({
+            "expired_memories_excluded": self.expired_excluded,
+            "include_expired": self.include_expired,
+            "reason": "these memories carry a valid_until that has passed; \
+                       rerun with --include-expired to search them",
         }))
     }
 
@@ -729,12 +758,51 @@ where
     let mut source_map: HashMap<Uuid, HashSet<RetrievalSource>> = HashMap::new();
     let mut runs: Vec<Vec<RankedHit>> = Vec::new();
 
-    let chunks = store.iter_chunks_with_embedding_records_since(
+    let mut chunks = store.iter_chunks_with_embedding_records_since(
         diary,
         kb,
         since.as_deref(),
         until.as_deref(),
     )?;
+
+    // VALIDITY WINDOW: a memory whose `valid_until` has passed is withheld
+    // from every retrieval path unless the caller asked for it. The scope
+    // stats below are captured from the PRE-expiry set, so an all-expired
+    // scope still reads as "scope had content, all of it expired" rather than
+    // "scope was empty" — validity and absence are different claims
+    // (gate-4 H9). The exclusion count lands in `RecallNotes`, never silence.
+    let chunks_in_scope = chunks.len();
+    let kbs_in_scope: Vec<String> = {
+        let mut kbs: Vec<String> = chunks
+            .iter()
+            .map(|c| c.kb.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        kbs.sort();
+        kbs
+    };
+    notes.include_expired = params.filters.include_expired;
+    let expired_memories: HashSet<Uuid> = if params.filters.include_expired {
+        HashSet::new()
+    } else {
+        store.expired_memory_ids(&chrono::Utc::now().to_rfc3339())?
+    };
+    // Distinct memories actually withheld, across every path that can
+    // surface one (dense below, lexical later — FTS reaches chunks without
+    // embeddings, so it needs its own filter).
+    let mut expired_withheld: HashSet<Uuid> = HashSet::new();
+    if !expired_memories.is_empty() {
+        expired_withheld.extend(
+            chunks
+                .iter()
+                .filter(|c| expired_memories.contains(&c.memory_id))
+                .map(|c| c.memory_id),
+        );
+        notes.expired_excluded = expired_withheld.len();
+        chunks.retain(|c| !expired_memories.contains(&c.memory_id));
+    }
+
     guard_embedding_compatibility(
         &chunks,
         &expected_model,
@@ -777,17 +845,11 @@ where
     // means the SCOPE was empty, which is a different answer from "nothing
     // matched" and the read surface reports it as one.
     let mut stats = RecallStats {
-        chunks_considered: chunks.len(),
-        kbs_searched: {
-            let mut kbs: Vec<String> = chunks
-                .iter()
-                .map(|c| c.kb.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            kbs.sort();
-            kbs
-        },
+        // Pre-expiry scope (see the validity-window block above): "how much
+        // the scope held" and "how much of it was searchable" are kept
+        // distinguishable via notes.expired_excluded.
+        chunks_considered: chunks_in_scope,
+        kbs_searched: kbs_in_scope,
         ..RecallStats::default()
     };
 
@@ -826,6 +888,33 @@ where
         };
         if let Some(allowed) = &allowed_chunks {
             lexical.retain(|(id, _)| allowed.contains(id));
+        }
+        // Expired-memory filter, lexical leg: FTS queries the whole table, so
+        // it can surface chunks of expired memories (including chunks with no
+        // embedding record, which the dense-path filter above never saw).
+        // A chunk already in `chunk_index` survived the dense-path filter;
+        // only the rest need their parent resolved. An unresolvable chunk is
+        // kept — over-filtering on a lookup miss would be a silent loss.
+        if !expired_memories.is_empty() {
+            let unresolved: Vec<Uuid> = lexical
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| !chunk_index.contains_key(id))
+                .collect();
+            if !unresolved.is_empty() {
+                let parents = store.memory_ids_for_chunks(&unresolved)?;
+                lexical.retain(|(id, _)| {
+                    chunk_index.contains_key(id)
+                        || parents.get(id).map_or(true, |m| {
+                            let expired = expired_memories.contains(m);
+                            if expired {
+                                expired_withheld.insert(*m);
+                            }
+                            !expired
+                        })
+                });
+                notes.expired_excluded = expired_withheld.len();
+            }
         }
         // Chunk content/citations for lexical-only hits are resolved lazily for
         // the rerank pool (see resolve_candidate), not here — so we don't do a
