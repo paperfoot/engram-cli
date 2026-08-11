@@ -1,20 +1,22 @@
 # engram v0.4 → next session handoff
 
-Written 2026-08-02. Everything below is verified against the tree, not recalled.
+Written 2026-08-02; release-state section updated 2026-08-11. Everything below
+is verified against the tree, not recalled.
 
-## State right now
+## State right now (2026-08-11)
 
 | | |
 |---|---|
-| Branch | `arch/v0.4`, **94 commits** over `main`, pushed to `origin` (private repo `paperfoot/engram-cli`) |
+| Branch | `arch/v0.4`, pushed to `origin` (private repo `paperfoot/engram-cli`) |
 | Working tree | clean |
-| Tests | **1181 passed, 0 failed, 4 ignored** (each ignore names its blocker) |
+| Tests | **1213 passed, 0 failed** |
 | Schema on branch | **v13** |
-| **Installed binary** | **still 0.3.1** — untouched |
-| **Boris's live store** | **still schema v9** — never migrated, never written to by this work |
+| **Published** | **0.4.1 on crates.io (all 10 crates) + brew tap formula**, 2026-08-11, after a GO from six independent gate rounds. A **0.4.0** also exists on crates.io: published from `2373a91` (2026-08-05) by an earlier session that never updated this doc — it predates expiry/purity/index/harness work, is coherent, unyanked, and the tap never pointed at it. |
+| **Installed binary** | **still 0.3.1** — untouched; the 0.4.1 install verification ran from a scratchpad `--root`, never PATH |
+| **Boris's live store** | **still schema v9** — never migrated, never written to. TWO migration rehearsals on full copies passed (v9→v13, counts identical, backup written, index healed). `brew upgrade engram` + any `engram` command migrates it ONE-WAY; recommend `cp -R` of the store dir first anyway. |
 
-**Nothing has been installed or published.** Not crates.io, not the brew tap, not
-`~/.cargo/bin/engram`. That is deliberate and must stay true until he explicitly says otherwise.
+**Update this table when you publish or install. The stale "nothing published"
+claim here is exactly what burned the 0.4.0 version number.**
 
 ## Rules that do not bend
 
@@ -86,9 +88,16 @@ lines removable (~31%), 12 tables, six read verbs → two.
 > **2026-08-11 update:** a three-week external field report (0.3.1, heavy multi-agent
 > use) independently reproduced the same failure classes and added one new capability
 > (document sync). The execution sequence is now the **80/20 order in
-> `field-report-deltas.md`** — the four priorities below stand, but the cheap items
-> (the two `state` bugs, priorities 2–3, `--json` purity, expiry-at-recall) land first
-> because they are hours, not days.
+> `field-report-deltas.md`**.
+>
+> **2026-08-11, later — Tier 1 SHIPPED as 0.4.1:** expiry-at-recall
+> (`remember --valid-until` / `recall --include-expired`, two quarantines, SQL-side
+> lexical cutoff, `all_candidates_expired`), the `--json` purity contract tests, the
+> entity kind index heal, and the test-harness `ENGRAM_STORE` isolation fix. Six
+> Codex gate rounds (five NO-GO, then GO) — reports in the session scratchpad,
+> substance recorded in the 0.4.1 commit messages. Deliberately deferred on gate-4
+> grounds: single-copy wire (H5 injection boundary) and the abstention floor (H8 no
+> valid score) — they remain priorities 2–3 below, unstarted.
 
 **1. Invert fact extraction.** Boris's insight and the highest-leverage change: engram pays
 `gemini-3.5-flash-lite` via OpenRouter to re-read text a *frontier model just wrote*. The caller
