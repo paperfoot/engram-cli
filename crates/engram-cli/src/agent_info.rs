@@ -396,6 +396,8 @@ fn manifest() -> Value {
 /// exit vocabulary, and the invariants. Copied out of the full manifest
 /// rather than rebuilt, so a scoped read cannot drift from the full one. The
 /// store paths stay out: they are not rules, and `config show` reports them.
+/// The global flags ride as the one-line `flags` map, not `global_flags`,
+/// whose FlagSpec objects say the same three things in twice the bytes.
 const CORE: &[&str] = &[
     "name",
     "version",
@@ -407,7 +409,7 @@ const CORE: &[&str] = &[
     "env_prefix",
     "exit_codes",
     "envelope",
-    "global_flags",
+    "flags",
     "error_code_exits",
     "invariants",
 ];
