@@ -1333,6 +1333,7 @@ fn apply_judgement(
                 rule: "semantic_llm",
             };
             let mut kept: Vec<PlannedConflict> = Vec::new();
+            let mut refused = false;
             for q in std::mem::take(&mut plan.queue) {
                 let named = ids.iter().any(|i| i == &q.old_fact_id.to_string());
                 let allowed = by_id
@@ -1350,13 +1351,24 @@ fn apply_judgement(
                         resolution_tag: "semantic_llm",
                     }),
                     // Named but refused: an LLM is not evidence that a
-                    // medication stopped. Not named: the judge said nothing
-                    // about this pair, and silence is not an answer — it used
-                    // to be dropped, an unrecorded coexist. Both survive.
-                    (true, false) | (false, _) => kept.push(q),
+                    // medication stopped, and the note says why the close
+                    // the judge asked for did not happen.
+                    (true, false) => {
+                        refused = true;
+                        kept.push(q);
+                    }
+                    // Not named: the judge said nothing about this pair, and
+                    // silence is not an answer — it used to be dropped, an
+                    // unrecorded coexist.
+                    (false, _) => kept.push(q),
                 }
             }
             plan.queue = kept;
+            if refused {
+                plan.notes.push(PlanNote::AdjudicationKeptSafety {
+                    action: "supersede",
+                });
+            }
         }
     }
 }

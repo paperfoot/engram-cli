@@ -1073,9 +1073,9 @@ pub enum PlanNote {
     AdjudicationFailed {
         reason: &'static str,
     },
-    /// The machine adjudicator answered `coexist` or `reject_new` on a safety
-    /// pair. Neither is its to give: the pair stays queued and the caller's
-    /// observation is kept.
+    /// The machine adjudicator answered `coexist`, `reject_new` or
+    /// `supersede` on a safety pair. None is its to give: the pair stays
+    /// queued and the caller's observation is kept.
     AdjudicationKeptSafety {
         action: &'static str,
     },
@@ -1124,8 +1124,7 @@ impl PlanNote {
             ),
             PlanNote::AdjudicationKeptSafety { action } => format!(
                 "the adjudicator answered {action} on a safety relation; only the caller may \
-                 clear or discard a safety question, so it stays queued and the observation is \
-                 kept"
+                 settle a safety question, so it stays queued and the observation is kept"
             ),
             PlanNote::AdjudicationStale => {
                 "the store changed between adjudication and this write, \

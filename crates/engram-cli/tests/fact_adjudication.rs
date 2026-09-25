@@ -273,6 +273,39 @@ fn the_judge_cannot_dismiss_a_safety_question() {
     assert_eq!(open_conflicts(tmp.path())["data"]["total_open"], 1);
 }
 
+/// `may_close` already refused this close; the answer now says so rather than
+/// counting a supersede that closed nothing, with no reason given.
+#[test]
+fn a_refused_safety_supersede_is_explained() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana takes metformin 500 mg.",
+        &med("metformin 500 mg"),
+    );
+    let old = facts_for(tmp.path(), "Ana")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = judged(
+        tmp.path(),
+        "Ana now takes metformin 1000 mg.",
+        &med("metformin 1000 mg"),
+        &format!(r#"{{"action":"supersede","ids":["{old}"]}}"#),
+    );
+    assert_eq!(queued(&v).len(), 1, "{v}");
+    assert_eq!(note_kinds(&v), ["adjudication_kept_safety"], "{v}");
+    assert!(v["data"]["plan_notes"][0]["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("answered supersede"));
+    assert_eq!(v["metadata"]["adjudication"]["pairs_closed"], 0, "{v}");
+    assert_eq!(
+        open_objects(tmp.path()),
+        ["metformin 1000 mg", "metformin 500 mg"]
+    );
+}
+
 /// And outside the safety registry the judge's answers still stand — the fix
 /// is scoped, not a switch that turns `--autonomy full` into `assisted`.
 #[test]
