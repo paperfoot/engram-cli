@@ -148,7 +148,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
 }
 
 fn describe_key_source(env: &str, file: &toml::Value, path: &str) -> serde_json::Value {
-    if let Ok(v) = std::env::var(env) {
+    if let Some(v) = env_secret(env) {
         return json!({ "source": "env", "env": env, "value": mask_key(&v) });
     }
     // Walk path dot-separated
@@ -161,7 +161,7 @@ fn describe_key_source(env: &str, file: &toml::Value, path: &str) -> serde_json:
             }
         }
     }
-    if let Some(s) = cur.as_str() {
+    if let Some(s) = cur.as_str().filter(|s| !s.is_empty()) {
         json!({ "source": "config_file", "value": mask_key(s) })
     } else {
         json!({ "source": "unset" })
@@ -254,7 +254,13 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
             "gemini": if gemini { "configured" } else { "missing" },
             "gemini_keys_probed": probes,
             "cohere": if cohere { "configured (optional)" } else { "missing (optional)" },
-            "openrouter": if openrouter { "configured (compiler)" } else { "missing (compiler optional)" },
+            // Not "compiler optional": `remember` extracts facts through
+            // OpenRouter by default, so without it no facts are stored.
+            "openrouter": if openrouter {
+                "configured (fact extraction, compiler, judge)"
+            } else {
+                "missing (no fact extraction or compiler; judge only via TypeSafe)"
+            },
             // Configured is not working: "ok" is true only when a key in
             // the chain actually SERVED the live probe. An agent branching on
             // this contract must not proceed on a depleted chain.
@@ -297,7 +303,7 @@ async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'stat
 }
 
 fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
-    if std::env::var(env).is_ok() {
+    if env_secret(env).is_some() {
         return true;
     }
     let mut cur = file;
@@ -338,15 +344,21 @@ pub fn gemini_fallback_keys() -> Vec<String> {
         .collect()
 }
 
+/// A key from the environment; an empty variable is absent. The one env
+/// reader for keys: `config show` and `config check` once treated
+/// `OPENROUTER_API_KEY=` as configured while every command using the key
+/// treated it as missing.
+fn env_secret(env: &str) -> Option<String> {
+    std::env::var(env).ok().filter(|v| !v.is_empty())
+}
+
 /// Resolve a secret in the canonical order: env var → config file → None.
 /// This is the single source of truth for key lookup so users can either
 /// set `GEMINI_API_KEY` in the environment or run `engram config set keys.gemini <value>` and
 /// both work identically. Framework rule: env overrides file.
 pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(env) {
-        if !v.is_empty() {
-            return Some(v);
-        }
+    if let Some(v) = env_secret(env) {
+        return Some(v);
     }
     let root = read_toml().ok()?;
     let mut cur = &root;
