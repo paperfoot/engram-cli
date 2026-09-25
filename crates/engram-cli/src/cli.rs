@@ -1082,11 +1082,12 @@ pub enum FactsCommand {
     Show {
         /// Subject name (case-insensitive). Pass "*" to use all diaries.
         subject: String,
-        /// Diary scope. Default is "default". Pass "*" for all.
-        #[arg(long, default_value = "default")]
+        /// Diary scope. Omit (or pass "*") for every diary.
+        #[arg(long, default_value = "*")]
         diary: String,
-        /// Knowledge base/domain namespace. Pass "*" for all.
-        #[arg(long, default_value = "default")]
+        /// Knowledge base/domain namespace. Omit (or pass "*") for every KB,
+        /// the same default as `state` and `facts list`.
+        #[arg(long, default_value = "*")]
         kb: String,
     },
     /// Show recent contradictions: facts that were superseded by newer claims.

@@ -416,6 +416,42 @@ fn a_listing_reports_returned_total_verdict_and_scope() {
     );
 }
 
+/// Reads span every KB since 0.3.x, and `facts show` was the one that still
+/// defaulted to `default`: a fact filed under `personal` answered "0 facts",
+/// with `origin: flag` although no flag was passed. `state` found it.
+#[test]
+fn facts_show_without_kb_finds_a_fact_filed_under_personal() {
+    let sb = Sandbox::new();
+    let facts = r#"[{"subject":"Ana","predicate":"lives_in","object":"Lisbon"}]"#;
+    let out = sb
+        .cmd()
+        .args([
+            "remember",
+            "Ana lives in Lisbon.",
+            "--kb",
+            "personal",
+            "--offline",
+        ])
+        .args(["--facts-json", facts])
+        .output()
+        .expect("remember");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = sb
+        .cmd()
+        .args(["facts", "show", "Ana"])
+        .output()
+        .expect("facts show");
+    assert!(out.status.success());
+    let v = Sandbox::json(&out);
+    let active = v["data"]["active"].as_array().expect("active facts");
+    assert_eq!(active.len(), 1, "{v}");
+    assert_eq!(v["metadata"]["scope"]["origin"], "all_kbs");
+}
+
 /// `state` is the command whose whole promise is that an absent answer is an
 /// ANSWER: exit 0, `no_match`, and a reason naming the miss.
 #[test]

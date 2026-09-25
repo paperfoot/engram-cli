@@ -33,6 +33,9 @@ that told the agent to load a 36k-token manifest.
   omits `diary_isolation`, `temporal_scope` and `expiry` from
   `data.metadata` when they are null. Scores and confidences print at four
   decimal places (`0.92`, not `0.9200000166893005`).
+- `facts show` spans every KB and diary by default, like `facts list` and
+  `state`. It read only `default`, so a fact filed under `personal` came back
+  as zero facts with `origin: flag` although no flag was passed.
 
 ## 0.4.1 — 2026-08-11
 

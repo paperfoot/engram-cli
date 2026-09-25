@@ -1275,18 +1275,18 @@ const FACTS_SHOW_FLAGS: &[FlagSpec] = &[
         cli_long: "diary",
         aliases: &[],
         ty: Ty::Str,
-        default: Some("default"),
+        default: Some("*"),
         required: false,
-        doc: "diary scope; '*' for all",
+        doc: "diary scope; omit or '*' for every diary",
     },
     FlagSpec {
         name: "kb",
         cli_long: "kb",
         aliases: &[],
         ty: Ty::Str,
-        default: Some("default"),
+        default: Some("*"),
         required: false,
-        doc: "KB scope; '*' for all",
+        doc: "KB scope; omit or '*' for every KB",
     },
 ];
 
@@ -2903,7 +2903,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         exit_codes: &[0, 1, 3],
         rules: &[
             "`facts show` is the HISTORY view. For what is true now, prefer `engram state <subject>`: it groups by relation, carries provenance and confidence, and lists the questions still open about that subject.",
-            "Both scopes default to one namespace here, unlike `facts list`. Pass --kb '*' --diary '*' for the whole store.",
+            "Both scopes default to every KB and diary, like `facts list` and `state`; `metadata.scope.origin` says `all_kbs` unless --kb narrowed it.",
         ],
         examples: &["engram facts show 'Ana' --kb '*' --diary '*' --json"],
     },
