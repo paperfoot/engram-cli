@@ -6,7 +6,7 @@
 
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::output::{print_success, Metadata};
+use crate::output::{print_success, Metadata, OutputFormat};
 use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_llm::openrouter::OpenRouterClient;
@@ -36,24 +36,30 @@ pub struct BenchArgs {
     pub profile: String,
 }
 
-pub async fn run(ctx: &AppContext, args: BenchArgs) -> Result<(), CliError> {
+/// Takes the output format, not a context: `dispatch` calls this BEFORE any
+/// store is opened. A benchmark measures fixtures and downloaded datasets, and
+/// building the context first meant every `engram bench` run without
+/// `ENGRAM_STORE` migrated, backed up and cached into the user's real store.
+/// The one suite input that genuinely lives there (`--kb` for litqa2 fulltext
+/// and biogen) opens it itself.
+pub async fn run(format: OutputFormat, args: BenchArgs) -> Result<(), CliError> {
     match args.suite.as_str() {
-        "mini" => run_mini(ctx).await,
+        "mini" => run_mini(format).await,
         "personal" => {
             run_personal(
-                ctx,
+                format,
                 args.profile,
                 top_k_or(args.top_k, PERSONAL_DEFAULT_TOP_K),
                 args.save,
             )
             .await
         }
-        "mini-fts" => run_mini_fts(ctx),
-        "scientific-mini" | "science-mini" => run_scientific_mini(ctx).await,
-        "longmemeval" => run_longmemeval(ctx, args.download, args.limit).await,
+        "mini-fts" => run_mini_fts(format),
+        "scientific-mini" | "science-mini" => run_scientific_mini(format).await,
+        "longmemeval" => run_longmemeval(format, args.download, args.limit).await,
         "longmemeval-qa" | "lme-qa" => {
             run_longmemeval_qa(
-                ctx,
+                format,
                 args.limit,
                 args.answerer,
                 args.judge,
@@ -65,7 +71,7 @@ pub async fn run(ctx: &AppContext, args: BenchArgs) -> Result<(), CliError> {
         }
         "locomo-plus" | "locomo-plus-qa" => {
             run_locomo_plus_qa(
-                ctx,
+                format,
                 args.limit,
                 args.answerer,
                 args.judge,
@@ -77,7 +83,7 @@ pub async fn run(ctx: &AppContext, args: BenchArgs) -> Result<(), CliError> {
         }
         "memoryagentbench" | "mab" => {
             run_memoryagentbench_qa(
-                ctx,
+                format,
                 args.mab_split,
                 args.limit,
                 args.answerer,
@@ -89,7 +95,7 @@ pub async fn run(ctx: &AppContext, args: BenchArgs) -> Result<(), CliError> {
         }
         "litqa2" => {
             run_litqa2(
-                ctx,
+                format,
                 args.mode,
                 args.limit,
                 args.kb,
@@ -103,7 +109,7 @@ pub async fn run(ctx: &AppContext, args: BenchArgs) -> Result<(), CliError> {
         }
         "beir" => {
             run_beir(
-                ctx,
+                format,
                 args.dataset,
                 args.rerank,
                 top_k_or(args.top_k, BEIR_DEFAULT_TOP_K),
@@ -113,7 +119,7 @@ pub async fn run(ctx: &AppContext, args: BenchArgs) -> Result<(), CliError> {
         }
         "biogen" => {
             run_biogen(
-                ctx,
+                format,
                 args.year,
                 args.kb,
                 args.corpus,
@@ -159,7 +165,7 @@ fn top_k_or(value: usize, default: usize) -> usize {
 ///   `{ _id|id|doi, text|abstract|contents }` rows, or the same one-per-line as
 ///   JSONL (the BEIR `corpus.jsonl` shape).
 fn build_corpus(
-    ctx: &AppContext,
+    format: OutputFormat,
     kb: Option<&str>,
     corpus_path: Option<&std::path::Path>,
 ) -> Result<std::collections::HashMap<String, String>, CliError> {
@@ -170,16 +176,19 @@ fn build_corpus(
         (None, None) => Err(CliError::BadInput(
             "full-text retrieval requires --kb <name> or --corpus <file>".into(),
         )),
-        (Some(kb), None) => build_corpus_from_kb(ctx, kb),
+        (Some(kb), None) => build_corpus_from_kb(format, kb),
         (None, Some(path)) => load_corpus_file(path),
     }
 }
 
 fn build_corpus_from_kb(
-    ctx: &AppContext,
+    format: OutputFormat,
     kb: &str,
 ) -> Result<std::collections::HashMap<String, String>, CliError> {
     use std::collections::HashMap;
+    // The only suite input that lives in the store, so the only place a bench
+    // run opens one.
+    let ctx = AppContext::new(format, true)?;
     // document_id -> stable corpus key (DOI when available, else title/id).
     let mut doc_key: HashMap<uuid::Uuid, String> = HashMap::new();
     for doc in ctx.store.list_documents(Some(kb), 1_000_000)? {
@@ -305,7 +314,7 @@ fn load_corpus_file(
     Ok(corpus)
 }
 
-async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
+async fn run_scientific_mini(format: OutputFormat) -> Result<(), CliError> {
     use crate::retrieval::{hybrid_recall, Filters, HybridParams, RecallMode};
     use chrono::Utc;
     use engram_core::types::{Memory, MemorySource};
@@ -316,7 +325,7 @@ async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
     use uuid::Uuid;
 
     let store = SqliteStore::open_in_memory()?;
-    let fixture_ctx = AppContext::fixture(ctx.format, store);
+    let fixture_ctx = AppContext::fixture(format, store);
     let kb = "scientific-mini";
     fixture_ctx
         .store
@@ -444,7 +453,7 @@ async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
         "compile": compile,
         "per_question": per_question,
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
@@ -464,7 +473,7 @@ async fn run_scientific_mini(ctx: &AppContext) -> Result<(), CliError> {
 /// on). Measuring that is the job — the suite asserts nothing about score
 /// levels, it reports them.
 async fn run_personal(
-    ctx: &AppContext,
+    format: OutputFormat,
     profile: String,
     top_k: usize,
     save: Option<std::path::PathBuf>,
@@ -629,7 +638,7 @@ async fn run_personal(
         meta.add("saved_to", path.to_string_lossy());
     }
 
-    print_success(ctx.format, report, meta, print_personal_table);
+    print_success(format, report, meta, print_personal_table);
     Ok(())
 }
 
@@ -724,7 +733,7 @@ fn fmt3(v: f32) -> String {
     format!("{v:.3}")
 }
 
-async fn run_mini(ctx: &AppContext) -> Result<(), CliError> {
+async fn run_mini(format: OutputFormat) -> Result<(), CliError> {
     // Hybrid path if GEMINI_API_KEY is set; otherwise fall back to FTS-only
     // so the loop still runs deterministically in CI.
     let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
@@ -769,13 +778,13 @@ async fn run_mini(ctx: &AppContext) -> Result<(), CliError> {
         "questions_evaluated": m.questions_evaluated,
         "per_question": report.per_question,
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
 }
 
-fn run_mini_fts(ctx: &AppContext) -> Result<(), CliError> {
+fn run_mini_fts(format: OutputFormat) -> Result<(), CliError> {
     let report = engram_bench::mini::run_fts_baseline()?;
     let m = &report.metrics;
     let payload = json!({
@@ -790,7 +799,7 @@ fn run_mini_fts(ctx: &AppContext) -> Result<(), CliError> {
         "questions_evaluated": m.questions_evaluated,
         "per_question": report.per_question,
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
@@ -798,7 +807,7 @@ fn run_mini_fts(ctx: &AppContext) -> Result<(), CliError> {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_longmemeval_qa(
-    ctx: &AppContext,
+    format: OutputFormat,
     limit: Option<usize>,
     answerer_model: String,
     judge_model: String,
@@ -914,7 +923,7 @@ async fn run_longmemeval_qa(
         "by_question_type": report.by_question_type,
         "saved_to": save_path.to_string_lossy(),
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
@@ -922,7 +931,7 @@ async fn run_longmemeval_qa(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_locomo_plus_qa(
-    ctx: &AppContext,
+    format: OutputFormat,
     limit: Option<usize>,
     answerer_model: String,
     judge_model: String,
@@ -1088,7 +1097,7 @@ async fn run_locomo_plus_qa(
         "by_relation_type": report.by_question_type,
         "saved_to": save_path.to_string_lossy(),
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
@@ -1096,7 +1105,7 @@ async fn run_locomo_plus_qa(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_memoryagentbench_qa(
-    ctx: &AppContext,
+    format: OutputFormat,
     split_name: String,
     limit: Option<usize>,
     answerer_model: String,
@@ -1254,7 +1263,7 @@ async fn run_memoryagentbench_qa(
         "notes": report.notes,
         "saved_to": save_path.to_string_lossy(),
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
@@ -1262,7 +1271,7 @@ async fn run_memoryagentbench_qa(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_litqa2(
-    ctx: &AppContext,
+    format: OutputFormat,
     mode_str: String,
     limit: Option<usize>,
     kb: Option<String>,
@@ -1325,7 +1334,7 @@ async fn run_litqa2(
     // and a Gemini embedder.
     let corpus = match mode {
         LitQa2Mode::ClosedBook => std::collections::HashMap::new(),
-        LitQa2Mode::FullText => build_corpus(ctx, kb.as_deref(), corpus_path.as_deref())?,
+        LitQa2Mode::FullText => build_corpus(format, kb.as_deref(), corpus_path.as_deref())?,
     };
 
     let benchmarks_dir = std::path::PathBuf::from("benchmarks");
@@ -1414,14 +1423,14 @@ async fn run_litqa2(
         "notes": report.notes,
         "saved_to": save_path.to_string_lossy(),
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
 }
 
 async fn run_beir(
-    ctx: &AppContext,
+    format: OutputFormat,
     dataset_name: String,
     rerank_str: String,
     top_k: usize,
@@ -1689,7 +1698,7 @@ async fn run_beir(
     }
     std::fs::write(&save_path, serde_json::to_string_pretty(&payload)?)?;
 
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
@@ -1697,7 +1706,7 @@ async fn run_beir(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_biogen(
-    ctx: &AppContext,
+    format: OutputFormat,
     year: String,
     kb: Option<String>,
     corpus_path: Option<std::path::PathBuf>,
@@ -1732,7 +1741,7 @@ async fn run_biogen(
     }
     let topics = BioGenTopics::load_from_file(&topics_path)?;
 
-    let corpus = build_corpus(ctx, kb.as_deref(), corpus_path.as_deref())?;
+    let corpus = build_corpus(format, kb.as_deref(), corpus_path.as_deref())?;
 
     let openrouter_key =
         crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
@@ -1801,14 +1810,14 @@ async fn run_biogen(
         "notes": report.notes,
         "saved_to": save_path.to_string_lossy(),
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())
 }
 
 async fn run_longmemeval(
-    ctx: &AppContext,
+    format: OutputFormat,
     _download: bool,
     limit: Option<usize>,
 ) -> Result<(), CliError> {
@@ -1880,7 +1889,7 @@ async fn run_longmemeval(
         "r10_correct": report.r10_count,
         "limit": limit,
     });
-    print_success(ctx.format, payload, Metadata::default(), |data| {
+    print_success(format, payload, Metadata::default(), |data| {
         println!("{}", serde_json::to_string_pretty(data).unwrap())
     });
     Ok(())

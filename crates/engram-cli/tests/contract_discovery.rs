@@ -186,3 +186,70 @@ fn assert_one_compact_line(stdout: &[u8], what: &str) {
     let v: serde_json::Value = serde_json::from_str(body).expect("one JSON document");
     assert!(v.is_object(), "{what}");
 }
+
+/// `engram bench` built the store context before dispatch, so every run
+/// without `ENGRAM_STORE` opened, migrated and backed up the user's REAL
+/// store to measure an in-memory fixture. This is the one test here that must
+/// leave `ENGRAM_STORE` unset — the bug lives on the default path — so it
+/// points `HOME` (and the XDG roots) at a TempDir instead, and refuses to run
+/// the benchmark at all unless the binary agrees its default store is inside
+/// that TempDir. A regression then creates a file in the TempDir, never in a
+/// developer's home.
+#[test]
+fn bench_mini_fts_opens_no_store_on_the_default_path() {
+    let home = tempfile::TempDir::new().expect("tempdir");
+    let cmd = || {
+        let mut c = assert_cmd::Command::cargo_bin("engram").expect("engram binary");
+        c.env("HOME", home.path())
+            .env("XDG_DATA_HOME", home.path().join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env_remove("ENGRAM_STORE")
+            .env_remove("GEMINI_API_KEY")
+            .env_remove("GEMINI_API_KEY_FALLBACKS")
+            .env_remove("COHERE_API_KEY")
+            .env_remove("OPENROUTER_API_KEY");
+        c
+    };
+
+    let info = cmd().arg("agent-info").output().unwrap();
+    let data_path = Sandbox::json(&info)["data_path"]
+        .as_str()
+        .expect("data_path")
+        .to_string();
+    let root = home.path().canonicalize().unwrap();
+    assert!(
+        std::path::Path::new(&data_path).starts_with(home.path())
+            || std::path::Path::new(&data_path).starts_with(&root),
+        "the default store resolves outside the temp HOME ({data_path}); refusing to run bench"
+    );
+
+    let out = cmd()
+        .args(["bench", "mini-fts", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(Sandbox::json(&out)["data"]["suite"], "mini-fts");
+    let created = files_under(home.path());
+    assert!(
+        created.is_empty(),
+        "bench mini-fts wrote into the default store location: {created:?}"
+    );
+}
+
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
+}
