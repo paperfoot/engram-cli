@@ -1,27 +1,40 @@
 //! `engram agent-info` — self-describing manifest for AI agents.
 //!
 //! Per agent-cli-framework principle #1, this returns the raw JSON manifest
-//! directly (NOT wrapped in the standard success envelope). Agents parse
-//! this once to discover every command.
+//! directly (NOT wrapped in the standard success envelope). `--command` and
+//! `--index` answer from the same manifest, narrowed, so an agent pulls the
+//! command it needs instead of every command there is.
 
 use crate::error::CliError;
 use crate::output::OutputFormat;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::io::Write;
+
+/// Which answer `agent-info` gives; clap makes the flags exclusive.
+pub enum View {
+    Full,
+    /// One command's JSON Schema.
+    Schema(String),
+    /// One command or group, with the invariants and the rules that govern it.
+    Command(String),
+    /// Every command path, one line each.
+    Index,
+}
 
 /// Takes no context on purpose: the discovery surface must answer without
 /// opening, creating, or migrating any store — `dispatch` returns before
 /// `AppContext::new`, and the path fields below use the non-creating peek
 /// getters.
-///
-/// `schema` narrows the answer to one command. Three separate error surfaces
-/// have been telling agents to run `agent-info --schema '<command>'` since
-/// before the flag existed; the generator was always there, so this is the
-/// door, not a new room.
-pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
-    if let Some(path) = schema {
-        return print_schema(path, format);
+pub fn run(view: View, format: OutputFormat) -> Result<(), CliError> {
+    match view {
+        View::Full => emit(&manifest(), format),
+        View::Schema(path) => print_schema(&path, format),
+        View::Command(path) => emit(&scoped(&manifest(), &path)?, format),
+        View::Index => emit(&indexed(&manifest()), format),
     }
+}
+
+fn manifest() -> Value {
     let manifest = json!({
         "name": "engram",
         "version": env!("CARGO_PKG_VERSION"),
@@ -47,7 +60,7 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
             "`--store <dir>` works on every command and on `engramd`, and outranks ENGRAM_STORE. Use it for scratch work rather than exporting an env var you will forget to unset."
         ],
         "commands": {
-            "agent-info | info": "Print this manifest (raw JSON, not enveloped). `agent-info --schema '<command>'` prints ONE command's JSON Schema instead — input types, required arguments, and the output envelope's documented fields. Aliases resolve (`--schema search` is `recall`), and an unknown name is exit 3 listing every command that has a schema.",
+            "agent-info | info": "Print this manifest (raw JSON, not enveloped). `agent-info --command <path>` describes ONE command, or a group such as `facts`, with the global invariants, its contract entry, its prose and its decision rules: pull that instead of this whole manifest. `agent-info --index` lists every command path with a one-line summary. `agent-info --schema '<command>'` prints ONE command's JSON Schema instead — input types, required arguments, and the output envelope's documented fields. Aliases resolve (`--schema search` is `recall`), and an unknown name is exit 3 listing every command that has a schema.",
             "kb create <name>": "Create/update a knowledge base. Flags: --description <text>. Rarely needed: writing with --kb <name> registers the KB.",
             "kb list | kb show <name> | kb delete <name> --confirm": "Manage domain KBs.",
             "kb repair [--dry-run]": "Register KBs that hold memories but are missing from `kb list` — the residue of stores written by builds that predated write-time registration. Idempotent and additive; never touches memories. `doctor --integrity` reports the same fault as `unregistered_kbs`.",
@@ -376,8 +389,166 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
         },
         "framework": "https://github.com/paperfoot/agent-cli-framework"
     });
+    merge_contract(manifest)
+}
 
-    emit(&merge_contract(manifest), format)
+/// The top-level keys every scoped answer carries: identity, the envelope and
+/// exit vocabulary, and the invariants. Copied out of the full manifest
+/// rather than rebuilt, so a scoped read cannot drift from the full one. The
+/// store paths stay out: they are not rules, and `config show` reports them.
+const CORE: &[&str] = &[
+    "name",
+    "version",
+    "description",
+    "contract_version",
+    "schema_version",
+    "schema_hash",
+    "auto_json_when_piped",
+    "env_prefix",
+    "exit_codes",
+    "envelope",
+    "global_flags",
+    "error_code_exits",
+    "invariants",
+];
+
+fn core(manifest: &Value) -> Map<String, Value> {
+    CORE.iter()
+        .filter_map(|k| manifest.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect()
+}
+
+/// The entries of one manifest object whose key passes `keep`.
+fn narrowed(section: &Value, keep: impl Fn(&str) -> bool) -> Map<String, Value> {
+    section
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| keep(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+fn first_word(s: &str) -> &str {
+    s.split_whitespace().next().unwrap_or(s)
+}
+
+/// The `agent_decision_rules` groups that govern a command. A lookup table
+/// until those groups move into the `rules` of the commands they govern.
+fn rule_groups(path: &str) -> &'static [&'static str] {
+    match (first_word(path), path) {
+        (_, "recall" | "memory search") => &["recall"],
+        (_, "remember" | "memory add") => &["remember"],
+        (_, "state") => &["what_is_true_now"],
+        (_, "facts list" | "facts show") => &["what_is_true_now", "conflicts"],
+        ("facts", _) => &["conflicts"],
+        (_, "edit" | "forget") => &["correcting_and_retracting"],
+        ("jobs", _) | (_, "compile") => &["background_work"],
+        ("lessons", _) | (_, "reflect") => &["lessons"],
+        ("people", _) | (_, "graph neighbors") => &["people"],
+        (_, "ingest") => &["ingest"],
+        (_, "update") => &["update"],
+        _ => &[],
+    }
+}
+
+/// Top-level sections that belong to one command rather than to all of them.
+fn sections(path: &str) -> &'static [&'static str] {
+    match first_word(path) {
+        "serve" => &["daemon_api"],
+        "config" => &["config_keys"],
+        _ => &[],
+    }
+}
+
+/// `agent-info --command PATH`: the core, then only what describes PATH.
+/// Every key it shares with the full manifest is byte-identical to it.
+fn scoped(manifest: &Value, path: &str) -> Result<Value, CliError> {
+    let paths = engram_contract::agent_info::scope(path);
+    if paths.is_empty() {
+        return Err(unknown_path(path));
+    }
+    let mut out = core(manifest);
+    let words: Vec<&str> = paths.iter().map(|p| first_word(p)).collect();
+    let groups: Vec<&str> = paths.iter().flat_map(|p| rule_groups(p)).copied().collect();
+    let parts = [
+        (
+            "command_schemas",
+            narrowed(&manifest["command_schemas"], |k| paths.contains(&k)),
+        ),
+        (
+            "commands",
+            narrowed(&manifest["commands"], |k| words.contains(&first_word(k))),
+        ),
+        (
+            "agent_decision_rules",
+            narrowed(&manifest["agent_decision_rules"], |k| groups.contains(&k)),
+        ),
+    ];
+    for (key, part) in parts {
+        if !part.is_empty() {
+            out.insert(key.into(), Value::Object(part));
+        }
+    }
+    let gaps: Vec<Value> = manifest["schema_unavailable"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|u| u["path"].as_str().is_some_and(|p| paths.contains(&p)))
+        .cloned()
+        .collect();
+    if !gaps.is_empty() {
+        out.insert("schema_unavailable".into(), Value::Array(gaps));
+    }
+    for key in paths.iter().flat_map(|p| sections(p)) {
+        out.insert(key.to_string(), manifest[*key].clone());
+    }
+    Ok(Value::Object(out))
+}
+
+/// `agent-info --index`: the core plus one line per command path.
+fn indexed(manifest: &Value) -> Value {
+    let mut out = core(manifest);
+    out.insert(
+        "commands_index".into(),
+        engram_contract::agent_info::render_index(),
+    );
+    Value::Object(out)
+}
+
+/// An unknown `--command` path names its nearest neighbours and the groups,
+/// and points at the index: never at itself, and never at the full manifest.
+fn unknown_path(path: &str) -> CliError {
+    let c = engram_contract::contract();
+    let paths = c
+        .commands
+        .iter()
+        .map(|s| s.path)
+        .chain(c.schema_unavailable.iter().map(|u| u.path));
+    let names = c
+        .commands
+        .iter()
+        .flat_map(|s| s.aliases.iter().copied())
+        .chain(paths.clone());
+    let typed = path.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut scored: Vec<(f64, &str)> = names
+        .map(|n| (strsim::jaro_winkler(&typed, n), n))
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let nearest: Vec<&str> = scored.iter().take(3).map(|(_, n)| *n).collect();
+    let mut groups: Vec<&str> = paths
+        .filter_map(|p| p.split_once(' ').map(|(g, _)| g))
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    CliError::BadInputHint {
+        message: format!(
+            "no command or group `{typed}` — nearest: {}; groups: {}",
+            nearest.join(", "),
+            groups.join(", ")
+        ),
+        suggestion: "run `engram agent-info --index` for every command path".into(),
+    }
 }
 
 /// Raw JSON — NOT wrapped in the envelope (framework principle #1), and

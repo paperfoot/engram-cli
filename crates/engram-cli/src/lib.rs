@@ -40,7 +40,19 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     // must not be that call either; the one suite that reads a KB opens the
     // store itself.
     let command = match cli.command {
-        Command::AgentInfo { schema } => return agent_info::run(schema.as_deref(), format),
+        Command::AgentInfo {
+            schema,
+            command,
+            index,
+        } => {
+            let view = match (schema, command) {
+                (Some(path), _) => agent_info::View::Schema(path),
+                (None, Some(path)) => agent_info::View::Command(path),
+                (None, None) if index => agent_info::View::Index,
+                (None, None) => agent_info::View::Full,
+            };
+            return agent_info::run(view, format);
+        }
         Command::Bench {
             suite,
             profile,

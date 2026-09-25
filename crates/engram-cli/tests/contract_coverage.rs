@@ -16,11 +16,6 @@ use clap::CommandFactory;
 use contract_support::{manifest, Sandbox};
 use engram_cli::cli::Cli;
 
-/// Leaves still documented only by the hand-written manifest. This list only
-/// shrinks: each transcription commit removes its paths, and the test below
-/// fails if an entry here has in fact been transcribed.
-const NOT_YET_TRANSCRIBED: &[&str] = &["agent-info"];
-
 /// Every non-hidden leaf clap will dispatch, as a space-separated canonical
 /// path (`"facts resolve"`).
 fn clap_leaves() -> Vec<String> {
@@ -75,29 +70,11 @@ fn every_clap_leaf_has_a_contract_entry_or_a_declared_gap() {
     let missing: Vec<&String> = leaves
         .iter()
         .filter(|p| !described(p) && !declared_unavailable(p))
-        .filter(|p| !NOT_YET_TRANSCRIBED.contains(&p.as_str()))
         .collect();
     assert!(
         missing.is_empty(),
         "clap runs these and discovery has never heard of them: {missing:?}"
     );
-}
-
-/// The ratchet only turns one way: a path listed as untranscribed that the
-/// contract now describes (or that clap no longer has) is a stale exemption.
-#[test]
-fn the_untranscribed_list_names_only_real_gaps() {
-    let leaves = clap_leaves();
-    for path in NOT_YET_TRANSCRIBED {
-        assert!(
-            leaves.iter().any(|l| l == path),
-            "{path} is not a clap leaf"
-        );
-        assert!(
-            !described(path) && !declared_unavailable(path),
-            "{path} is in the contract now — delete it from NOT_YET_TRANSCRIBED"
-        );
-    }
 }
 
 #[test]
@@ -124,9 +101,6 @@ fn every_contract_path_and_alias_parses_in_clap() {
 fn every_leaf_answers_its_schema_path_or_says_why_not() {
     let sb = Sandbox::new();
     for leaf in clap_leaves() {
-        if NOT_YET_TRANSCRIBED.contains(&leaf.as_str()) {
-            continue;
-        }
         let out = sb
             .cmd()
             .args(["agent-info", "--schema", &leaf])
@@ -175,9 +149,6 @@ fn the_manifest_advertises_no_command_whose_pull_fails() {
     let sb = Sandbox::new();
     let m = manifest(&sb);
     for key in m["command_schemas"].as_object().unwrap().keys() {
-        if NOT_YET_TRANSCRIBED.contains(&key.as_str()) {
-            continue;
-        }
         let out = sb
             .cmd()
             .args(["agent-info", "--schema", key])
@@ -201,4 +172,33 @@ fn the_manifest_advertises_no_command_whose_pull_fails() {
             u.path
         );
     }
+}
+
+/// `agent-info --index` is the map an agent chooses from, so it must be the
+/// map clap runs: every leaf is an entry or an entry's alias, and every entry
+/// is a leaf.
+#[test]
+fn the_index_lists_exactly_the_clap_leaves() {
+    let sb = Sandbox::new();
+    let out = sb
+        .cmd()
+        .args(["agent-info", "--index"])
+        .output()
+        .expect("index");
+    assert!(out.status.success());
+    let index = Sandbox::json(&out)["commands_index"].clone();
+    let index = index.as_object().expect("commands_index");
+    for leaf in clap_leaves() {
+        let listed = index.contains_key(&leaf)
+            || index.values().any(|e| {
+                e["aliases"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == leaf.as_str()))
+            });
+        assert!(listed, "the index does not list `{leaf}`");
+    }
+    for path in index.keys() {
+        assert_eq!(clap_resolve(path).as_deref(), Some(path.as_str()), "{path}");
+    }
+    assert!(std::fs::read_dir(sb.store_path()).unwrap().next().is_none());
 }

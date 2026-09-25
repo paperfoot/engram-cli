@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 
 use crate::model::{CommandSpec, FieldSpec};
 use crate::runtime::RuntimeContext;
-use crate::{command, contract, schema_hash};
+use crate::{command, contract, schema_hash, unavailable};
 
 /// One command's `command_schemas` entry, byte-compatible with the shape the
 /// 0.3.1 manifest used: an object of `flag -> description`, so an agent that
@@ -101,6 +101,10 @@ pub fn render(rt: &RuntimeContext<'_>) -> Value {
     for (name, members) in c.vocabularies {
         vocabularies.insert((*name).into(), json!(members));
     }
+    let mut error_code_exits = Map::new();
+    for e in c.error_codes {
+        error_code_exits.insert(e.code.into(), json!(e.exit));
+    }
     json!({
         "contract_version": c.contract_version,
         "schema_version": c.schema_version,
@@ -113,5 +117,68 @@ pub fn render(rt: &RuntimeContext<'_>) -> Value {
         "env_vars": c.env_vars,
         "global_flags": c.global_flags,
         "schema_unavailable": c.schema_unavailable,
+        "invariants": c.invariants,
+        "error_code_exits": error_code_exits,
     })
+}
+
+/// The canonical paths `agent-info --command PATH` describes: the command
+/// PATH names (aliases resolve, whitespace is collapsed), or every command
+/// under it when PATH is a group (`facts`, `person`). Empty when PATH names
+/// nothing; the caller reports that rather than guessing.
+pub fn scope(path: &str) -> Vec<&'static str> {
+    let path = path.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(c) = command(&path) {
+        return vec![c.path];
+    }
+    if let Some(u) = unavailable(&path) {
+        return vec![u.path];
+    }
+    let prefix = format!("{path} ");
+    let c = contract();
+    let described = c
+        .commands
+        .iter()
+        .filter(|spec| {
+            spec.path.starts_with(&prefix) || spec.aliases.iter().any(|a| a.starts_with(&prefix))
+        })
+        .map(|spec| spec.path);
+    let gaps = c
+        .schema_unavailable
+        .iter()
+        .filter(|u| u.path.starts_with(&prefix))
+        .map(|u| u.path);
+    described.chain(gaps).collect()
+}
+
+/// `agent-info --index`: every command path the contract knows, with one line
+/// each — the map an agent reads before choosing which command to pull.
+///
+/// `destructive: true` and `schema_available: false` appear only on the
+/// entries they describe. Spelling out the defaults on every line was a third
+/// of the index, paid on every read to say nothing.
+pub fn render_index() -> Value {
+    let c = contract();
+    let mut index = Map::new();
+    for spec in c.commands {
+        let mut entry = Map::new();
+        entry.insert("summary".into(), json!(spec.summary));
+        if !spec.aliases.is_empty() {
+            entry.insert("aliases".into(), json!(spec.aliases));
+        }
+        if spec.destructive {
+            entry.insert("destructive".into(), json!(true));
+        }
+        index.insert(spec.path.into(), Value::Object(entry));
+    }
+    for u in c.schema_unavailable {
+        let mut entry = Map::new();
+        entry.insert("summary".into(), json!(u.summary));
+        if u.destructive {
+            entry.insert("destructive".into(), json!(true));
+        }
+        entry.insert("schema_available".into(), json!(false));
+        index.insert(u.path.into(), Value::Object(entry));
+    }
+    Value::Object(index)
 }

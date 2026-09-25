@@ -35,8 +35,17 @@ pub enum Command {
         /// Print one command's JSON Schema instead of the whole manifest, e.g.
         /// `--schema 'facts resolve'`. Aliases resolve; an unknown name lists
         /// the valid ones.
-        #[arg(long, value_name = "COMMAND")]
+        #[arg(long, value_name = "COMMAND", conflicts_with_all = ["command", "index"])]
         schema: Option<String>,
+        /// Describe one command, or every command in a group (`facts`): the
+        /// global invariants, its contract entry, its prose and the decision
+        /// rules that govern it. Aliases resolve.
+        #[arg(long = "command", value_name = "PATH", conflicts_with = "index")]
+        command: Option<String>,
+        /// List every command path with a one-line summary, plus the global
+        /// invariants.
+        #[arg(long)]
+        index: bool,
     },
 
     /// Store a new memory.

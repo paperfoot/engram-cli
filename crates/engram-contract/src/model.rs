@@ -172,4 +172,5 @@ pub struct Contract {
     pub error_codes: &'static [ErrorCodeSpec],
     pub vocabularies: &'static [(&'static str, &'static [&'static str])],
     pub env_vars: &'static [EnvVarSpec],
+    pub invariants: &'static [&'static str],
 }
