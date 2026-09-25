@@ -736,11 +736,25 @@ fn an_unusable_gate_threshold_is_exit_2_before_anything_is_stored() {
         "{listed}"
     );
 
-    engram(tmp.path())
+    // An extraction LLM resolves (the stub), so exit 2 here can only be the
+    // threshold: without one, backfill exits 2 on the missing key anyway.
+    let out = engram(tmp.path())
+        .env("ENGRAM_FACT_LLM_STUB", r#"{"*":"[]"}"#)
         .env("ENGRAM_FACT_NOVEL_THRESHOLD", "0.99")
         .args(["facts", "backfill", "--kb", "personal", "--json"])
         .assert()
-        .code(2);
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+    let err: Value = serde_json::from_slice(&out).expect("JSON error");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ENGRAM_FACT_NOVEL_THRESHOLD"),
+        "{err}"
+    );
 }
 
 // ----- B16: the dedup answer carries every always-present field ------------
