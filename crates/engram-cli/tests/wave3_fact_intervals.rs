@@ -321,4 +321,8 @@ fn backfill_reports_plan_notes_too() {
         notes.iter().any(|n| n["kind"] == "unreadable_valid_until"),
         "{v}"
     );
+    // And the same measurement counters as `remember`.
+    assert_eq!(v["metadata"]["gate"]["ran"], 1, "{v}");
+    assert_eq!(v["metadata"]["adjudication"]["calls"], 0, "{v}");
+    assert!(v["metadata"]["queued_by_rule"].is_object(), "{v}");
 }

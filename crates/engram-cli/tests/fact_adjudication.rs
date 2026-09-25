@@ -498,3 +498,60 @@ fn a_failed_judgement_is_journaled_as_failed() {
         .unwrap_or_default()
         .starts_with("action=failed model="));
 }
+
+// ----- measurement: what the gate and the judge did ------------------------
+
+#[test]
+fn the_metadata_counts_what_the_gate_and_the_judge_did() {
+    let tmp = store();
+    let first = remember_facts(
+        tmp.path(),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
+    );
+    assert_eq!(
+        first["metadata"]["gate"],
+        json!({"ran": 1, "skipped_has_siblings": 0, "duplicate": 0, "novel": 1,
+               "uncertain": 0, "uncertain_candidates": 0}),
+        "{first}"
+    );
+    assert_eq!(first["metadata"]["adjudication"]["calls"], 0);
+
+    let old = facts_for(tmp.path(), "Ana")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = judged(
+        tmp.path(),
+        "Ana was born 1990-04-13.",
+        &birthday("1990-04-13"),
+        &format!(r#"{{"action":"supersede","ids":["{old}"]}}"#),
+    );
+    assert_eq!(v["metadata"]["gate"]["skipped_has_siblings"], 1, "{v}");
+    assert_eq!(
+        v["metadata"]["adjudication"],
+        json!({"calls": 1, "failed": 0, "supersede": 1, "coexist": 0, "reject_new": 0,
+               "stale": 0, "pairs_in": 1, "pairs_closed": 1, "pairs_kept": 0}),
+        "{v}"
+    );
+    assert_eq!(v["metadata"]["queued_by_rule"], json!({}));
+
+    remember_facts(
+        tmp.path(),
+        "Ana takes metformin 500 mg.",
+        &med("metformin 500 mg"),
+    );
+    let v = judged(
+        tmp.path(),
+        "Ana now takes metformin 1000 mg.",
+        &med("metformin 1000 mg"),
+        "I cannot decide",
+    );
+    let adjudication = &v["metadata"]["adjudication"];
+    assert_eq!(adjudication["failed"], 1, "{v}");
+    assert_eq!(adjudication["pairs_kept"], 1, "{v}");
+    assert_eq!(
+        v["metadata"]["queued_by_rule"],
+        json!({"safety_member_change": 1})
+    );
+}

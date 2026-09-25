@@ -50,7 +50,7 @@ use engram_graph::semantics::{
 };
 use engram_llm::ChatLlm;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -162,6 +162,15 @@ pub struct FactWriteOutcome {
     /// `derivation.ran` output list, which is what lets `admin rebuild`
     /// reconstruct the extraction marker instead of losing it [G6].
     pub fact_ids: Vec<Uuid>,
+    /// Measurement: what the novelty gate did. `facts_deduped` folds a gate
+    /// duplicate, a planner confirmation and a judge's `reject_new` into one
+    /// number; these tell them apart.
+    pub gate: GateCounters,
+    /// Measurement: the questions handed to the caller, by the rule that
+    /// queued them.
+    pub queued_by_rule: BTreeMap<&'static str, usize>,
+    /// Measurement: what the `--autonomy full` judge was asked and answered.
+    pub adjudication: AdjudicationCounters,
 }
 
 impl FactWriteOutcome {
@@ -170,7 +179,7 @@ impl FactWriteOutcome {
     /// Only a committed batch may contribute. A batch that rolled back left
     /// nothing in the store, so reporting its counts — or its queued conflict
     /// ids, which reference rows that no longer exist — would describe a store
-    /// that never happened.
+    /// that never happened. That includes the judge calls it paid for.
     pub fn merge(&mut self, other: FactWriteOutcome) {
         self.added += other.added;
         self.deduped += other.deduped;
@@ -179,6 +188,78 @@ impl FactWriteOutcome {
         self.date_warnings.extend(other.date_warnings);
         self.plan_notes.extend(other.plan_notes);
         self.fact_ids.extend(other.fact_ids);
+        self.gate.merge(other.gate);
+        for (rule, n) in other.queued_by_rule {
+            *self.queued_by_rule.entry(rule).or_default() += n;
+        }
+        self.adjudication.merge(other.adjudication);
+    }
+
+    /// The measurement counters, for a command's `metadata`.
+    pub fn counters(&self) -> [(&'static str, serde_json::Value); 3] {
+        [
+            ("gate", json!(self.gate)),
+            ("queued_by_rule", json!(self.queued_by_rule)),
+            ("adjudication", json!(self.adjudication)),
+        ]
+    }
+}
+
+/// What the novelty gate did, one count per fact that reached it.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct GateCounters {
+    pub ran: usize,
+    /// Not run: the (subject, relation) already has facts to compare with.
+    pub skipped_has_siblings: usize,
+    pub duplicate: usize,
+    pub novel: usize,
+    pub uncertain: usize,
+    /// Candidates the uncertain band handed to the planner.
+    pub uncertain_candidates: usize,
+}
+
+impl GateCounters {
+    fn merge(&mut self, o: GateCounters) {
+        self.ran += o.ran;
+        self.skipped_has_siblings += o.skipped_has_siblings;
+        self.duplicate += o.duplicate;
+        self.novel += o.novel;
+        self.uncertain += o.uncertain;
+        self.uncertain_candidates += o.uncertain_candidates;
+    }
+}
+
+/// What the write-path judge was asked and answered.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct AdjudicationCounters {
+    /// One per observation whose queued pairs were sent to a judge.
+    pub calls: usize,
+    /// Calls that returned no verdict.
+    pub failed: usize,
+    pub supersede: usize,
+    pub coexist: usize,
+    pub reject_new: usize,
+    /// Verdicts not applied: the pairs changed before the write.
+    pub stale: usize,
+    /// Pairs sent to a judge.
+    pub pairs_in: usize,
+    /// Intervals an applied verdict closed.
+    pub pairs_closed: usize,
+    /// Pairs still queued for the caller after an applied verdict.
+    pub pairs_kept: usize,
+}
+
+impl AdjudicationCounters {
+    fn merge(&mut self, o: AdjudicationCounters) {
+        self.calls += o.calls;
+        self.failed += o.failed;
+        self.supersede += o.supersede;
+        self.coexist += o.coexist;
+        self.reject_new += o.reject_new;
+        self.stale += o.stale;
+        self.pairs_in += o.pairs_in;
+        self.pairs_closed += o.pairs_closed;
+        self.pairs_kept += o.pairs_kept;
     }
 }
 
@@ -947,12 +1028,16 @@ async fn prepare(
                 .store
                 .active_fact_embeddings(diary, kb, &embedder.model())?;
             let (dup_t, novel_t) = gate_thresholds();
+            outcome.gate.ran += 1;
             match novelty_gate(&emb, &existing, dup_t, novel_t) {
                 GateDecision::Duplicate { fact_id, .. } => {
+                    outcome.gate.duplicate += 1;
                     return Ok(Prepared::GateDuplicate(fact_id));
                 }
-                GateDecision::Novel => {}
+                GateDecision::Novel => outcome.gate.novel += 1,
                 GateDecision::Uncertain { candidates } => {
+                    outcome.gate.uncertain += 1;
+                    outcome.gate.uncertain_candidates += candidates.len();
                     others = candidates
                         .iter()
                         .filter_map(|(id, s)| {
@@ -963,6 +1048,7 @@ async fn prepare(
             }
             embedding = Some(emb);
         } else {
+            outcome.gate.skipped_has_siblings += 1;
             // The fact IS stored either way; a failed embed only costs the
             // novelty gate one vector. With the pre-warmed cache this makes no
             // call at all in the common path.
@@ -1032,31 +1118,30 @@ async fn write_judged_fact(
             )));
         }
     }
-    let p = match prepare(ctx, w, ef, cache, outcome).await? {
-        Prepared::Unwritable => return Ok(()),
-        Prepared::GateDuplicate(fact_id) => {
-            ctx.store.increment_fact_confirmations(fact_id)?;
-            outcome.deduped += 1;
+    let (mut plan, p) = match prepare(ctx, w, ef, cache, outcome).await? {
+        Prepared::Planned(p) => {
+            let mut p = *p;
+            (std::mem::take(&mut p.plan), p)
+        }
+        early => {
+            if let Some(j) = judged {
+                settle_judgement(ctx, w, j, None, outcome)?;
+            }
+            if let Prepared::GateDuplicate(fact_id) = early {
+                ctx.store.increment_fact_confirmations(fact_id)?;
+                outcome.deduped += 1;
+            }
             return Ok(());
         }
-        Prepared::Planned(p) => p,
     };
-    let mut p = *p;
-    let mut plan = std::mem::take(&mut p.plan);
-    let fresh = judged.filter(|j| {
-        !plan.queue.is_empty() && j.about == JudgedPairs::of(&p.observation, &plan.queue)
-    });
-    if let Some(j) = judged {
-        record_judgement(ctx, w, j, fresh.is_none())?;
-    }
-    match fresh {
-        Some(j) => apply_judgement(&mut plan, &p.observation, &p.by_id(), &j.judgement),
+    let applied = match judged {
+        Some(j) => settle_judgement(ctx, w, j, Some((&mut plan, &p)), outcome)?,
+        None => false,
+    };
+    if !applied && w.autonomy == Autonomy::Full && w.llm.is_some() && !plan.queue.is_empty() {
         // The store moved between judging and writing (an earlier fact of
         // this batch landed), so no verdict answers THESE pairs.
-        None if w.autonomy == Autonomy::Full && w.llm.is_some() && !plan.queue.is_empty() => {
-            plan.notes.push(PlanNote::AdjudicationStale)
-        }
-        None => {}
+        plan.notes.push(PlanNote::AdjudicationStale);
     }
 
     apply_plan(
@@ -1069,6 +1154,41 @@ async fn write_judged_fact(
         p.embedding.as_deref(),
         outcome,
     )
+}
+
+/// One gathered verdict, handled exactly once: counted, journaled, and
+/// applied if it still answers this observation's queued pairs. `planned` is
+/// `None` when the observation no longer plans at all (the gate now finds it
+/// stored). Returns whether the verdict was applied.
+fn settle_judgement(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    judged: &Judged,
+    planned: Option<(&mut WritePlan, &PreparedPlan)>,
+    outcome: &mut FactWriteOutcome,
+) -> Result<bool, CliError> {
+    let counts = &mut outcome.adjudication;
+    counts.calls += 1;
+    counts.pairs_in += judged.about.pairs.len();
+    match &judged.judgement.action {
+        Ok(AdjudicationAction::Supersede(_)) => counts.supersede += 1,
+        Ok(AdjudicationAction::Coexist) => counts.coexist += 1,
+        Ok(AdjudicationAction::RejectNew) => counts.reject_new += 1,
+        Err(_) => counts.failed += 1,
+    }
+    let fresh = planned.filter(|(plan, p)| {
+        !plan.queue.is_empty() && judged.about == JudgedPairs::of(&p.observation, &plan.queue)
+    });
+    record_judgement(ctx, w, judged, fresh.is_none())?;
+    let Some((plan, p)) = fresh else {
+        counts.stale += 1;
+        return Ok(false);
+    };
+    let closes = plan.closes.len();
+    apply_judgement(plan, &p.observation, &p.by_id(), &judged.judgement);
+    counts.pairs_closed += plan.closes.len().saturating_sub(closes);
+    counts.pairs_kept += plan.queue.len();
+    Ok(true)
 }
 
 /// `--autonomy full`: let a machine judge settle what the classifier queued.
@@ -1415,6 +1535,10 @@ fn queue_conflict(
         ),
     );
     outcome.queued.push(serde_json::Value::Object(obj));
+    *outcome
+        .queued_by_rule
+        .entry(planned.verdict.rule)
+        .or_default() += 1;
     Ok(())
 }
 

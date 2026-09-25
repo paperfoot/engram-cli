@@ -1263,6 +1263,9 @@ pub async fn backfill(
     meta.add("conflicts_queued", outcome.queued.len());
     meta.add("date_parse_warnings", outcome.date_warnings.len());
     meta.add("extraction_model", model.clone());
+    for (name, counts) in outcome.counters() {
+        meta.add(name, counts);
+    }
     if let Some(note) = gate_embedder.degradation_note() {
         meta.add("embedder_degraded", note.clone());
         eprintln!("warning: {note}");

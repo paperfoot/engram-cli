@@ -343,6 +343,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             meta.add("handle", crate::commands::memory::render_handle(existing));
             meta.add("facts_added", outcome.added);
             meta.add("facts_source_kind", facts_source_kind);
+            for (name, counts) in outcome.counters() {
+                meta.add(name, counts);
+            }
             print_success(
                 ctx.format,
                 json!({
@@ -637,6 +640,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     }
     let facts_source_kind = facts_source_kind(caller_batch_committed, extraction_batch_committed);
 
+    let counters = outcome.counters();
     let facts_added = outcome.added;
     let conflicts = outcome.conflicts;
     let adjudication_needed = outcome.queued;
@@ -677,6 +681,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     meta.add("date_parse_warnings", date_warnings.len());
     meta.add("fact_extraction", status.as_str());
     meta.add("facts_source_kind", facts_source_kind);
+    for (name, counts) in counters {
+        meta.add(name, counts);
+    }
     let note = status.note(&kb);
     if let Some(note) = &note {
         meta.add("fact_extraction_note", note.clone());
