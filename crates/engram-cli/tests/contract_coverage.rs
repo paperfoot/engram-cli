@@ -25,7 +25,6 @@ const NOT_YET_TRANSCRIBED: &[&str] = &[
     "budget show",
     "budget set",
     "budget clear",
-    "update",
 ];
 
 /// Every non-hidden leaf clap will dispatch, as a space-separated canonical

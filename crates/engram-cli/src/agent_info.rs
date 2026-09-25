@@ -93,29 +93,7 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
             "--quiet": "Suppress non-essential stderr output",
             "--store <dir>": "Root every path (db, vectors, config, cache) at DIR for this invocation. Outranks ENGRAM_STORE, which outranks the platform data dir. Accepted on every command and on `engramd`, so a scratch store needs no exported variable."
         },
-        "command_schemas": {
-            "update": {
-                "destructive": false,
-                "args": {},
-                "flags": { "check": "boolean; only report update status and command" },
-                "config": {
-                    "update.mode": "auto|check_only|disabled; auto permits `engram update` to run the package-manager command",
-                    "update.channel": "github|crates",
-                    "update.install_source": "optional override: homebrew|cargo|standalone|source_build"
-                },
-                "output_data": {
-                    "current_version": "string",
-                    "latest_version": "string|null",
-                    "update_available": "boolean",
-                    "install_source": "homebrew|cargo|standalone|source_build|unknown",
-                    "update_mode": "auto|check_only|disabled",
-                    "release_url": "string|null",
-                    "upgrade_command": "string|null",
-                    "can_execute_update": "boolean",
-                    "post_update_commands": "string[]"
-                }
-            }
-        },
+        "command_schemas": {},
         "exit_codes": {
             "0": "Success",
             "1": "Transient (retry with backoff)",
