@@ -484,9 +484,10 @@ fn print_schema(path: &str, format: OutputFormat) -> Result<(), CliError> {
                 .map(|c| c.path)
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(CliError::BadInput(format!(
-                "no command `{path}` — `agent-info --schema` describes: {known}"
-            )))
+            Err(CliError::BadInputHint {
+                message: format!("no command `{path}` — `agent-info --schema` describes: {known}"),
+                suggestion: "run `engram --help` for every command name, then `engram <command> --help` for its flags".into(),
+            })
         }
     }
 }

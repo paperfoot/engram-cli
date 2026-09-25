@@ -130,3 +130,26 @@ fn the_suggestion_the_parser_hands_out_actually_runs() {
         String::from_utf8_lossy(&followed.stderr)
     );
 }
+
+/// The loop this file's header describes, closed at its last door: a wrong
+/// name passed to `--schema` used to get the generic `bad_input` advice —
+/// "run `engram agent-info --schema '<command>'`" — the call that had just
+/// failed. The suggestion must name a different call, and that call must run.
+#[test]
+fn an_unknown_schema_path_does_not_suggest_itself() {
+    let sb = Sandbox::new();
+    let out = sb
+        .cmd()
+        .args(["agent-info", "--schema", "ingest-all"])
+        .output()
+        .expect("schema");
+    assert_eq!(out.status.code(), Some(3));
+    let err = Sandbox::err_json(&out);
+    assert_eq!(err["error"]["code"], "bad_input");
+    let suggestion = err["error"]["suggestion"].as_str().unwrap();
+    assert!(!suggestion.contains("--schema"), "{suggestion}");
+    assert!(suggestion.contains("engram --help"), "{suggestion}");
+    let followed = sb.cmd().arg("--help").output().unwrap();
+    assert!(followed.status.success());
+    assert!(store_is_untouched(&sb));
+}

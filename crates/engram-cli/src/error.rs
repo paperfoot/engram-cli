@@ -27,6 +27,13 @@ pub enum CliError {
     #[error("bad input: {0}")]
     BadInput(String),
 
+    /// Bad input whose recovery depends on where it happened. The generic
+    /// `bad_input` advice points at `agent-info --schema`, which is a loop
+    /// when the call that failed WAS `agent-info --schema`. Same code, same
+    /// exit; only the suggestion is specific.
+    #[error("bad input: {message}")]
+    BadInputHint { message: String, suggestion: String },
+
     #[error("rate limited: {0}")]
     RateLimited(String),
 
@@ -137,7 +144,7 @@ impl CliError {
         match self {
             Transient(_) | Io(_) | Serde(_) | Zip(_) => ErrorCode::Transient,
             Config(_) => ErrorCode::Config,
-            BadInput(_) | Ingest(_) | Bench(_) => ErrorCode::BadInput,
+            BadInput(_) | BadInputHint { .. } | Ingest(_) | Bench(_) => ErrorCode::BadInput,
             RateLimited(_) => ErrorCode::RateLimited,
             Storage(e) => storage_error_code(e),
             // Preserves today's exit 2: the highest-traffic setup failure
@@ -174,7 +181,7 @@ impl CliError {
         match self {
             Transient(_) => "transient_error",
             Config(_) => "config_error",
-            BadInput(_) => "bad_input",
+            BadInput(_) | BadInputHint { .. } => "bad_input",
             RateLimited(_) => "rate_limited",
             Embed(_) => "embed_error",
             Rerank(_) => "rerank_error",
@@ -202,6 +209,7 @@ impl CliError {
                 "run `engram agent-info --schema '<command>'` for this command's exact argument shape"
                     .to_string()
             }
+            BadInputHint { suggestion, .. } => suggestion.clone(),
             Config(_) => {
                 "run `engram config check` — it live-probes every configured key and names the one that failed"
                     .to_string()
@@ -382,6 +390,10 @@ mod tests {
             CliError::Transient("x".into()),
             CliError::Config("x".into()),
             CliError::BadInput("x".into()),
+            CliError::BadInputHint {
+                message: "x".into(),
+                suggestion: "`engram --help` lists every command".into(),
+            },
             CliError::RateLimited("x".into()),
             CliError::Storage(StorageError::NotFound("x".into())),
             CliError::NotFound {

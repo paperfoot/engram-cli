@@ -1323,10 +1323,10 @@ fn suggest(kind: ErrorKind, e: &clap::Error) -> String {
         ErrorKind::InvalidSubcommand => {
             let typed = context_string(e, ContextKind::InvalidSubcommand);
             match typed.as_deref().and_then(nearest_subcommand) {
-                Some(near) => format!(
-                    "did you mean `engram {near}`? run `engram agent-info` for the full command list"
-                ),
-                None => "run `engram agent-info` for the full command list".to_string(),
+                Some(near) => {
+                    format!("did you mean `engram {near}`? `engram --help` lists every command")
+                }
+                None => "`engram --help` lists every command".to_string(),
             }
         }
         ErrorKind::UnknownArgument => {
@@ -1437,11 +1437,15 @@ mod tests {
         }
     }
 
+    /// A typo is answered with the 0.6k-token command list, not the
+    /// 30k-token manifest: the recovery an error suggests is a call the agent
+    /// then pays for.
     #[test]
     fn a_nonsense_subcommand_does_not_invent_a_neighbour() {
         match parse_from(vec!["engram", "zzzzzzzz"]) {
             Err(ParseOutcome::Invalid { suggestion, .. }) => {
-                assert!(suggestion.contains("agent-info"), "{suggestion}")
+                assert!(suggestion.contains("engram --help"), "{suggestion}");
+                assert!(!suggestion.contains("did you mean"), "{suggestion}");
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
