@@ -101,13 +101,6 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
                 "output_data": { "person": "object with canonical_name + aliases", "relations": "array — typed edges with provenance, merged across KBs under --kb '*'", "kbs": "string[] — every KB this person appears in", "relations_by_kb": "array — the per-KB breakdown behind the merged `relations`", "memories": "array of snippets that mention them" },
                 "agent_rule": "Use --kb '*' for 'who is X': under the default scope a person written to `personal` is simply absent, and the merge is what joins their work and personal relationships into one view."
             },
-            "kb repair": {
-                "destructive": false,
-                "safe_mode": "--dry-run",
-                "repairs": ["KBs that hold live memories but have no `knowledge_bases` row, so `kb list` cannot see them"],
-                "idempotency": "additive only; a healed store reports an empty list. Will not resurrect a KB removed by `kb delete`.",
-                "output_data": { "unregistered_kbs": "string[]", "registered": "integer", "dry_run": "boolean" }
-            },
             "ingest": {
                 "destructive": false,
                 "args": { "path": "file_or_directory" },

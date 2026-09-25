@@ -2284,6 +2284,33 @@ const SERVE_FLAGS: &[FlagSpec] = &[
     },
 ];
 
+const KB_NAME_ARG: &[ArgSpec] = &[ArgSpec {
+    name: "name",
+    ty: Ty::Str,
+    required: true,
+    doc: "KB name: lowercase letters, digits, hyphen or underscore",
+}];
+
+const KB_CREATE_FLAGS: &[FlagSpec] = &[FlagSpec {
+    name: "description",
+    cli_long: "description",
+    aliases: &[],
+    ty: Ty::Str,
+    default: None,
+    required: false,
+    doc: "free text; replaces the stored description when the KB exists",
+}];
+
+const KB_REPAIR_FLAGS: &[FlagSpec] = &[FlagSpec {
+    name: "dry_run",
+    cli_long: "dry-run",
+    aliases: &[],
+    ty: Ty::Bool,
+    default: Some("false"),
+    required: false,
+    doc: "safe mode: report what would be registered and write nothing",
+}];
+
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         path: "remember",
@@ -3042,6 +3069,134 @@ pub const COMMANDS: &[CommandSpec] = &[
             "It shuts down on a signal instead of being killed: in-flight writes finish and the journal is not torn.",
         ],
         examples: &["engram serve --host 127.0.0.1 --port 8768", "engramd --store /tmp/scratch-store"],
+    },
+    CommandSpec {
+        path: "kb create",
+        aliases: &[],
+        summary: "Create a knowledge base, or update an existing one's description.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: KB_NAME_ARG,
+        flags: KB_CREATE_FLAGS,
+        data: &[
+            FieldSpec { name: "name", ty: Ty::Str, doc: "the KB", always: true },
+            FieldSpec { name: "description", ty: Ty::Nullable(&Ty::Str), doc: "as passed", always: true },
+            FieldSpec { name: "created", ty: Ty::Bool, doc: "true whether the KB was new or only its description changed", always: true },
+        ],
+        metadata: ELAPSED_ONLY,
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &[
+            "Rarely needed: writing with `--kb <name>` registers the KB. Create one only to give it a description.",
+        ],
+        examples: &["engram kb create ageing-biology --description 'papers on ageing'"],
+    },
+    CommandSpec {
+        path: "kb list",
+        aliases: &["kb ls"],
+        summary: "List the registered knowledge bases with their document, memory and chunk counts.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: &[],
+        data: &[FieldSpec {
+            name: "knowledge_bases",
+            ty: Ty::Array(&Ty::Object),
+            doc: "{ name, description, created_at, updated_at, document_count, memory_count, chunk_count }",
+            always: true,
+        }],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "count", ty: Ty::Int, doc: "KBs listed", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1],
+        rules: &[
+            "Memories filed under a KB this list does not show predate write-time registration: run `engram kb repair --dry-run`.",
+        ],
+        examples: &["engram kb list --json"],
+    },
+    CommandSpec {
+        path: "kb show",
+        aliases: &[],
+        summary: "One knowledge base's row and counts.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: KB_NAME_ARG,
+        flags: &[],
+        data: &[FieldSpec {
+            name: "knowledge_base",
+            ty: Ty::Object,
+            doc: "{ name, description, created_at, updated_at, document_count, memory_count, chunk_count }",
+            always: true,
+        }],
+        metadata: ELAPSED_ONLY,
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &["An unregistered name is `bad_input` (exit 3) — including a KB that holds memories but predates registration; `engram kb repair` registers those."],
+        examples: &["engram kb show personal --json"],
+    },
+    CommandSpec {
+        path: "kb delete",
+        aliases: &[],
+        summary: "Delete a knowledge base: its memories, its facts and everything derived from it.",
+        destructive: true,
+        requires: &["--confirm"],
+        opens_store: true,
+        args: KB_NAME_ARG,
+        flags: &[FlagSpec {
+            name: "confirm",
+            cli_long: "confirm",
+            aliases: &[],
+            ty: Ty::Bool,
+            default: Some("false"),
+            required: false,
+            doc: "required: this is destructive",
+        }],
+        data: &[
+            FieldSpec { name: "name", ty: Ty::Str, doc: "the KB", always: true },
+            FieldSpec { name: "deleted", ty: Ty::Bool, doc: "false when no KB of that name was registered", always: true },
+        ],
+        metadata: ELAPSED_ONLY,
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 2, 3],
+        rules: &[
+            "Soft-deletes every memory in the KB and clears its derived claims, entities, relations and wiki pages. Its facts are REMOVED, not closed — unlike `edit` and `forget`, no interval history survives.",
+            "The `default` KB cannot be deleted (refused with exit 2). A name that is not registered answers `deleted: false`, exit 0.",
+        ],
+        examples: &["engram kb delete scratch --confirm"],
+    },
+    CommandSpec {
+        path: "kb repair",
+        aliases: &[],
+        summary: "Register KBs that hold live memories but have no registry row, so `kb list` cannot see them.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: KB_REPAIR_FLAGS,
+        data: &[
+            FieldSpec { name: "unregistered_kbs", ty: Ty::Array(&Ty::Str), doc: "KBs holding live memories with no registry row (on a real run, the ones just registered)", always: true },
+            FieldSpec { name: "registered", ty: Ty::Int, doc: "rows added; 0 on --dry-run", always: true },
+            FieldSpec { name: "dry_run", ty: Ty::Bool, doc: "whether anything was written", always: true },
+            FieldSpec { name: "note", ty: Ty::Str, doc: "one line saying what to do next", always: true },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "unregistered", ty: Ty::Int, doc: "length of unregistered_kbs", always: true },
+            FieldSpec { name: "registered", ty: Ty::Int, doc: "as in data", always: true },
+            FieldSpec { name: "dry_run", ty: Ty::Bool, doc: "as in data", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1],
+        rules: &[
+            "The residue of stores written by builds that predated write-time KB registration. `doctor --integrity` reports the same fault as `unregistered_kbs`.",
+            "Idempotent and additive only: a healed store reports an empty list, memories are never touched, and a KB removed by `kb delete` is not resurrected. Run --dry-run first.",
+        ],
+        examples: &["engram kb repair --dry-run --json", "engram kb repair"],
     },
 ];
 
