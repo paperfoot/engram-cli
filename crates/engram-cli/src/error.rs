@@ -28,9 +28,9 @@ pub enum CliError {
     BadInput(String),
 
     /// Bad input whose recovery depends on where it happened. The generic
-    /// `bad_input` advice points at `agent-info --schema`, which is a loop
-    /// when the call that failed WAS `agent-info --schema`. Same code, same
-    /// exit; only the suggestion is specific.
+    /// `bad_input` advice points at `agent-info --command`, which is a loop
+    /// when the call that failed WAS a discovery call. Same code, same exit;
+    /// only the suggestion is specific.
     #[error("bad input: {message}")]
     BadInputHint { message: String, suggestion: String },
 
@@ -206,7 +206,7 @@ impl CliError {
         use CliError::*;
         Some(match self {
             BadInput(_) | Ingest(_) | Bench(_) => {
-                "run `engram agent-info --schema '<command>'` for this command's exact argument shape"
+                "run `engram agent-info --command '<command>'` for this command's exact argument shape and rules"
                     .to_string()
             }
             BadInputHint { suggestion, .. } => suggestion.clone(),
@@ -252,7 +252,7 @@ impl CliError {
             // and it will never run the one command that would have shown it
             // a broken store.
             MalformedJson { field, .. } => format!(
-                "check the JSON you passed in `{field}`; `engram agent-info --schema '<command>'` gives the exact shape"
+                "check the JSON you passed in `{field}`; `engram agent-info --command '<command>'` gives the exact shape"
             ),
             Storage(e) if storage_error_code(e) == ErrorCode::MalformedJson => {
                 "a stored row failed to deserialize — this is store corruption or a half-applied migration, not your arguments. Run `engram doctor --json`; do not retry"

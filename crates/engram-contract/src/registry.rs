@@ -186,7 +186,7 @@ pub const ERROR_CODES: &[ErrorCodeSpec] = &[
         code: "bad_input",
         exit: 3,
         retryable: false,
-        suggestion: "run `engram agent-info --schema '<command>'` for this command's exact argument shape",
+        suggestion: "run `engram agent-info --command '<command>'` for this command's exact argument shape and rules",
         doc: "the arguments were wrong; an identical retry fails identically",
     },
     ErrorCodeSpec {

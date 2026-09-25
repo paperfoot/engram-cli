@@ -1339,7 +1339,7 @@ fn suggest(kind: ErrorKind, e: &clap::Error) -> String {
             }
         }
         ErrorKind::UnknownArgument => {
-            "`engram <command> --help` lists the flags this command accepts; `engram agent-info --schema '<command>'` gives their exact types"
+            "`engram <command> --help` lists the flags this command accepts; `engram agent-info --command '<command>'` gives their types and rules"
                 .to_string()
         }
         ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
@@ -1349,7 +1349,7 @@ fn suggest(kind: ErrorKind, e: &clap::Error) -> String {
             }
         }
         _ => {
-            "run `engram <command> --help`, or `engram agent-info --schema '<command>'` for this command's exact argument shape"
+            "run `engram <command> --help`, or `engram agent-info --command '<command>'` for this command's exact argument shape and rules"
                 .to_string()
         }
     }

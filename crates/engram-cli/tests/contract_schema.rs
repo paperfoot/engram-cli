@@ -119,10 +119,10 @@ fn the_suggestion_the_parser_hands_out_actually_runs() {
     let out = sb.cmd().args(["recall", "--nonsense"]).output().unwrap();
     let err = Sandbox::err_json(&out);
     let suggestion = err["error"]["suggestion"].as_str().unwrap().to_string();
-    assert!(suggestion.contains("agent-info --schema"), "{suggestion}");
+    assert!(suggestion.contains("agent-info --command"), "{suggestion}");
     let followed = sb
         .cmd()
-        .args(["agent-info", "--schema", "recall"])
+        .args(["agent-info", "--command", "recall"])
         .output()
         .expect("the advertised invocation");
     assert!(
@@ -153,4 +153,63 @@ fn an_unknown_schema_path_does_not_suggest_itself() {
     let followed = sb.cmd().arg("--help").output().unwrap();
     assert!(followed.status.success());
     assert!(store_is_untouched(&sb));
+}
+
+/// Recovery is executable and cheap: every discovery command an error hands
+/// out runs, and none of them is the full manifest. A suggestion that sends an
+/// agent to a 39k-token read after a typo costs more than the typo.
+#[test]
+fn every_parser_suggestion_runs_and_stays_small() {
+    let sb = Sandbox::new();
+    // The followed calls run in their own sandbox: `repair` opens the store
+    // before it refuses, but the discovery calls it points at must not.
+    let probe = Sandbox::new();
+    // (argv that fails, the command an agent would substitute for <command>)
+    let cases: &[(&[&str], &str)] = &[
+        (&["recal", "x"], "recall"),
+        (&["recall", "x", "--nonsense"], "recall"),
+        (&["recall", "x", "--layer", "bogus"], "recall"),
+        (&["recall"], "recall"),
+        (&["repair"], "repair"),
+        (&["agent-info", "--schema", "bogus"], "recall"),
+        (&["agent-info", "--command", "bogus"], "recall"),
+    ];
+    for (argv, command) in cases {
+        let out = sb.cmd().args(*argv).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{argv:?}");
+        let suggestion = Sandbox::err_json(&out)["error"]["suggestion"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let runnable: Vec<Vec<String>> = suggestion
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|c| {
+                c.starts_with("engram ") && (c.contains("--help") || c.contains("agent-info"))
+            })
+            .map(|c| {
+                c.replace("'<command>'", command)
+                    .replace("<command>", command)
+                    .split_whitespace()
+                    .skip(1)
+                    .map(String::from)
+                    .collect()
+            })
+            .collect();
+        assert!(
+            !runnable.is_empty(),
+            "{argv:?} suggests nothing runnable: {suggestion}"
+        );
+        for followed in runnable {
+            let out = probe.cmd().args(&followed).output().unwrap();
+            assert!(out.status.success(), "{argv:?} -> {followed:?} fails");
+            assert!(
+                out.stdout.len() < 12 * 1024,
+                "{argv:?} -> {followed:?} answers {} bytes",
+                out.stdout.len()
+            );
+        }
+    }
+    assert!(store_is_untouched(&probe));
 }
