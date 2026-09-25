@@ -65,8 +65,11 @@ pub const MAX_QUESTIONS_PER_REQUEST: usize = 64;
 /// falls as the state grows, so the split happens well before either.
 pub const MAX_REQUEST_TOKENS: usize = 24_000;
 
-/// Parts of one split request in flight at once. Public-endpoint guidance is
-/// "small pools"; eight is where throughput stops improving.
+/// Parts of one split request in flight at once. TypeSafe's cookbooks keep
+/// pools small (4 to 12 workers) because the public endpoint rate-limits
+/// above roughly eight concurrent requests. This pool multiplies with any
+/// the caller runs (the eval harness runs eight requests at once), so it
+/// takes the low end.
 pub const BATCH_CONCURRENCY: usize = 4;
 
 /// Choice and Score bounds the API enforces (it reports only the first

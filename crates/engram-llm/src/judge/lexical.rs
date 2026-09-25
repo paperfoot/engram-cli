@@ -1,8 +1,10 @@
 //! Deterministic grounding: the rules a judge result is compared against and
 //! falls back to.
 //!
-//! Moved from `compile.rs` with identical behaviour so compile, the fact write
-//! path and the judge eval share one copy. These rules are cheap and catch an
+//! Copied from `compile.rs` with identical behaviour, for the fact write path
+//! and the judge eval. `compile.rs` still has its own copy until it calls
+//! [`claim_grounded_lexically`]; change both or neither, or the shipped gate
+//! drifts from the evaluated one. These rules are cheap and catch an
 //! invented number, but they cannot see meaning: on SciFact's human labels the
 //! word-overlap rule admits 69% of claims the passage CONTRADICTS, and no
 //! lexical rule can see a negation (see the tests). The judge owns polarity;
