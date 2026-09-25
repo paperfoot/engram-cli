@@ -254,7 +254,7 @@ pub fn cloud_gemini(key: String) -> GeminiEmbedder {
 }
 
 /// Pick the embedder for one WRITE (`remember`, `memory add`, `edit`,
-/// `memory update`, `lessons add`, `chunks repair`, `reindex`).
+/// `memory update`, `lessons add`, `ingest`, `chunks repair`, `reindex`).
 ///
 /// WHY THIS EXISTS. Every read surface hard-errors when a cloud profile has no
 /// Gemini key, but the write paths silently fell back to the 64-dim hash stub.

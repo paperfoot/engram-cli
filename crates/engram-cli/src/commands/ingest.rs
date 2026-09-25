@@ -4,10 +4,10 @@ use crate::commands::usage::gemini_embed_cost_usd;
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
+use crate::retrieval::WriteEmbedder;
 use chrono::Utc;
 use engram_core::types::{Memory, MemorySource};
-use engram_embed::stub::StubEmbedder;
-use engram_embed::{Embedder, TaskMode};
+use engram_embed::TaskMode;
 use engram_ingest::{
     chunker::PendingChunk, conversations, general as general_mode, papers, repos, Mode,
 };
@@ -31,6 +31,7 @@ pub async fn run(
     exclude: Vec<String>,
     max_files: Option<usize>,
     all: bool,
+    offline: bool,
 ) -> Result<(), CliError> {
     crate::commands::validate_diary_for_write(&diary)?;
     if !path.exists() {
@@ -127,31 +128,23 @@ pub async fn run(
     // $0.15 per 1M input tokens for gemini-embedding-2 (priced 2026-04).
     let mut total_embedded_chars: usize = 0;
 
-    // Embedder: env var → config file → stub fallback
-    let force_stub = crate::commands::config::stub_forced();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let have_gemini = gemini_key.is_some() && !force_stub;
+    // ONE embedder for the whole run, built before the loop. Per-file
+    // construction re-read the config from disk for every file AND discarded
+    // the key-rotation state, so a dead primary bought one doomed request per
+    // file before each fresh failover.
+    let WriteEmbedder {
+        embedder,
+        cloud: have_gemini,
+        model: model_name,
+        dims,
+        prompt_format,
+    } = crate::retrieval::resolve_write_embedder("ingest", offline)?;
 
     // Enforce spend guardrails before embedding (and, when --compile is set,
     // before the compiler's own paid calls).
     if have_gemini {
         crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     }
-    // ONE embedder for the whole run, built before the loop. Per-file
-    // construction re-read the config from disk for every file AND discarded
-    // the key-rotation state, so a dead primary bought one doomed request per
-    // file before each fresh failover.
-    let gemini_embedder =
-        have_gemini.then(|| crate::retrieval::cloud_gemini(gemini_key.clone().unwrap()));
-    let stub_embedder = StubEmbedder::default();
-    let (model_name, dims, prompt_format) = match &gemini_embedder {
-        Some(e) => (e.model(), e.dimensions(), e.prompt_format().to_string()),
-        None => (
-            stub_embedder.model(),
-            stub_embedder.dimensions(),
-            stub_embedder.prompt_format().to_string(),
-        ),
-    };
 
     for file in files {
         let text = if engram_ingest::pdf::is_pdf(&file) {
@@ -261,11 +254,8 @@ pub async fn run(
         let embed_chars: usize = chunk_texts.iter().map(|t| t.len()).sum();
         let embeddings: Vec<Vec<f32>> = if chunk_texts.is_empty() {
             Vec::new()
-        } else if let Some(e) = &gemini_embedder {
-            e.embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
-                .await?
         } else {
-            stub_embedder
+            embedder
                 .embed_batch(&chunk_texts, TaskMode::RetrievalDocument)
                 .await?
         };
@@ -377,10 +367,7 @@ pub async fn run(
         meta.add("compiled_wiki_pages", stats.wiki_pages);
     }
     // The highest-volume embed surface must not be the one silent failover.
-    if let Some(note) = gemini_embedder
-        .as_ref()
-        .and_then(engram_embed::Embedder::degradation_note)
-    {
+    if let Some(note) = embedder.degradation_note() {
         meta.add("embedder_degraded", note.clone());
         eprintln!("warning: {note}");
     }

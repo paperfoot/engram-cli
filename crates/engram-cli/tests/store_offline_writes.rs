@@ -1,6 +1,6 @@
-//! [C8] `chunks repair` takes the write side's key rule.
+//! [C8] `ingest` and `chunks repair` take the write side's key rule.
 //!
-//! It embedded with the 64-dim stub whenever no Gemini key resolved, and said
+//! Both embedded with the 64-dim stub whenever no Gemini key resolved, and said
 //! nothing: default recall then refused the store ("embedding metadata
 //! mismatch"). Keyless use is now the explicit `--offline`, as on `remember`.
 //!
@@ -11,6 +11,8 @@
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
+
+const NOTE: &str = "Ana keeps her sailing logs in a notebook by the door.";
 
 fn keyless(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("engram").expect("binary built");
@@ -62,6 +64,76 @@ fn refused(cmd: &mut Command, args: &[&str]) -> Value {
 
 fn counts(home: &Path) -> Value {
     run_json(&mut keyless(home), &["export", "--format", "json"])["data"]["counts"].clone()
+}
+
+#[test]
+fn a_keyless_ingest_refuses_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let note = tmp.path().join("note.md");
+    std::fs::write(&note, NOTE).unwrap();
+
+    let err = refused(
+        &mut keyless(tmp.path()),
+        &["ingest", note.to_str().unwrap(), "--kb", "personal"],
+    );
+    let msg = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("engram ingest"), "{msg}");
+
+    let c = counts(tmp.path());
+    assert_eq!(c["memories"], 0, "{c}");
+    assert_eq!(c["chunks"], 0, "{c}");
+}
+
+#[test]
+fn an_offline_ingest_records_the_stub_metadata_remember_offline_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let note = tmp.path().join("note.md");
+    std::fs::write(&note, NOTE).unwrap();
+
+    let v = run_json(
+        &mut keyless(tmp.path()),
+        &[
+            "ingest",
+            note.to_str().unwrap(),
+            "--kb",
+            "personal",
+            "--offline",
+        ],
+    );
+    assert_eq!(v["data"]["chunks_created"], 1, "{v}");
+    assert_eq!(v["metadata"]["embedder"], "stub-64", "{v}");
+    assert_eq!(v["metadata"]["embed_dimensions"], 64, "{v}");
+
+    run_json(
+        &mut keyless(tmp.path()),
+        &[
+            "remember",
+            "The sailing club meets on Thursdays.",
+            "--kb",
+            "personal",
+            "--no-extract-facts",
+            "--offline",
+        ],
+    );
+
+    // The recall guard refuses a scope holding two kinds of embedding
+    // metadata, so one offline read over both writes proves they match.
+    let found = run_json(
+        &mut keyless(tmp.path()),
+        &[
+            "recall",
+            "sailing logs notebook",
+            "--kb",
+            "personal",
+            "--profile",
+            "offline",
+        ],
+    );
+    let results = found["data"]["results"].as_array().expect("results");
+    assert!(
+        results.iter().any(|r| r["content"] == NOTE),
+        "the ingested note is searchable: {found}"
+    );
 }
 
 #[test]

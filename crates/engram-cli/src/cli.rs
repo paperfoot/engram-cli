@@ -247,6 +247,13 @@ Examples:
         /// Confirm full recursive directory ingest when no filters are provided.
         #[arg(long)]
         all: bool,
+
+        /// Embed with the deterministic offline stub instead of Gemini.
+        /// Without this flag an ingest with no Gemini key is a config error
+        /// (exit 2), never a silent 64-dim stub. Same flag as
+        /// `remember --offline`.
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Inspect and manage ingested source documents.

@@ -128,9 +128,11 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             exclude,
             max_files,
             all,
+            offline,
         } => {
             commands::ingest::run(
                 &ctx, path, mode, diary, kb, compile, dry_run, include, exclude, max_files, all,
+                offline,
             )
             .await
         }

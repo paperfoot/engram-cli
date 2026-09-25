@@ -136,7 +136,8 @@ fn the_ingest_subprocess_inherits_the_isolated_store() {
 
     let (status, body) = daemon.post(
         "/v1/ingest",
-        &serde_json::json!({ "path": doc.to_str().unwrap(), "kb": "default" }).to_string(),
+        &serde_json::json!({ "path": doc.to_str().unwrap(), "kb": "default", "offline": true })
+            .to_string(),
     );
     assert_eq!(status, 200, "{body}");
     let docs = store.seed(&["documents", "list", "--kb", "default"]);
