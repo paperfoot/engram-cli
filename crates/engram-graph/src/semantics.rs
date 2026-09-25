@@ -1079,6 +1079,10 @@ pub enum PlanNote {
     AdjudicationKeptSafety {
         action: &'static str,
     },
+    /// Under `--autonomy full` the pairs queued here are not the pairs the
+    /// judge was asked about — the store moved between judging (outside the
+    /// write lock) and writing — so no verdict applies and they stay queued.
+    AdjudicationStale,
 }
 
 impl PlanNote {
@@ -1090,6 +1094,7 @@ impl PlanNote {
             PlanNote::ReplayApplied { .. } => "replay_applied",
             PlanNote::AdjudicationFailed { .. } => "adjudication_failed",
             PlanNote::AdjudicationKeptSafety { .. } => "adjudication_kept_safety",
+            PlanNote::AdjudicationStale => "adjudication_stale",
         }
     }
 
@@ -1117,6 +1122,11 @@ impl PlanNote {
                  clear or discard a safety question, so it stays queued and the observation is \
                  kept"
             ),
+            PlanNote::AdjudicationStale => {
+                "the store changed between adjudication and this write, \
+                 so no verdict applies; the pairs stay queued for the caller"
+                    .to_string()
+            }
         }
     }
 

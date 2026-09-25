@@ -568,11 +568,12 @@ impl FactBatchError {
 /// silently. Managing that state means teaching the queue about half-processed
 /// memories; removing it means the batch commits or it never happened.
 ///
-/// Everything network-bound is paid for BEFORE the transaction opens (see
-/// [`FactEmbedCache`]). One await can still occur inside it: `--autonomy full`
-/// adjudicates an unsettled candidate with an LLM call. That is opt-in, bounded
-/// by one call per contested fact, and the same defect class the refinement
-/// plan's 2.4 removes from `compile`.
+/// Everything network-bound is paid for BEFORE the transaction opens: the
+/// embeddings (see [`FactEmbedCache`]) and, under `--autonomy full`, every
+/// judge call (see [`gather_judgements`]). The adjudication call used to await
+/// INSIDE `BEGIN IMMEDIATE`, and with a provider's retry policy that held the
+/// write lock for minutes — every concurrent `remember`, daemon job and
+/// `facts resolve` then failed on busy_timeout.
 ///
 /// PRECONDITION: no transaction is open on this connection. Both call sites
 /// (`remember`, `facts backfill`) are top-level; a nested call fails at
@@ -602,11 +603,19 @@ pub async fn write_fact_batch(
         None => FactEmbedCache::empty(),
     };
 
+    let judged = match (w.autonomy, w.llm) {
+        (Autonomy::Full, Some(llm)) => gather_judgements(ctx, w, batch.facts, &cache, llm)
+            .await
+            .map_err(|(i, e)| fail(i, e))?,
+        _ => Vec::new(),
+    };
+
     ctx.store.begin_immediate().map_err(|e| fail(0, e.into()))?;
     let mut scratch = FactWriteOutcome::default();
     let mut failed: Option<(usize, CliError)> = None;
     for (i, ef) in batch.facts.iter().enumerate() {
-        if let Err(e) = write_fact(ctx, w, ef, &cache, &mut scratch).await {
+        let verdict = judged.get(i).and_then(Option::as_ref);
+        if let Err(e) = write_judged_fact(ctx, w, ef, &cache, verdict, &mut scratch).await {
             tracing::warn!("fact {} of {total} failed to persist: {e}", i + 1);
             failed = Some((i, e));
             break;
@@ -733,32 +742,165 @@ fn build_observation(
     })
 }
 
-pub async fn write_fact(
+/// GATHER: every judge call a batch needs, made BEFORE the write lock is
+/// taken. Each observation is planned read-only against the store as it is
+/// now; the ones that would queue a pair are judged, one call each.
+///
+/// The verdict is only a PROPOSAL. The apply pass plans again inside the
+/// transaction — earlier facts of the same batch have landed by then — and
+/// uses a verdict only for an observation whose queued pairs are exactly the
+/// pairs that were judged (see [`JudgedPairs`]). Anything else stays queued.
+///
+/// Warnings and notes from this pass are thrown away: the apply pass reports
+/// them, once.
+async fn gather_judgements(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    facts: &[ExtractedFact],
+    cache: &FactEmbedCache,
+    llm: &dyn ChatLlm,
+) -> Result<Vec<Option<Judged>>, (usize, CliError)> {
+    let mut discarded = FactWriteOutcome::default();
+    let mut out = Vec::with_capacity(facts.len());
+    for (i, ef) in facts.iter().enumerate() {
+        let prepared = prepare(ctx, w, ef, cache, &mut discarded)
+            .await
+            .map_err(|e| (i, e))?;
+        let judged = match prepared {
+            Prepared::Planned(p) if !p.plan.queue.is_empty() => {
+                let by_id = p.by_id();
+                let olds: Vec<&Fact> = p
+                    .plan
+                    .queue
+                    .iter()
+                    .filter_map(|q| by_id.get(&q.old_fact_id).copied())
+                    .collect();
+                if olds.is_empty() {
+                    None
+                } else {
+                    Some(Judged {
+                        about: JudgedPairs::of(&p.observation, &p.plan.queue),
+                        judgement: judge_pairs(llm, &p.text, &olds).await,
+                    })
+                }
+            }
+            _ => None,
+        };
+        out.push(judged);
+    }
+    Ok(out)
+}
+
+/// One judge's answer about ONE observation's queued pairs.
+pub struct Judgement {
+    /// Who answered, as the journal names it: `judge:<judge>`.
+    pub judge: &'static str,
+    pub model: String,
+    /// `Err` = no verdict (the call failed, or the reply was not one). The
+    /// reason is a stable word, never the reply.
+    pub action: Result<AdjudicationAction, &'static str>,
+}
+
+/// THE JUDGE SEAM: one observation (`new_fact`, rendered "subject relation
+/// object") and the stored facts its queued pairs name, in; one verdict out.
+///
+/// Called with no transaction open. Whatever it returns, the applier enforces
+/// the same limits: a failure keeps every pair queued, a safety pair is never
+/// cleared or discarded, a close needs `may_close`. A different judge plugs in
+/// here and inherits all three.
+pub async fn judge_pairs(llm: &dyn ChatLlm, new_fact: &str, olds: &[&Fact]) -> Judgement {
+    let rendered: Vec<String> = olds
+        .iter()
+        .map(|f| format!("{} | {} {} {}", f.id, f.subject, f.predicate, f.object))
+        .collect();
+    let action = adjudicate(llm, new_fact, &rendered).await.map_err(|e| {
+        // Logged, never echoed into the envelope: the error is sanitized,
+        // but the note only needs to say that nobody decided.
+        tracing::warn!("adjudication gave no verdict; the pairs stay queued: {e}");
+        failure_reason(&e)
+    });
+    Judgement {
+        judge: "llm",
+        model: llm.model_id().to_string(),
+        action,
+    }
+}
+
+/// What a verdict was ABOUT: the observation, and its queued pairs by old
+/// fact and rule. Fact ids of the observation itself are minted per planning
+/// pass, so they are deliberately not part of it.
+#[derive(Debug, PartialEq, Eq)]
+struct JudgedPairs {
+    subject_norm: String,
+    relation: String,
+    object_norm: String,
+    pairs: Vec<(Uuid, &'static str)>,
+}
+
+impl JudgedPairs {
+    fn of(observation: &Observation, queue: &[PlannedConflict]) -> JudgedPairs {
+        let mut pairs: Vec<(Uuid, &'static str)> = queue
+            .iter()
+            .map(|q| (q.old_fact_id, q.verdict.rule))
+            .collect();
+        pairs.sort();
+        JudgedPairs {
+            subject_norm: observation.subject_norm.clone(),
+            relation: observation.relation.clone(),
+            object_norm: observation.object_norm.clone(),
+            pairs,
+        }
+    }
+}
+
+/// A verdict gathered before the transaction, and what it was about.
+struct Judged {
+    about: JudgedPairs,
+    judgement: Judgement,
+}
+
+/// One observation, planned against the store as it is now. Reads only.
+enum Prepared {
+    /// Not writable (a blank subject, relation or object) — silent on
+    /// purpose: an extractor emitting a blank object is not a user-facing
+    /// failure.
+    Unwritable,
+    /// The novelty gate found the same statement already stored.
+    GateDuplicate(Uuid),
+    Planned(Box<PreparedPlan>),
+}
+
+struct PreparedPlan {
+    observation: Observation,
+    siblings: Vec<Fact>,
+    others: Vec<(Fact, f32)>,
+    embedding: Option<Vec<f32>>,
+    /// "subject relation object", the string the judge and the embedder see.
+    text: String,
+    plan: WritePlan,
+}
+
+impl PreparedPlan {
+    fn by_id(&self) -> HashMap<Uuid, &Fact> {
+        self.siblings
+            .iter()
+            .chain(self.others.iter().map(|(f, _)| f))
+            .map(|f| (f.id, f))
+            .collect()
+    }
+}
+
+/// Everything up to the plan, with no write: resolve the observation, load
+/// its siblings, run the novelty gate, plan.
+async fn prepare(
     ctx: &AppContext,
     w: &FactWriteCtx<'_>,
     ef: &ExtractedFact,
     cache: &FactEmbedCache,
     outcome: &mut FactWriteOutcome,
-) -> Result<(), CliError> {
-    if let Ok(needle) = std::env::var(WRITE_FAIL_ENV) {
-        let needle = needle.trim();
-        if !needle.is_empty() && (ef.subject.contains(needle) || ef.predicate.contains(needle)) {
-            // Never `{ef:?}`: the fact restates the memory it came from, and
-            // this string is rendered into `fact_extraction_note`, which goes
-            // to stdout AND stderr. Only the operator's own needle is echoed.
-            // `Io`, not `Migration`: R11 classifies a migration failure as a
-            // CONFIG error (exit 2, "fix your setup"), and this seam fabricates
-            // a failed write, which is transient (exit 1, "retry the identical
-            // command") — the advice the batch's own error message gives.
-            return Err(CliError::Storage(engram_storage::StorageError::Io(
-                std::io::Error::other(format!(
-                    "{WRITE_FAIL_ENV} injected a persistence failure (needle '{needle}')"
-                )),
-            )));
-        }
-    }
+) -> Result<Prepared, CliError> {
     let Some(observation) = build_observation(ctx, w, ef, outcome) else {
-        return Ok(());
+        return Ok(Prepared::Unwritable);
     };
     let (diary, kb) = (w.diary, w.kb);
 
@@ -794,9 +936,7 @@ pub async fn write_fact(
             let (dup_t, novel_t) = gate_thresholds();
             match novelty_gate(&emb, &existing, dup_t, novel_t) {
                 GateDecision::Duplicate { fact_id, .. } => {
-                    ctx.store.increment_fact_confirmations(fact_id)?;
-                    outcome.deduped += 1;
-                    return Ok(());
+                    return Ok(Prepared::GateDuplicate(fact_id));
                 }
                 GateDecision::Novel => {}
                 GateDecision::Uncertain { candidates } => {
@@ -822,35 +962,99 @@ pub async fn write_fact(
     // settled safety question and can re-close an interval the caller
     // reinstated.
     let prior = |key: &SemanticKey| ctx.store.binding_decision(kb, key);
-    let mut plan = plan_write(
+    let plan = plan_write(
         &observation,
         &siblings,
         &others,
         classify_mode_for(w.source_kind),
         &prior,
     )?;
+    Ok(Prepared::Planned(Box::new(PreparedPlan {
+        observation,
+        siblings,
+        others,
+        embedding,
+        text,
+        plan,
+    })))
+}
 
-    if w.autonomy == Autonomy::Full && !plan.queue.is_empty() {
-        if let Some(llm) = w.llm {
-            adjudicate_plan(llm, &text, &observation, &siblings, &others, &mut plan).await;
+/// Write one fact inside the caller's transaction. Never calls a judge:
+/// `compile` uses this directly, and under `--autonomy full` the judging
+/// happens in [`write_fact_batch`], before its transaction opens.
+pub async fn write_fact(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    ef: &ExtractedFact,
+    cache: &FactEmbedCache,
+    outcome: &mut FactWriteOutcome,
+) -> Result<(), CliError> {
+    write_judged_fact(ctx, w, ef, cache, None, outcome).await
+}
+
+/// APPLY: plan again, inside the transaction, and use a gathered verdict only
+/// if it is still about exactly this observation's queued pairs.
+async fn write_judged_fact(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    ef: &ExtractedFact,
+    cache: &FactEmbedCache,
+    judged: Option<&Judged>,
+    outcome: &mut FactWriteOutcome,
+) -> Result<(), CliError> {
+    if let Ok(needle) = std::env::var(WRITE_FAIL_ENV) {
+        let needle = needle.trim();
+        if !needle.is_empty() && (ef.subject.contains(needle) || ef.predicate.contains(needle)) {
+            // Never `{ef:?}`: the fact restates the memory it came from, and
+            // this string is rendered into `fact_extraction_note`, which goes
+            // to stdout AND stderr. Only the operator's own needle is echoed.
+            // `Io`, not `Migration`: R11 classifies a migration failure as a
+            // CONFIG error (exit 2, "fix your setup"), and this seam fabricates
+            // a failed write, which is transient (exit 1, "retry the identical
+            // command") — the advice the batch's own error message gives.
+            return Err(CliError::Storage(engram_storage::StorageError::Io(
+                std::io::Error::other(format!(
+                    "{WRITE_FAIL_ENV} injected a persistence failure (needle '{needle}')"
+                )),
+            )));
+        }
+    }
+    let p = match prepare(ctx, w, ef, cache, outcome).await? {
+        Prepared::Unwritable => return Ok(()),
+        Prepared::GateDuplicate(fact_id) => {
+            ctx.store.increment_fact_confirmations(fact_id)?;
+            outcome.deduped += 1;
+            return Ok(());
+        }
+        Prepared::Planned(p) => p,
+    };
+    let mut p = *p;
+    let mut plan = std::mem::take(&mut p.plan);
+    if w.autonomy == Autonomy::Full && w.llm.is_some() && !plan.queue.is_empty() {
+        let about = JudgedPairs::of(&p.observation, &plan.queue);
+        match judged.filter(|j| j.about == about) {
+            Some(j) => apply_judgement(&mut plan, &p.observation, &p.by_id(), &j.judgement),
+            // The store moved between judging and writing (an earlier fact of
+            // this batch landed), so the verdict answers a different question.
+            None => plan.notes.push(PlanNote::AdjudicationStale),
         }
     }
 
     apply_plan(
         ctx,
         w,
-        &observation,
+        &p.observation,
         &plan,
-        &siblings,
-        &others,
-        embedding.as_deref(),
+        &p.siblings,
+        &p.others,
+        p.embedding.as_deref(),
         outcome,
     )
 }
 
-/// `--autonomy full`: let this system's LLM settle what the classifier queued.
+/// `--autonomy full`: let a machine judge settle what the classifier queued.
 ///
-/// The LLM is a `Heuristic` authority and nothing more. Its `supersede` can
+/// The judge is a `Heuristic` authority and nothing more. Its `supersede` can
 /// close a routine interval and CANNOT close a safety one — `may_close`
 /// refuses, the pair stays queued, and the caller (who has the conversation)
 /// decides. Its `coexist` and `reject_new` are refused on a safety pair for
@@ -861,37 +1065,16 @@ pub async fn write_fact(
 /// `assisted` would have done anyway, and the envelope says so
 /// (`adjudication_failed`). It used to read as `Coexist`, which clears the
 /// queue — every judge outage silently deleted the questions it was asked.
-async fn adjudicate_plan(
-    llm: &dyn ChatLlm,
-    text: &str,
-    observation: &Observation,
-    siblings: &[Fact],
-    others: &[(Fact, f32)],
+fn apply_judgement(
     plan: &mut WritePlan,
+    observation: &Observation,
+    by_id: &HashMap<Uuid, &Fact>,
+    judgement: &Judgement,
 ) {
-    let by_id: HashMap<Uuid, &Fact> = siblings
-        .iter()
-        .chain(others.iter().map(|(f, _)| f))
-        .map(|f| (f.id, f))
-        .collect();
-    let rendered: Vec<String> = plan
-        .queue
-        .iter()
-        .filter_map(|q| by_id.get(&q.old_fact_id))
-        .map(|f| format!("{} | {} {} {}", f.id, f.subject, f.predicate, f.object))
-        .collect();
-    if rendered.is_empty() {
-        return;
-    }
-    let action = match adjudicate(llm, text, &rendered).await {
-        Ok(action) => action,
-        Err(e) => {
-            // Logged, never echoed into the envelope: the error is sanitized,
-            // but the note only needs to say that nobody decided.
-            tracing::warn!("adjudication gave no verdict; the pairs stay queued: {e}");
-            plan.notes.push(PlanNote::AdjudicationFailed {
-                reason: failure_reason(&e),
-            });
+    let action = match judgement.action {
+        Ok(ref action) => action,
+        Err(reason) => {
+            plan.notes.push(PlanNote::AdjudicationFailed { reason });
             return;
         }
     };
@@ -1366,6 +1549,104 @@ mod tests {
         assert_eq!(total.deduped, 1);
         // A batch that never committed is simply never merged — the numbers it
         // would have reported describe rows that do not exist.
+    }
+
+    // ----- the judge seam fails closed -----
+
+    /// A judge that is never reachable: a timeout, a 401, exhausted retries.
+    struct Unreachable;
+
+    impl ChatLlm for Unreachable {
+        fn name(&self) -> &'static str {
+            "unreachable"
+        }
+
+        fn model_id(&self) -> &str {
+            "unreachable-model"
+        }
+
+        fn chat<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _messages: &'life1 [engram_llm::ChatMessage],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<engram_llm::ChatResponse, engram_llm::LlmError>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(engram_llm::LlmError::RateLimited { provider: "test" }) })
+        }
+    }
+
+    fn metformin(object: &str) -> Observation {
+        let relation = "takes_medication".to_string();
+        let object_norm = normalize(object);
+        Observation {
+            fact_id: Uuid::new_v4(),
+            subject: "Ana".into(),
+            subject_norm: "ana".into(),
+            spec: relation_spec(&relation),
+            member: member_identity(&relation, &object_norm),
+            relation,
+            object: object.into(),
+            object_norm,
+            confidence: 1.0,
+            source_memory_id: Uuid::new_v4(),
+            source_kind: SourceKind::UserStated,
+            fact_type: FactType::Assertion,
+            diary: "default".into(),
+            kb: "personal".into(),
+            interval: Interval {
+                from: moment("2026-01-01"),
+                until: None,
+            },
+            state: ObservationState::Ongoing,
+            autonomy: Autonomy::Full,
+            queue_everything: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_judge_gives_no_verdict_and_every_pair_survives() {
+        let old = metformin("metformin 500 mg").to_fact(moment("2025-01-01"));
+        let new = metformin("metformin 1000 mg");
+        let judgement = judge_pairs(
+            &Unreachable,
+            "Ana takes_medication metformin 1000 mg",
+            &[&old],
+        )
+        .await;
+        assert_eq!(judgement.action, Err("llm_error"));
+        assert_eq!(judgement.model, "unreachable-model");
+
+        let prior = |_: &SemanticKey| Ok(None);
+        let mut plan = plan_write(
+            &new,
+            std::slice::from_ref(&old),
+            &[],
+            ClassifyMode::Write,
+            &prior,
+        )
+        .unwrap();
+        assert_eq!(plan.queue.len(), 1, "a dose change is a question");
+        let before = plan.queue.clone();
+        let by_id: HashMap<Uuid, &Fact> = HashMap::from([(old.id, &old)]);
+        apply_judgement(&mut plan, &new, &by_id, &judgement);
+        assert_eq!(plan.queue, before, "no verdict decides nothing");
+        assert!(plan.insert.is_some() && plan.closes.is_empty());
+        assert_eq!(
+            plan.notes,
+            [PlanNote::AdjudicationFailed {
+                reason: "llm_error"
+            }]
+        );
     }
 
     #[test]

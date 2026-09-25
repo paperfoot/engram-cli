@@ -342,3 +342,36 @@ fn pairs_the_judge_did_not_name_stay_queued() {
     assert_eq!(asked[0]["old"]["object"], "1990-04-13");
     assert_eq!(open_objects(tmp.path()), ["1990-04-13", "1990-04-14"]);
 }
+
+// ----- B5: judged outside the write lock, applied only to what it saw ------
+
+/// Two facts in one batch. The judge sees both BEFORE the transaction, when
+/// 04-14 conflicts only with 04-12. By the time 04-14 is written, 04-13 has
+/// landed and it is a second question — so the verdict answers a question
+/// nobody is asking any more, and both pairs stay queued.
+#[test]
+fn a_verdict_about_different_pairs_is_not_applied() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
+    );
+    let v = judged(
+        tmp.path(),
+        "Ana was born on the 13th, or the 14th.",
+        r#"[{"subject":"Ana","predicate":"birthday","object":"1990-04-13"},
+            {"subject":"Ana","predicate":"birthday","object":"1990-04-14"}]"#,
+        r#"{"action":"coexist"}"#,
+    );
+    assert!(
+        note_kinds(&v).contains(&"adjudication_stale".to_string()),
+        "{v}"
+    );
+    let asked = queued(&v);
+    assert_eq!(asked.len(), 2, "{v}");
+    assert!(
+        asked.iter().all(|q| q["new"]["object"] == "1990-04-14"),
+        "the 04-13 verdict still applied to the pairs it was about: {v}"
+    );
+}
