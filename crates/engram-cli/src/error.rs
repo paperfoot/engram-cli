@@ -34,6 +34,12 @@ pub enum CliError {
     #[error("bad input: {message}")]
     BadInputHint { message: String, suggestion: String },
 
+    /// A config error whose fix is known where it happens. Same code, same
+    /// exit as `Config`; the generic `config check` advice would send the
+    /// caller to probe API keys for a problem that has nothing to do with them.
+    #[error("config error: {message}")]
+    ConfigHint { message: String, suggestion: String },
+
     #[error("rate limited: {0}")]
     RateLimited(String),
 
@@ -143,7 +149,7 @@ impl CliError {
         use CliError::*;
         match self {
             Transient(_) | Io(_) | Serde(_) | Zip(_) => ErrorCode::Transient,
-            Config(_) => ErrorCode::Config,
+            Config(_) | ConfigHint { .. } => ErrorCode::Config,
             BadInput(_) | BadInputHint { .. } | Ingest(_) | Bench(_) => ErrorCode::BadInput,
             RateLimited(_) => ErrorCode::RateLimited,
             Storage(e) => storage_error_code(e),
@@ -180,7 +186,7 @@ impl CliError {
         use CliError::*;
         match self {
             Transient(_) => "transient_error",
-            Config(_) => "config_error",
+            Config(_) | ConfigHint { .. } => "config_error",
             BadInput(_) | BadInputHint { .. } => "bad_input",
             RateLimited(_) => "rate_limited",
             Embed(_) => "embed_error",
@@ -209,7 +215,7 @@ impl CliError {
                 "run `engram agent-info --command '<command>'` for this command's exact argument shape and rules"
                     .to_string()
             }
-            BadInputHint { suggestion, .. } => suggestion.clone(),
+            BadInputHint { suggestion, .. } | ConfigHint { suggestion, .. } => suggestion.clone(),
             Config(_) => {
                 "run `engram config check` — it live-probes every configured key and names the one that failed"
                     .to_string()

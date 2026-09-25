@@ -279,7 +279,14 @@ fn skill_install_refuses_to_clobber_a_locally_modified_skill() {
         message.contains(edited.to_str().unwrap()),
         "error did not name the path: {message}"
     );
-    assert!(message.contains("--force"), "no recovery hint: {message}");
+    // The recovery names the flag, not `config check`: the refusal has
+    // nothing to do with API keys.
+    let suggestion = err["error"]["suggestion"].as_str().unwrap();
+    assert!(
+        suggestion.contains("--force"),
+        "no recovery hint: {suggestion}"
+    );
+    assert!(!suggestion.contains("config check"), "{suggestion}");
 
     // Nothing was written — not even to the untouched targets.
     assert_eq!(
@@ -323,6 +330,68 @@ fn skill_install_force_overwrites_a_modified_skill() {
         3
     );
     assert_eq!(std::fs::read_to_string(&edited).unwrap(), pristine);
+}
+
+/// `update` tells every user to run `skill install` afterwards, and it used
+/// to refuse: any copy that differed from the new body counted as a hand
+/// edit. An untouched copy of an earlier release is replaced without --force.
+#[test]
+fn skill_install_replaces_a_pristine_previous_release_copy_without_force() {
+    const V0_4_1: &str = include_str!("../../engram-contract/tests/fixtures/skill-0.4.1.md");
+    let (tmp, mut first) = with_isolated_home();
+    first
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success();
+    let target = tmp.path().join(".codex/skills/engram/SKILL.md");
+    let current = std::fs::read_to_string(&target).unwrap();
+    std::fs::write(&target, V0_4_1).unwrap();
+
+    let out = cmd_in(&tmp)
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = parse_stdout(&out);
+    let dirs = v["data"]["directories"].as_array().unwrap();
+    let codex = dirs
+        .iter()
+        .find(|d| d["skill_path"] == target.to_str().unwrap())
+        .expect("codex target present");
+    assert_eq!(codex["status"], "upgraded");
+    assert_eq!(v["metadata"]["upgraded"], 1);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), current);
+}
+
+/// Releases from here on carry their own `body_hash`: a copy whose body still
+/// matches it was written by engram, whatever release wrote it.
+#[test]
+fn skill_install_replaces_a_self_verifying_copy_from_another_build() {
+    let (tmp, mut first) = with_isolated_home();
+    first
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success();
+    let target = tmp.path().join(".claude/skills/engram/SKILL.md");
+    let current = std::fs::read_to_string(&target).unwrap();
+    let other_build = engram_contract::skill::stamp(&current.replacen(
+        "# engram",
+        "# engram (a later release's wording)",
+        1,
+    ));
+    std::fs::write(&target, &other_build).unwrap();
+
+    cmd_in(&tmp)
+        .arg("--json")
+        .args(["skill", "install"])
+        .assert()
+        .success();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), current);
 }
 
 /// A target that never had the skill installs normally even while a sibling

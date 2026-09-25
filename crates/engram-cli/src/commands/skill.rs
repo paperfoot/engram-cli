@@ -39,9 +39,11 @@ fn target_dirs() -> Vec<PathBuf> {
 /// What `install` did to one target directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallStatus {
-    /// The file was absent (or only differed in the packaged metadata) and
-    /// has been written.
+    /// The file was absent (or --force replaced an edited one) and has been
+    /// written.
     Installed,
+    /// An untouched copy from another release, replaced.
+    Upgraded,
     /// Already byte-identical to what we ship — nothing to do.
     Unchanged,
     /// Locally modified, so left exactly as the user left it.
@@ -52,20 +54,33 @@ impl InstallStatus {
     fn as_str(self) -> &'static str {
         match self {
             Self::Installed => "installed",
+            Self::Upgraded => "upgraded",
             Self::Unchanged => "unchanged",
             Self::SkippedModified => "skipped_modified",
         }
     }
 }
 
-/// True when `path` exists with content that is neither absent nor identical
-/// to `body` — i.e. writing would destroy someone's edits.
-fn is_locally_modified(path: &Path, body: &str) -> bool {
+/// Whether writing `path` would destroy somebody's edits. A copy engram wrote
+/// and nobody touched — this release's or an earlier one's — is not an edit:
+/// treating every earlier release as one made `skill install`, the step
+/// `update` prescribes, refuse on every upgrade.
+fn classify(path: &Path, force: bool) -> InstallStatus {
+    if !path.exists() {
+        return InstallStatus::Installed;
+    }
     match std::fs::read(path) {
-        Ok(existing) => existing != body.as_bytes(),
         // Unreadable is not "modified": let the write attempt report the real
         // IO error rather than silently claiming the user edited it.
-        Err(_) => false,
+        Err(_) => InstallStatus::Installed,
+        Ok(existing) if existing == SKILL_BODY.as_bytes() => InstallStatus::Unchanged,
+        Ok(existing)
+            if std::str::from_utf8(&existing).is_ok_and(engram_contract::skill::is_pristine) =>
+        {
+            InstallStatus::Upgraded
+        }
+        Ok(_) if force => InstallStatus::Installed,
+        Ok(_) => InstallStatus::SkippedModified,
     }
 }
 
@@ -91,15 +106,7 @@ fn install(ctx: &AppContext, force: bool) -> Result<(), CliError> {
     let mut plan: Vec<(PathBuf, InstallStatus)> = Vec::with_capacity(dirs.len());
     for dir in &dirs {
         let skill_path = dir.join("SKILL.md");
-        let status = if !skill_path.exists() {
-            InstallStatus::Installed
-        } else if !is_locally_modified(&skill_path, SKILL_BODY) {
-            InstallStatus::Unchanged
-        } else if force {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::SkippedModified
-        };
+        let status = classify(&skill_path, force);
         plan.push((skill_path, status));
     }
 
@@ -109,12 +116,15 @@ fn install(ctx: &AppContext, force: bool) -> Result<(), CliError> {
         .map(|(p, _)| p.to_string_lossy().into_owned())
         .collect();
     if !modified.is_empty() {
-        return Err(CliError::Config(format!(
-            "refusing to overwrite locally modified skill file(s): {}. \
-             Re-run `engram skill install --force` to replace them, or move your \
-             edits aside first. Nothing was written.",
-            modified.join(", ")
-        )));
+        return Err(CliError::ConfigHint {
+            message: format!(
+                "refusing to overwrite locally modified skill file(s): {}. Nothing was written.",
+                modified.join(", ")
+            ),
+            suggestion:
+                "run `engram skill install --force` to replace them, or move your edits aside first"
+                    .into(),
+        });
     }
 
     let mut installed = Vec::new();
@@ -137,6 +147,12 @@ fn install(ctx: &AppContext, force: bool) -> Result<(), CliError> {
         "installed",
         plan.iter()
             .filter(|(_, s)| *s == InstallStatus::Installed)
+            .count(),
+    );
+    meta.add(
+        "upgraded",
+        plan.iter()
+            .filter(|(_, s)| *s == InstallStatus::Upgraded)
             .count(),
     );
     meta.add(

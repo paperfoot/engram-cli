@@ -38,7 +38,10 @@ fn an_installed_copy_of_a_previous_release_reads_as_stale() {
     );
     match engram_contract::skill::freshness(Some(&previous)) {
         engram_contract::skill::Freshness::Stale { installed } => {
-            assert_eq!(installed, "00000000000000000000000000000000")
+            assert_eq!(
+                installed.as_deref(),
+                Some("00000000000000000000000000000000")
+            )
         }
         other => panic!("expected stale, got {other:?}"),
     }
