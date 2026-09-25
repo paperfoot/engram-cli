@@ -1383,8 +1383,9 @@ fn apply_judgement(
 /// machine `keep_both` would be replayed as the answer to that question on
 /// every later write, safety dose changes included.
 ///
-/// A stale verdict (judged against a store that moved before the write) is
-/// journaled as `action=stale`: it was paid for and answered, just not used.
+/// A stale verdict (judged against a store that moved before the write)
+/// keeps the judge's real answer and adds `applied=false`: it was paid for
+/// and answered, just not used, and the audit trail says what it was.
 fn record_judgement(
     ctx: &AppContext,
     w: &FactWriteCtx<'_>,
@@ -1392,10 +1393,11 @@ fn record_judgement(
     stale: bool,
 ) -> Result<(), CliError> {
     let j = &judged.judgement;
-    let action = if stale { "stale" } else { j.action_word() };
+    let action = j.action_word();
+    let applied = if stale { " applied=false" } else { "" };
     let actor = format!("judge:{}", j.judge);
     for (_, rule, key) in &judged.about.pairs {
-        let note = format!("action={action} model={} rule={rule}", j.model);
+        let note = format!("action={action}{applied} model={} rule={rule}", j.model);
         ctx.store.record_decision(
             w.kb,
             w.diary,

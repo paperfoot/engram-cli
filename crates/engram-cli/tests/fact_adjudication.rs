@@ -407,7 +407,8 @@ fn a_verdict_about_different_pairs_is_not_applied() {
         asked.iter().all(|q| q["new"]["object"] == "1990-04-14"),
         "the 04-13 verdict still applied to the pairs it was about: {v}"
     );
-    // The unused verdict is still journaled, as stale, on the pair it judged.
+    // The unused verdict is still journaled on the pair it judged, with the
+    // judge's real answer and a mark that it was not applied.
     let judged_pair = asked
         .iter()
         .find(|q| q["old"]["object"] == "1990-04-12")
@@ -422,7 +423,7 @@ fn a_verdict_about_different_pairs_is_not_applied() {
         .note
         .as_deref()
         .unwrap_or_default()
-        .starts_with("action=stale model="));
+        .starts_with("action=coexist applied=false model="));
 }
 
 /// Two facts of one memory that conflict only with EACH OTHER. When the batch
