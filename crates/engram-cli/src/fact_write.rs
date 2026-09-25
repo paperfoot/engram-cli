@@ -241,6 +241,9 @@ pub struct AdjudicationCounters {
     pub reject_new: usize,
     /// Verdicts not applied: the pairs changed before the write.
     pub stale: usize,
+    /// Observations whose pairs arose after judging (an earlier fact of the
+    /// same batch landed): no judge saw them, and they stay queued.
+    pub not_asked: usize,
     /// Pairs sent to a judge.
     pub pairs_in: usize,
     /// Intervals an applied verdict closed.
@@ -257,6 +260,7 @@ impl AdjudicationCounters {
         self.coexist += o.coexist;
         self.reject_new += o.reject_new;
         self.stale += o.stale;
+        self.not_asked += o.not_asked;
         self.pairs_in += o.pairs_in;
         self.pairs_closed += o.pairs_closed;
         self.pairs_kept += o.pairs_kept;
@@ -1212,8 +1216,15 @@ async fn write_judged_fact(
     };
     if !applied && w.autonomy == Autonomy::Full && w.llm.is_some() && !plan.queue.is_empty() {
         // The store moved between judging and writing (an earlier fact of
-        // this batch landed), so no verdict answers THESE pairs.
-        plan.notes.push(PlanNote::AdjudicationStale);
+        // this batch landed), so no verdict answers THESE pairs. Either the
+        // judge answered different pairs, or it was never asked: the pairs
+        // did not exist yet when the batch was judged.
+        plan.notes.push(if judged.is_some() {
+            PlanNote::AdjudicationStale
+        } else {
+            outcome.adjudication.not_asked += 1;
+            PlanNote::AdjudicationNotAsked
+        });
     }
 
     apply_plan(

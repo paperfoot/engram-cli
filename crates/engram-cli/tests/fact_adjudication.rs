@@ -392,6 +392,28 @@ fn a_verdict_about_different_pairs_is_not_applied() {
         .starts_with("action=stale model="));
 }
 
+/// Two facts of one memory that conflict only with EACH OTHER. When the batch
+/// is judged the store holds neither, so there is nothing to ask; the pair
+/// exists only once the first has landed. It stays queued, and the answer
+/// says a judge was never asked — not that a verdict went stale.
+#[test]
+fn a_conflict_inside_one_batch_says_no_judge_was_asked() {
+    let tmp = store();
+    let v = judged(
+        tmp.path(),
+        "Ana was born on the 12th, or the 13th.",
+        r#"[{"subject":"Ana","predicate":"birthday","object":"1990-04-12"},
+            {"subject":"Ana","predicate":"birthday","object":"1990-04-13"}]"#,
+        r#"{"action":"coexist"}"#,
+    );
+    assert_eq!(queued(&v).len(), 1, "{v}");
+    assert_eq!(note_kinds(&v), ["adjudication_not_asked"], "{v}");
+    let adjudication = &v["metadata"]["adjudication"];
+    assert_eq!(adjudication["calls"], 0, "{v}");
+    assert_eq!(adjudication["stale"], 0, "{v}");
+    assert_eq!(adjudication["not_asked"], 1, "{v}");
+}
+
 // ----- which judge answered: journaled, never binding ----------------------
 
 /// A routine question the judge settled. Its answer is journaled — `void`,
@@ -531,7 +553,7 @@ fn the_metadata_counts_what_the_gate_and_the_judge_did() {
     assert_eq!(
         v["metadata"]["adjudication"],
         json!({"calls": 1, "failed": 0, "supersede": 1, "coexist": 0, "reject_new": 0,
-               "stale": 0, "pairs_in": 1, "pairs_closed": 1, "pairs_kept": 0}),
+               "stale": 0, "not_asked": 0, "pairs_in": 1, "pairs_closed": 1, "pairs_kept": 0}),
         "{v}"
     );
     assert_eq!(v["metadata"]["queued_by_rule"], json!({}));

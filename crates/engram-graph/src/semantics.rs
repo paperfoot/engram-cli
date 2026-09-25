@@ -1083,6 +1083,10 @@ pub enum PlanNote {
     /// judge was asked about — the store moved between judging (outside the
     /// write lock) and writing — so no verdict applies and they stay queued.
     AdjudicationStale,
+    /// Under `--autonomy full` these pairs appeared only after judging —
+    /// typically against an earlier fact of the same batch — so no judge was
+    /// asked about them and they stay queued.
+    AdjudicationNotAsked,
 }
 
 impl PlanNote {
@@ -1095,6 +1099,7 @@ impl PlanNote {
             PlanNote::AdjudicationFailed { .. } => "adjudication_failed",
             PlanNote::AdjudicationKeptSafety { .. } => "adjudication_kept_safety",
             PlanNote::AdjudicationStale => "adjudication_stale",
+            PlanNote::AdjudicationNotAsked => "adjudication_not_asked",
         }
     }
 
@@ -1125,6 +1130,11 @@ impl PlanNote {
             PlanNote::AdjudicationStale => {
                 "the store changed between adjudication and this write, \
                  so no verdict applies; the pairs stay queued for the caller"
+                    .to_string()
+            }
+            PlanNote::AdjudicationNotAsked => {
+                "these pairs arose after adjudication (an earlier fact of this batch, or a \
+                 concurrent write), so no adjudicator was asked; they stay queued for the caller"
                     .to_string()
             }
         }
