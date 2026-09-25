@@ -1282,6 +1282,7 @@ pub async fn backfill(
             "conflicts": outcome.conflicts,
             "adjudication_needed": outcome.queued,
             "date_parse_warnings": outcome.date_warnings,
+            "plan_notes": outcome.plan_notes,
             "extraction_model": model,
         }),
         meta,

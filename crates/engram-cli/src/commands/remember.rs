@@ -358,6 +358,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     "conflicts": outcome.conflicts,
                     "adjudication_needed": outcome.queued,
                     "date_parse_warnings": outcome.date_warnings,
+                    "plan_notes": outcome.plan_notes,
                     "reason": "identical content already stored in this kb/diary; nothing re-embedded",
                 }),
                 meta,
@@ -641,6 +642,11 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let adjudication_needed = outcome.queued;
     let facts_deduped = outcome.deduped;
     let date_warnings = outcome.date_warnings;
+    // The planner's non-fatal reports: an unreadable `valid_until`, an ending
+    // with nothing open, a prior ruling applied instead of asked again. They
+    // were collected and dropped here, so a replayed caller decision changed
+    // the store with no trace in the answer.
+    let plan_notes = outcome.plan_notes;
 
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -705,6 +711,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             "facts_added": facts_added,
             "facts_deduped": facts_deduped,
             "date_parse_warnings": date_warnings,
+            "plan_notes": plan_notes,
             "conflicts": conflicts,
             "adjudication_needed": adjudication_needed,
         }),
