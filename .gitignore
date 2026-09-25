@@ -28,5 +28,6 @@ engram-skill.zip
 # LitQA2 / BEIR datasets + per-question result JSONs (hold-back content + CC-BY-NC; never commit)
 data/litqa2/
 data/beir/
+data/scifact/
 benchmarks/litqa2-*.json
 benchmarks/beir-*.json
