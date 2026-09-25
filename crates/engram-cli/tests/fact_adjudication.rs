@@ -699,3 +699,77 @@ fn a_duplicate_remember_answers_with_every_required_field() {
         assert_eq!(v["metadata"]["fact_extraction"], status, "{v}");
     }
 }
+
+// ----- the polypharmacy guarantee holds under --autonomy full --------------
+
+const MEDS: [&str; 5] = [
+    "empagliflozin 12.5 mg daily",
+    "rapamycin 6 mg weekly",
+    "metformin 500 mg twice daily",
+    "lisinopril 10 mg daily",
+    "levothyroxine 75 mcg daily",
+];
+
+/// A judge that would retire every fact it is shown, if it were ever asked.
+fn supersede_everything(store: &std::path::Path) -> String {
+    let mut ids: Vec<Value> = facts_for(store, "Ana")
+        .iter()
+        .map(|f| f["id"].clone())
+        .collect();
+    if ids.is_empty() {
+        // `supersede` with no ids is not a verdict; name something.
+        ids.push(json!("00000000-0000-0000-0000-000000000000"));
+    }
+    json!({ "action": "supersede", "ids": ids }).to_string()
+}
+
+fn assert_five_open_and_untouched(store: &std::path::Path) {
+    assert_eq!(open_conflicts(store)["data"]["total_open"], 0);
+    let facts = facts_for(store, "Ana");
+    assert_eq!(facts.len(), 5, "{facts:?}");
+    for f in &facts {
+        assert!(f["valid_until"].is_null(), "an interval was closed: {f}");
+        assert!(f["superseded_by"].is_null(), "{f}");
+    }
+}
+
+/// Five medications are five members of a set, never a question, so the
+/// judge is never consulted — not even one that answers `supersede` for
+/// everything it is shown.
+#[test]
+fn five_medications_under_full_autonomy_close_nothing() {
+    let tmp = store();
+    for m in MEDS {
+        let reply = supersede_everything(tmp.path());
+        let v = judged(tmp.path(), &format!("Ana takes {m}."), &med(m), &reply);
+        assert_eq!(v["data"]["facts_added"], 1, "{m}: {v}");
+        assert_eq!(queued(&v).len(), 0, "{m} queued a question: {v}");
+        assert_eq!(
+            v["data"]["conflicts"].as_array().map(Vec::len),
+            Some(0),
+            "{m} closed something: {v}"
+        );
+        assert_eq!(v["metadata"]["adjudication"]["calls"], 0, "{m}: {v}");
+    }
+    assert_five_open_and_untouched(tmp.path());
+}
+
+#[test]
+fn five_medications_from_one_memory_under_full_autonomy_close_nothing() {
+    let tmp = store();
+    let triples: Vec<Value> = MEDS
+        .iter()
+        .map(|m| json!({"subject": "Ana", "predicate": "takes_medication", "object": m}))
+        .collect();
+    let v = judged(
+        tmp.path(),
+        "Ana's current regimen: empagliflozin, rapamycin, metformin, lisinopril, levothyroxine.",
+        &Value::Array(triples).to_string(),
+        &supersede_everything(tmp.path()),
+    );
+    assert_eq!(v["data"]["facts_added"], 5, "{v}");
+    assert_eq!(queued(&v).len(), 0, "{v}");
+    assert_eq!(v["data"]["conflicts"].as_array().map(Vec::len), Some(0));
+    assert_eq!(v["metadata"]["adjudication"]["calls"], 0, "{v}");
+    assert_five_open_and_untouched(tmp.path());
+}
