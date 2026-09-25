@@ -407,7 +407,7 @@ pub const INVARIANTS: &[&str] = &[
     "An empty read is an answer: read verdict, then absence.reason, then metadata.scope before saying nothing is stored.",
     "A read without --kb spans every KB; add --kb only to exclude the others, never to find something.",
     "Destructive commands refuse without --confirm (exit 3); run --dry-run first where the command has one.",
-    "Without a Gemini key, cloud reads and every embedding write are config_error (exit 2); --profile offline (reads) and --offline (writes) ask for the stub on purpose. `embedder_degraded` means a fallback key served: the call worked, and the primary key needs attention (`engram config check`).",
+    "Without a Gemini key, cloud reads and every embedding write except `ingest` and `chunks repair` (which still embed with the stub silently) are config_error (exit 2); --profile offline (reads) and --offline (writes) ask for the stub on purpose. `embedder_degraded` means a fallback key served: the call worked, and the primary key needs attention (`engram config check`).",
     "Errors are JSON on stderr with code, message and suggestion; exit 1 and 4 are retryable, 2 and 3 are not.",
     "Discovery: `engram --help` lists commands, `engram agent-info --command <path>` describes one, `--schema <path>` is its JSON Schema, `--index` lists every path, and bare `agent-info` is the full manifest.",
 ];
