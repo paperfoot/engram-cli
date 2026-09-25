@@ -21,9 +21,6 @@ use engram_cli::cli::Cli;
 /// fails if an entry here has in fact been transcribed.
 const NOT_YET_TRANSCRIBED: &[&str] = &[
     "agent-info",
-    "documents list",
-    "documents show",
-    "documents delete",
     "reindex",
     "doctor",
     "usage",

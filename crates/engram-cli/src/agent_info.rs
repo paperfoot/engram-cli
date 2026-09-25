@@ -124,11 +124,6 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
                 "idempotency": "same kb+source_path is skipped when it already has active chunks",
                 "output_data": { "matched_count": "integer", "matched_files": "string[]", "skipped_existing": "integer", "memories_created": "integer", "chunks_created": "integer" }
             },
-            "documents delete": {
-                "destructive": true,
-                "requires": ["--confirm"],
-                "side_effects": ["soft-deletes document memories", "removes facts for those memories", "clears derived graph/wiki artifacts for the KB"]
-            },
             "repair": {
                 "destructive": true,
                 "safe_mode": "--dry-run",

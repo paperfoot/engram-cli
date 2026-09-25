@@ -2311,6 +2311,52 @@ const KB_REPAIR_FLAGS: &[FlagSpec] = &[FlagSpec {
     doc: "safe mode: report what would be registered and write nothing",
 }];
 
+const DOCUMENTS_LIST_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        name: "kb",
+        cli_long: "kb",
+        aliases: &[],
+        ty: Ty::Str,
+        default: Some("default"),
+        required: false,
+        doc: "the one KB to list. Unlike `recall`, this does NOT span every KB by default",
+    },
+    FlagSpec {
+        name: "all_kbs",
+        cli_long: "all-kbs",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "list every KB; --kb is ignored",
+    },
+    FlagSpec {
+        name: "limit",
+        cli_long: "limit",
+        aliases: &[],
+        ty: Ty::Int,
+        default: Some("100"),
+        required: false,
+        doc: "page length",
+    },
+    FlagSpec {
+        name: "cursor",
+        cli_long: "cursor",
+        aliases: &[],
+        ty: Ty::Str,
+        default: None,
+        required: false,
+        doc: "opaque token from a previous page's `cursor`; pass it back verbatim",
+    },
+];
+
+const DOCUMENT_ID_ARG: &[ArgSpec] = &[ArgSpec {
+    name: "id",
+    ty: Ty::Uuid,
+    required: true,
+    doc: "the document's bare uuid (the `id` field of `documents list`). A `doc:` handle is refused today as an invalid UUID (exit 3)",
+}];
+
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         path: "remember",
@@ -3197,6 +3243,85 @@ pub const COMMANDS: &[CommandSpec] = &[
             "Idempotent and additive only: a healed store reports an empty list, memories are never touched, and a KB removed by `kb delete` is not resurrected. Run --dry-run first.",
         ],
         examples: &["engram kb repair --dry-run --json", "engram kb repair"],
+    },
+    CommandSpec {
+        path: "documents list",
+        aliases: &["documents ls"],
+        summary: "List ingested source documents, newest first.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: DOCUMENTS_LIST_FLAGS,
+        data: &[
+            FieldSpec { name: "documents", ty: Ty::Array(&Ty::Object), doc: "{ id, handle, kb, title, source_path, source_url, doi, year, mode, metadata, created_at }", always: true },
+            FieldSpec { name: "kb", ty: Ty::Str, doc: "the KB listed; '*' with --all-kbs", always: true },
+            FieldSpec { name: "returned", ty: Ty::Int, doc: "rows in this page", always: true },
+            FieldSpec { name: "total", ty: Ty::Int, doc: "documents matching the scope", always: true },
+            FieldSpec { name: "count", ty: Ty::Int, doc: "legacy alias for `returned`", always: true },
+            FieldSpec { name: "cursor", ty: Ty::Str, doc: "next page; absent when there is none", always: false },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "documents", ty: Ty::Int, doc: "rows returned", always: true },
+            FieldSpec { name: "kb", ty: Ty::Str, doc: "as in data", always: true },
+            FieldSpec { name: "scope", ty: Ty::Object, doc: "{ kbs, diary: '*', origin, diary_applicable: false }", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &["An empty list under the default scope says nothing about other KBs: pass --all-kbs before concluding nothing was ingested."],
+        examples: &["engram documents list --all-kbs --json", "engram documents list --kb ageing-biology --limit 20 --json"],
+    },
+    CommandSpec {
+        path: "documents show",
+        aliases: &[],
+        summary: "One ingested document and the memories it produced.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: DOCUMENT_ID_ARG,
+        flags: &[],
+        data: &[
+            FieldSpec { name: "document", ty: Ty::Object, doc: "the row, as in `documents list` without `handle`", always: true },
+            FieldSpec { name: "handle", ty: Ty::Str, doc: "`doc:<uuid>`", always: true },
+            FieldSpec { name: "provenance", ty: Ty::Object, doc: "{ memory_ids: the first 20 bare uuids, memory_count, truncated }", always: true },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "document_id", ty: Ty::Uuid, doc: "the id passed", always: true },
+            FieldSpec { name: "kb", ty: Ty::Str, doc: "the document's KB", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &["An unknown id is `bad_input` (exit 3), not an empty success."],
+        examples: &["engram documents show 0f8c2a1e-6d0b-4a55-9d1e-2b7c1f3e9a40 --json"],
+    },
+    CommandSpec {
+        path: "documents delete",
+        aliases: &[],
+        summary: "Retract one ingested document: its memories, its recallable chunks and the claims cited to it.",
+        destructive: true,
+        requires: &["--confirm"],
+        opens_store: true,
+        args: DOCUMENT_ID_ARG,
+        flags: CONFIRM_FLAG,
+        data: &[
+            FieldSpec { name: "document_id", ty: Ty::Uuid, doc: "the id passed", always: true },
+            FieldSpec { name: "deleted", ty: Ty::Bool, doc: "false when no document has that id (already deleted, or never existed)", always: true },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "document_id", ty: Ty::Uuid, doc: "as in data", always: true },
+            FieldSpec { name: "deleted", ty: Ty::Bool, doc: "as in data", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &[
+            "Each memory the document produced is retracted as `forget` retracts one: journaled, and its facts CLOSED rather than erased. Claims, source spans and takeaways cited to the document are removed.",
+            "The KB's entities, relations and wiki pages are left in place and go stale until the next `engram compile`; deleting one document no longer wipes the KB's compiled knowledge.",
+            "An id that names nothing answers `deleted: false` with exit 0 — read the flag, not the exit code.",
+        ],
+        examples: &["engram documents delete 0f8c2a1e-6d0b-4a55-9d1e-2b7c1f3e9a40 --confirm --json"],
     },
 ];
 
