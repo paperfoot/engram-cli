@@ -205,18 +205,21 @@ impl Freshness {
     }
 }
 
-/// Compares one installed SKILL.md against this binary's contract.
+/// Compares one installed SKILL.md against this binary's contract. An edit
+/// is checked first: an edited copy blocks `skill install` whatever hash it
+/// carries, so calling it fresh or stale would give advice the binary refuses.
 pub fn freshness(installed_body: Option<&str>) -> Freshness {
     let Some(body) = installed_body else {
         return Freshness::Missing;
     };
+    if !is_pristine(body) {
+        return Freshness::Modified;
+    }
     let hash = parse_schema_hash(body);
     if hash.as_deref() == Some(schema_hash().as_str()) {
         Freshness::Fresh
-    } else if is_pristine(body) {
-        Freshness::Stale { installed: hash }
     } else {
-        Freshness::Modified
+        Freshness::Stale { installed: hash }
     }
 }
 
@@ -256,15 +259,16 @@ pub fn doctor_json(installed: &[(String, Option<String>)]) -> serde_json::Value 
         .filter(|(_, f)| *f == Freshness::Modified)
         .count();
 
-    let suggestion = if stale_count > 0 {
+    // An edited copy makes `skill install` refuse the whole install, so its
+    // advice comes first: suggesting a plain reinstall would be refused.
+    let suggestion = if modified_count > 0 {
+        Some(format!(
+            "{modified_count} skill file(s) were edited locally; `engram skill install --force` replaces them, or move them aside first"
+        ))
+    } else if stale_count > 0 {
         Some(format!(
             "run `engram skill install` to refresh {stale_count} stale skill file(s)"
         ))
-    } else if modified_count > 0 {
-        Some(
-            "that copy was edited locally; `engram skill install --force` replaces it, or move it aside first"
-                .to_string(),
-        )
     } else {
         None
     };
@@ -417,6 +421,18 @@ mod tests {
         let stamped = stamp("---\nname: engram\n---\n\n# engram\n");
         assert_eq!(freshness(Some(&stamped)), Freshness::Fresh);
         assert!(is_pristine(&stamped));
+    }
+
+    #[test]
+    fn an_edited_copy_of_this_release_is_modified_and_its_advice_comes_first() {
+        let edited = installed(&schema_hash()).replace("# engram", "# engram, mine");
+        assert_eq!(freshness(Some(&edited)), Freshness::Modified);
+        let v = doctor_json(&[
+            ("a".into(), Some(edited)),
+            ("b".into(), Some(installed("deadbeef"))),
+        ]);
+        assert_eq!(v["status"], "modified");
+        assert!(v["suggestion"].as_str().unwrap().contains("--force"));
     }
 
     #[test]
