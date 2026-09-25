@@ -297,7 +297,7 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
             },
             // Presence only, no live probe. `route` is what a judged command
             // would use; `warnings` names a site set to shadow or on with
-            // no route.
+            // no route or on the test stub.
             "judge": crate::judge::status(),
             // Configured is not working: "ok" is true only when a key in
             // the chain actually SERVED the live probe. An agent branching on

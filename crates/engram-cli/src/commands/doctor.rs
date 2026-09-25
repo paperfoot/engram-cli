@@ -15,8 +15,9 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
     let typesafe =
         crate::commands::config::resolve_secret("TYPESAFE_API_KEY", "keys.typesafe").is_some();
     // Offline, like the rest of doctor: modes and route from settings only.
-    // A shadow/on site with no route is a warning inside the block; an
-    // invalid setting fails `ok`, because every judged command would exit 2.
+    // A shadow/on site with no route, or on the stub, is a warning inside
+    // the block; an invalid setting fails `ok`, because every judged
+    // command would exit 2.
     let judge = crate::judge::status();
     let schema_version = ctx.store.schema_version()?;
     let profiles = ctx.store.embedding_profiles(None)?;

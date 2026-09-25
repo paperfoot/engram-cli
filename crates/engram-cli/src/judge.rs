@@ -271,7 +271,8 @@ pub struct JudgeStatus {
     pub route: Option<&'static str>,
     /// Settings that make judged commands exit 2.
     pub errors: Vec<String>,
-    /// A site in shadow or on with no route: it runs without the judge.
+    /// A site in shadow or on with no route (it runs without the judge),
+    /// or answered by the test stub.
     pub warnings: Vec<String>,
 }
 
@@ -290,6 +291,8 @@ pub fn status() -> JudgeStatus {
     let route = route_name(false)
         .map_err(|e| errors.push(e.to_string()))
         .ok();
+    // A broken config.toml fails every site the same way: report it once.
+    errors.dedup();
     JudgeStatus {
         grounding: modes[0],
         adjudicate: modes[1],
@@ -300,23 +303,29 @@ pub fn status() -> JudgeStatus {
     }
 }
 
-/// `modes` in [`JudgeSite::ALL`] order. An unresolvable route is an error,
-/// already reported, not a reason to warn.
+/// `modes` in [`JudgeSite::ALL`] order. A site in shadow or on warns when
+/// no judge answers it, or when the test stub does. An unresolvable route
+/// is an error, already reported, not a reason to warn.
 fn warnings_for(modes: &[Option<JudgeMode>], route: Option<&str>) -> Vec<String> {
-    if route != Some("none") {
-        return Vec::new();
-    }
+    let why = match route {
+        Some("none") => {
+            "no judge is reachable, so the site runs without it: set TYPESAFE_API_KEY (or \
+             `engram config set keys.typesafe <KEY>`) or OPENROUTER_API_KEY; --offline and \
+             ENGRAM_BENCH_FORCE_STUB also disable the judge"
+        }
+        Some("stub") => {
+            "ENGRAM_JUDGE_STUB is set, so scripted answers stand in for the judge: unset it \
+             outside tests"
+        }
+        _ => return Vec::new(),
+    };
     JudgeSite::ALL
         .iter()
         .zip(modes)
         .filter_map(|(site, mode)| match mode {
-            Some(m @ (JudgeMode::Shadow | JudgeMode::On)) => Some(format!(
-                "{} is {} but no judge is reachable, so the site runs without it: set \
-                 TYPESAFE_API_KEY (or `engram config set keys.typesafe <KEY>`) or \
-                 OPENROUTER_API_KEY; --offline and ENGRAM_BENCH_FORCE_STUB also disable the judge",
-                site.config_key(),
-                m.as_str()
-            )),
+            Some(m @ (JudgeMode::Shadow | JudgeMode::On)) => {
+                Some(format!("{} is {} but {why}", site.config_key(), m.as_str()))
+            }
             _ => None,
         })
         .collect()
@@ -463,14 +472,19 @@ mod tests {
     }
 
     #[test]
-    fn warnings_only_for_a_live_mode_with_no_route() {
+    fn warnings_only_for_a_live_mode_with_no_route_or_the_stub() {
         let modes = [Some(JudgeMode::Shadow), Some(JudgeMode::Off), None];
         let w = warnings_for(&modes, Some("none"));
         assert_eq!(w.len(), 1);
         assert!(w[0].starts_with("judge.grounding is shadow"), "{}", w[0]);
+        let w = warnings_for(&modes, Some("stub"));
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains(STUB_ENV), "{}", w[0]);
         assert!(warnings_for(&modes, Some("typesafe")).is_empty());
+        assert!(warnings_for(&modes, Some("openrouter")).is_empty());
         assert!(warnings_for(&modes, None).is_empty());
         assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("none")).is_empty());
+        assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("stub")).is_empty());
     }
 
     fn response(provider: &'static str) -> JudgeResponse {
