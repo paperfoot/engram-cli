@@ -283,15 +283,23 @@ async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'stat
     let Some(client) = client else {
         return "probe_error";
     };
+    // The key rides in a header, never the URL: reqwest puts the URL in its
+    // error text, so a `?key=` URL leaks the key wherever an error is shown.
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={key}",
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
         engram_embed::gemini::DEFAULT_MODEL
     );
     let body = json!({
         "content": {"parts": [{"text": "probe"}]},
         "outputDimensionality": 8,
     });
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .header("x-goog-api-key", key)
+        .json(&body)
+        .send()
+        .await
+    {
         Err(_) => "unreachable",
         Ok(resp) => match resp.status().as_u16() {
             200 => "ok",
