@@ -94,29 +94,6 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
             "--store <dir>": "Root every path (db, vectors, config, cache) at DIR for this invocation. Outranks ENGRAM_STORE, which outranks the platform data dir. Accepted on every command and on `engramd`, so a scratch store needs no exported variable."
         },
         "command_schemas": {
-            "ingest": {
-                "destructive": false,
-                "args": { "path": "file_or_directory" },
-                "flags": {
-                    "kb": "string",
-                    "diary": "string",
-                    "mode": "papers|takeaways|conversations|repos|general|auto",
-                    "compile": "none|evidence",
-                    "dry_run": "boolean preview without writes",
-                    "include": "string[] glob-like patterns; repeatable; matches file name and relative path",
-                    "exclude": "string[] glob-like patterns; repeatable; matches file name and relative path",
-                    "max_files": "integer cap; refuses if matched files exceed cap",
-                    "all": "boolean explicit full recursive directory confirmation"
-                },
-                "safety": {
-                    "single_file": "ingests exactly that file",
-                    "directory_default": "refuses unless --all, --include/--exclude, --max-files, or --dry-run is present when ingest.require_scope is true",
-                    "agent_rule": "for directories, run --dry-run first, inspect matched_files, then repeat with the same scope and without --dry-run",
-                    "config": ["ingest.require_scope", "ingest.include", "ingest.exclude", "ingest.max_files"]
-                },
-                "idempotency": "same kb+source_path is skipped when it already has active chunks",
-                "output_data": { "matched_count": "integer", "matched_files": "string[]", "skipped_existing": "integer", "memories_created": "integer", "chunks_created": "integer" }
-            },
             "update": {
                 "destructive": false,
                 "args": {},
