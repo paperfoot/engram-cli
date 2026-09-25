@@ -948,9 +948,10 @@ async fn adjudicate_plan(
                         resolution_tag: "semantic_llm",
                     }),
                     // Named but refused: an LLM is not evidence that a
-                    // medication stopped. The question survives.
-                    (true, false) => kept.push(q),
-                    (false, _) => {}
+                    // medication stopped. Not named: the judge said nothing
+                    // about this pair, and silence is not an answer — it used
+                    // to be dropped, an unrecorded coexist. Both survive.
+                    (true, false) | (false, _) => kept.push(q),
                 }
             }
             plan.queue = kept;

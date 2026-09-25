@@ -302,3 +302,43 @@ fn the_judge_still_settles_a_routine_question() {
     assert_eq!(v["data"]["facts_deduped"], 1, "{v}");
     assert_eq!(open_objects(tmp.path()), ["1990-04-12", "1990-04-13"]);
 }
+
+// ----- B11: a supersede that names one pair leaves the others asked --------
+
+#[test]
+fn pairs_the_judge_did_not_name_stay_queued() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
+    );
+    remember_facts(
+        tmp.path(),
+        "Ana was born 1990-04-13.",
+        &birthday("1990-04-13"),
+    );
+    let id_of = |object: &str| {
+        facts_for(tmp.path(), "Ana")
+            .into_iter()
+            .find(|f| f["object"] == object)
+            .and_then(|f| f["id"].as_str().map(str::to_string))
+            .expect("stored")
+    };
+    let first = id_of("1990-04-12");
+    let v = judged(
+        tmp.path(),
+        "Ana was born 1990-04-14.",
+        &birthday("1990-04-14"),
+        &format!(r#"{{"action":"supersede","ids":["{first}"]}}"#),
+    );
+    assert_eq!(v["data"]["conflicts"].as_array().unwrap().len(), 1, "{v}");
+    let asked: Vec<Value> = queued(&v);
+    assert_eq!(
+        asked.len(),
+        1,
+        "the unnamed 04-13 pair is still a question: {v}"
+    );
+    assert_eq!(asked[0]["old"]["object"], "1990-04-13");
+    assert_eq!(open_objects(tmp.path()), ["1990-04-13", "1990-04-14"]);
+}
