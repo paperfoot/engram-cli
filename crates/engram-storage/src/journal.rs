@@ -592,6 +592,22 @@ pub mod payload {
         drop_nulls(m)
     }
 
+    /// [V5] A close's `resolution` audit tag: WHICH rule or judge retired the
+    /// interval (`slot_lww`, `semantic_llm`, …). It used to live in the
+    /// projection alone, so `admin rebuild` erased it. Additive — readers
+    /// ignore unknown fields (interfaces §1) — and events written before it
+    /// carry none, so a replay keeps the tag the observed row already had.
+    ///
+    /// An audit tag and nothing more: a replay takes close authority from
+    /// `authority` and never from this string, or a forged `"caller"` here
+    /// would promote an imported close to a person's decision.
+    pub fn with_resolution(mut close: Value, resolution: Option<&str>) -> Value {
+        if let (Some(tag), Value::Object(m)) = (resolution, &mut close) {
+            m.insert("resolution".into(), json!(tag));
+        }
+        close
+    }
+
     pub fn fact_confirmed(fact_id: Uuid) -> Value {
         json!({ "fact_id": fact_id.to_string() })
     }

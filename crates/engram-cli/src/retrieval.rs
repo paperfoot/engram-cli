@@ -245,8 +245,16 @@ pub struct WriteEmbedder {
     pub prompt_format: String,
 }
 
+/// THE one constructor for a cloud Gemini embedder. Every call site must go
+/// through here so the fallback-key chain can never be forgotten again —
+/// `chunks repair` shipped without failover precisely because the wiring was
+/// sprinkled per site.
+pub fn cloud_gemini(key: String) -> GeminiEmbedder {
+    GeminiEmbedder::new(key).with_fallback_keys(crate::commands::config::gemini_fallback_keys())
+}
+
 /// Pick the embedder for one WRITE (`remember`, `memory add`, `edit`,
-/// `memory update`).
+/// `memory update`, `lessons add`, `chunks repair`, `reindex`).
 ///
 /// WHY THIS EXISTS. Every read surface hard-errors when a cloud profile has no
 /// Gemini key, but the write paths silently fell back to the 64-dim hash stub.
@@ -262,14 +270,6 @@ pub struct WriteEmbedder {
 /// Budget enforcement deliberately stays with the caller: `remember` gates every
 /// write on its KB budget (paid or not) before it does anything, which is not
 /// the read side's rule, and `edit` gates only its `--content` branch.
-/// THE one constructor for a cloud Gemini embedder. Every call site must go
-/// through here so the fallback-key chain can never be forgotten again —
-/// `chunks repair` shipped without failover precisely because the wiring was
-/// sprinkled per site.
-pub fn cloud_gemini(key: String) -> GeminiEmbedder {
-    GeminiEmbedder::new(key).with_fallback_keys(crate::commands::config::gemini_fallback_keys())
-}
-
 pub fn resolve_write_embedder(
     command: &str,
     offline: bool,
@@ -730,22 +730,39 @@ struct CandidateRecord {
     parent_chunk: Option<Uuid>,
 }
 
-fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
+/// The query side of the dense scan's cosine, normalised once per recall
+/// rather than once per chunk. Same f32 operations, in the same order, as the
+/// per-pair form it replaced, so every score is bit-identical.
+struct QueryVector<'a> {
+    v: &'a [f32],
+    norm: f32,
+}
+
+impl<'a> QueryVector<'a> {
+    fn new(v: &'a [f32]) -> Self {
+        let mut sq = 0f32;
+        for x in v {
+            sq += x * x;
+        }
+        Self { v, norm: sq.sqrt() }
     }
-    let mut dot = 0f32;
-    let mut na = 0f32;
-    let mut nb = 0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na.sqrt() * nb.sqrt())
+
+    /// Cosine similarity with `b`; 0.0 for a width mismatch or a zero vector.
+    fn cosine(&self, b: &[f32]) -> f32 {
+        if self.v.len() != b.len() {
+            return 0.0;
+        }
+        let mut dot = 0f32;
+        let mut nb = 0f32;
+        for (x, y) in self.v.iter().zip(b.iter()) {
+            dot += x * y;
+            nb += y * y;
+        }
+        if self.norm == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (self.norm * nb.sqrt())
+        }
     }
 }
 
@@ -910,9 +927,8 @@ where
     let allowed_chunks: Option<HashSet<Uuid>> =
         temporal_active.then(|| chunks.iter().map(|c| c.chunk_id).collect());
 
-    // Index chunk content/kb by id so the dense path can score all chunks
-    // without cloning content or fetching citations for every one — those are
-    // materialized lazily for only the post-fusion rerank pool (see below).
+    // Index the scanned chunks by id. They carry no text: the text and the
+    // citations are fetched for only the post-fusion rerank pool (see below).
     let chunk_index: HashMap<Uuid, &StoredChunkEmbedding> =
         chunks.iter().map(|c| (c.chunk_id, c)).collect();
 
@@ -935,12 +951,13 @@ where
         let q_emb = embedder
             .embed_one(params.query, TaskMode::RetrievalQuery)
             .await?;
+        let query = QueryVector::new(&q_emb);
         let mut dense_scored: Vec<(Uuid, f32)> = Vec::new();
         for chunk in &chunks {
             if chunk.embedding.len() != q_emb.len() {
                 continue;
             }
-            dense_scored.push((chunk.chunk_id, cosine_sim(&q_emb, &chunk.embedding)));
+            dense_scored.push((chunk.chunk_id, query.cosine(&chunk.embedding)));
         }
         dense_scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
@@ -1156,16 +1173,23 @@ where
     stats.top_score = fused.first().map(|(_, s)| s.into_inner());
 
     // Resolve content for ONLY the post-fusion rerank pool. Chunk candidates
-    // that were never materialized (dense/lexical-only hits) get their content
-    // from the in-memory chunk index — no per-candidate DB round-trip, and
-    // citations are fetched lazily below for just the survivors.
+    // that were never materialized (dense/lexical-only hits) take their text
+    // from one batch query over the in-scope pool ids; citations are fetched
+    // lazily below for just the survivors.
+    let pool = &fused[..fused.len().min(params.rerank_top_n)];
+    let pool_chunks: Vec<Uuid> = pool
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !candidate_records.contains_key(id) && chunk_index.contains_key(id))
+        .collect();
+    let chunk_text = store.chunk_contents(&pool_chunks)?;
     let mut rerank_candidates: Vec<RerankCandidate> = Vec::new();
     let mut candidate_ids: Vec<Uuid> = Vec::new();
-    for (id, _) in fused.iter().take(params.rerank_top_n) {
+    for (id, _) in pool {
         let text = if let Some(c) = candidate_records.get(id) {
             Some(c.content.clone())
         } else {
-            chunk_index.get(id).map(|c| c.content.clone())
+            chunk_text.get(id).cloned()
         };
         if let Some(text) = text {
             candidate_ids.push(*id);
@@ -1240,11 +1264,11 @@ where
                     citations,
                     c.parent_chunk,
                 )
-            } else if let Some(chunk) = chunk_index.get(&id) {
+            } else if let (Some(chunk), Some(text)) = (chunk_index.get(&id), chunk_text.get(&id)) {
                 let citations = store.citations_for_chunk(id).unwrap_or_default();
                 (
                     "chunk".to_string(),
-                    chunk.content.clone(),
+                    text.clone(),
                     chunk.kb.clone(),
                     citations,
                     None,

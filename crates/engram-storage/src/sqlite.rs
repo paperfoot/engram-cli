@@ -108,20 +108,20 @@ pub struct DocumentRecord {
     pub metadata: serde_json::Value,
 }
 
+/// One chunk as recall's dense scan scores it. No text: recall reads every
+/// chunk in scope, and the text is needed only for the few that survive
+/// fusion ([`SqliteStore::chunk_contents`] fetches those by id).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredChunkEmbedding {
     pub chunk_id: Uuid,
     pub memory_id: Uuid,
-    pub content: String,
     pub embedding: Vec<f32>,
     pub diary: String,
     pub kb: String,
-    pub section: Option<String>,
     pub embed_model: Option<String>,
     pub embed_dimensions: Option<usize>,
     pub embed_prompt_format: Option<String>,
     pub document_id: Option<Uuid>,
-    pub source: Option<String>,
 }
 
 /// A memory's two dates: its `--event-time` (when the content happened, if
@@ -1931,17 +1931,10 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub fn iter_chunks_with_embedding_records(
-        &self,
-        diary: Option<&str>,
-        kb: Option<&str>,
-    ) -> Result<Vec<StoredChunkEmbedding>, StorageError> {
-        self.iter_chunks_with_embedding_records_since(diary, kb, None, None)
-    }
-
-    /// Like `iter_chunks_with_embedding_records` but with optional temporal
-    /// bounds. `since`/`until` are RFC3339 timestamps compared against each
-    /// memory's effective event time `COALESCE(event_time, created_at)`, so a
+    /// Every live embedded chunk in scope, as recall's dense scan scores it:
+    /// vectors and scope metadata, no text (see [`StoredChunkEmbedding`]).
+    /// `since`/`until` are RFC3339 timestamps compared against each memory's
+    /// effective event time `COALESCE(event_time, created_at)`, so a
     /// `recall --since/--until` actually scopes results to that window instead
     /// of silently ignoring the flag.
     pub fn iter_chunks_with_embedding_records_since(
@@ -1952,12 +1945,10 @@ impl SqliteStore {
         until: Option<&str>,
     ) -> Result<Vec<StoredChunkEmbedding>, StorageError> {
         let mut sql = String::from(
-            "SELECT c.id, c.memory_id, c.content, c.embedding, m.diary, m.kb, c.section,
-                    c.embed_model, c.embed_dimensions, c.embed_prompt_format,
-                    c.document_id, COALESCE(d.source_path, json_extract(m.source_json, '$.path'))
+            "SELECT c.id, c.memory_id, c.embedding, m.diary, m.kb,
+                    c.embed_model, c.embed_dimensions, c.embed_prompt_format, c.document_id
              FROM chunks c
              JOIN memories m ON m.id = c.memory_id
-             LEFT JOIN documents d ON d.id = c.document_id
              WHERE c.embedding IS NOT NULL AND m.deleted = 0",
         );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1991,6 +1982,36 @@ impl SqliteStore {
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// The text of the given chunks, by id, in one query. Recall calls it for
+    /// the post-fusion candidate pool only. An id with no row (the chunk was
+    /// deleted since the scan) is simply absent from the map.
+    pub fn chunk_contents(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, StorageError> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id, content FROM chunks WHERE id IN ({placeholders})");
+        let binds: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, content) = row?;
+            if let Ok(id) = Uuid::parse_str(&id) {
+                out.insert(id, content);
+            }
+        }
+        Ok(out)
     }
 
     /// Ids of live memories whose validity window has closed strictly before
@@ -6014,21 +6035,18 @@ fn parse_memory_from_offset(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Mem
 fn parse_chunk_embedding_row(r: &rusqlite::Row) -> rusqlite::Result<StoredChunkEmbedding> {
     let chunk_id: String = r.get(0)?;
     let memory_id: String = r.get(1)?;
-    let blob: Vec<u8> = r.get(3)?;
-    let document_id: Option<String> = r.get(10)?;
+    let blob: Vec<u8> = r.get(2)?;
+    let document_id: Option<String> = r.get(8)?;
     Ok(StoredChunkEmbedding {
         chunk_id: Uuid::parse_str(&chunk_id).unwrap_or(Uuid::nil()),
         memory_id: Uuid::parse_str(&memory_id).unwrap_or(Uuid::nil()),
-        content: r.get(2)?,
         embedding: f32_bytes_to_vec(&blob),
-        diary: r.get(4)?,
-        kb: r.get(5)?,
-        section: r.get(6)?,
-        embed_model: r.get(7)?,
-        embed_dimensions: r.get::<_, Option<i64>>(8)?.map(|v| v as usize),
-        embed_prompt_format: r.get(9)?,
+        diary: r.get(3)?,
+        kb: r.get(4)?,
+        embed_model: r.get(5)?,
+        embed_dimensions: r.get::<_, Option<i64>>(6)?.map(|v| v as usize),
+        embed_prompt_format: r.get(7)?,
         document_id: document_id.and_then(|s| Uuid::parse_str(&s).ok()),
-        source: r.get(11)?,
     })
 }
 

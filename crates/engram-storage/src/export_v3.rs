@@ -556,14 +556,18 @@ mod tests {
             .iter()
             .map(|f| {
                 format!(
-                    "{}|{}|{}|{:?}|{:?}|{:?}|{}",
+                    "{}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
                     f.id,
                     f.object_norm,
                     f.kb,
                     f.valid_until,
                     f.close_reason,
                     f.superseded_by,
-                    f.fact_type.as_str()
+                    f.fact_type.as_str(),
+                    f.close_authority,
+                    // [V5] Which rule or judge closed it travels in the close
+                    // event now, so a round trip must bring it back.
+                    f.resolution
                 )
             })
             .collect();
@@ -740,6 +744,77 @@ mod tests {
         assert_eq!(report.close_authority_rejected, 0);
         let f = target.get_fact(lisbon).unwrap().unwrap();
         assert!(f.valid_until.is_some(), "Bruno really did move out");
+        assert_eq!(f.close_authority.as_deref(), Some("caller"));
+    }
+
+    /// [V5] `resolution` is an audit tag, never authority. A file whose close
+    /// event claims `resolution: "caller"` over `authority: "heuristic"`
+    /// lands the tag and keeps the machine authority — on import and again
+    /// on every rebuild — because nothing on the replay path maps the tag to
+    /// an authority.
+    #[test]
+    fn a_forged_caller_resolution_does_not_promote_a_heuristic_close() {
+        let (_tmp, _g, source) = temp_store();
+        let (_m, _porto, lisbon) = seed(&source);
+        let mut doc = source.export_v3(None).unwrap();
+        for e in doc.events.iter_mut() {
+            if e.kind == "fact.interval_closed" {
+                e.payload["authority"] = serde_json::json!("heuristic");
+                e.payload["resolution"] = serde_json::json!("caller");
+            }
+        }
+
+        let target = extra_store(&_tmp, "target");
+        target.import_v3(&doc).unwrap();
+        target.rebuild_projections(None, false).unwrap();
+        let f = target.get_fact(lisbon).unwrap().unwrap();
+        assert!(f.valid_until.is_some(), "an ordinary close still lands");
+        assert_eq!(f.close_authority.as_deref(), Some("heuristic"));
+        assert_eq!(f.resolution.as_deref(), Some("caller"));
+    }
+
+    /// [V5] The "would this move anything?" exemption compares `resolution`
+    /// too. A store holds its own closed allergy; an imported copy of that
+    /// close with a fresh event id moves nothing and is not counted, but the
+    /// same copy re-tagged with another judge would rewrite the safety fact's
+    /// audit trail, so the gate refuses it.
+    #[test]
+    fn an_imported_close_cannot_retag_a_closed_safety_fact() {
+        let (_tmp, _g, store) = temp_store();
+        let (_m, allergy) = seed_allergy(&store);
+        store
+            .close_fact_interval(
+                allergy,
+                chrono::Utc::now(),
+                "corrected",
+                "caller",
+                None,
+                Some("caller"),
+            )
+            .unwrap();
+        let close = store
+            .export_v3(None)
+            .unwrap()
+            .events
+            .into_iter()
+            .find(|e| e.kind == "fact.interval_closed")
+            .unwrap();
+        let replay = |id: &str, resolution: &str| {
+            let mut e = close.clone();
+            e.id = id.into();
+            e.payload["resolution"] = serde_json::json!(resolution);
+            let mut doc = store.export_v3(None).unwrap();
+            doc.events = vec![e];
+            store.import_v3(&doc).unwrap().close_authority_rejected
+        };
+
+        assert_eq!(replay("aaaaaaaa-bbbb-4ccc-8ddd-000000000001", "caller"), 0);
+        assert_eq!(
+            replay("aaaaaaaa-bbbb-4ccc-8ddd-000000000002", "semantic_llm"),
+            1
+        );
+        let f = store.get_fact(allergy).unwrap().unwrap();
+        assert_eq!(f.resolution.as_deref(), Some("caller"));
         assert_eq!(f.close_authority.as_deref(), Some("caller"));
     }
 
