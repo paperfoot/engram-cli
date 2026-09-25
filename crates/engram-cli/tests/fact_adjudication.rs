@@ -650,3 +650,52 @@ fn an_unusable_gate_threshold_is_exit_2_before_anything_is_stored() {
         .assert()
         .code(2);
 }
+
+// ----- B16: the dedup answer carries every always-present field ------------
+
+#[test]
+fn a_duplicate_remember_answers_with_every_required_field() {
+    let tmp = store();
+    let schema = run_json(
+        &mut engram(tmp.path()),
+        &["agent-info", "--schema", "remember"],
+    );
+    let required: Vec<String> = schema["properties"]["output"]["properties"]["data"]["required"]
+        .as_array()
+        .expect("remember publishes required data fields")
+        .iter()
+        .filter_map(|f| f.as_str().map(str::to_string))
+        .collect();
+    assert!(
+        required.contains(&"fact_extraction".to_string()),
+        "{required:?}"
+    );
+
+    let content = "Ana takes metformin 500 mg.";
+    let remember = |extra: &[&str]| {
+        let mut args = vec!["remember", content, "--kb", "personal"];
+        args.extend_from_slice(extra);
+        run_json(&mut engram(tmp.path()), &args)
+    };
+    let first = remember(&["--no-extract-facts"]);
+    assert_eq!(first["data"]["stored"], true, "{first}");
+
+    let facts = med("metformin 500 mg");
+    for (extra, status) in [
+        (vec!["--no-extract-facts"], "disabled"),
+        (vec!["--facts-json", facts.as_str()], "skipped_facts_json"),
+        (vec![], "skipped_duplicate"),
+    ] {
+        let v = remember(&extra);
+        assert_eq!(v["data"]["deduplicated"], true, "{v}");
+        for field in &required {
+            assert!(
+                v["data"].get(field).is_some(),
+                "{extra:?}: `{field}` is always-present in the schema: {v}"
+            );
+        }
+        assert_eq!(v["data"]["chunks"], 0, "nothing re-embedded: {v}");
+        assert_eq!(v["data"]["fact_extraction"], status, "{extra:?}: {v}");
+        assert_eq!(v["metadata"]["fact_extraction"], status, "{v}");
+    }
+}

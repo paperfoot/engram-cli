@@ -80,6 +80,9 @@ enum ExtractionStatus {
     CallerSupplied,
     /// No OpenRouter key resolved — the loud skip.
     SkippedNoKey,
+    /// Identical content was already stored: the extractor saw it then (or
+    /// `facts backfill` still will), so the duplicate costs no LLM call.
+    SkippedDuplicate,
     /// The LLM call was attempted and failed. The memory is still stored.
     Failed(String),
     /// The facts could not be persisted, so NOTHING was — a batch is one unit
@@ -100,6 +103,7 @@ impl ExtractionStatus {
             ExtractionStatus::Disabled => "disabled",
             ExtractionStatus::CallerSupplied => "skipped_facts_json",
             ExtractionStatus::SkippedNoKey => "skipped_no_openrouter_key",
+            ExtractionStatus::SkippedDuplicate => "skipped_duplicate",
             ExtractionStatus::Failed(_) => "failed",
             // Renamed from `failed_partial_persist`: a partial persist is
             // exactly what can no longer happen.
@@ -334,8 +338,21 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 validity_updated = ctx.store.set_memory_valid_until(existing, vu)?;
             }
             let facts_source_kind = facts_source_kind(caller_batch_committed, false);
+            // `chunks` and `fact_extraction` are always-present in the
+            // published schema; this envelope used to omit both. The flags
+            // keep their main-path meaning; otherwise extraction was skipped
+            // because the content is not new.
+            let status = if no_extract_facts {
+                ExtractionStatus::Disabled
+            } else if facts_json.is_some() && !force_extract_facts {
+                ExtractionStatus::CallerSupplied
+            } else {
+                ExtractionStatus::SkippedDuplicate
+            };
             let mut meta = Metadata::default();
             meta.add("deduplicated", true);
+            meta.add("chunks_stored", 0);
+            meta.add("fact_extraction", status.as_str());
             meta.add("existing_id", existing.to_string());
             if validity_updated {
                 meta.add("valid_until_updated", true);
@@ -357,7 +374,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     "stored": false,
                     "deduplicated": true,
                     "valid_until_updated": validity_updated,
+                    "chunks": 0,
                     "kb": kb,
+                    "fact_extraction": status.as_str(),
                     "facts_added": outcome.added,
                     "facts_source_kind": facts_source_kind,
                     "facts_deduped": outcome.deduped,
