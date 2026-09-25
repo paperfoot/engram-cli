@@ -1,4 +1,5 @@
-//! Chat LLM providers for answer generation and judging.
+//! Chat LLM providers for answer generation and judging, plus the calibrated
+//! judge (`judge`): typed questions in, calibrated probabilities out.
 //!
 //! Currently supports OpenRouter which proxies 350+ frontier models behind
 //! one OpenAI-compatible API. Use this for:
@@ -7,6 +8,7 @@
 //!  - Computing RAGAS metrics (faithfulness, relevance, etc.)
 
 pub mod error;
+pub mod judge;
 pub mod openrouter;
 pub mod stub;
 
