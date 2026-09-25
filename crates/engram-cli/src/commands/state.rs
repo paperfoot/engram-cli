@@ -37,7 +37,9 @@ use uuid::Uuid;
 
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::output::{print_success, Absence, Listing, Metadata, NearestSubject, Scope, Verdict};
+use crate::output::{
+    print_success, round_score, Absence, Listing, Metadata, NearestSubject, Scope, Verdict,
+};
 use crate::read_surface::{self, CursorKey, Provenance};
 
 /// The confidence terms, pinned as constants so the number and its published
@@ -123,11 +125,11 @@ pub struct ConfidenceBasis {
 impl ConfidenceBasis {
     fn to_json(&self) -> Value {
         json!({
-            "extraction": self.extraction,
-            "source_kind": self.source_kind,
-            "confirmations": self.confirmations,
-            "staleness": self.staleness,
-            "contested": self.contested,
+            "extraction": round_score(self.extraction),
+            "source_kind": round_score(self.source_kind),
+            "confirmations": round_score(self.confirmations),
+            "staleness": round_score(self.staleness),
+            "contested": self.contested.map(round_score),
         })
     }
 }
@@ -425,7 +427,11 @@ fn confidence_for(
         }
     };
     ConfidenceBasis {
-        extraction: f.confidence,
+        // The one term that can carry more than four real decimals (a
+        // caller-supplied `--facts-json` confidence). Rounded here, before
+        // the sum, so the published terms still add up to the published
+        // confidence once both are printed at four places.
+        extraction: round_score(f.confidence) as f32,
         source_kind,
         confirmations,
         staleness,
@@ -839,7 +845,7 @@ impl StateView {
                         "valid_from": v.fact.valid_from.map(|t| t.to_rfc3339()),
                         "valid_until": v.fact.valid_until.map(|t| t.to_rfc3339()),
                         "open": engram_core::interval::is_open_fact(&v.fact),
-                        "confidence": v.confidence,
+                        "confidence": round_score(v.confidence),
                         "confidence_basis": v.basis.to_json(),
                         "source_kind": v.fact.source_kind.as_str(),
                         "confirmations": v.fact.confirmations,
@@ -860,7 +866,7 @@ impl StateView {
             json!(self.resolved_from.as_str()),
         );
         if let SubjectResolution::Fuzzy { score } = self.resolved_from {
-            payload.insert("resolution_score".to_string(), json!(score));
+            payload.insert("resolution_score".to_string(), json!(round_score(score)));
         }
         payload.insert("as_of".to_string(), json!(self.as_of.to_rfc3339()));
         payload.insert("state".to_string(), Value::Array(state));

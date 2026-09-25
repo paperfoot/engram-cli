@@ -516,6 +516,83 @@ fn live_recall_output_satisfies_its_own_schema() {
     }
 }
 
+/// Scores are computed in `f32` and were printed widened to `f64`:
+/// `0.9200000166893005` for a stored `0.92`. Every score, confidence and
+/// threshold an agent reads is now four decimal places at most — on recall,
+/// on state (including a caller-supplied six-decimal confidence), and on the
+/// absence block a near-miss subject gets.
+#[test]
+fn no_serialized_score_carries_more_than_4_decimals() {
+    const SCORES: &[&str] = &[
+        "score",
+        "rerank_score",
+        "top_score",
+        "threshold",
+        "confidence",
+        "resolution_score",
+        "extraction",
+        "source_kind",
+        "confirmations",
+        "staleness",
+        "contested",
+    ];
+    fn walk(v: &Value, key: &str, seen: &mut usize, context: &str) {
+        match v {
+            Value::Object(map) => map.iter().for_each(|(k, v)| walk(v, k, seen, context)),
+            Value::Array(items) => items.iter().for_each(|v| walk(v, key, seen, context)),
+            Value::Number(n) if SCORES.contains(&key) && n.is_f64() => {
+                *seen += 1;
+                let text = n.to_string();
+                let decimals = text.split_once('.').map_or(0, |(_, d)| d.len());
+                assert!(
+                    decimals <= 4 && !text.contains('e'),
+                    "{context}: `{key}` printed as {text}"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let sb = Sandbox::new();
+    remember(&sb, "Sarah prefers async standups; sync only for incidents");
+    remember(&sb, "The pricing model is annual only, decided in March");
+    let facts =
+        r#"[{"subject":"Ana","predicate":"lives_in","object":"Lisbon","confidence":0.123456}]"#;
+    let out = sb
+        .cmd()
+        .args([
+            "remember",
+            "Ana lives in Lisbon",
+            "--kb",
+            "personal",
+            "--offline",
+        ])
+        .args(["--facts-json", facts])
+        .output()
+        .expect("remember");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut seen = 0;
+    // `Anna` is a fuzzy match (resolution_score); `Zed` is an absence with a
+    // threshold, a top score and scored nearest subjects.
+    let probes: [&[&str]; 4] = [
+        &["recall", "pricing standups", "--profile", "offline"],
+        &["state", "Ana"],
+        &["state", "Anna"],
+        &["state", "Zed"],
+    ];
+    for argv in probes {
+        let out = sb.cmd().args(argv).output().expect("probe");
+        assert!(out.status.success(), "{argv:?}");
+        walk(&Sandbox::json(&out), "", &mut seen, &argv.join(" "));
+    }
+    assert!(seen > 5, "the fixture printed only {seen} scores to check");
+}
+
 // --- the taxonomy and the vocabularies --------------------------------------
 
 /// The four codes v0.4 added are documented, with the exits and the

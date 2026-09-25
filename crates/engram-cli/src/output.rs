@@ -207,11 +207,24 @@ impl Scope {
     }
 }
 
+/// A computed score or confidence, as published: four decimal places.
+/// Scores are `f32`, and widening one to `f64` for `json!` prints
+/// `0.9200000166893005` — fourteen digits of conversion noise around two of
+/// signal, paid for by every reader and mistaken by some for precision.
+pub fn round_score(x: impl Into<f64>) -> f64 {
+    (x.into() * 1e4).round() / 1e4
+}
+
+fn serialize_score<S: serde::Serializer>(x: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(round_score(*x))
+}
+
 /// A subject the store nearly matched. Reasoning-layer's near-miss list, so
 /// "no such subject" can say which subjects do exist.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct NearestSubject {
     pub subject: String,
+    #[serde(serialize_with = "serialize_score")]
     pub score: f64,
 }
 
@@ -262,10 +275,10 @@ impl Absence {
     fn to_value(&self) -> Value {
         let mut obj = serde_json::Map::new();
         if let Some(s) = self.top_score {
-            obj.insert("top_score".to_string(), json!(s));
+            obj.insert("top_score".to_string(), json!(round_score(s)));
         }
         if let Some(t) = self.threshold {
-            obj.insert("threshold".to_string(), json!(t));
+            obj.insert("threshold".to_string(), json!(round_score(t)));
         }
         obj.insert("searched_kbs".to_string(), json!(self.searched_kbs));
         obj.insert("searched_chunks".to_string(), json!(self.searched_chunks));

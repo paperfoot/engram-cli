@@ -3,7 +3,7 @@
 use crate::commands::usage::{cohere_rerank_cost_usd, estimated_tokens, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::output::{print_envelope, Metadata, Scope, Verdict};
+use crate::output::{print_envelope, round_score, Metadata, Scope, Verdict};
 use crate::read_surface::{self, RequestShape};
 use crate::respond;
 use crate::retrieval::{
@@ -187,8 +187,8 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             "handle": read_surface::hit_handle(&r.kind, r.id),
             "provenance": r.provenance.to_json(),
             "kind": r.kind,
-            "score": r.score,
-            "rerank_score": r.rerank_score,
+            "score": round_score(r.score),
+            "rerank_score": r.rerank_score.map(round_score),
             "kb": r.kb,
             "content": r.content,
             "citations": r.citations.iter().map(|c| json!({
