@@ -321,23 +321,7 @@ async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'stat
     let Some(client) = client else {
         return "probe_error";
     };
-    // The key rides in a header, never the URL: reqwest puts the URL in its
-    // error text, so a `?key=` URL leaks the key wherever an error is shown.
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
-        engram_embed::gemini::DEFAULT_MODEL
-    );
-    let body = json!({
-        "content": {"parts": [{"text": "probe"}]},
-        "outputDimensionality": 8,
-    });
-    match client
-        .post(&url)
-        .header("x-goog-api-key", key)
-        .json(&body)
-        .send()
-        .await
-    {
+    match gemini_probe(client, key).send().await {
         Err(_) => "unreachable",
         Ok(resp) => match resp.status().as_u16() {
             200 => "ok",
@@ -346,6 +330,20 @@ async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'stat
             _ => "probe_error",
         },
     }
+}
+
+/// The probe request. The key rides in a header, never the URL: reqwest
+/// puts the URL in its error text, so a `?key=` URL leaks the key wherever
+/// an error is shown.
+fn gemini_probe(client: &reqwest::Client, key: &str) -> reqwest::RequestBuilder {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
+        engram_embed::gemini::DEFAULT_MODEL
+    );
+    client.post(url).header("x-goog-api-key", key).json(&json!({
+        "content": {"parts": [{"text": "probe"}]},
+        "outputDimensionality": 8,
+    }))
 }
 
 fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
@@ -501,6 +499,32 @@ mod tests {
             assert!(!msg.contains("AIza"), "{msg}");
             assert!(msg.contains("/c/config.toml at line "), "{msg}");
         }
+    }
+
+    #[test]
+    fn an_empty_key_is_absent_in_env_and_in_the_file() {
+        let file: toml::Value = toml::from_str("[keys]\ntypesafe = \"\"\n").unwrap();
+        // Read by these tests only.
+        let unset = "ENGRAM_TEST_UNSET_KEY_3F9C1B";
+        let empty = "ENGRAM_TEST_EMPTY_KEY_3F9C1B";
+        std::env::set_var(empty, "");
+        for env in [unset, empty] {
+            assert!(!has_key(env, &file, "keys.typesafe"), "{env}");
+            assert_eq!(
+                describe_key_source(env, &file, "keys.typesafe"),
+                json!({ "source": "unset" }),
+                "{env}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gemini_probe_sends_its_key_in_a_header_not_the_url() {
+        let key = "AIzaFAKEPROBEKEY0123456789";
+        let req = gemini_probe(&reqwest::Client::new(), key).build().unwrap();
+        assert_eq!(req.url().query(), None);
+        assert!(!req.url().as_str().contains(key));
+        assert_eq!(req.headers()["x-goog-api-key"], key);
     }
 
     #[test]
