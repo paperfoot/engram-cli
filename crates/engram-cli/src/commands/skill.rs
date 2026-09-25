@@ -20,7 +20,9 @@ pub fn run(ctx: &AppContext, sub: SkillCommand) -> Result<(), CliError> {
     }
 }
 
-fn target_dirs() -> Vec<PathBuf> {
+/// The four directories install writes and uninstall clears; `doctor` reads
+/// the same list to report each copy's freshness.
+pub(crate) fn target_dirs() -> Vec<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|d| d.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
