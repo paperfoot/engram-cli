@@ -895,18 +895,18 @@ async fn gather_judgements(
         let judged = match prepared {
             Prepared::Planned(p) if !p.plan.queue.is_empty() => {
                 let by_id = p.by_id();
-                let olds: Vec<&Fact> = p
+                let pairs: Vec<(&PlannedConflict, &Fact)> = p
                     .plan
                     .queue
                     .iter()
-                    .filter_map(|q| by_id.get(&q.old_fact_id).copied())
+                    .filter_map(|q| by_id.get(&q.old_fact_id).map(|old| (q, *old)))
                     .collect();
-                if olds.is_empty() {
+                if pairs.is_empty() {
                     None
                 } else {
                     Some(Judged {
                         about: JudgedPairs::of(&p.observation, &p.plan.queue),
-                        judgement: judge_pairs(llm, &p.text, &olds).await,
+                        judgement: judge_pairs(llm, &p.text, &pairs).await,
                     })
                 }
             }
@@ -940,17 +940,26 @@ impl Judgement {
 }
 
 /// THE JUDGE SEAM: one observation (`new_fact`, rendered "subject relation
-/// object") and the stored facts its queued pairs name, in; one verdict out.
+/// object") and its queued pairs, each the classifier's question (rule,
+/// semantic key, suggested action) with the stored fact it is about, in; one
+/// verdict out.
 ///
 /// Called with no transaction open. Whatever it returns, the applier enforces
 /// the same limits: a failure keeps every pair queued, a safety pair is never
-/// cleared or discarded, a close needs `may_close`. A different judge plugs in
-/// here and inherits all three, and its answers are journaled under its own
-/// name (`judge:<judge>`, see [`record_judgement`]).
-pub async fn judge_pairs(llm: &dyn ChatLlm, new_fact: &str, olds: &[&Fact]) -> Judgement {
-    let rendered: Vec<String> = olds
+/// cleared or discarded, a close needs `may_close`. A different judge is a
+/// function of this shape swapped in at the one call in
+/// [`gather_judgements`]; it inherits all three limits, and its answers are
+/// journaled under its own name (`judge:<judge>`, see [`record_judgement`]).
+pub async fn judge_pairs(
+    llm: &dyn ChatLlm,
+    new_fact: &str,
+    pairs: &[(&PlannedConflict, &Fact)],
+) -> Judgement {
+    // The LLM prompt only reads the stored facts; the rule and key are there
+    // for a judge that uses them.
+    let rendered: Vec<String> = pairs
         .iter()
-        .map(|f| format!("{} | {} {} {}", f.id, f.subject, f.predicate, f.object))
+        .map(|(_, f)| format!("{} | {} {} {}", f.id, f.subject, f.predicate, f.object))
         .collect();
     let action = adjudicate(llm, new_fact, &rendered).await.map_err(|e| {
         // Logged, never echoed into the envelope: the error is sanitized,
@@ -1923,15 +1932,6 @@ mod tests {
     async fn an_unreachable_judge_gives_no_verdict_and_every_pair_survives() {
         let old = metformin("metformin 500 mg").to_fact(moment("2025-01-01"));
         let new = metformin("metformin 1000 mg");
-        let judgement = judge_pairs(
-            &Unreachable,
-            "Ana takes_medication metformin 1000 mg",
-            &[&old],
-        )
-        .await;
-        assert_eq!(judgement.action, Err("llm_error"));
-        assert_eq!(judgement.model, "unreachable-model");
-
         let prior = |_: &SemanticKey| Ok(None);
         let mut plan = plan_write(
             &new,
@@ -1943,6 +1943,16 @@ mod tests {
         .unwrap();
         assert_eq!(plan.queue.len(), 1, "a dose change is a question");
         let before = plan.queue.clone();
+
+        let judgement = judge_pairs(
+            &Unreachable,
+            "Ana takes_medication metformin 1000 mg",
+            &[(&before[0], &old)],
+        )
+        .await;
+        assert_eq!(judgement.action, Err("llm_error"));
+        assert_eq!(judgement.model, "unreachable-model");
+
         let by_id: HashMap<Uuid, &Fact> = HashMap::from([(old.id, &old)]);
         apply_judgement(&mut plan, &new, &by_id, &judgement);
         assert_eq!(plan.queue, before, "no verdict decides nothing");
