@@ -22,7 +22,6 @@ use engram_cli::cli::Cli;
 const NOT_YET_TRANSCRIBED: &[&str] = &[
     "agent-info",
     "reindex",
-    "doctor",
     "usage",
     "budget show",
     "budget set",
@@ -31,7 +30,6 @@ const NOT_YET_TRANSCRIBED: &[&str] = &[
     "skill package",
     "skill uninstall",
     "ingest",
-    "repair",
     "update",
 ];
 

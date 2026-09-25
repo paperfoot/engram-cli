@@ -117,12 +117,6 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
                 "idempotency": "same kb+source_path is skipped when it already has active chunks",
                 "output_data": { "matched_count": "integer", "matched_files": "string[]", "skipped_existing": "integer", "memories_created": "integer", "chunks_created": "integer" }
             },
-            "repair": {
-                "destructive": true,
-                "safe_mode": "--dry-run",
-                "mutating_mode": "--confirm",
-                "repairs": ["facts from deleted memories", "derived graph residue in empty KBs"]
-            },
             "update": {
                 "destructive": false,
                 "args": {},

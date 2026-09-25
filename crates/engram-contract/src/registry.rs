@@ -2420,6 +2420,48 @@ const PEOPLE_SHOW_FLAGS: &[FlagSpec] = &[
     },
 ];
 
+const DOCTOR_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        name: "compiler",
+        cli_long: "compiler",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "also require an OpenRouter key for `ok`",
+    },
+    FlagSpec {
+        name: "integrity",
+        cli_long: "integrity",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "also run the store lifecycle checks and report them under `integrity`",
+    },
+];
+
+const REPAIR_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        name: "dry_run",
+        cli_long: "dry-run",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "safe mode: report what would be repaired and write nothing; wins over --confirm",
+    },
+    FlagSpec {
+        name: "confirm",
+        cli_long: "confirm",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "required to apply the repair",
+    },
+];
+
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         path: "remember",
@@ -3535,6 +3577,66 @@ pub const COMMANDS: &[CommandSpec] = &[
             "Each configured Gemini key costs one tiny live embed call; nothing else is called.",
         ],
         examples: &["engram config check --json"],
+    },
+    CommandSpec {
+        path: "doctor",
+        aliases: &[],
+        summary: "Check keys (presence only), store schema, embedding consistency, the daemon port and, with --integrity, lifecycle residue.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: DOCTOR_FLAGS,
+        data: &[
+            FieldSpec { name: "ok", ty: Ty::Bool, doc: "every check passed; see rules for what it requires", always: true },
+            FieldSpec { name: "keys", ty: Ty::Object, doc: "{ gemini, cohere, openrouter: present|missing, note }", always: true },
+            FieldSpec { name: "db", ty: Ty::Object, doc: "{ path, schema_version }", always: true },
+            FieldSpec { name: "compiler", ty: Ty::Object, doc: "{ llm_requested, openrouter_required, extraction_model, synthesis_model }", always: true },
+            FieldSpec { name: "embedding", ty: Ty::Object, doc: "{ expected_model, expected_dimensions, expected_prompt_format, consistent, profiles: [{ model, dimensions, prompt_format, count }] }", always: true },
+            FieldSpec { name: "daemon", ty: Ty::Object, doc: "{ host, port, available } — available means nothing listens on the port yet", always: true },
+            FieldSpec { name: "integrity", ty: Ty::Nullable(&Ty::Object), doc: "null without --integrity, else { ok, stale_facts_from_deleted_memories, orphan_chunks, empty_kbs_with_derived, duplicate_source_documents, unregistered_kbs }", always: true },
+        ],
+        metadata: ELAPSED_ONLY,
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1],
+        rules: &[
+            "`ok: false` is still exit 0: read the sub-objects for which check failed. `ok` needs Gemini and Cohere keys present (OpenRouter too under --compiler), every chunk on the cloud Gemini embedding profile, port 8768 free, and a clean integrity report when --integrity ran.",
+            "An offline store (stub vectors) reports `embedding.consistent: false`, and a running `engram serve` reports `daemon.available: false`; both make `ok` false without anything being broken.",
+            "No network call is made. `engram config check` live-probes the keys.",
+            "Integrity residue is healed by `engram repair` (facts of deleted memories, derived rows in KBs with no memories) and `engram kb repair` (unregistered_kbs). Orphan chunks and duplicate source documents are reported only.",
+        ],
+        examples: &["engram doctor --json", "engram doctor --integrity --json"],
+    },
+    CommandSpec {
+        path: "repair",
+        aliases: &[],
+        summary: "Close the facts of deleted memories and clear derived rows left in KBs that hold no memories.",
+        destructive: true,
+        requires: &["--confirm"],
+        opens_store: true,
+        args: &[],
+        flags: REPAIR_FLAGS,
+        data: &[FieldSpec {
+            name: "repair",
+            ty: Ty::Object,
+            doc: "{ dry_run, facts_from_deleted_memories_removed, facts_from_deleted_memories_closed, derived_kbs_cleared: [kb], duplicate_source_documents: [{ document_id, kb, source_path, active_memories, active_chunks }] }",
+            always: true,
+        }],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "dry_run", ty: Ty::Bool, doc: "as in data", always: true },
+            FieldSpec { name: "facts_from_deleted_memories_removed", ty: Ty::Int, doc: "as in data", always: true },
+            FieldSpec { name: "derived_kbs_cleared", ty: Ty::Int, doc: "length of data.repair.derived_kbs_cleared", always: true },
+            FieldSpec { name: "duplicate_source_documents", ty: Ty::Int, doc: "length of data.repair.duplicate_source_documents", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &[
+            "Neither --dry-run nor --confirm is `bad_input` (exit 3). Run --dry-run first.",
+            "Facts of deleted memories are CLOSED (close_reason `retracted_source`), never deleted. `facts_from_deleted_memories_removed` is the number FOUND, despite its name; `facts_from_deleted_memories_closed` is the number this run closed.",
+            "Derived rows (claims, entities, relations, wiki pages) are deleted only in KBs with no active memories; `compile` rebuilds them. Duplicate source documents are reported, never touched.",
+        ],
+        examples: &["engram repair --dry-run --json", "engram repair --confirm --json"],
     },
 ];
 
