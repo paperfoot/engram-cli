@@ -3,7 +3,7 @@ name: engram
 description: Personal, business, and project memory for AI agents — durable facts, decisions, relationships, competitor/market intel, and project context. Use BEFORE answering to recall prior facts/decisions, and AFTER learning something durable to remember it. This is for PERSONAL/BUSINESS knowledge, NOT scientific-paper corpora — for research literature (papers, neuromodulation/medical corpora) use the superlibrary skill instead. Shell out to `engram` for hybrid semantic + keyword retrieval. Run `engram agent-info` once to discover every command.
 compatibility: Requires the `engram` CLI on PATH. Works with Claude Code, Codex, Gemini CLI, and Agent Skills compatible clients.
 metadata:
-  schema_hash: "10d95a0ee7d55c968a6df9e4441e5393"
+  schema_hash: "b084bb53b10e5e398ad880f38f35c328"
   contract_version: "contract@1"
   homepage: "https://github.com/paperfoot/engram-cli"
   package: "engram-skill.zip"

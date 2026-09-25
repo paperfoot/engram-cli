@@ -2462,6 +2462,36 @@ const REPAIR_FLAGS: &[FlagSpec] = &[
     },
 ];
 
+const REINDEX_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        name: "kb",
+        cli_long: "kb",
+        aliases: &[],
+        ty: Ty::Str,
+        default: None,
+        required: false,
+        doc: "the one KB to re-embed; this or --all is required",
+    },
+    FlagSpec {
+        name: "all",
+        cli_long: "all",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "re-embed every KB",
+    },
+    FlagSpec {
+        name: "offline",
+        cli_long: "offline",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "re-embed with the 64-dim offline stub instead of Gemini; searchable only by --profile offline reads",
+    },
+];
+
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         path: "remember",
@@ -3637,6 +3667,39 @@ pub const COMMANDS: &[CommandSpec] = &[
             "Derived rows (claims, entities, relations, wiki pages) are deleted only in KBs with no active memories; `compile` rebuilds them. Duplicate source documents are reported, never touched.",
         ],
         examples: &["engram repair --dry-run --json", "engram repair --confirm --json"],
+    },
+    CommandSpec {
+        path: "reindex",
+        aliases: &[],
+        summary: "Re-embed every chunk in one KB or all of them, so the store sits on one embedding model again.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: REINDEX_FLAGS,
+        data: &[
+            FieldSpec { name: "chunks_reindexed", ty: Ty::Int, doc: "chunks re-embedded", always: true },
+            FieldSpec { name: "kb", ty: Ty::Str, doc: "the KB, or '*' under --all", always: true },
+            FieldSpec { name: "model", ty: Ty::Str, doc: "the embedding model now on those chunks", always: true },
+            FieldSpec { name: "dimensions", ty: Ty::Int, doc: "its vector size", always: true },
+            FieldSpec { name: "prompt_format", ty: Ty::Str, doc: "its prompt format", always: true },
+            FieldSpec { name: "degraded", ty: Ty::Str, doc: "set when a fallback Gemini key served the rebuild; fix the primary", always: false },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time of the re-embed", always: true },
+            FieldSpec { name: "chunks_reindexed", ty: Ty::Int, doc: "as in data", always: true },
+            FieldSpec { name: "model", ty: Ty::Str, doc: "as in data", always: true },
+            FieldSpec { name: "dimensions", ty: Ty::Int, doc: "as in data", always: true },
+            FieldSpec { name: "prompt_format", ty: Ty::Str, doc: "as in data", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 2, 3, 4],
+        rules: &[
+            "This is the fix recall names when a store mixes stub and cloud vectors: `engram reindex --all` with a Gemini key.",
+            "Without a Gemini key and without --offline it is `config_error` (exit 2) and nothing changes. --offline replaces every selected vector with the stub, which only --profile offline reads can search; do not use it to make the error go away.",
+            "Neither --kb nor --all is `bad_input` (exit 3). A cloud run pays to re-embed every selected chunk and is recorded in `engram usage`.",
+        ],
+        examples: &["engram reindex --all --json", "engram reindex --kb personal --json"],
     },
 ];
 
