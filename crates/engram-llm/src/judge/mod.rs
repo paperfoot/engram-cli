@@ -9,6 +9,8 @@
 //!
 //! The seam later code writes against:
 //! - [`Judge`] — the provider trait.
+//! - [`questions`] — the ONE module holding every question text, criterion and
+//!   threshold. Nothing else in engram writes question wording.
 //! - [`ask_batched`] — splits an oversized request, runs the parts with
 //!   bounded concurrency and merges the answers.
 //! - [`JudgeResponse::noul`] — a missing or mistyped answer is an error for
@@ -17,6 +19,7 @@
 //!   the judge is compared against and falls back to.
 
 pub mod lexical;
+pub mod questions;
 
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
