@@ -358,6 +358,22 @@ pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The value at a dotted `toml_path` in config.toml, `None` when unset.
+/// Unlike [`resolve_config_string`], an unreadable or invalid file is an
+/// error rather than "unset", for settings that must never fall back to a
+/// default silently.
+pub fn config_value(toml_path: &str) -> Result<Option<toml::Value>, CliError> {
+    let root = read_toml()?;
+    let mut cur = &root;
+    for part in toml_path.split('.') {
+        match cur.get(part) {
+            Some(next) => cur = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cur.clone()))
+}
+
 pub fn resolve_config_string(toml_path: &str) -> Option<String> {
     let root = read_toml().ok()?;
     let mut cur = &root;
