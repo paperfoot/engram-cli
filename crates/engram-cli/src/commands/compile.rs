@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompileStats {
     pub kb: String,
     pub chunks_scanned: usize,
@@ -296,67 +296,51 @@ pub async fn compile_kb_with_options(
     options: CompileOptions,
 ) -> Result<CompileStats, CliError> {
     ctx.store.ensure_kb(kb, None)?;
-    let chunks = ctx.store.list_chunks_for_kb(kb)?;
+    let mut stats = CompileStats {
+        kb: kb.to_string(),
+        llm_enabled: options.llm,
+        extraction_model: options.llm.then_some(options.extraction_model.clone()),
+        synthesis_model: options.llm.then_some(options.synthesis_model.clone()),
+        ..Default::default()
+    };
+
+    // Every provider call happens first, with no transaction open. The write
+    // lock used to be held across one extraction call per chunk plus the
+    // synthesis call (up to ~16 min per call under the provider retries),
+    // and every other writer failed on its 5 s busy_timeout meanwhile. A
+    // provider error still aborts the compile, now before anything is written.
+    let gathered = if options.llm {
+        Some(gather_llm(ctx, kb, &options).await?)
+    } else {
+        None
+    };
 
     // Build-then-swap: clear + rebuild happen inside ONE transaction. Under
     // WAL, concurrent readers keep seeing the previous compilation until
-    // commit; if the rebuild fails partway (e.g. the LLM provider dies at
-    // chunk 40/100), rollback restores the previous good compilation instead
-    // of leaving the KB half-wiped.
-    let mut usage_events: Vec<PendingUsage> = Vec::new();
+    // commit; if the rebuild fails partway, rollback restores the previous
+    // good compilation instead of leaving the KB half-wiped.
     ctx.store.begin_immediate()?;
-    let result = compile_within_tx(ctx, kb, &chunks, &options, &mut usage_events).await;
-    let stats = match result {
-        Ok(stats) => {
-            ctx.store.commit()?;
-            stats
-        }
+    match compile_within_tx(ctx, kb, gathered, &mut stats).await {
+        Ok(()) => ctx.store.commit()?,
         Err(e) => {
             let _ = ctx.store.rollback();
-            // Usage was still spent even though the compile failed; record
-            // it outside the rolled-back transaction.
-            flush_usage_events(ctx, kb, &usage_events);
             return Err(e);
         }
-    };
-    flush_usage_events(ctx, kb, &usage_events);
+    }
     Ok(stats)
 }
 
 async fn compile_within_tx(
     ctx: &AppContext,
     kb: &str,
-    chunks: &[engram_storage::ChunkRecord],
-    options: &CompileOptions,
-    usage_events: &mut Vec<PendingUsage>,
-) -> Result<CompileStats, CliError> {
+    gathered: Option<LlmGathered>,
+    stats: &mut CompileStats,
+) -> Result<(), CliError> {
     ctx.store.clear_derived_for_kb(kb)?;
-
-    let mut stats = CompileStats {
-        kb: kb.to_string(),
-        chunks_scanned: chunks.len(),
-        source_spans: 0,
-        claims: 0,
-        entities: 0,
-        people: 0,
-        relations: 0,
-        person_relations: 0,
-        takeaways: 0,
-        wiki_pages: 0,
-        llm_enabled: options.llm,
-        llm_extraction_chunks: 0,
-        llm_claims: 0,
-        llm_claims_rejected: 0,
-        llm_facts: 0,
-        llm_facts_rejected: 0,
-        llm_facts_queued: 0,
-        llm_entities: 0,
-        llm_relations: 0,
-        llm_takeaways: 0,
-        llm_wiki_pages: 0,
-        extraction_model: options.llm.then_some(options.extraction_model.clone()),
-        synthesis_model: options.llm.then_some(options.synthesis_model.clone()),
-    };
+    // Listed inside the transaction: the LLM gather may have run for minutes,
+    // and a memory forgotten meanwhile must not get claims or entities.
+    let chunks = ctx.store.list_chunks_for_kb(kb)?;
+    stats.chunks_scanned = chunks.len();
 
     let mut entity_ids: HashMap<String, uuid::Uuid> = HashMap::new();
     let mut entity_display: HashMap<String, String> = HashMap::new();
@@ -373,7 +357,7 @@ async fn compile_within_tx(
     // when two full names compete for it (see `PersonIndex`).
     let person_index = {
         let mut builder = engram_graph::people::PersonIndexBuilder::default();
-        for chunk in chunks {
+        for chunk in &chunks {
             // Each extraction is folded in and dropped: only the name/kind
             // aggregate is kept, never every chunk's edges and sentences.
             builder.add(&engram_graph::people::analyze(&chunk.content));
@@ -381,7 +365,7 @@ async fn compile_within_tx(
         builder.finish()
     };
 
-    for chunk in chunks {
+    for chunk in &chunks {
         // Chunk-level span (no char offset — used by the LLM path, which
         // attributes claims to the whole chunk).
         let preview: String = chunk.content.chars().take(500).collect();
@@ -545,16 +529,15 @@ async fn compile_within_tx(
         }
     }
 
-    if options.llm {
-        run_llm_compiler(
+    if let Some(gathered) = gathered {
+        apply_llm_evidence(
             ctx,
             kb,
-            chunks,
+            &chunks,
             &span_by_chunk,
+            gathered,
             &mut entity_mentions,
-            &mut stats,
-            options,
-            usage_events,
+            stats,
         )
         .await?;
     }
@@ -566,8 +549,8 @@ async fn compile_within_tx(
         .store
         .list_entities_by_kind(Some(kb), engram_graph::people::KIND_PERSON, usize::MAX, 1)?
         .len();
-    stats.wiki_pages = write_wiki(ctx, kb, chunks, &entity_mentions)?;
-    Ok(stats)
+    stats.wiki_pages = write_wiki(ctx, kb, &chunks, &entity_mentions)?;
+    Ok(())
 }
 
 /// Non-person entities kept per chunk. The chunker caps chunks at ~1800
@@ -579,40 +562,36 @@ const MAX_ENTITIES_PER_CHUNK: usize = 16;
 /// dinner is exactly the note a networker cares about most.
 const MAX_PEOPLE_PER_CHUNK: usize = 32;
 
-/// A cloud-usage record buffered during a compile transaction. Usage is
-/// flushed AFTER commit/rollback so a rolled-back compile still accounts for
-/// the tokens it spent.
-struct PendingUsage {
-    operation: &'static str,
-    model: String,
-    fallback_prompt_tokens: i64,
-    prompt_tokens: Option<u32>,
-    completion_tokens: Option<u32>,
-}
-
-fn flush_usage_events(ctx: &AppContext, kb: &str, events: &[PendingUsage]) {
-    for ev in events {
-        let input = ev
-            .prompt_tokens
-            .map(|v| v as i64)
-            .unwrap_or(ev.fallback_prompt_tokens);
-        let output = ev.completion_tokens.map(|v| v as i64).unwrap_or(0);
-        if let Err(e) = ctx.store.record_usage_event(
-            "openrouter",
-            ev.operation,
-            Some(&ev.model),
-            Some(kb),
-            None,
-            1,
-            1,
-            input,
-            output,
-            0.0,
-            0.0,
-            json!({ "estimated_cost": false }),
-        ) {
-            tracing::warn!("failed to record compiler usage event: {e}");
-        }
+/// One usage row per paid compiler call, written as soon as it is paid for:
+/// no transaction is open during the gather phase, so a compile that fails
+/// later still accounts for the tokens it spent.
+fn record_compiler_usage(
+    ctx: &AppContext,
+    kb: &str,
+    operation: &str,
+    response: &engram_llm::ChatResponse,
+    prompt: &str,
+) {
+    let input = response
+        .prompt_tokens
+        .map(i64::from)
+        .unwrap_or_else(|| estimated_tokens(prompt));
+    let output = response.completion_tokens.map(i64::from).unwrap_or(0);
+    if let Err(e) = ctx.store.record_usage_event(
+        "openrouter",
+        operation,
+        Some(&response.model),
+        Some(kb),
+        None,
+        1,
+        1,
+        input,
+        output,
+        0.0,
+        0.0,
+        json!({ "estimated_cost": false }),
+    ) {
+        tracing::warn!("failed to record compiler usage event: {e}");
     }
 }
 
@@ -664,26 +643,31 @@ fn resolve_compiler_llms(options: &CompileOptions) -> Result<CompilerLlms, CliEr
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_llm_compiler(
+/// What the network phase of an LLM compile produced, for the write
+/// transaction to apply.
+struct LlmGathered {
+    /// Parsed extractions, in chunk order.
+    extracted: Vec<(uuid::Uuid, LlmEvidence)>,
+    /// The synthesis overview, citations not yet validated.
+    overview: Option<String>,
+    /// The chunks the synthesis call was given: the citations it may make.
+    synthesis_chunk_ids: HashSet<uuid::Uuid>,
+}
+
+/// Every provider call of an LLM compile, with no transaction open.
+async fn gather_llm(
     ctx: &AppContext,
     kb: &str,
-    chunks: &[engram_storage::ChunkRecord],
-    span_by_chunk: &HashMap<uuid::Uuid, uuid::Uuid>,
-    entity_mentions: &mut BTreeMap<String, usize>,
-    stats: &mut CompileStats,
     options: &CompileOptions,
-    usage_events: &mut Vec<PendingUsage>,
-) -> Result<(), CliError> {
+) -> Result<LlmGathered, CliError> {
     // Spend guardrails bind before a provider is chosen, whichever it is.
     crate::commands::budget::enforce_budget(ctx, Some(kb))?;
     let (extraction_llm, synthesis_llm, live) = resolve_compiler_llms(options)?;
+    let chunks = ctx.store.list_chunks_for_kb(kb)?;
     let max_chunks = options.max_llm_chunks.unwrap_or(chunks.len());
-    // Bound the corpus the synthesis pass may cite to the chunks actually
-    // seen, so we can validate its [chunk:uuid] citations.
-    let known_chunk_ids: HashSet<uuid::Uuid> =
-        chunks.iter().take(max_chunks).map(|c| c.chunk_id).collect();
-    for chunk in chunks.iter().take(max_chunks) {
+    let in_scope = &chunks[..max_chunks.min(chunks.len())];
+    let mut extracted = Vec::new();
+    for chunk in in_scope {
         let prompt = extraction_prompt(kb, chunk);
         let response = extraction_llm
             .chat(&[
@@ -697,32 +681,20 @@ async fn run_llm_compiler(
         // A stub spends nothing and must not write an `openrouter` usage row —
         // the budget guard would then count it against a real cap.
         if live {
-            usage_events.push(PendingUsage {
-                operation: "compiler_extract",
-                model: response.model.clone(),
-                fallback_prompt_tokens: estimated_tokens(&prompt),
-                prompt_tokens: response.prompt_tokens,
-                completion_tokens: response.completion_tokens,
-            });
+            record_compiler_usage(ctx, kb, "compiler_extract", &response, &prompt);
         }
-        let evidence = match parse_llm_evidence(&response.content) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    "compiler extraction parse failed for {}: {e}",
-                    chunk.chunk_id
-                );
-                continue;
-            }
-        };
-        let span_id = span_by_chunk.get(&chunk.chunk_id).copied();
-        insert_llm_evidence(ctx, kb, chunk, span_id, evidence, entity_mentions, stats).await?;
-        stats.llm_extraction_chunks += 1;
+        match parse_llm_evidence(&response.content) {
+            Ok(evidence) => extracted.push((chunk.chunk_id, evidence)),
+            Err(e) => tracing::warn!(
+                "compiler extraction parse failed for {}: {e}",
+                chunk.chunk_id
+            ),
+        }
     }
 
-    if !known_chunk_ids.is_empty() {
-        let synth_chunks: Vec<&engram_storage::ChunkRecord> =
-            chunks.iter().take(max_chunks).collect();
+    let mut overview = None;
+    if !in_scope.is_empty() {
+        let synth_chunks: Vec<&engram_storage::ChunkRecord> = in_scope.iter().collect();
         let overview_prompt = synthesis_prompt(kb, &synth_chunks);
         let response = synthesis_llm
             .chat(&[
@@ -734,33 +706,65 @@ async fn run_llm_compiler(
             .await
             .map_err(|e| CliError::Transient(format!("compiler synthesis failed: {e}")))?;
         if live {
-            usage_events.push(PendingUsage {
-                operation: "compiler_synthesize",
-                model: response.model.clone(),
-                fallback_prompt_tokens: estimated_tokens(&overview_prompt),
-                prompt_tokens: response.prompt_tokens,
-                completion_tokens: response.completion_tokens,
-            });
+            record_compiler_usage(ctx, kb, "compiler_synthesize", &response, &overview_prompt);
         }
         let content = response.content.trim();
         if !content.is_empty() {
-            // Validate [chunk:<uuid>] citations: fabricated ones (not in the
-            // set we actually gave the model) are stripped so the wiki never
-            // shows a citation that can't be re-verified with `recall`.
-            let (validated, dropped) = validate_chunk_citations(content, &known_chunk_ids);
-            if dropped > 0 {
-                tracing::warn!(
-                    "compiler synthesis: stripped {dropped} fabricated chunk citation(s) for kb {kb}"
-                );
-            }
-            ctx.store.upsert_wiki_page(
-                kb,
-                "llm/overview.md",
-                &format!("{kb} LLM overview"),
-                &validated,
-            )?;
-            stats.llm_wiki_pages += 1;
+            overview = Some(content.to_string());
         }
+    }
+    Ok(LlmGathered {
+        extracted,
+        overview,
+        synthesis_chunk_ids: in_scope.iter().map(|c| c.chunk_id).collect(),
+    })
+}
+
+/// Write what [`gather_llm`] produced, inside the compile transaction.
+/// `chunks` is the list read inside it: a chunk whose memory was forgotten
+/// while the gather ran gets nothing.
+async fn apply_llm_evidence(
+    ctx: &AppContext,
+    kb: &str,
+    chunks: &[engram_storage::ChunkRecord],
+    span_by_chunk: &HashMap<uuid::Uuid, uuid::Uuid>,
+    gathered: LlmGathered,
+    entity_mentions: &mut BTreeMap<String, usize>,
+    stats: &mut CompileStats,
+) -> Result<(), CliError> {
+    let live: HashMap<uuid::Uuid, &engram_storage::ChunkRecord> =
+        chunks.iter().map(|c| (c.chunk_id, c)).collect();
+    for (chunk_id, evidence) in gathered.extracted {
+        let Some(chunk) = live.get(&chunk_id) else {
+            continue;
+        };
+        let span_id = span_by_chunk.get(&chunk_id).copied();
+        insert_llm_evidence(ctx, kb, chunk, span_id, evidence, entity_mentions, stats).await?;
+        stats.llm_extraction_chunks += 1;
+    }
+
+    if let Some(content) = gathered.overview {
+        // Validate [chunk:<uuid>] citations: fabricated ones (not in the
+        // set we actually gave the model) are stripped so the wiki never
+        // shows a citation that can't be re-verified with `recall`.
+        let known: HashSet<uuid::Uuid> = gathered
+            .synthesis_chunk_ids
+            .into_iter()
+            .filter(|id| live.contains_key(id))
+            .collect();
+        let (validated, dropped) = validate_chunk_citations(&content, &known);
+        if dropped > 0 {
+            tracing::warn!(
+                "compiler synthesis: stripped {dropped} fabricated chunk citation(s) for kb {kb}"
+            );
+        }
+        ctx.store.upsert_wiki_page(
+            kb,
+            "llm/overview.md",
+            &format!("{kb} LLM overview"),
+            &validated,
+        )?;
+        stats.llm_wiki_pages += 1;
     }
     Ok(())
 }
