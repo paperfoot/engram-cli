@@ -245,8 +245,16 @@ pub struct WriteEmbedder {
     pub prompt_format: String,
 }
 
+/// THE one constructor for a cloud Gemini embedder. Every call site must go
+/// through here so the fallback-key chain can never be forgotten again —
+/// `chunks repair` shipped without failover precisely because the wiring was
+/// sprinkled per site.
+pub fn cloud_gemini(key: String) -> GeminiEmbedder {
+    GeminiEmbedder::new(key).with_fallback_keys(crate::commands::config::gemini_fallback_keys())
+}
+
 /// Pick the embedder for one WRITE (`remember`, `memory add`, `edit`,
-/// `memory update`).
+/// `memory update`, `lessons add`, `chunks repair`, `reindex`).
 ///
 /// WHY THIS EXISTS. Every read surface hard-errors when a cloud profile has no
 /// Gemini key, but the write paths silently fell back to the 64-dim hash stub.
@@ -262,14 +270,6 @@ pub struct WriteEmbedder {
 /// Budget enforcement deliberately stays with the caller: `remember` gates every
 /// write on its KB budget (paid or not) before it does anything, which is not
 /// the read side's rule, and `edit` gates only its `--content` branch.
-/// THE one constructor for a cloud Gemini embedder. Every call site must go
-/// through here so the fallback-key chain can never be forgotten again —
-/// `chunks repair` shipped without failover precisely because the wiring was
-/// sprinkled per site.
-pub fn cloud_gemini(key: String) -> GeminiEmbedder {
-    GeminiEmbedder::new(key).with_fallback_keys(crate::commands::config::gemini_fallback_keys())
-}
-
 pub fn resolve_write_embedder(
     command: &str,
     offline: bool,

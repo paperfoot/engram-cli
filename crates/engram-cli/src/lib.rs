@@ -557,7 +557,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 all_kbs,
                 dry_run,
-            } => commands::chunks::repair(&ctx, kb, all_kbs, dry_run).await,
+                offline,
+            } => commands::chunks::repair(&ctx, kb, all_kbs, dry_run, offline).await,
         },
     }
 }

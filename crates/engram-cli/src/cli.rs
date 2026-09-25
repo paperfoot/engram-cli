@@ -615,6 +615,11 @@ pub enum ChunksCommand {
         /// Report what would change without writing or embedding anything.
         #[arg(long)]
         dry_run: bool,
+        /// Re-embed with the deterministic offline stub instead of Gemini.
+        /// Without a key this is required: keyless repair used to write stub
+        /// vectors next to cloud ones. Same flag as `reindex --offline`.
+        #[arg(long)]
+        offline: bool,
     },
 }
 
