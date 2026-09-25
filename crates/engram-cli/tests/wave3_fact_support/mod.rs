@@ -22,6 +22,11 @@ pub fn engram(store: &std::path::Path) -> Command {
     cmd.env_remove("GEMINI_API_KEY");
     cmd.env_remove("COHERE_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
+    cmd.env_remove("TYPESAFE_API_KEY");
+    cmd.env_remove("ENGRAM_JUDGE_STUB");
+    cmd.env_remove("ENGRAM_JUDGE_GROUNDING");
+    cmd.env_remove("ENGRAM_JUDGE_ADJUDICATE");
+    cmd.env_remove("ENGRAM_JUDGE_DEDUPE");
     cmd.env_remove("ENGRAM_FACT_LLM_STUB");
     cmd.env_remove("ENGRAM_FACT_WRITE_FAIL");
     cmd.env_remove("ENGRAM_FACT_QUEUE_ALL");
