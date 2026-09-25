@@ -894,11 +894,11 @@ async fn adjudicate_plan(
         }
     };
     match action {
-        AdjudicationAction::RejectNew => {
-            plan.insert = None;
-            plan.queue.clear();
-            plan.absorbed = Some("semantic_llm");
-        }
+        // The planner's own absorb, not a hand-rolled half of it: a close,
+        // confirmation or replay planned on behalf of an observation that is
+        // then discarded would retire a value on the word of a fact that
+        // never reaches the store.
+        AdjudicationAction::RejectNew => plan.absorb("semantic_llm"),
         AdjudicationAction::Coexist => plan.queue.clear(),
         AdjudicationAction::Supersede(ids) => {
             let authority = CloseAuthority::Heuristic {

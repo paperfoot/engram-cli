@@ -1412,11 +1412,11 @@ fn dispatch(
             if verdict.rule == "restates_closed_interval" {
                 // Re-opening a window someone deliberately ended is the one
                 // thing this arm exists to prevent.
-                absorb(plan, "restates_closed_interval");
+                plan.absorb("restates_closed_interval");
             }
         }
         ConflictClass::Duplicate => {
-            absorb(plan, "duplicate_object");
+            plan.absorb("duplicate_object");
             plan.confirm.push(old_view.fact.id);
         }
         ConflictClass::SupersedeOld => {
@@ -1470,20 +1470,31 @@ fn dispatch(
     Ok(())
 }
 
-/// The observation turned out to be news to nobody, so NOTHING it implied
-/// survives.
-///
-/// Clearing the rest of the plan is not tidiness. An earlier sibling can
-/// already have planned a close — "Ana lives in Paris" arrives, closes the
-/// open London interval, and is then absorbed by a Paris interval that was
-/// deliberately ended in 2020. Keeping the close would retire the current
-/// value on the strength of an assertion the planner just discarded.
-fn absorb(plan: &mut WritePlan, rule: &'static str) {
-    plan.insert = None;
-    plan.closes.clear();
-    plan.queue.clear();
-    plan.replays.clear();
-    plan.absorbed = Some(rule);
+impl WritePlan {
+    /// The observation turned out to be news to nobody, so NOTHING it implied
+    /// survives.
+    ///
+    /// Clearing the rest of the plan is not tidiness. An earlier sibling can
+    /// already have planned a close — "Ana lives in Paris" arrives, closes the
+    /// open London interval, and is then absorbed by a Paris interval that was
+    /// deliberately ended in 2020. Keeping the close would retire the current
+    /// value on the strength of an assertion the planner just discarded.
+    ///
+    /// Public because the planner is not the only thing that discards an
+    /// observation: a machine adjudicator's `reject_new` used to hand-roll
+    /// half of this, kept the closes, and retired a birthday "on behalf of" a
+    /// fact that was never written — a `closed_by` pointing at no row.
+    pub fn absorb(&mut self, rule: &'static str) {
+        self.insert = None;
+        self.confirm.clear();
+        self.closes.clear();
+        self.queue.clear();
+        self.replays.clear();
+        // A withdrawn replay must not be reported as applied.
+        self.notes
+            .retain(|n| !matches!(n, PlanNote::ReplayApplied { .. }));
+        self.absorbed = Some(rule);
+    }
 }
 
 type PairContext<'a, 'f> = (

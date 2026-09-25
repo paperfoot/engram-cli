@@ -174,3 +174,50 @@ fn full_autonomy_without_a_judge_queues_like_assisted() {
     assert_eq!(queued(&v).len(), 1, "{v}");
     assert_eq!(queued(&v)[0]["suggested_action"], "requires_context");
 }
+
+// ----- B2: reject_new discards the WHOLE observation -----------------------
+
+/// The report's repro: a caller's birthday correction plans a close of the
+/// extractor's guess; the judge then rejects the correction. The close used to
+/// survive — `close_authority=caller`, `closed_by` naming a fact that was never
+/// written.
+#[test]
+fn a_rejected_observation_closes_nothing_on_its_way_out() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
+    );
+    // An EXTRACTED 04-13, so the caller's 04-14 below is a correction of it.
+    run_json(
+        engram(tmp.path()).env(
+            "ENGRAM_FACT_LLM_STUB",
+            r#"[{"subject":"Ana","predicate":"birthday","object":"1990-04-13"}]"#,
+        ),
+        &[
+            "remember",
+            "Ana's birthday is the 13th.",
+            "--kb",
+            "personal",
+        ],
+    );
+    let v = judged(
+        tmp.path(),
+        "Ana was born 1990-04-14.",
+        &birthday("1990-04-14"),
+        r#"{"action":"reject_new"}"#,
+    );
+    assert_eq!(v["data"]["facts_added"], 0, "{v}");
+    assert_eq!(v["data"]["facts_deduped"], 1, "{v}");
+    assert_eq!(
+        v["data"]["conflicts"].as_array().unwrap().len(),
+        0,
+        "a discarded observation closes nothing: {v}"
+    );
+    assert!(
+        closed_facts(tmp.path(), "Ana").is_empty(),
+        "no interval may be closed by a fact that does not exist"
+    );
+    assert_eq!(open_objects(tmp.path()), ["1990-04-12", "1990-04-13"]);
+}
