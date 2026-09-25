@@ -559,16 +559,16 @@ fn the_metadata_counts_what_the_gate_and_the_judge_did() {
 // ----- B4: a gate duplicate is a restatement about the SAME subject --------
 
 /// `remember --facts-json` with a novelty gate loose enough that the offline
-/// stub's vectors for two people on the same drug read as duplicates.
-fn gated(store: &std::path::Path, subject: &str, predicate: &str) -> Value {
-    let facts = json!([{ "subject": subject, "predicate": predicate, "object": "metformin" }]);
+/// stub's vectors for two short statements about one drug read as duplicates.
+fn gated(store: &std::path::Path, subject: &str, predicate: &str, object: &str) -> Value {
+    let facts = json!([{ "subject": subject, "predicate": predicate, "object": object }]);
     run_json(
         engram(store)
             .env("ENGRAM_FACT_DUP_THRESHOLD", "0.30")
             .env("ENGRAM_FACT_NOVEL_THRESHOLD", "0.10"),
         &[
             "remember",
-            &format!("{subject} {predicate} metformin."),
+            &format!("{subject} {predicate} {object}."),
             "--kb",
             "personal",
             "--facts-json",
@@ -577,14 +577,23 @@ fn gated(store: &std::path::Path, subject: &str, predicate: &str) -> Value {
     )
 }
 
+fn predicates_of(store: &std::path::Path, subject: &str) -> Vec<String> {
+    let mut predicates: Vec<String> = facts_for(store, subject)
+        .iter()
+        .filter_map(|f| f["predicate"].as_str().map(str::to_string))
+        .collect();
+    predicates.sort();
+    predicates
+}
+
 /// The report's repro: Carol's metformin was absorbed as a confirmation of
 /// Bob's, and Carol had no fact at all.
 #[test]
 fn a_gate_duplicate_never_crosses_subjects() {
     let tmp = store();
-    let bob = gated(tmp.path(), "Bob Smith", "takes_medication");
+    let bob = gated(tmp.path(), "Bob Smith", "takes_medication", "metformin");
     assert_eq!(bob["data"]["facts_added"], 1, "{bob}");
-    let carol = gated(tmp.path(), "Carol Diaz", "takes_medication");
+    let carol = gated(tmp.path(), "Carol Diaz", "takes_medication", "metformin");
     assert_eq!(carol["data"]["facts_added"], 1, "{carol}");
     assert_eq!(carol["data"]["facts_deduped"], 0, "{carol}");
     assert_eq!(carol["metadata"]["gate"]["duplicate"], 0, "{carol}");
@@ -595,9 +604,36 @@ fn a_gate_duplicate_never_crosses_subjects() {
 
     // Within one subject the gate still does its job: the same statement
     // under a relation the registry does not know is absorbed.
-    let again = gated(tmp.path(), "Bob Smith", "uses");
+    gated(tmp.path(), "Dan Reyes", "likes", "chess");
+    let again = gated(tmp.path(), "Dan Reyes", "enjoys", "chess");
     assert_eq!(again["metadata"]["gate"]["duplicate"], 1, "{again}");
     assert_eq!(again["data"]["facts_added"], 0, "{again}");
+    assert_eq!(predicates_of(tmp.path(), "Dan Reyes"), ["likes"]);
+}
+
+/// A gate duplicate is an absorb across relations, and an absorb is a
+/// heuristic discarding the caller's observation: Bob's penicillin ALLERGY
+/// vanished as a restatement of Bob taking penicillin, with no question and
+/// no note. On a safety relation, either side, the classifier decides.
+#[test]
+fn a_gate_duplicate_never_discards_a_safety_fact() {
+    let tmp = store();
+    gated(tmp.path(), "Bob Smith", "takes_medication", "penicillin");
+    let allergy = gated(tmp.path(), "Bob Smith", "allergic_to", "penicillin");
+    assert_eq!(allergy["data"]["facts_added"], 1, "{allergy}");
+    assert_eq!(allergy["data"]["facts_deduped"], 0, "{allergy}");
+    assert_eq!(allergy["metadata"]["gate"]["duplicate"], 0, "{allergy}");
+    assert_eq!(allergy["metadata"]["gate"]["uncertain"], 1, "{allergy}");
+
+    // A routine statement is not absorbed into a safety fact either: that
+    // would count as a confirmation of the medication.
+    let uses = gated(tmp.path(), "Bob Smith", "uses", "penicillin");
+    assert_eq!(uses["data"]["facts_added"], 1, "{uses}");
+    assert_eq!(uses["metadata"]["gate"]["duplicate"], 0, "{uses}");
+    assert_eq!(
+        predicates_of(tmp.path(), "Bob Smith"),
+        ["allergic_to", "takes_medication", "uses"]
+    );
 }
 
 // ----- B9: a gate threshold nobody can use is a config error ---------------

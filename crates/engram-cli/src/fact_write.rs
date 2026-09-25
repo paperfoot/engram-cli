@@ -468,6 +468,11 @@ fn fact_text(subject: &str, predicate: &str, object: &str) -> String {
     format!("{subject} {predicate} {object}")
 }
 
+/// A stored fact on a safety relation (takes_medication, allergic_to, …).
+fn is_safety_fact(f: &Fact) -> bool {
+    relation_spec(&canonical_predicate(&f.predicate)).is_safety()
+}
+
 fn fact_summary(f: &Fact) -> serde_json::Value {
     json!({
         "id": f.id.to_string(),
@@ -1082,9 +1087,24 @@ async fn prepare(
             let (dup_t, novel_t) = gate_thresholds()?;
             outcome.gate.ran += 1;
             match novelty_gate(&emb, &existing, dup_t, novel_t) {
-                GateDecision::Duplicate { fact_id, .. } => {
-                    outcome.gate.duplicate += 1;
-                    return Ok(Prepared::GateDuplicate(fact_id));
+                GateDecision::Duplicate { fact_id, score } => {
+                    let candidate = ctx.store.get_fact(fact_id)?;
+                    if !observation.spec.is_safety()
+                        && !candidate.as_ref().is_some_and(is_safety_fact)
+                    {
+                        outcome.gate.duplicate += 1;
+                        return Ok(Prepared::GateDuplicate(fact_id));
+                    }
+                    // An absorb is a heuristic discarding the caller's
+                    // observation, and the candidate is by construction on
+                    // ANOTHER relation: the gate only runs when this one has
+                    // no facts. "Allergic to penicillin" vanished as a
+                    // restatement of "takes penicillin". A safety fact is
+                    // never retired or discarded by a heuristic (IN-19), so
+                    // the classifier decides, as in the uncertain band.
+                    outcome.gate.uncertain += 1;
+                    outcome.gate.uncertain_candidates += 1;
+                    others = candidate.map(|f| (f, score)).into_iter().collect();
                 }
                 GateDecision::Novel => outcome.gate.novel += 1,
                 GateDecision::Uncertain { candidates } => {
@@ -1277,10 +1297,7 @@ fn apply_judgement(
     // instruction, never by a heuristic" (IN-19), and an absorb or a cleared
     // question is the same outcome reached by another door.
     let is_safety = |q: &PlannedConflict| {
-        observation.spec.is_safety()
-            || by_id
-                .get(&q.old_fact_id)
-                .is_some_and(|f| relation_spec(&canonical_predicate(&f.predicate)).is_safety())
+        observation.spec.is_safety() || by_id.get(&q.old_fact_id).is_some_and(|f| is_safety_fact(f))
     };
     match action {
         AdjudicationAction::RejectNew if plan.queue.iter().any(is_safety) => {
