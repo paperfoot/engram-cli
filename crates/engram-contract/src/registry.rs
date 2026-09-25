@@ -2576,6 +2576,41 @@ const INGEST_FLAGS: &[FlagSpec] = &[
     },
 ];
 
+const BUDGET_KB_FLAG: FlagSpec = FlagSpec {
+    name: "kb",
+    cli_long: "kb",
+    aliases: &[],
+    ty: Ty::Str,
+    default: None,
+    required: false,
+    doc: "the KB's budget (scope `kb:<name>`); omit for the global one",
+};
+
+const BUDGET_SET_FLAGS: &[FlagSpec] = &[
+    BUDGET_KB_FLAG,
+    FlagSpec {
+        name: "daily_usd",
+        cli_long: "daily-usd",
+        aliases: &[],
+        ty: Ty::Float,
+        default: None,
+        required: false,
+        doc: "daily cap in USD, >= 0",
+    },
+    FlagSpec {
+        name: "monthly_usd",
+        cli_long: "monthly-usd",
+        aliases: &[],
+        ty: Ty::Float,
+        default: None,
+        required: false,
+        doc: "monthly cap in USD, >= 0",
+    },
+];
+
+const BUDGET_ROW_DOC: &str =
+    "{ scope, kb, daily_usd, monthly_usd, created_at, updated_at }, or null when none is set";
+
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         path: "remember",
@@ -3980,6 +4015,108 @@ pub const COMMANDS: &[CommandSpec] = &[
             "After a successful update, restart the agent process and run `engram skill install` if local agent skill files are used.",
         ],
         examples: &["engram update --check --json"],
+    },
+    CommandSpec {
+        path: "usage",
+        aliases: &[],
+        summary: "Recorded provider usage (Gemini embeds, Cohere reranks, OpenRouter calls), grouped by provider, operation and model, with estimated cost.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: &[
+            FlagSpec { name: "kb", cli_long: "kb", aliases: &[], ty: Ty::Str, default: None, required: false, doc: "only usage billed to this KB" },
+            FlagSpec { name: "since", cli_long: "since", aliases: &[], ty: Ty::Str, default: None, required: false, doc: "RFC3339 or YYYY-MM-DD lower bound, compared as text against the recorded timestamps" },
+        ],
+        data: &[
+            FieldSpec { name: "filters", ty: Ty::Object, doc: "{ kb, since } as passed", always: true },
+            FieldSpec { name: "summary", ty: Ty::Array(&Ty::Object), doc: "{ provider, operation, model, events, request_count, item_count, input_tokens_estimated, output_tokens_estimated, search_units, cost_usd_estimated }", always: true },
+            FieldSpec { name: "totals", ty: Ty::Object, doc: "{ events, requests, input_tokens_estimated, output_tokens_estimated, search_units, cost_usd_estimated }", always: true },
+            FieldSpec { name: "notes", ty: Ty::Array(&Ty::Str), doc: "how each provider's numbers are estimated", always: true },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "rows", ty: Ty::Int, doc: "length of summary", always: true },
+            FieldSpec { name: "cost_usd_estimated", ty: Ty::Str, doc: "the total, as a 6-decimal string", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1],
+        rules: &[
+            "Costs are local estimates, not invoices: Gemini tokens are chars/4, Cohere is priced only when ENGRAM_COHERE_RERANK_USD_PER_SEARCH is set, and OpenRouter calls record tokens but no cost.",
+        ],
+        examples: &["engram usage --since 2026-09-01 --json"],
+    },
+    CommandSpec {
+        path: "budget show",
+        aliases: &[],
+        summary: "One budget scope's caps, and today's and this month's estimated spend against them.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: &[BUDGET_KB_FLAG],
+        data: &[
+            FieldSpec { name: "scope", ty: Ty::Str, doc: "global | kb:<name>", always: true },
+            FieldSpec { name: "kb", ty: Ty::Nullable(&Ty::Str), doc: "as passed", always: true },
+            FieldSpec { name: "budget", ty: Ty::Nullable(&Ty::Object), doc: BUDGET_ROW_DOC, always: true },
+            FieldSpec { name: "daily", ty: Ty::Object, doc: "{ since, cost_usd_estimated, input_tokens_estimated, requests, search_units, budget_usd, remaining_usd_estimated, over_budget } from 00:00 UTC", always: true },
+            FieldSpec { name: "monthly", ty: Ty::Object, doc: "the same, from the 1st of the month UTC", always: true },
+            FieldSpec { name: "note", ty: Ty::Str, doc: "budgets are guardrails over estimates", always: true },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "scope", ty: Ty::Str, doc: "as in data", always: true },
+            FieldSpec { name: "daily_cost_usd_estimated", ty: Ty::Str, doc: "6-decimal string", always: true },
+            FieldSpec { name: "monthly_cost_usd_estimated", ty: Ty::Str, doc: "6-decimal string", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1],
+        rules: &[
+            "A paid call checks its KB's budget and the global one first; at a cap it is `rate_limited` (exit 4). ENGRAM_BUDGET_ENFORCE=off overrides for one run.",
+            "Only estimated cost counts, so OpenRouter spend (no local price) never reaches a cap.",
+        ],
+        examples: &["engram budget show --json"],
+    },
+    CommandSpec {
+        path: "budget set",
+        aliases: &[],
+        summary: "Set the daily and/or monthly USD cap for the global scope or one KB.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: BUDGET_SET_FLAGS,
+        data: &[
+            FieldSpec { name: "scope", ty: Ty::Str, doc: "global | kb:<name>", always: true },
+            FieldSpec { name: "budget", ty: Ty::Nullable(&Ty::Object), doc: BUDGET_ROW_DOC, always: true },
+        ],
+        metadata: ELAPSED_ONLY,
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &[
+            "It REPLACES both caps: a cap you omit is cleared. Pass --daily-usd and --monthly-usd together to change one and keep the other.",
+            "Neither flag, or a negative value, is `bad_input` (exit 3).",
+        ],
+        examples: &["engram budget set --daily-usd 1 --monthly-usd 20 --json"],
+    },
+    CommandSpec {
+        path: "budget clear",
+        aliases: &[],
+        summary: "Remove the budget for the global scope or one KB.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: &[BUDGET_KB_FLAG],
+        data: &[
+            FieldSpec { name: "scope", ty: Ty::Str, doc: "global | kb:<name>", always: true },
+            FieldSpec { name: "deleted", ty: Ty::Bool, doc: "false when that scope had no budget", always: true },
+        ],
+        metadata: ELAPSED_ONLY,
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1],
+        rules: &[],
+        examples: &["engram budget clear --kb scratch --json"],
     },
 ];
 

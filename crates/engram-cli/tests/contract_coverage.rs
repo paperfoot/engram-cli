@@ -19,13 +19,7 @@ use engram_cli::cli::Cli;
 /// Leaves still documented only by the hand-written manifest. This list only
 /// shrinks: each transcription commit removes its paths, and the test below
 /// fails if an entry here has in fact been transcribed.
-const NOT_YET_TRANSCRIBED: &[&str] = &[
-    "agent-info",
-    "usage",
-    "budget show",
-    "budget set",
-    "budget clear",
-];
+const NOT_YET_TRANSCRIBED: &[&str] = &["agent-info"];
 
 /// Every non-hidden leaf clap will dispatch, as a space-separated canonical
 /// path (`"facts resolve"`).
