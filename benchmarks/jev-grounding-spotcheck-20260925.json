@@ -1,0 +1,463 @@
+{
+ "reviewer": "Claude (main session), reading each passage; not a human",
+ "sample": "stratified random, seed 7: 20 supported, 15 not_supported, 15 perturbations",
+ "agreement_overall": 0.84,
+ "by_stratum": {
+  "supported": "20/20",
+  "perturbation": "15/15",
+  "not_supported": "7/15"
+ },
+ "finding": "Every disagreement is Opus being stricter than the passage warrants (dropped hedge word, missing population qualifier, malformed-but-true triple). Supported and perturbation labels are reliable; the extracted not_supported subset is noisy.",
+ "items": [
+  {
+   "n": 1,
+   "id": "19427410-c2",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 2,
+   "id": "19427410-c0-p1",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 3,
+   "id": "3308636-c2",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 4,
+   "id": "3308636-c2-p4",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 5,
+   "id": "9976969-c0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 6,
+   "id": "22707413-f1",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 7,
+   "id": "21323587-f0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 8,
+   "id": "21323587-c0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 9,
+   "id": "21323587-c0-p2",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 10,
+   "id": "1203035-c0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 11,
+   "id": "469066-c2",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 12,
+   "id": "469066-c0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 13,
+   "id": "469066-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "supported",
+   "agree": false,
+   "note": "fact drops \"approximately\" (~80%); content supported"
+  },
+  {
+   "n": 14,
+   "id": "11048759-f0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 15,
+   "id": "34386619-f0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 16,
+   "id": "24541180-c1",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 17,
+   "id": "24541180-c2-p8",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 18,
+   "id": "9498458-f0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 19,
+   "id": "10012166-f1",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 20,
+   "id": "10012166-c1-p4",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 21,
+   "id": "33554389-c0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 22,
+   "id": "13823200-c0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 23,
+   "id": "1428840-c0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 24,
+   "id": "7227763-c2",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 25,
+   "id": "7227763-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "supported",
+   "agree": false,
+   "note": "malformed triple but content true (Wistar rat model of hemorrhagic shock)"
+  },
+  {
+   "n": 26,
+   "id": "7227763-c2-p6",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 27,
+   "id": "8856690-c0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 28,
+   "id": "18188022-f0",
+   "stratum": "supported",
+   "opus": "supported",
+   "reviewer": "supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 29,
+   "id": "3329824-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "supported",
+   "agree": false,
+   "note": "malformed triple but RR 1.35 is stated"
+  },
+  {
+   "n": 30,
+   "id": "31902335-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 31,
+   "id": "36345578-c0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "supported",
+   "agree": false,
+   "note": "drops \"many\" (many neutrophils); minor overgeneralisation, core supported"
+  },
+  {
+   "n": 32,
+   "id": "4303075-f2",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 33,
+   "id": "4303075-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 34,
+   "id": "3435889-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "supported",
+   "agree": false,
+   "note": "omits population (mouse ESCs) rather than asserting a wrong one"
+  },
+  {
+   "n": 35,
+   "id": "13464392-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "supported",
+   "agree": false,
+   "note": "omits population (hypoproteinemic ALI patients); conclusion states it"
+  },
+  {
+   "n": 36,
+   "id": "25515662-c2",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 37,
+   "id": "25515662-c1-p6",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 38,
+   "id": "364522-c0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 39,
+   "id": "21557614-c3",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 40,
+   "id": "485020-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 41,
+   "id": "485020-c1",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "supported",
+   "agree": false,
+   "note": "\"associated with\" is a faithful reading of \"consistent with ... greater use\""
+  },
+  {
+   "n": 42,
+   "id": "9539753-f0",
+   "stratum": "not_supported",
+   "opus": "not_supported",
+   "reviewer": "supported",
+   "agree": false,
+   "note": "omits species (C. elegans) rather than asserting a wrong one"
+  },
+  {
+   "n": 43,
+   "id": "2576811-c2-p8",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 44,
+   "id": "829646-c0-p1",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 45,
+   "id": "4463811-c0-p2",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 46,
+   "id": "4283694-c0-p1",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 47,
+   "id": "27127885-c2-p8",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 48,
+   "id": "27127885-c0-p2",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 49,
+   "id": "356218-c1-p3",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  },
+  {
+   "n": 50,
+   "id": "2904102-c0-p0",
+   "stratum": "perturbation",
+   "opus": "not_supported",
+   "reviewer": "not_supported",
+   "agree": true,
+   "note": null
+  }
+ ]
+}
