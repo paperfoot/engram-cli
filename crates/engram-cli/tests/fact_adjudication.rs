@@ -555,6 +555,39 @@ fn a_failed_judgement_is_journaled_as_failed() {
         .starts_with("action=failed model="));
 }
 
+/// The judge's journal row is a `void`: it rules on nothing, so a caller who
+/// answers the question it failed to settle has overruled nobody. `reflect`
+/// read every `machine` row as a ruling and proposed the lesson "the machine
+/// ruled `void` and the caller ruled `keep_both`" — exactly on the questions
+/// this lane routes to the caller (a failed, stale or safety-refused judge).
+#[test]
+#[ignore = "needs cross-lane patch F: reflect.rs caller_overruled_machine must skip void decisions"]
+fn a_caller_answering_after_the_judge_overrules_nobody() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana takes metformin 500 mg.",
+        &med("metformin 500 mg"),
+    );
+    let v = judged(
+        tmp.path(),
+        "Ana now takes metformin 1000 mg.",
+        &med("metformin 1000 mg"),
+        "I cannot decide",
+    );
+    let id = queued(&v)[0]["conflict_id"]
+        .as_str()
+        .expect("queued")
+        .to_string();
+    run_json(
+        &mut engram(tmp.path()),
+        &["facts", "resolve", &id, "--action", "keep-both"],
+    );
+    let reflected = run_json(&mut engram(tmp.path()), &["reflect", "--kb", "personal"]);
+    assert_eq!(reflected["data"]["candidates"], 0, "{reflected}");
+    assert_eq!(reflected["data"]["lessons_written"], 0, "{reflected}");
+}
+
 // ----- measurement: what the gate and the judge did ------------------------
 
 #[test]
