@@ -46,7 +46,7 @@ use engram_graph::gate::{novelty_gate, GateDecision};
 use engram_graph::semantics::{
     classify_mode_for, compile_resolution, end_resolution_tag, plan_write, DecisionLedger,
     Observation, ObservationState, PlanNote, PlannedClose, PlannedConflict, SemanticKey,
-    UnknownAutonomy, WritePlan,
+    UnknownAutonomy, WritePlan, SEMANTIC_KEY_VERSION,
 };
 use engram_llm::ChatLlm;
 use serde_json::json;
@@ -801,13 +801,26 @@ pub struct Judgement {
     pub action: Result<AdjudicationAction, &'static str>,
 }
 
+impl Judgement {
+    /// The answer as one word, for the journal note.
+    fn action_word(&self) -> &'static str {
+        match &self.action {
+            Ok(AdjudicationAction::Supersede(_)) => "supersede",
+            Ok(AdjudicationAction::Coexist) => "coexist",
+            Ok(AdjudicationAction::RejectNew) => "reject_new",
+            Err(_) => "failed",
+        }
+    }
+}
+
 /// THE JUDGE SEAM: one observation (`new_fact`, rendered "subject relation
 /// object") and the stored facts its queued pairs name, in; one verdict out.
 ///
 /// Called with no transaction open. Whatever it returns, the applier enforces
 /// the same limits: a failure keeps every pair queued, a safety pair is never
 /// cleared or discarded, a close needs `may_close`. A different judge plugs in
-/// here and inherits all three.
+/// here and inherits all three, and its answers are journaled under its own
+/// name (`judge:<judge>`, see [`record_judgement`]).
 pub async fn judge_pairs(llm: &dyn ChatLlm, new_fact: &str, olds: &[&Fact]) -> Judgement {
     let rendered: Vec<String> = olds
         .iter()
@@ -827,21 +840,21 @@ pub async fn judge_pairs(llm: &dyn ChatLlm, new_fact: &str, olds: &[&Fact]) -> J
 }
 
 /// What a verdict was ABOUT: the observation, and its queued pairs by old
-/// fact and rule. Fact ids of the observation itself are minted per planning
-/// pass, so they are deliberately not part of it.
+/// fact, rule and semantic key. Fact ids of the observation itself are minted
+/// per planning pass, so they are deliberately not part of it.
 #[derive(Debug, PartialEq, Eq)]
 struct JudgedPairs {
     subject_norm: String,
     relation: String,
     object_norm: String,
-    pairs: Vec<(Uuid, &'static str)>,
+    pairs: Vec<(Uuid, &'static str, String)>,
 }
 
 impl JudgedPairs {
     fn of(observation: &Observation, queue: &[PlannedConflict]) -> JudgedPairs {
-        let mut pairs: Vec<(Uuid, &'static str)> = queue
+        let mut pairs: Vec<(Uuid, &'static str, String)> = queue
             .iter()
-            .map(|q| (q.old_fact_id, q.verdict.rule))
+            .map(|q| (q.old_fact_id, q.verdict.rule, q.key.encode()))
             .collect();
         pairs.sort();
         JudgedPairs {
@@ -1030,14 +1043,20 @@ async fn write_judged_fact(
     };
     let mut p = *p;
     let mut plan = std::mem::take(&mut p.plan);
-    if w.autonomy == Autonomy::Full && w.llm.is_some() && !plan.queue.is_empty() {
-        let about = JudgedPairs::of(&p.observation, &plan.queue);
-        match judged.filter(|j| j.about == about) {
-            Some(j) => apply_judgement(&mut plan, &p.observation, &p.by_id(), &j.judgement),
-            // The store moved between judging and writing (an earlier fact of
-            // this batch landed), so the verdict answers a different question.
-            None => plan.notes.push(PlanNote::AdjudicationStale),
+    let fresh = judged.filter(|j| {
+        !plan.queue.is_empty() && j.about == JudgedPairs::of(&p.observation, &plan.queue)
+    });
+    if let Some(j) = judged {
+        record_judgement(ctx, w, j, fresh.is_none())?;
+    }
+    match fresh {
+        Some(j) => apply_judgement(&mut plan, &p.observation, &p.by_id(), &j.judgement),
+        // The store moved between judging and writing (an earlier fact of
+        // this batch landed), so no verdict answers THESE pairs.
+        None if w.autonomy == Autonomy::Full && w.llm.is_some() && !plan.queue.is_empty() => {
+            plan.notes.push(PlanNote::AdjudicationStale)
         }
+        None => {}
     }
 
     apply_plan(
@@ -1140,6 +1159,45 @@ fn apply_judgement(
             plan.queue = kept;
         }
     }
+}
+
+/// Journal WHICH judge answered: one `void` machine decision per pair the
+/// verdict was about, on the existing `decision.recorded` event, so it
+/// survives `admin rebuild` (the close's `resolution` tag does not).
+///
+/// `void` because the row must record without binding. `lookup_decision`
+/// never selects a void and `replay` treats one as not binding, so the next
+/// write on the same key is planned exactly as if this row did not exist. A
+/// machine `keep_both` would be replayed as the answer to that question on
+/// every later write, safety dose changes included.
+///
+/// A stale verdict (judged against a store that moved before the write) is
+/// journaled as `action=stale`: it was paid for and answered, just not used.
+fn record_judgement(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    judged: &Judged,
+    stale: bool,
+) -> Result<(), CliError> {
+    let j = &judged.judgement;
+    let action = if stale { "stale" } else { j.action_word() };
+    let actor = format!("judge:{}", j.judge);
+    for (_, rule, key) in &judged.about.pairs {
+        let note = format!("action={action} model={} rule={rule}", j.model);
+        ctx.store.record_decision(
+            w.kb,
+            w.diary,
+            key,
+            "void",
+            None,
+            "machine",
+            &actor,
+            Some(&note),
+            None,
+            SEMANTIC_KEY_VERSION,
+        )?;
+    }
+    Ok(())
 }
 
 /// Why a judge gave no verdict, as a stable word for the envelope.

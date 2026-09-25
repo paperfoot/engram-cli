@@ -374,4 +374,127 @@ fn a_verdict_about_different_pairs_is_not_applied() {
         asked.iter().all(|q| q["new"]["object"] == "1990-04-14"),
         "the 04-13 verdict still applied to the pairs it was about: {v}"
     );
+    // The unused verdict is still journaled, as stale, on the pair it judged.
+    let judged_pair = asked
+        .iter()
+        .find(|q| q["old"]["object"] == "1990-04-12")
+        .expect("14 vs 12 queued");
+    let ledger = engram_storage::SqliteStore::open(tmp.path().join("db.sqlite"))
+        .expect("the temp store opens");
+    let rows = ledger
+        .decisions_for_key("personal", judged_pair["decision_key"].as_str().unwrap())
+        .expect("history");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]
+        .note
+        .as_deref()
+        .unwrap_or_default()
+        .starts_with("action=stale model="));
+}
+
+// ----- which judge answered: journaled, never binding ----------------------
+
+/// A routine question the judge settled. Its answer is journaled — `void`,
+/// `machine`, `judge:llm` — and a later write of the same question (same kb,
+/// so the same semantic key, from another diary) is planned exactly as in a
+/// store that never met the judge: asked again, nothing replayed. A machine
+/// `keep_both` here would have answered it silently forever.
+#[test]
+fn a_judges_answer_is_journaled_and_binds_nothing() {
+    let later = |store: &std::path::Path| {
+        for object in ["1990-04-12", "1990-04-13"] {
+            let v = run_json(
+                &mut engram(store),
+                &[
+                    "remember",
+                    &format!("Ana was born {object}."),
+                    "--kb",
+                    "personal",
+                    "--diary",
+                    "other",
+                    "--facts-json",
+                    &birthday(object),
+                ],
+            );
+            if object == "1990-04-13" {
+                return v;
+            }
+        }
+        unreachable!()
+    };
+
+    let judged_store = store();
+    remember_facts(
+        judged_store.path(),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
+    );
+    let v = judged(
+        judged_store.path(),
+        "Ana was born 1990-04-13.",
+        &birthday("1990-04-13"),
+        r#"{"action":"reject_new"}"#,
+    );
+    assert_eq!(v["data"]["facts_deduped"], 1, "{v}");
+    let after_judge = later(judged_store.path());
+
+    let control = store();
+    let without_judge = later(control.path());
+
+    for v in [&after_judge, &without_judge] {
+        assert_eq!(queued(v).len(), 1, "asked again: {v}");
+        assert!(note_kinds(v).is_empty(), "nothing replayed: {v}");
+    }
+    let (a, b) = (&queued(&after_judge)[0], &queued(&without_judge)[0]);
+    for field in ["rule", "suggested_action", "decision_key"] {
+        assert_eq!(a[field], b[field], "{field}");
+    }
+
+    let key = a["decision_key"].as_str().expect("keyed");
+    let ledger = engram_storage::SqliteStore::open(judged_store.path().join("db.sqlite"))
+        .expect("the temp store opens");
+    let rows = ledger.decisions_for_key("personal", key).expect("history");
+    assert_eq!(rows.len(), 1, "one row per judged pair");
+    let row = &rows[0];
+    assert_eq!(row.verdict, "void");
+    assert_eq!(row.authority, "machine");
+    assert_eq!(row.actor, "judge:llm");
+    let note = row.note.as_deref().unwrap_or_default();
+    assert!(
+        note.starts_with("action=reject_new model=")
+            && note.ends_with(" rule=immutable_attribute_disagreement"),
+        "{note}"
+    );
+}
+
+/// A failure is an answer too, as far as the journal is concerned: the pairs
+/// stay queued AND the ledger says which judge failed to decide them.
+#[test]
+fn a_failed_judgement_is_journaled_as_failed() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana takes metformin 500 mg.",
+        &med("metformin 500 mg"),
+    );
+    let v = judged(
+        tmp.path(),
+        "Ana now takes metformin 1000 mg.",
+        &med("metformin 1000 mg"),
+        "I cannot decide",
+    );
+    let key = queued(&v)[0]["decision_key"]
+        .as_str()
+        .expect("keyed")
+        .to_string();
+    let ledger = engram_storage::SqliteStore::open(tmp.path().join("db.sqlite"))
+        .expect("the temp store opens");
+    let rows = ledger.decisions_for_key("personal", &key).expect("history");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].verdict, "void");
+    assert!(rows[0]
+        .note
+        .as_deref()
+        .unwrap_or_default()
+        .starts_with("action=failed model="));
 }
