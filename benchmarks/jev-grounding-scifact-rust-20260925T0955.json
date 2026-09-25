@@ -1,0 +1,126 @@
+{
+  "suite": "jev-grounding",
+  "source": "judge-eval-grounding-rust.jsonl",
+  "pairs": 1189,
+  "labels": {
+    "NEI": 416,
+    "CONTRADICT": 265,
+    "SUPPORT": 508
+  },
+  "missing": 0,
+  "summary": {
+    "cost_usd": 0.021983345999999987,
+    "errors": [],
+    "failed_requests": 0,
+    "input_tokens": 523413,
+    "latency_ms_p50": 263,
+    "latency_ms_p95": 556,
+    "missing_answers": 0,
+    "model": "jev-1.13.0",
+    "requests": 629,
+    "route": "typesafe"
+  },
+  "auc": {
+    "judge": 0.9652,
+    "num+judge": 0.9545,
+    "lexical": 0.6797
+  },
+  "lexical": {
+    "precision_supported": 0.5872,
+    "recall_supported": 0.7559,
+    "contradict_admitted": 0.6906,
+    "nei_admitted": 0.2091
+  },
+  "numbers_ok_only": {
+    "precision_supported": 0.4421,
+    "recall_supported": 0.9843,
+    "contradict_admitted": 0.9887,
+    "nei_admitted": 0.887
+  },
+  "thresholds": {
+    "0.3": {
+      "judge": {
+        "precision_supported": 0.9119,
+        "recall_supported": 0.876,
+        "contradict_admitted": 0.0377,
+        "nei_admitted": 0.0793
+      },
+      "num+judge": {
+        "precision_supported": 0.9132,
+        "recall_supported": 0.8701,
+        "contradict_admitted": 0.0377,
+        "nei_admitted": 0.0769
+      }
+    },
+    "0.5": {
+      "judge": {
+        "precision_supported": 0.9439,
+        "recall_supported": 0.8287,
+        "contradict_admitted": 0.0226,
+        "nei_admitted": 0.0457
+      },
+      "num+judge": {
+        "precision_supported": 0.9458,
+        "recall_supported": 0.8248,
+        "contradict_admitted": 0.0226,
+        "nei_admitted": 0.0433
+      }
+    },
+    "0.6": {
+      "judge": {
+        "precision_supported": 0.9523,
+        "recall_supported": 0.7854,
+        "contradict_admitted": 0.0113,
+        "nei_admitted": 0.0409
+      },
+      "num+judge": {
+        "precision_supported": 0.9543,
+        "recall_supported": 0.7815,
+        "contradict_admitted": 0.0113,
+        "nei_admitted": 0.0385
+      }
+    },
+    "0.7": {
+      "judge": {
+        "precision_supported": 0.9543,
+        "recall_supported": 0.7402,
+        "contradict_admitted": 0.0113,
+        "nei_admitted": 0.0361
+      },
+      "num+judge": {
+        "precision_supported": 0.9565,
+        "recall_supported": 0.7362,
+        "contradict_admitted": 0.0113,
+        "nei_admitted": 0.0337
+      }
+    },
+    "0.8": {
+      "judge": {
+        "precision_supported": 0.9687,
+        "recall_supported": 0.6693,
+        "contradict_admitted": 0.0075,
+        "nei_admitted": 0.0216
+      },
+      "num+judge": {
+        "precision_supported": 0.9685,
+        "recall_supported": 0.6654,
+        "contradict_admitted": 0.0075,
+        "nei_admitted": 0.0216
+      }
+    },
+    "0.9": {
+      "judge": {
+        "precision_supported": 0.9714,
+        "recall_supported": 0.5354,
+        "contradict_admitted": 0.0075,
+        "nei_admitted": 0.0144
+      },
+      "num+judge": {
+        "precision_supported": 0.9713,
+        "recall_supported": 0.5335,
+        "contradict_admitted": 0.0075,
+        "nei_admitted": 0.0144
+      }
+    }
+  }
+}
