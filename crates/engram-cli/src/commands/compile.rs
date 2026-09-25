@@ -11,13 +11,15 @@ use crate::error::CliError;
 use crate::fact_write::{
     write_fact, Autonomy, FactEmbedCache, FactWriteCtx, FactWriteOutcome, MemoryTime,
 };
+use crate::judge::{JudgeMode, JudgeSite};
 use crate::output::{print_success, Metadata};
 use engram_core::relations::{canonical_relation, relation_spec};
 use engram_core::types::SourceKind;
 use engram_graph::facts::ExtractedFact;
 use engram_llm::judge::lexical::{
-    claim_grounded_lexically, fact_grounded_lexically, negated_object, word_set,
+    claim_grounded_lexically, fact_grounded_lexically, negated_object, numbers_ok, word_set,
 };
+use engram_llm::judge::{ask_many, questions, Judge, JudgeError, BATCH_CONCURRENCY};
 use engram_llm::openrouter::{OpenRouterClient, DEFAULT_EXTRACTION_MODEL, DEFAULT_SYNTHESIS_MODEL};
 use engram_llm::{ChatLlm, ChatMessage};
 use serde::{Deserialize, Serialize};
@@ -60,6 +62,88 @@ pub struct CompileStats {
     pub llm_wiki_pages: usize,
     pub extraction_model: Option<String>,
     pub synthesis_model: Option<String>,
+    /// `judge.grounding` for this compile: `off` | `shadow` | `on`. Null
+    /// when the LLM pass did not run.
+    #[serde(default)]
+    pub judge_mode: Option<String>,
+    /// Who answered the grounding judge: `typesafe` | `openrouter` | `stub`,
+    /// or `none` when no judge was reachable and the compile ran as if off.
+    /// Null when the mode is off.
+    #[serde(default)]
+    pub judge_route: Option<String>,
+    #[serde(default)]
+    pub judge_requests: usize,
+    #[serde(default)]
+    pub judge_input_tokens: u64,
+    #[serde(default)]
+    pub judge_cost_usd: f64,
+    /// Chunks the judge did not decide (its call failed or left an item
+    /// unanswered): the lexical rules decided them.
+    #[serde(default)]
+    pub judge_fallback_chunks: usize,
+    /// Judged claims, by whether the lexical rule and the judge's `on` rule
+    /// admit them. In shadow they say what `on` would change.
+    #[serde(default)]
+    pub judge_claims_admitted_by_both: usize,
+    #[serde(default)]
+    pub judge_claims_rejected_by_both: usize,
+    #[serde(default)]
+    pub judge_claims_judge_only_admitted: usize,
+    #[serde(default)]
+    pub judge_claims_lexical_only_admitted: usize,
+    /// The same agreement counts for judged facts.
+    #[serde(default)]
+    pub judge_facts_admitted_by_both: usize,
+    #[serde(default)]
+    pub judge_facts_rejected_by_both: usize,
+    #[serde(default)]
+    pub judge_facts_judge_only_admitted: usize,
+    #[serde(default)]
+    pub judge_facts_lexical_only_admitted: usize,
+}
+
+/// What grounding decides about: an extracted claim or an extracted fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    Claim,
+    Fact,
+}
+
+impl CompileStats {
+    /// Whether an extracted item is admitted. `lexical` is the judge-free
+    /// rule; `judge` the `on` rule, `None` when the judge did not decide the
+    /// item's chunk. Where both exist their agreement is counted, in shadow
+    /// as in on.
+    fn admit(&mut self, item: Item, mode: JudgeMode, lexical: bool, judge: Option<bool>) -> bool {
+        let Some(judge) = judge else {
+            return lexical;
+        };
+        let [both, neither, judge_only, lexical_only] = match item {
+            Item::Claim => [
+                &mut self.judge_claims_admitted_by_both,
+                &mut self.judge_claims_rejected_by_both,
+                &mut self.judge_claims_judge_only_admitted,
+                &mut self.judge_claims_lexical_only_admitted,
+            ],
+            Item::Fact => [
+                &mut self.judge_facts_admitted_by_both,
+                &mut self.judge_facts_rejected_by_both,
+                &mut self.judge_facts_judge_only_admitted,
+                &mut self.judge_facts_lexical_only_admitted,
+            ],
+        };
+        *match (lexical, judge) {
+            (true, true) => both,
+            (false, false) => neither,
+            (false, true) => judge_only,
+            (true, false) => lexical_only,
+        } += 1;
+        if mode == JudgeMode::On {
+            judge
+        } else {
+            lexical
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -310,7 +394,7 @@ pub async fn compile_kb_with_options(
     // and every other writer failed on its 5 s busy_timeout meanwhile. A
     // provider error still aborts the compile, now before anything is written.
     let gathered = if options.llm {
-        Some(gather_llm(ctx, kb, &options).await?)
+        Some(gather_llm(ctx, kb, &options, &mut stats).await?)
     } else {
         None
     };
@@ -654,15 +738,30 @@ struct LlmGathered {
     synthesis_chunk_ids: HashSet<uuid::Uuid>,
 }
 
-/// Every provider call of an LLM compile, with no transaction open.
+/// Every provider call of an LLM compile, with no transaction open: one
+/// extraction per chunk, the grounding judge, the synthesis. Claims and facts
+/// come back already grounded.
 async fn gather_llm(
     ctx: &AppContext,
     kb: &str,
     options: &CompileOptions,
+    stats: &mut CompileStats,
 ) -> Result<LlmGathered, CliError> {
     // Spend guardrails bind before a provider is chosen, whichever it is.
     crate::commands::budget::enforce_budget(ctx, Some(kb))?;
+    // Read before the first paid call: a mistyped mode is exit 2, not a
+    // compile that paid for its extractions and then died.
+    let mode = crate::judge::judge_mode(JudgeSite::Grounding)?;
     let (extraction_llm, synthesis_llm, live) = resolve_compiler_llms(options)?;
+    // `off` never resolves a judge, so none of its settings are read.
+    let judge = match mode {
+        JudgeMode::Off => None,
+        JudgeMode::Shadow | JudgeMode::On => crate::judge::resolve_judge(false)?,
+    };
+    stats.judge_mode = Some(mode.as_str().to_string());
+    if mode != JudgeMode::Off {
+        stats.judge_route = Some(judge.as_ref().map_or("none", |j| j.name()).to_string());
+    }
     let chunks = ctx.store.list_chunks_for_kb(kb)?;
     let max_chunks = options.max_llm_chunks.unwrap_or(chunks.len());
     let in_scope = &chunks[..max_chunks.min(chunks.len())];
@@ -684,13 +783,26 @@ async fn gather_llm(
             record_compiler_usage(ctx, kb, "compiler_extract", &response, &prompt);
         }
         match parse_llm_evidence(&response.content) {
-            Ok(evidence) => extracted.push((chunk.chunk_id, evidence)),
+            Ok(evidence) => extracted.push((chunk, tidy(evidence))),
             Err(e) => tracing::warn!(
                 "compiler extraction parse failed for {}: {e}",
                 chunk.chunk_id
             ),
         }
     }
+
+    let verdicts = match &judge {
+        Some(judge) => judge_chunks(ctx, kb, judge.as_ref(), &extracted, stats).await,
+        None => extracted.iter().map(|_| None).collect(),
+    };
+    let extracted = extracted
+        .into_iter()
+        .zip(verdicts)
+        .map(|((chunk, evidence), verdicts)| {
+            let evidence = ground_evidence(chunk, evidence, mode, verdicts.as_ref(), stats);
+            (chunk.chunk_id, evidence)
+        })
+        .collect();
 
     let mut overview = None;
     if !in_scope.is_empty() {
@@ -834,30 +946,11 @@ async fn insert_llm_evidence(
         *entity_mentions.entry(canonical.name).or_insert(0) += 1;
         stats.llm_entities += 1;
     }
+    // Claims and facts arrive grounded (see `ground_evidence`).
     for claim in evidence.claims {
-        let content = claim.content.trim();
-        if content.is_empty() {
-            continue;
-        }
-        // HALLUCINATION GATE: an LLM-extracted claim is only stored if it is
-        // actually grounded in the source chunk. Otherwise a fabricated claim
-        // would land in the KB carrying a real chunk/span citation — a
-        // fully-sourced-looking falsehood, which is exactly what this tool
-        // exists to prevent. We require (a) every number in the claim to
-        // appear in the chunk, and (b) meaningful lexical overlap with the
-        // chunk.
-        if !claim_grounded_lexically(content, &chunk.content) {
-            tracing::warn!(
-                "compiler: dropped ungrounded LLM claim for chunk {}: {:?}",
-                chunk.chunk_id,
-                content.chars().take(80).collect::<String>()
-            );
-            stats.llm_claims_rejected += 1;
-            continue;
-        }
         ctx.store.insert_claim(
             kb,
-            content,
+            &claim.content,
             claim.evidence_level.as_deref().unwrap_or("unknown"),
             claim.confidence.unwrap_or(0.75).clamp(0.0, 1.0),
             span_id,
@@ -976,20 +1069,10 @@ async fn insert_llm_evidence(
     // the cache is never consulted.
     let cache = FactEmbedCache::empty();
     for fact in facts {
-        let subject = fact.subject.trim();
-        let predicate = fact.predicate.trim();
-        let object = fact.object.trim();
-        if subject.is_empty() || predicate.is_empty() || object.is_empty() {
-            continue;
-        }
-        if !fact_grounded_in_chunk(subject, predicate, object, &chunk.content) {
-            stats.llm_facts_rejected += 1;
-            continue;
-        }
         let ef = ExtractedFact {
-            subject: subject.to_string(),
-            predicate: predicate.to_string(),
-            object: object.to_string(),
+            subject: fact.subject,
+            predicate: fact.predicate,
+            object: fact.object,
             confidence: fact.confidence.unwrap_or(0.7).clamp(0.0, 1.0),
             fact_type: None,
             // The compiler extracts no date of its own, so the memory's is the
@@ -1004,6 +1087,159 @@ async fn insert_llm_evidence(
     stats.llm_facts += outcome.added;
     stats.llm_facts_queued += outcome.queued.len();
     Ok(())
+}
+
+/// Trim the claims and facts and drop blank ones, so the judge, the
+/// grounding rules and the writer see the same items. A blank item was never
+/// stored and is not counted as rejected.
+fn tidy(mut evidence: LlmEvidence) -> LlmEvidence {
+    for claim in &mut evidence.claims {
+        claim.content = claim.content.trim().to_string();
+    }
+    evidence.claims.retain(|c| !c.content.is_empty());
+    for fact in &mut evidence.facts {
+        for part in [&mut fact.subject, &mut fact.predicate, &mut fact.object] {
+            *part = part.trim().to_string();
+        }
+    }
+    evidence
+        .facts
+        .retain(|f| !(f.subject.is_empty() || f.predicate.is_empty() || f.object.is_empty()));
+    evidence
+}
+
+/// The judge's question ids for a chunk's claims and facts.
+fn claim_id(i: usize) -> String {
+    format!("c{i}")
+}
+
+fn fact_id(i: usize) -> String {
+    format!("f{i}")
+}
+
+/// P(supported) for every claim and fact of one chunk, by question id.
+struct ChunkVerdicts {
+    p: HashMap<String, f32>,
+}
+
+/// One grounding request per chunk (its claims, and its facts as sentences),
+/// [`BATCH_CONCURRENCY`] chunks at a time. A chunk whose request failed or
+/// left an item unanswered gets `None` and falls back to the lexical rules:
+/// a partial answer set is not a decision.
+async fn judge_chunks(
+    ctx: &AppContext,
+    kb: &str,
+    judge: &dyn Judge,
+    extracted: &[(&engram_storage::ChunkRecord, LlmEvidence)],
+    stats: &mut CompileStats,
+) -> Vec<Option<ChunkVerdicts>> {
+    let items: Vec<Vec<(String, String)>> = extracted
+        .iter()
+        .map(|(_, evidence)| {
+            let claims = evidence
+                .claims
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (claim_id(i), c.content.clone()));
+            let facts = evidence.facts.iter().enumerate().map(|(i, f)| {
+                let text = questions::fact_as_claim(&f.subject, &f.predicate, &f.object);
+                (fact_id(i), text)
+            });
+            claims.chain(facts).collect()
+        })
+        .collect();
+    // A chunk with nothing to judge sends nothing.
+    let asked: Vec<usize> = (0..items.len()).filter(|&i| !items[i].is_empty()).collect();
+    let requests: Vec<_> = asked
+        .iter()
+        .map(|&i| questions::grounding_request(&extracted[i].0.content, &items[i]))
+        .collect();
+    let responses = ask_many(judge, &requests, BATCH_CONCURRENCY).await;
+    let mut verdicts: Vec<Option<ChunkVerdicts>> = extracted.iter().map(|_| None).collect();
+    for (i, response) in asked.into_iter().zip(responses) {
+        let decided = response.and_then(|resp| {
+            crate::judge::record_judge_usage(
+                ctx,
+                JudgeSite::Grounding.operation(),
+                &resp,
+                Some(kb),
+                None,
+            );
+            stats.judge_requests += resp.requests as usize;
+            stats.judge_input_tokens += resp.input_tokens;
+            stats.judge_cost_usd += resp.cost_usd;
+            let p = items[i]
+                .iter()
+                .map(|(id, _)| Ok((id.clone(), resp.noul(id)?)))
+                .collect::<Result<_, JudgeError>>()?;
+            Ok(ChunkVerdicts { p })
+        });
+        match decided {
+            Ok(v) => verdicts[i] = Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    "compiler: the judge did not decide chunk {}, the lexical rules do: {e}",
+                    extracted[i].0.chunk_id
+                );
+                stats.judge_fallback_chunks += 1;
+            }
+        }
+    }
+    verdicts
+}
+
+/// Keep the claims and facts of one chunk that grounding admits, counting
+/// the rest.
+///
+/// HALLUCINATION GATE: an extracted claim or fact that the chunk does not
+/// support would land in the KB carrying a real chunk citation, a
+/// fully-sourced-looking falsehood; a fact would also reach `state`. Off, in
+/// shadow, and for a chunk the judge did not decide, the lexical rules
+/// decide. On, the judge does, with two checks kept in code: every number
+/// must be in the chunk (the judge is weak at numbers) and a safety member is
+/// never a negation (the judge reads it as supported).
+fn ground_evidence(
+    chunk: &engram_storage::ChunkRecord,
+    mut evidence: LlmEvidence,
+    mode: JudgeMode,
+    verdicts: Option<&ChunkVerdicts>,
+    stats: &mut CompileStats,
+) -> LlmEvidence {
+    let text = &chunk.content;
+    let p_of = |id: String| verdicts.and_then(|v| v.p.get(&id).copied());
+    let judge_admits =
+        |p: f32, numbers: bool| numbers && questions::admits(p, questions::COMPILE_ADMIT_P);
+
+    for (i, claim) in std::mem::take(&mut evidence.claims).into_iter().enumerate() {
+        let lexical = claim_grounded_lexically(&claim.content, text);
+        let numbers = numbers_ok(&claim.content, text);
+        let p = p_of(claim_id(i));
+        let judge = p.map(|p| judge_admits(p, numbers));
+        if stats.admit(Item::Claim, mode, lexical, judge) {
+            evidence.claims.push(claim);
+        } else {
+            tracing::warn!(
+                "compiler: dropped ungrounded LLM claim for chunk {}: {:?}",
+                chunk.chunk_id,
+                claim.content.chars().take(80).collect::<String>()
+            );
+            stats.llm_claims_rejected += 1;
+        }
+    }
+    for (i, fact) in std::mem::take(&mut evidence.facts).into_iter().enumerate() {
+        let (subject, predicate, object) = (&fact.subject, &fact.predicate, &fact.object);
+        let negated = negated_safety_member(predicate, object);
+        let lexical = fact_grounded_in_chunk(subject, predicate, object, text);
+        let numbers = numbers_ok(&questions::fact_as_claim(subject, predicate, object), text);
+        let p = p_of(fact_id(i));
+        let judge = p.map(|p| judge_admits(p, numbers) && !negated);
+        if stats.admit(Item::Fact, mode, lexical, judge) {
+            evidence.facts.push(fact);
+        } else {
+            stats.llm_facts_rejected += 1;
+        }
+    }
+    evidence
 }
 
 /// The judge-free rule for a compiled fact, which lands in the canonical
@@ -1463,5 +1699,51 @@ mod tests {
         assert_eq!(dropped, 1);
         assert!(out.contains("[chunk:unverified]"));
         assert!(out.contains(&uuid::Uuid::nil().to_string()));
+    }
+
+    #[test]
+    fn grounding_follows_the_mode_and_counts_agreement_only_when_judged() {
+        let mut stats = CompileStats::default();
+        // Not judged (off, no route, or a fallback chunk): the lexical rule.
+        assert!(stats.admit(Item::Claim, JudgeMode::On, true, None));
+        assert!(!stats.admit(Item::Fact, JudgeMode::On, false, None));
+        // Judged: `on` takes the judge, shadow keeps the lexical rule.
+        assert!(!stats.admit(Item::Claim, JudgeMode::On, true, Some(false)));
+        assert!(stats.admit(Item::Claim, JudgeMode::Shadow, true, Some(false)));
+        assert!(stats.admit(Item::Fact, JudgeMode::On, false, Some(true)));
+        assert!(!stats.admit(Item::Fact, JudgeMode::Shadow, false, Some(true)));
+        assert!(stats.admit(Item::Fact, JudgeMode::On, true, Some(true)));
+        assert_eq!(stats.judge_claims_lexical_only_admitted, 2);
+        assert_eq!(stats.judge_facts_judge_only_admitted, 2);
+        assert_eq!(stats.judge_facts_admitted_by_both, 1);
+        assert_eq!(
+            stats.judge_claims_admitted_by_both
+                + stats.judge_claims_rejected_by_both
+                + stats.judge_claims_judge_only_admitted
+                + stats.judge_facts_rejected_by_both
+                + stats.judge_facts_lexical_only_admitted,
+            0
+        );
+    }
+
+    #[test]
+    fn a_negation_is_refused_only_for_the_safety_sets() {
+        assert!(negated_safety_member(
+            "takes_medication",
+            "no blood thinners"
+        ));
+        assert!(negated_safety_member("allergy", "none"));
+        assert!(negated_safety_member(
+            "diagnosed_with",
+            "ruled out appendicitis"
+        ));
+        // A blood type of "O negative" is a value, and a non-safety
+        // relation is not this check's business.
+        assert!(!negated_safety_member("blood_type", "O negative"));
+        assert!(!negated_safety_member("prefers", "no meetings before ten"));
+        assert!(!negated_safety_member(
+            "takes_medication",
+            "metformin 500 mg"
+        ));
     }
 }

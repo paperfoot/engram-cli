@@ -106,3 +106,182 @@ fn a_negated_safety_member_is_rejected_and_a_grounded_one_is_written() {
     assert_eq!(ana.len(), 1, "{ana:?}");
     assert_eq!(ana[0]["object"], "metformin 500 mg");
 }
+
+// ---------------------------------------------------------------------------
+// The grounding judge (`judge.grounding`), scripted with ENGRAM_JUDGE_STUB.
+// ---------------------------------------------------------------------------
+
+/// Two memories: a trial result the extractor inverts (lexically grounded,
+/// wrong) next to a true claim, and a medication the extractor reads once
+/// right and once with an invented dose.
+fn seed_corpus(store: &Path) {
+    seed(
+        store,
+        "In this cohort, rapamycin did not decrease mortality compared with placebo, \
+         but it lowered fasting insulin in every participant.",
+    );
+    seed(store, "Ana takes metformin 500 mg daily for her diabetes.");
+}
+
+fn corpus_extractor() -> String {
+    extractor(&[
+        (
+            "did not decrease mortality",
+            r#"{"claims":[
+                {"content":"Rapamycin decreased mortality compared with placebo."},
+                {"content":"Rapamycin lowered fasting insulin in every participant."}]}"#,
+        ),
+        (
+            "metformin 500 mg daily",
+            r#"{"facts":[
+                {"subject":"Ana","predicate":"takes_medication","object":"metformin 500 mg"},
+                {"subject":"Ana","predicate":"takes_medication","object":"metformin 850 mg"}]}"#,
+        ),
+    ])
+}
+
+/// The inverted claim scores 0.1; everything else, the invented dose
+/// included, scores 0.95.
+const JUDGE: &str = r#"{"decreased mortality": 0.1, "*": 0.95}"#;
+
+fn medications(store: &Path) -> Vec<Value> {
+    facts_about(store, "Ana")
+        .iter()
+        .map(|f| f["object"].clone())
+        .collect()
+}
+
+#[test]
+fn on_the_judge_drops_the_inverted_claim_and_the_numbers_stay_in_code() {
+    let s = store();
+    seed_corpus(s.path());
+    let stats = compile(
+        s.path(),
+        &corpus_extractor(),
+        &[
+            ("ENGRAM_JUDGE_GROUNDING", "on"),
+            ("ENGRAM_JUDGE_STUB", JUDGE),
+        ],
+    );
+    assert_eq!(stats["judge_mode"], "on", "{stats}");
+    assert_eq!(stats["judge_route"], "stub", "{stats}");
+    assert_eq!(stats["judge_requests"], 2, "{stats}");
+    assert_eq!(stats["judge_fallback_chunks"], 0, "{stats}");
+    // The lexical rule admits "decreased mortality" (5 of its 6 words are in
+    // the chunk); the judge does not.
+    assert_eq!(stats["llm_claims"], 1, "{stats}");
+    assert_eq!(stats["llm_claims_rejected"], 1, "{stats}");
+    assert_eq!(stats["judge_claims_admitted_by_both"], 1, "{stats}");
+    assert_eq!(stats["judge_claims_lexical_only_admitted"], 1, "{stats}");
+    // 850 mg scored 0.95 and is still dropped: it is not in the chunk.
+    assert_eq!(stats["llm_facts"], 1, "{stats}");
+    assert_eq!(stats["llm_facts_rejected"], 1, "{stats}");
+    assert_eq!(stats["judge_facts_admitted_by_both"], 1, "{stats}");
+    assert_eq!(stats["judge_facts_rejected_by_both"], 1, "{stats}");
+    assert_eq!(medications(s.path()), vec!["metformin 500 mg"]);
+}
+
+#[test]
+fn shadow_stores_what_off_stores_and_counts_what_on_would_change() {
+    let off = store();
+    seed_corpus(off.path());
+    let off_stats = compile(off.path(), &corpus_extractor(), &[]);
+    let shadow = store();
+    seed_corpus(shadow.path());
+    let shadow_stats = compile(
+        shadow.path(),
+        &corpus_extractor(),
+        &[
+            ("ENGRAM_JUDGE_GROUNDING", "shadow"),
+            ("ENGRAM_JUDGE_STUB", JUDGE),
+        ],
+    );
+    for key in [
+        "llm_claims",
+        "llm_claims_rejected",
+        "llm_facts",
+        "llm_facts_rejected",
+    ] {
+        assert_eq!(off_stats[key], shadow_stats[key], "{key}: {shadow_stats}");
+    }
+    assert_eq!(off_stats["llm_claims"], 2, "{off_stats}");
+    assert_eq!(medications(off.path()), medications(shadow.path()));
+
+    assert_eq!(off_stats["judge_mode"], "off", "{off_stats}");
+    assert!(off_stats["judge_route"].is_null(), "{off_stats}");
+    assert_eq!(off_stats["judge_claims_lexical_only_admitted"], 0);
+    assert_eq!(shadow_stats["judge_mode"], "shadow", "{shadow_stats}");
+    assert_eq!(shadow_stats["judge_claims_admitted_by_both"], 1);
+    assert_eq!(shadow_stats["judge_claims_lexical_only_admitted"], 1);
+    assert_eq!(shadow_stats["judge_facts_admitted_by_both"], 1);
+    assert_eq!(shadow_stats["judge_facts_rejected_by_both"], 1);
+}
+
+/// The judge answers the inverted claim but not its neighbour, so it did not
+/// decide that chunk: the lexical rules do, and the 0.1 is not used. The
+/// medication chunk it answered in full is still judged.
+#[test]
+fn a_chunk_the_judge_leaves_half_answered_falls_back_to_the_lexical_rules() {
+    let s = store();
+    seed_corpus(s.path());
+    let stats = compile(
+        s.path(),
+        &corpus_extractor(),
+        &[
+            ("ENGRAM_JUDGE_GROUNDING", "on"),
+            (
+                "ENGRAM_JUDGE_STUB",
+                r#"{"decreased mortality": 0.1, "metformin": 0.95}"#,
+            ),
+        ],
+    );
+    assert_eq!(stats["judge_fallback_chunks"], 1, "{stats}");
+    assert_eq!(stats["llm_claims"], 2, "{stats}");
+    assert_eq!(stats["llm_claims_rejected"], 0, "{stats}");
+    assert_eq!(stats["judge_claims_lexical_only_admitted"], 0, "{stats}");
+    assert_eq!(stats["judge_facts_admitted_by_both"], 1, "{stats}");
+    assert_eq!(medications(s.path()), vec!["metformin 500 mg"]);
+}
+
+/// A judge request carries a memory to a third party: `off` must not even
+/// look at the judge's settings, and a site set to shadow with no reachable
+/// judge runs as off and says so.
+#[test]
+fn off_never_reads_the_judge_settings_and_no_route_runs_as_off() {
+    let s = store();
+    seed_corpus(s.path());
+    let stats = compile(
+        s.path(),
+        &corpus_extractor(),
+        &[("ENGRAM_JUDGE_STUB", "not a judge spec")],
+    );
+    assert_eq!(stats["judge_mode"], "off", "{stats}");
+    assert_eq!(stats["llm_claims"], 2, "{stats}");
+
+    // The same stub is read, and refused, once the site asks the judge.
+    let out = engram(s.path())
+        .env("ENGRAM_COMPILER_LLM_STUB", corpus_extractor())
+        .env("ENGRAM_JUDGE_GROUNDING", "shadow")
+        .env("ENGRAM_JUDGE_STUB", "not a judge spec")
+        .args(["compile", "--kb", KB, "--all", "--llm", "--json"])
+        .output()
+        .expect("engram runs");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ENGRAM_JUDGE_STUB"),
+        "{out:?}"
+    );
+
+    // No stub and no key (the harness strips them and forces stub
+    // embeddings, which also rules the judge out).
+    let stats = compile(
+        s.path(),
+        &corpus_extractor(),
+        &[("ENGRAM_JUDGE_GROUNDING", "shadow")],
+    );
+    assert_eq!(stats["judge_mode"], "shadow", "{stats}");
+    assert_eq!(stats["judge_route"], "none", "{stats}");
+    assert_eq!(stats["judge_requests"], 0, "{stats}");
+    assert_eq!(stats["judge_claims_admitted_by_both"], 0, "{stats}");
+    assert_eq!(stats["llm_claims"], 2, "{stats}");
+}
