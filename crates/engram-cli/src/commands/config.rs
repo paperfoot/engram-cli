@@ -61,6 +61,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
     let gemini_source = describe_key_source("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere_source = describe_key_source("COHERE_API_KEY", &file_cfg, "keys.cohere");
     let openrouter_source = describe_key_source("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
+    let typesafe_source = describe_key_source("TYPESAFE_API_KEY", &file_cfg, "keys.typesafe");
     let chunking = crate::commands::chunks::resolve_policy();
 
     print_success(
@@ -78,7 +79,11 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
                     .collect::<Vec<_>>(),
                 "cohere": cohere_source,
                 "openrouter": openrouter_source,
+                "typesafe": typesafe_source,
             },
+            // Per-site judge modes (off | shadow | on; default off) and the
+            // route a networked command would take.
+            "judge": crate::judge::status(),
             "retrieval": {
                 "profile": "cloud_quality",
                 // Derived, not hardcoded: this line said 50 long after the
@@ -207,6 +212,7 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
     let gemini = has_key("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere = has_key("COHERE_API_KEY", &file_cfg, "keys.cohere");
     let openrouter = has_key("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
+    let typesafe = has_key("TYPESAFE_API_KEY", &file_cfg, "keys.typesafe");
 
     // LIVE per-key probe. "Configured" is not "working": a key can be
     // syntactically present while its AI Studio project sits at zero prepaid
@@ -261,6 +267,15 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
             } else {
                 "missing (no fact extraction or compiler; judge only via TypeSafe)"
             },
+            "typesafe": if typesafe {
+                "configured (judge, direct)"
+            } else {
+                "missing (optional; the judge can go through OpenRouter)"
+            },
+            // Presence only, no live probe. `route` is what a judged command
+            // would use; `warnings` names a site set to shadow or on with
+            // no route.
+            "judge": crate::judge::status(),
             // Configured is not working: "ok" is true only when a key in
             // the chain actually SERVED the live probe. An agent branching on
             // this contract must not proceed on a depleted chain.

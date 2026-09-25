@@ -266,8 +266,9 @@ pub struct JudgeStatus {
     pub grounding: Option<JudgeMode>,
     pub adjudicate: Option<JudgeMode>,
     pub dedupe: Option<JudgeMode>,
-    /// The route a networked command would take (see [`route_name`]).
-    pub route: &'static str,
+    /// The route a networked command would take (see [`route_name`]);
+    /// `null` when `ENGRAM_JUDGE_STUB` is malformed (see `errors`).
+    pub route: Option<&'static str>,
     /// Settings that make judged commands exit 2.
     pub errors: Vec<String>,
     /// A site in shadow or on with no route: it runs without the judge.
@@ -286,10 +287,9 @@ pub fn status() -> JudgeStatus {
                 .ok()
         })
         .collect();
-    let route = route_name(false).unwrap_or_else(|e| {
-        errors.push(e.to_string());
-        "none"
-    });
+    let route = route_name(false)
+        .map_err(|e| errors.push(e.to_string()))
+        .ok();
     JudgeStatus {
         grounding: modes[0],
         adjudicate: modes[1],
@@ -300,9 +300,10 @@ pub fn status() -> JudgeStatus {
     }
 }
 
-/// `modes` in [`JudgeSite::ALL`] order.
-fn warnings_for(modes: &[Option<JudgeMode>], route: &str) -> Vec<String> {
-    if route != "none" {
+/// `modes` in [`JudgeSite::ALL`] order. An unresolvable route is an error,
+/// already reported, not a reason to warn.
+fn warnings_for(modes: &[Option<JudgeMode>], route: Option<&str>) -> Vec<String> {
+    if route != Some("none") {
         return Vec::new();
     }
     JudgeSite::ALL
@@ -464,11 +465,12 @@ mod tests {
     #[test]
     fn warnings_only_for_a_live_mode_with_no_route() {
         let modes = [Some(JudgeMode::Shadow), Some(JudgeMode::Off), None];
-        let w = warnings_for(&modes, "none");
+        let w = warnings_for(&modes, Some("none"));
         assert_eq!(w.len(), 1);
         assert!(w[0].starts_with("judge.grounding is shadow"), "{}", w[0]);
-        assert!(warnings_for(&modes, "typesafe").is_empty());
-        assert!(warnings_for(&[Some(JudgeMode::Off); 3], "none").is_empty());
+        assert!(warnings_for(&modes, Some("typesafe")).is_empty());
+        assert!(warnings_for(&modes, None).is_empty());
+        assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("none")).is_empty());
     }
 
     fn response(provider: &'static str) -> JudgeResponse {
