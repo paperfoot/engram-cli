@@ -243,7 +243,7 @@ fn decode_failure_message(e: &serde_json::Error, body_len: usize) -> String {
 }
 
 /// serde_json's own category as a stable word, without its message.
-fn classify_json_error(e: &serde_json::Error) -> &'static str {
+pub(crate) fn classify_json_error(e: &serde_json::Error) -> &'static str {
     use serde_json::error::Category;
     match e.classify() {
         Category::Syntax => "syntax",

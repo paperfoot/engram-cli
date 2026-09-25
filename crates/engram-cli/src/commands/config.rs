@@ -36,8 +36,31 @@ fn read_toml() -> Result<toml::Value, CliError> {
         return Ok(toml::Value::Table(toml::value::Table::new()));
     }
     let text = std::fs::read_to_string(&p)?;
-    toml::from_str(&text)
-        .map_err(|e| CliError::Config(format!("invalid TOML at {}: {e}", p.display())))
+    toml::from_str(&text).map_err(|e| toml_error(&p, &text, &e))
+}
+
+/// A config.toml parse error as a line and column, never the source line:
+/// `toml`'s Display quotes the offending line, which can hold an API key,
+/// and this error reaches `doctor`, `config show|check|set` and every
+/// command that reads a strict setting.
+fn toml_error(path: &std::path::Path, text: &str, e: &toml::de::Error) -> CliError {
+    let at = e
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| {
+            let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+            format!(
+                " at line {}, column {}",
+                before.matches('\n').count() + 1,
+                before[line_start..].chars().count() + 1
+            )
+        })
+        .unwrap_or_default();
+    CliError::Config(format!(
+        "invalid TOML in {}{at}: {}",
+        path.display(),
+        e.message().trim().replace('\n', "; ")
+    ))
 }
 
 fn write_toml(value: &toml::Value) -> Result<(), CliError> {
@@ -61,6 +84,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
     let gemini_source = describe_key_source("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere_source = describe_key_source("COHERE_API_KEY", &file_cfg, "keys.cohere");
     let openrouter_source = describe_key_source("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
+    let typesafe_source = describe_key_source("TYPESAFE_API_KEY", &file_cfg, "keys.typesafe");
     let chunking = crate::commands::chunks::resolve_policy();
 
     print_success(
@@ -78,7 +102,11 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
                     .collect::<Vec<_>>(),
                 "cohere": cohere_source,
                 "openrouter": openrouter_source,
+                "typesafe": typesafe_source,
             },
+            // Per-site judge modes (off | shadow | on; default off) and the
+            // route a networked command would take.
+            "judge": crate::judge::status(),
             "retrieval": {
                 "profile": "cloud_quality",
                 // Derived, not hardcoded: this line said 50 long after the
@@ -148,7 +176,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
 }
 
 fn describe_key_source(env: &str, file: &toml::Value, path: &str) -> serde_json::Value {
-    if let Ok(v) = std::env::var(env) {
+    if let Some(v) = env_secret(env) {
         return json!({ "source": "env", "env": env, "value": mask_key(&v) });
     }
     // Walk path dot-separated
@@ -161,7 +189,7 @@ fn describe_key_source(env: &str, file: &toml::Value, path: &str) -> serde_json:
             }
         }
     }
-    if let Some(s) = cur.as_str() {
+    if let Some(s) = cur.as_str().filter(|s| !s.is_empty()) {
         json!({ "source": "config_file", "value": mask_key(s) })
     } else {
         json!({ "source": "unset" })
@@ -207,6 +235,7 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
     let gemini = has_key("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere = has_key("COHERE_API_KEY", &file_cfg, "keys.cohere");
     let openrouter = has_key("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
+    let typesafe = has_key("TYPESAFE_API_KEY", &file_cfg, "keys.typesafe");
 
     // LIVE per-key probe. "Configured" is not "working": a key can be
     // syntactically present while its AI Studio project sits at zero prepaid
@@ -254,7 +283,22 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
             "gemini": if gemini { "configured" } else { "missing" },
             "gemini_keys_probed": probes,
             "cohere": if cohere { "configured (optional)" } else { "missing (optional)" },
-            "openrouter": if openrouter { "configured (compiler)" } else { "missing (compiler optional)" },
+            // Not "compiler optional": `remember` extracts facts through
+            // OpenRouter by default, so without it no facts are stored.
+            "openrouter": if openrouter {
+                "configured (fact extraction, compiler, judge)"
+            } else {
+                "missing (no fact extraction or compiler; judge only via TypeSafe)"
+            },
+            "typesafe": if typesafe {
+                "configured (judge, direct)"
+            } else {
+                "missing (optional; the judge can go through OpenRouter)"
+            },
+            // Presence only, no live probe. `route` is what a judged command
+            // would use; `warnings` names a site set to shadow or on with
+            // no route or on the test stub.
+            "judge": crate::judge::status(),
             // Configured is not working: "ok" is true only when a key in
             // the chain actually SERVED the live probe. An agent branching on
             // this contract must not proceed on a depleted chain.
@@ -277,15 +321,7 @@ async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'stat
     let Some(client) = client else {
         return "probe_error";
     };
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={key}",
-        engram_embed::gemini::DEFAULT_MODEL
-    );
-    let body = json!({
-        "content": {"parts": [{"text": "probe"}]},
-        "outputDimensionality": 8,
-    });
-    match client.post(&url).json(&body).send().await {
+    match gemini_probe(client, key).send().await {
         Err(_) => "unreachable",
         Ok(resp) => match resp.status().as_u16() {
             200 => "ok",
@@ -296,8 +332,22 @@ async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'stat
     }
 }
 
+/// The probe request. The key rides in a header, never the URL: reqwest
+/// puts the URL in its error text, so a `?key=` URL leaks the key wherever
+/// an error is shown.
+fn gemini_probe(client: &reqwest::Client, key: &str) -> reqwest::RequestBuilder {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
+        engram_embed::gemini::DEFAULT_MODEL
+    );
+    client.post(url).header("x-goog-api-key", key).json(&json!({
+        "content": {"parts": [{"text": "probe"}]},
+        "outputDimensionality": 8,
+    }))
+}
+
 fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
-    if std::env::var(env).is_ok() {
+    if env_secret(env).is_some() {
         return true;
     }
     let mut cur = file;
@@ -338,15 +388,21 @@ pub fn gemini_fallback_keys() -> Vec<String> {
         .collect()
 }
 
+/// A key from the environment; an empty variable is absent. The one env
+/// reader for keys: `config show` and `config check` once treated
+/// `OPENROUTER_API_KEY=` as configured while every command using the key
+/// treated it as missing.
+fn env_secret(env: &str) -> Option<String> {
+    std::env::var(env).ok().filter(|v| !v.is_empty())
+}
+
 /// Resolve a secret in the canonical order: env var → config file → None.
 /// This is the single source of truth for key lookup so users can either
 /// set `GEMINI_API_KEY` in the environment or run `engram config set keys.gemini <value>` and
 /// both work identically. Framework rule: env overrides file.
 pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(env) {
-        if !v.is_empty() {
-            return Some(v);
-        }
+    if let Some(v) = env_secret(env) {
+        return Some(v);
     }
     let root = read_toml().ok()?;
     let mut cur = &root;
@@ -356,6 +412,22 @@ pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
     cur.as_str()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// The value at a dotted `toml_path` in config.toml, `None` when unset.
+/// Unlike [`resolve_config_string`], an unreadable or invalid file is an
+/// error rather than "unset", for settings that must never fall back to a
+/// default silently.
+pub fn config_value(toml_path: &str) -> Result<Option<toml::Value>, CliError> {
+    let root = read_toml()?;
+    let mut cur = &root;
+    for part in toml_path.split('.') {
+        match cur.get(part) {
+            Some(next) => cur = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cur.clone()))
 }
 
 pub fn resolve_config_string(toml_path: &str) -> Option<String> {
@@ -410,7 +482,50 @@ pub fn stub_forced() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_list;
+    use super::*;
+
+    #[test]
+    fn a_toml_error_never_quotes_config_toml() {
+        let secret = "AIzaFAKESECRET0123456789abcdef";
+        for text in [
+            format!("[keys]\ngemini \"{secret}\"\n"),
+            format!("[keys]\nopenrouter = \"{secret}\n"),
+            format!("[keys]\ngemini = {secret}\n"),
+            format!("[keys]\n{secret}\n"),
+            format!("[keys]\ngemini = \"{secret}\"\ngemini = \"{secret}\"\n"),
+        ] {
+            let e = toml::from_str::<toml::Value>(&text).unwrap_err();
+            let msg = toml_error(std::path::Path::new("/c/config.toml"), &text, &e).to_string();
+            assert!(!msg.contains("AIza"), "{msg}");
+            assert!(msg.contains("/c/config.toml at line "), "{msg}");
+        }
+    }
+
+    #[test]
+    fn an_empty_key_is_absent_in_env_and_in_the_file() {
+        let file: toml::Value = toml::from_str("[keys]\ntypesafe = \"\"\n").unwrap();
+        // Read by these tests only.
+        let unset = "ENGRAM_TEST_UNSET_KEY_3F9C1B";
+        let empty = "ENGRAM_TEST_EMPTY_KEY_3F9C1B";
+        std::env::set_var(empty, "");
+        for env in [unset, empty] {
+            assert!(!has_key(env, &file, "keys.typesafe"), "{env}");
+            assert_eq!(
+                describe_key_source(env, &file, "keys.typesafe"),
+                json!({ "source": "unset" }),
+                "{env}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gemini_probe_sends_its_key_in_a_header_not_the_url() {
+        let key = "AIzaFAKEPROBEKEY0123456789";
+        let req = gemini_probe(&reqwest::Client::new(), key).build().unwrap();
+        assert_eq!(req.url().query(), None);
+        assert!(!req.url().as_str().contains(key));
+        assert_eq!(req.headers()["x-goog-api-key"], key);
+    }
 
     #[test]
     fn key_lists_split_on_commas_and_whitespace_and_dedup() {

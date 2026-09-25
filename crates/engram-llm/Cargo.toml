@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Chat LLM providers (OpenRouter) for answer generation and judging"
+description = "Chat LLM providers (OpenRouter) and the calibrated judge (TypeSafe JEV)"
 
 [lib]
 name = "engram_llm"
@@ -18,3 +18,9 @@ thiserror.workspace = true
 tokio.workspace = true
 async-trait = "0.1"
 tracing.workspace = true
+# Bounded-concurrency batching; already in the tree via reqwest/hyper.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# An in-process HTTP responder for the judge client's retry tests.
+tokio = { workspace = true, features = ["net", "io-util"] }
