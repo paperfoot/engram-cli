@@ -13,6 +13,10 @@
 //!   bounded concurrency and merges the answers.
 //! - [`JudgeResponse::noul`] — a missing or mistyped answer is an error for
 //!   that id, never a default value.
+//! - [`lexical`] — the deterministic grounding rules (numbers, word overlap)
+//!   the judge is compared against and falls back to.
+
+pub mod lexical;
 
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
