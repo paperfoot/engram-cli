@@ -36,8 +36,31 @@ fn read_toml() -> Result<toml::Value, CliError> {
         return Ok(toml::Value::Table(toml::value::Table::new()));
     }
     let text = std::fs::read_to_string(&p)?;
-    toml::from_str(&text)
-        .map_err(|e| CliError::Config(format!("invalid TOML at {}: {e}", p.display())))
+    toml::from_str(&text).map_err(|e| toml_error(&p, &text, &e))
+}
+
+/// A config.toml parse error as a line and column, never the source line:
+/// `toml`'s Display quotes the offending line, which can hold an API key,
+/// and this error reaches `doctor`, `config show|check|set` and every
+/// command that reads a strict setting.
+fn toml_error(path: &std::path::Path, text: &str, e: &toml::de::Error) -> CliError {
+    let at = e
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| {
+            let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+            format!(
+                " at line {}, column {}",
+                before.matches('\n').count() + 1,
+                before[line_start..].chars().count() + 1
+            )
+        })
+        .unwrap_or_default();
+    CliError::Config(format!(
+        "invalid TOML in {}{at}: {}",
+        path.display(),
+        e.message().trim().replace('\n', "; ")
+    ))
 }
 
 fn write_toml(value: &toml::Value) -> Result<(), CliError> {
@@ -461,7 +484,24 @@ pub fn stub_forced() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_list;
+    use super::*;
+
+    #[test]
+    fn a_toml_error_never_quotes_config_toml() {
+        let secret = "AIzaFAKESECRET0123456789abcdef";
+        for text in [
+            format!("[keys]\ngemini \"{secret}\"\n"),
+            format!("[keys]\nopenrouter = \"{secret}\n"),
+            format!("[keys]\ngemini = {secret}\n"),
+            format!("[keys]\n{secret}\n"),
+            format!("[keys]\ngemini = \"{secret}\"\ngemini = \"{secret}\"\n"),
+        ] {
+            let e = toml::from_str::<toml::Value>(&text).unwrap_err();
+            let msg = toml_error(std::path::Path::new("/c/config.toml"), &text, &e).to_string();
+            assert!(!msg.contains("AIza"), "{msg}");
+            assert!(msg.contains("/c/config.toml at line "), "{msg}");
+        }
+    }
 
     #[test]
     fn key_lists_split_on_commas_and_whitespace_and_dedup() {
