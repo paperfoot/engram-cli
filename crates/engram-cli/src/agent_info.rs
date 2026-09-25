@@ -5,7 +5,8 @@
 //! this once to discover every command.
 
 use crate::error::CliError;
-use serde_json::json;
+use crate::output::OutputFormat;
+use serde_json::{json, Value};
 use std::io::Write;
 
 /// Takes no context on purpose: the discovery surface must answer without
@@ -17,9 +18,9 @@ use std::io::Write;
 /// have been telling agents to run `agent-info --schema '<command>'` since
 /// before the flag existed; the generator was always there, so this is the
 /// door, not a new room.
-pub fn run(schema: Option<&str>) -> Result<(), CliError> {
+pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
     if let Some(path) = schema {
-        return print_schema(path);
+        return print_schema(path, format);
     }
     let manifest = json!({
         "name": "engram",
@@ -446,12 +447,25 @@ pub fn run(schema: Option<&str>) -> Result<(), CliError> {
         "framework": "https://github.com/paperfoot/agent-cli-framework"
     });
 
-    let manifest = merge_contract(manifest);
+    emit(&merge_contract(manifest), format)
+}
 
-    // Raw JSON — NOT wrapped in envelope. Framework principle #1.
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{}", serde_json::to_string_pretty(&manifest).unwrap());
-    Ok(())
+/// Raw JSON — NOT wrapped in the envelope (framework principle #1), and
+/// compact unless a person is reading a terminal. Indentation was 15% of the
+/// manifest's tokens, paid by every agent on every read for a layout only a
+/// human sees; `jq` restores it for anyone who wants it.
+fn emit(value: &Value, format: OutputFormat) -> Result<(), CliError> {
+    let text = match format {
+        OutputFormat::Human => serde_json::to_string_pretty(value),
+        OutputFormat::Json => serde_json::to_string(value),
+    }
+    .expect("a serde_json::Value always serializes");
+    // One write. A reader that stops early (`agent-info | head`) is not a
+    // failure of this command; any other write error is.
+    match writeln!(std::io::stdout().lock(), "{text}") {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// One command's JSON Schema, raw like the manifest itself.
@@ -460,13 +474,9 @@ pub fn run(schema: Option<&str>) -> Result<(), CliError> {
 /// answers "no such command" and then repeats the suggestion the caller just
 /// followed is a loop with a confident tone — which is exactly what this
 /// invocation used to be.
-fn print_schema(path: &str) -> Result<(), CliError> {
+fn print_schema(path: &str, format: OutputFormat) -> Result<(), CliError> {
     match engram_contract::jsonschema::schema_for(path) {
-        Some(schema) => {
-            let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "{}", serde_json::to_string_pretty(&schema).unwrap());
-            Ok(())
-        }
+        Some(schema) => emit(&schema, format),
         None => {
             let known = engram_contract::contract()
                 .commands
@@ -490,7 +500,7 @@ fn print_schema(path: &str) -> Result<(), CliError> {
 /// and the hand-written entry for anything not yet transcribed stays exactly
 /// as it shipped. `recall` is first because it is the command agents call
 /// most and the one whose documented defaults have drifted before.
-fn merge_contract(mut manifest: serde_json::Value) -> serde_json::Value {
+fn merge_contract(mut manifest: Value) -> Value {
     let rt = runtime();
     let generated = engram_contract::agent_info::render(&rt);
 

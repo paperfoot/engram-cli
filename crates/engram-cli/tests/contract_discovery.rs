@@ -151,3 +151,38 @@ fn agent_info_is_raw_json_not_enveloped() {
         "agent-info is wrapped in the success envelope"
     );
 }
+
+/// Piped, the manifest is ONE line: indentation was 15% of its tokens, paid by
+/// every agent on every read for a layout only a terminal shows. A trailing
+/// newline and nothing else — `jq` restores the indentation for a human.
+#[test]
+fn agent_info_is_one_compact_line_when_piped() {
+    let sb = Sandbox::new();
+    for args in [vec!["agent-info"], vec!["agent-info", "--json"]] {
+        let out = sb.cmd().args(&args).output().unwrap();
+        assert!(out.status.success(), "{args:?}");
+        assert_one_compact_line(&out.stdout, &format!("{args:?}"));
+    }
+    assert!(store_is_untouched(&sb));
+}
+
+#[test]
+fn schema_is_one_compact_line_when_piped() {
+    let sb = Sandbox::new();
+    let out = sb
+        .cmd()
+        .args(["agent-info", "--schema", "recall"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_one_compact_line(&out.stdout, "--schema recall");
+}
+
+fn assert_one_compact_line(stdout: &[u8], what: &str) {
+    let text = std::str::from_utf8(stdout).expect("utf-8");
+    let body = text.strip_suffix('\n').expect("ends in one newline");
+    assert!(!body.contains('\n'), "{what} is pretty-printed on a pipe");
+    assert!(!body.starts_with("{ "), "{what}");
+    let v: serde_json::Value = serde_json::from_str(body).expect("one JSON document");
+    assert!(v.is_object(), "{what}");
+}

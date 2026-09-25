@@ -37,13 +37,13 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     // AppContext runs migrations, and "run agent-info to check the setup"
     // must never be the call that migrates (or creates) a database.
     if let Command::AgentInfo { schema } = &cli.command {
-        return agent_info::run(schema.as_deref());
+        return agent_info::run(schema.as_deref(), format);
     }
     let ctx = context::AppContext::new(format, cli.quiet)?;
     ctx.core.set_actor(actor_for(&cli.command));
 
     match cli.command {
-        Command::AgentInfo { schema } => agent_info::run(schema.as_deref()),
+        Command::AgentInfo { schema } => agent_info::run(schema.as_deref(), format),
         Command::Remember {
             content,
             importance,
