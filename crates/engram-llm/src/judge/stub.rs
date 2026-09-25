@@ -108,6 +108,7 @@ impl StubJudge {
                 };
                 Some(Answer::Score {
                     value: level as f32,
+                    confidence: 1.0,
                     probabilities: (0..levels.len())
                         .map(|i| if i == level { 1.0 } else { 0.0 })
                         .collect(),

@@ -41,6 +41,7 @@
 pub mod lexical;
 pub mod questions;
 pub mod stub;
+pub mod typesafe;
 
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
@@ -302,8 +303,14 @@ pub enum Answer {
         confidence: f32,
         probabilities: BTreeMap<String, f32>,
     },
-    /// Expected level index (sum of index x p) and P(level), lowest first.
-    Score { value: f32, probabilities: Vec<f32> },
+    /// Expected level index (sum of index x p), the provider's confidence
+    /// (its formula past three levels is undocumented: read it, never
+    /// recompute it) and P(level), lowest first.
+    Score {
+        value: f32,
+        confidence: f32,
+        probabilities: Vec<f32>,
+    },
 }
 
 impl Answer {
@@ -649,6 +656,7 @@ mod tests {
                 "s".to_string(),
                 Answer::Score {
                     value: 1.0,
+                    confidence: 1.0,
                     probabilities: vec![0.0, 1.0],
                 },
             )]),

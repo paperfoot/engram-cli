@@ -20,3 +20,7 @@ async-trait = "0.1"
 tracing.workspace = true
 # Bounded-concurrency batching; already in the tree via reqwest/hyper.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# An in-process HTTP responder for the judge client's retry tests.
+tokio = { workspace = true, features = ["net", "io-util"] }
