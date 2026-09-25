@@ -367,6 +367,12 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         "answer_context": answer_context,
         "results": results_json,
         "conflicts": conflicts,
+        // `RECALL_DATA` has promised both at the top of `data` since the
+        // contract landed, as `always`; they were only ever emitted one level
+        // down, so recall failed its own published schema. The copies in
+        // `data.metadata` and the envelope's `metadata` stay.
+        "kb": scope.label(),
+        "kb_scope": scope.origin.as_str(),
         "metadata": {
             "profile": profile_enum.as_str(),
             "embed_model": backends.embed_model,
@@ -375,14 +381,25 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             "reranker": backends.reranker_label,
             "candidates_considered": rerank_candidates,
             "kb": scope.label(),
-            "kb_scope": scope.origin.as_str(),
-            "diary_isolation": notes.diary_isolation_json(),
-            "temporal_scope": notes.temporal_scope_json(),
-            "expiry": notes.expiry_json()
+            "kb_scope": scope.origin.as_str()
         }
     }) else {
         unreachable!("json! object literal");
     };
+    // Present only when they say something, exactly as in the envelope's
+    // `metadata`: three `null`s on every call were bytes paid to learn nothing,
+    // and the contract already calls all three present-only-in-some.
+    if let Some(Value::Object(inner)) = data.get_mut("metadata") {
+        for (key, note) in [
+            ("diary_isolation", notes.diary_isolation_json()),
+            ("temporal_scope", notes.temporal_scope_json()),
+            ("expiry", notes.expiry_json()),
+        ] {
+            if let Some(note) = note {
+                inner.insert(key.to_string(), note);
+            }
+        }
+    }
     // `absence` lands only on `no_match`: a certificate of absence beside
     // results would be a certificate of nothing.
     verdict.attach(&mut data);

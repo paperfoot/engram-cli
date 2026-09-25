@@ -476,6 +476,46 @@ fn every_provenance_block_carries_observed_at_and_snippet() {
     }
 }
 
+/// Recall against its own published schema: every `data` field the contract
+/// calls always-present is present, on both spellings. `kb` and `kb_scope`
+/// were promised at the top of `data` from the day the contract landed and
+/// only ever emitted one level down — an agent that trusted the schema read
+/// `null`. And the three notes that say nothing unless something happened
+/// are absent, not `null`, as the contract says.
+#[test]
+fn live_recall_output_satisfies_its_own_schema() {
+    let sb = Sandbox::new();
+    remember(&sb, "Ana moved to Lisbon in March and loves the tram");
+    let schema = engram_contract::jsonschema::schema_for("recall").unwrap();
+    let required = schema["properties"]["output"]["properties"]["data"]["required"]
+        .as_array()
+        .expect("required data fields");
+    let spellings: [&[&str]; 2] = [
+        &["recall", "Lisbon", "--profile", "offline"],
+        &["memory", "search", "Lisbon", "--profile", "offline"],
+    ];
+    for argv in spellings {
+        let out = sb.cmd().args(argv).output().expect("recall");
+        assert!(out.status.success(), "{argv:?}");
+        let v = Sandbox::json(&out);
+        for key in required {
+            let key = key.as_str().unwrap();
+            assert!(
+                v["data"].get(key).is_some(),
+                "{argv:?} omits `data.{key}`, which its schema requires"
+            );
+        }
+        assert_eq!(v["data"]["kb"], v["metadata"]["kb"], "{argv:?}");
+        assert_eq!(v["data"]["kb_scope"], "all_kbs", "{argv:?}");
+        for quiet in ["diary_isolation", "temporal_scope", "expiry"] {
+            assert!(
+                v["data"]["metadata"].get(quiet).is_none(),
+                "{argv:?} prints `data.metadata.{quiet}: null` on a call it says nothing about"
+            );
+        }
+    }
+}
+
 // --- the taxonomy and the vocabularies --------------------------------------
 
 /// The four codes v0.4 added are documented, with the exits and the
