@@ -27,7 +27,8 @@
 //! The caller is a frontier agent with conversation context this store cannot
 //! see — `assisted` mode hands it the adjudication instead of paying for a
 //! worse-informed LLM call here. Under `full` the LLM may adjudicate, but it
-//! is a `Heuristic` authority: it can no longer close a safety interval.
+//! is a `Heuristic` authority: it can no longer close a safety interval, clear
+//! a safety question, or discard a safety observation.
 
 use crate::context::AppContext;
 use crate::error::CliError;
@@ -852,8 +853,9 @@ pub async fn write_fact(
 /// The LLM is a `Heuristic` authority and nothing more. Its `supersede` can
 /// close a routine interval and CANNOT close a safety one — `may_close`
 /// refuses, the pair stays queued, and the caller (who has the conversation)
-/// decides. That is the one behaviour change `--autonomy full` sees: more
-/// queued pairs on medical content, fewer everywhere else.
+/// decides. Its `coexist` and `reject_new` are refused on a safety pair for
+/// the same reason. That is the one behaviour change `--autonomy full` sees:
+/// more queued pairs on medical content, fewer everywhere else.
 ///
 /// A failed adjudication is not an error: the pairs stay queued, which is what
 /// `assisted` would have done anyway, and the envelope says so
@@ -893,13 +895,37 @@ async fn adjudicate_plan(
             return;
         }
     };
+    // A safety pair is the caller's, whatever the judge says. `may_close`
+    // only guards CLOSES, and the two other answers dispose of a question
+    // too: `reject_new` drops the caller's observation (a dose change vanished
+    // and was reported as a duplicate), `coexist` deletes the question. The
+    // contract is "their intervals are closed only on your explicit
+    // instruction, never by a heuristic" (IN-19), and an absorb or a cleared
+    // question is the same outcome reached by another door.
+    let is_safety = |q: &PlannedConflict| {
+        observation.spec.is_safety()
+            || by_id
+                .get(&q.old_fact_id)
+                .is_some_and(|f| relation_spec(&canonical_predicate(&f.predicate)).is_safety())
+    };
     match action {
+        AdjudicationAction::RejectNew if plan.queue.iter().any(is_safety) => {
+            plan.notes.push(PlanNote::AdjudicationKeptSafety {
+                action: "reject_new",
+            });
+        }
         // The planner's own absorb, not a hand-rolled half of it: a close,
         // confirmation or replay planned on behalf of an observation that is
         // then discarded would retire a value on the word of a fact that
         // never reaches the store.
         AdjudicationAction::RejectNew => plan.absorb("semantic_llm"),
-        AdjudicationAction::Coexist => plan.queue.clear(),
+        AdjudicationAction::Coexist => {
+            plan.queue.retain(|q| is_safety(q));
+            if !plan.queue.is_empty() {
+                plan.notes
+                    .push(PlanNote::AdjudicationKeptSafety { action: "coexist" });
+            }
+        }
         AdjudicationAction::Supersede(ids) => {
             let authority = CloseAuthority::Heuristic {
                 rule: "semantic_llm",

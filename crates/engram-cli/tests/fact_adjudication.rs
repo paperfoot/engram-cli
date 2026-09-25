@@ -221,3 +221,84 @@ fn a_rejected_observation_closes_nothing_on_its_way_out() {
     );
     assert_eq!(open_objects(tmp.path()), ["1990-04-12", "1990-04-13"]);
 }
+
+// ----- B3: a safety question is the caller's -------------------------------
+
+/// The report's repro: a caller-asserted dose change, `reject_new`ed by the
+/// judge, vanished and was reported as a duplicate.
+#[test]
+fn the_judge_cannot_discard_a_safety_observation() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana takes metformin 500 mg.",
+        &med("metformin 500 mg"),
+    );
+    let v = judged(
+        tmp.path(),
+        "Ana now takes metformin 1000 mg.",
+        &med("metformin 1000 mg"),
+        r#"{"action":"reject_new"}"#,
+    );
+    assert_eq!(
+        v["data"]["facts_added"], 1,
+        "the caller's dose is kept: {v}"
+    );
+    assert_eq!(v["data"]["facts_deduped"], 0, "{v}");
+    assert_eq!(queued(&v).len(), 1, "{v}");
+    assert_eq!(queued(&v)[0]["suggested_action"], "requires_context");
+    assert!(note_kinds(&v).contains(&"adjudication_kept_safety".to_string()));
+    assert_eq!(
+        open_objects(tmp.path()),
+        ["metformin 1000 mg", "metformin 500 mg"]
+    );
+}
+
+#[test]
+fn the_judge_cannot_dismiss_a_safety_question() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana takes metformin 500 mg.",
+        &med("metformin 500 mg"),
+    );
+    let v = judged(
+        tmp.path(),
+        "Ana now takes metformin 1000 mg.",
+        &med("metformin 1000 mg"),
+        r#"{"action":"coexist"}"#,
+    );
+    assert_eq!(queued(&v).len(), 1, "the question survives: {v}");
+    assert!(note_kinds(&v).contains(&"adjudication_kept_safety".to_string()));
+    assert_eq!(open_conflicts(tmp.path())["data"]["total_open"], 1);
+}
+
+/// And outside the safety registry the judge's answers still stand — the fix
+/// is scoped, not a switch that turns `--autonomy full` into `assisted`.
+#[test]
+fn the_judge_still_settles_a_routine_question() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
+    );
+    let v = judged(
+        tmp.path(),
+        "Ana was born 1990-04-13.",
+        &birthday("1990-04-13"),
+        r#"{"action":"coexist"}"#,
+    );
+    assert_eq!(queued(&v).len(), 0, "{v}");
+    assert!(note_kinds(&v).is_empty(), "{v}");
+
+    let v = judged(
+        tmp.path(),
+        "Ana was born 1990-04-14.",
+        &birthday("1990-04-14"),
+        r#"{"action":"reject_new"}"#,
+    );
+    assert_eq!(v["data"]["facts_added"], 0, "{v}");
+    assert_eq!(v["data"]["facts_deduped"], 1, "{v}");
+    assert_eq!(open_objects(tmp.path()), ["1990-04-12", "1990-04-13"]);
+}

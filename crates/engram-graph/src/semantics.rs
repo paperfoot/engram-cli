@@ -1073,6 +1073,12 @@ pub enum PlanNote {
     AdjudicationFailed {
         reason: &'static str,
     },
+    /// The machine adjudicator answered `coexist` or `reject_new` on a safety
+    /// pair. Neither is its to give: the pair stays queued and the caller's
+    /// observation is kept.
+    AdjudicationKeptSafety {
+        action: &'static str,
+    },
 }
 
 impl PlanNote {
@@ -1083,6 +1089,7 @@ impl PlanNote {
             PlanNote::EndWithoutOpenInterval { .. } => "end_without_open_interval",
             PlanNote::ReplayApplied { .. } => "replay_applied",
             PlanNote::AdjudicationFailed { .. } => "adjudication_failed",
+            PlanNote::AdjudicationKeptSafety { .. } => "adjudication_kept_safety",
         }
     }
 
@@ -1104,6 +1111,11 @@ impl PlanNote {
             PlanNote::AdjudicationFailed { reason } => format!(
                 "the adjudicator gave no verdict ({reason}); every pair it was asked about stays \
                  queued for the caller"
+            ),
+            PlanNote::AdjudicationKeptSafety { action } => format!(
+                "the adjudicator answered {action} on a safety relation; only the caller may \
+                 clear or discard a safety question, so it stays queued and the observation is \
+                 kept"
             ),
         }
     }
