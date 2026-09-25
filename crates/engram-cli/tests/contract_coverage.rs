@@ -25,9 +25,6 @@ const NOT_YET_TRANSCRIBED: &[&str] = &[
     "budget show",
     "budget set",
     "budget clear",
-    "skill install",
-    "skill package",
-    "skill uninstall",
     "ingest",
     "update",
 ];
