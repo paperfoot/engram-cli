@@ -12,9 +12,12 @@ use crate::fact_write::{
     write_fact, Autonomy, FactEmbedCache, FactWriteCtx, FactWriteOutcome, MemoryTime,
 };
 use crate::output::{print_success, Metadata};
+use engram_core::relations::{canonical_relation, relation_spec};
 use engram_core::types::SourceKind;
 use engram_graph::facts::ExtractedFact;
-use engram_llm::judge::lexical::{claim_grounded_lexically, word_set};
+use engram_llm::judge::lexical::{
+    claim_grounded_lexically, fact_grounded_lexically, negated_object, word_set,
+};
 use engram_llm::openrouter::{OpenRouterClient, DEFAULT_EXTRACTION_MODEL, DEFAULT_SYNTHESIS_MODEL};
 use engram_llm::{ChatLlm, ChatMessage};
 use serde::{Deserialize, Serialize};
@@ -975,9 +978,7 @@ async fn insert_llm_evidence(
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
             continue;
         }
-        // Grounded like claims: the fact's subject and object must be
-        // supported by the chunk before the write path ever sees it.
-        if !claim_grounded_lexically(&format!("{subject} {object}"), &chunk.content) {
+        if !fact_grounded_in_chunk(subject, predicate, object, &chunk.content) {
             stats.llm_facts_rejected += 1;
             continue;
         }
@@ -999,6 +1000,24 @@ async fn insert_llm_evidence(
     stats.llm_facts += outcome.added;
     stats.llm_facts_queued += outcome.queued.len();
     Ok(())
+}
+
+/// The judge-free rule for a compiled fact, which lands in the canonical
+/// store `state` serves. Every subject and object token must be in the chunk:
+/// the claim rule's four-character floor let "Bob diagnosed_with HIV" through
+/// against a weather note, because it left nothing to check.
+fn fact_grounded_in_chunk(subject: &str, predicate: &str, object: &str, chunk: &str) -> bool {
+    fact_grounded_lexically(subject, predicate, object, chunk)
+        && !negated_safety_member(predicate, object)
+}
+
+/// A medication, allergy or diagnosis that is a negation ("takes_medication:
+/// no blood thinners"). The text does say it, so neither the lexical rule nor
+/// the judge objects; the shape is wrong, and `state` would list "no blood
+/// thinners" as a medication. Checked in every judge mode.
+fn negated_safety_member(predicate: &str, object: &str) -> bool {
+    let spec = relation_spec(&canonical_relation(predicate));
+    spec.is_set_valued() && spec.is_safety() && negated_object(object)
 }
 
 #[derive(Debug, Default, Deserialize)]
