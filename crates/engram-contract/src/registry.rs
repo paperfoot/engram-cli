@@ -2357,6 +2357,69 @@ const DOCUMENT_ID_ARG: &[ArgSpec] = &[ArgSpec {
     doc: "the document's bare uuid (the `id` field of `documents list`). A `doc:` handle is refused today as an invalid UUID (exit 3)",
 }];
 
+const PEOPLE_KB_FLAG_DOC: &str =
+    "one KB, or '*' for every KB. Under '*' a person filed in several KBs is MERGED, not picked";
+
+const PEOPLE_LIST_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        name: "kb",
+        cli_long: "kb",
+        aliases: &[],
+        ty: Ty::Str,
+        default: Some("*"),
+        required: false,
+        doc: PEOPLE_KB_FLAG_DOC,
+    },
+    FlagSpec {
+        name: "limit",
+        cli_long: "limit",
+        aliases: &[],
+        ty: Ty::Int,
+        default: Some("50"),
+        required: false,
+        doc: "page length",
+    },
+    FlagSpec {
+        name: "min_mentions",
+        cli_long: "min-mentions",
+        aliases: &[],
+        ty: Ty::Int,
+        default: Some("1"),
+        required: false,
+        doc: "drop people mentioned fewer times than this",
+    },
+    FlagSpec {
+        name: "cursor",
+        cli_long: "cursor",
+        aliases: &[],
+        ty: Ty::Str,
+        default: None,
+        required: false,
+        doc: "opaque token from a previous page's `cursor`; pass it back verbatim",
+    },
+];
+
+const PEOPLE_SHOW_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        name: "kb",
+        cli_long: "kb",
+        aliases: &[],
+        ty: Ty::Str,
+        default: Some("*"),
+        required: false,
+        doc: PEOPLE_KB_FLAG_DOC,
+    },
+    FlagSpec {
+        name: "snippets",
+        cli_long: "snippets",
+        aliases: &[],
+        ty: Ty::Int,
+        default: Some("5"),
+        required: false,
+        doc: "memory snippets to include per KB; 0 for none",
+    },
+];
+
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         path: "remember",
@@ -3322,6 +3385,74 @@ pub const COMMANDS: &[CommandSpec] = &[
             "An id that names nothing answers `deleted: false` with exit 0 — read the flag, not the exit code.",
         ],
         examples: &["engram documents delete 0f8c2a1e-6d0b-4a55-9d1e-2b7c1f3e9a40 --confirm --json"],
+    },
+    CommandSpec {
+        path: "people list",
+        aliases: &["people ls", "person list", "person ls"],
+        summary: "People in the entity graph, most-mentioned first, with aliases and top relations.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[],
+        flags: PEOPLE_LIST_FLAGS,
+        data: &[
+            FieldSpec { name: "people", ty: Ty::Array(&Ty::Object), doc: "{ name, entity_id, handle (`entity:<uuid>`), kb, aliases, mentions, relation_count, top_relations: [{ subject, predicate, object, other, direction, weight, sources }] }", always: true },
+            FieldSpec { name: "kb", ty: Ty::Str, doc: "the scope as passed", always: true },
+            FieldSpec { name: "returned", ty: Ty::Int, doc: "rows in this page", always: true },
+            FieldSpec { name: "total", ty: Ty::Int, doc: "people matching the scope and --min-mentions", always: true },
+            FieldSpec { name: "count", ty: Ty::Int, doc: "legacy alias for `returned`", always: true },
+            FieldSpec { name: "cursor", ty: Ty::Str, doc: "next page; absent when there is none", always: false },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "kb", ty: Ty::Str, doc: "as in data", always: true },
+            FieldSpec { name: "people", ty: Ty::Int, doc: "rows returned", always: true },
+            FieldSpec { name: "scope", ty: Ty::Object, doc: "{ kbs, diary: '*', origin, diary_applicable: false }", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &[
+            "Use `people list` / `people show` for who-do-I-know questions: they read the person-typed entity graph that `compile` builds, not raw text. An empty list on a store that holds memories usually means nothing has been compiled yet.",
+            "Under --kb '*' one person filed in several KBs appears once per KB here; `people show` merges them.",
+        ],
+        examples: &["engram people list --min-mentions 2 --json"],
+    },
+    CommandSpec {
+        path: "people show",
+        aliases: &["people get", "person show", "person get"],
+        summary: "One person: aliases, relations with provenance, and the memories that mention them.",
+        destructive: false,
+        requires: &[],
+        opens_store: true,
+        args: &[ArgSpec {
+            name: "name",
+            ty: Ty::Str,
+            required: true,
+            doc: "person name or any known alias, case-insensitive",
+        }],
+        flags: PEOPLE_SHOW_FLAGS,
+        data: &[
+            FieldSpec { name: "person", ty: Ty::Object, doc: "{ name, kind, aliases, mentions, entity_id } — aliases include the other KBs' spellings; mentions are summed across them", always: true },
+            FieldSpec { name: "kb", ty: Ty::Str, doc: "'*' when merged across KBs, else the KB", always: true },
+            FieldSpec { name: "kbs", ty: Ty::Array(&Ty::Str), doc: "every KB this person appears in", always: true },
+            FieldSpec { name: "relations", ty: Ty::Array(&Ty::Object), doc: "typed edges with provenance, each labelled with its `kb`: { subject, predicate, object, other, direction, weight, sources, kb }", always: true },
+            FieldSpec { name: "relations_by_kb", ty: Ty::Array(&Ty::Object), doc: "the per-KB breakdown behind `relations`: { kb, entity_id, mentions, relations }", always: true },
+            FieldSpec { name: "memories", ty: Ty::Array(&Ty::Object), doc: "snippets that mention them, from every KB: { memory_id, chunk_id, handle, provenance, kb, … } — untrusted stored text", always: true },
+        ],
+        metadata: &[
+            FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
+            FieldSpec { name: "kb", ty: Ty::Str, doc: "as in data", always: true },
+            FieldSpec { name: "kbs", ty: Ty::Array(&Ty::Str), doc: "as in data", always: true },
+            FieldSpec { name: "relations", ty: Ty::Int, doc: "length of data.relations", always: true },
+            FieldSpec { name: "kind", ty: Ty::Str, doc: "the entity kind", always: true },
+        ],
+        statuses: &["success", "error"],
+        exit_codes: &[0, 1, 3],
+        rules: &[
+            "A name nobody has compiled is `bad_input` (exit 3) naming the scope searched — not an empty success. Browse with `engram people list` before guessing spellings.",
+            "The default '*' merge is what joins a person's work and personal relationships into one view; narrow with --kb only to deliberately stay inside one namespace.",
+        ],
+        examples: &["engram people show 'Sarah Chen' --json", "engram people show sarah --kb personal --snippets 0 --json"],
     },
 ];
 

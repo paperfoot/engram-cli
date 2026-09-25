@@ -94,13 +94,6 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
             "--store <dir>": "Root every path (db, vectors, config, cache) at DIR for this invocation. Outranks ENGRAM_STORE, which outranks the platform data dir. Accepted on every command and on `engramd`, so a scratch store needs no exported variable."
         },
         "command_schemas": {
-            "people show": {
-                "destructive": false,
-                "args": { "name": "person name or any known alias (case-insensitive)" },
-                "flags": { "kb": "string; defaults to 'default'. Pass '*' to merge the person across EVERY KB", "snippets": "integer" },
-                "output_data": { "person": "object with canonical_name + aliases", "relations": "array — typed edges with provenance, merged across KBs under --kb '*'", "kbs": "string[] — every KB this person appears in", "relations_by_kb": "array — the per-KB breakdown behind the merged `relations`", "memories": "array of snippets that mention them" },
-                "agent_rule": "Use --kb '*' for 'who is X': under the default scope a person written to `personal` is simply absent, and the merge is what joins their work and personal relationships into one view."
-            },
             "ingest": {
                 "destructive": false,
                 "args": { "path": "file_or_directory" },
@@ -280,7 +273,7 @@ pub fn run(schema: Option<&str>, format: OutputFormat) -> Result<(), CliError> {
             ],
             "people": [
                 "Use `people list` / `people show` for who-do-I-know questions; they read the person-typed entity graph, not raw text.",
-                "Pass --kb '*' unless you deliberately want one KB: these commands still default to `default`, and --kb '*' MERGES the person across KBs (`kbs`, `relations_by_kb`) instead of showing whichever KB happened to win.",
+                "Both default to every KB ('*'); pass --kb only to deliberately stay inside one. Under '*' `people show` MERGES the person across KBs (`kbs`, `relations_by_kb`) instead of showing whichever KB happened to win.",
                 "`graph neighbors <name> --typed-only` gives the real relationship graph; without it you also get weak `co_occurs_with` co-mention edges."
             ],
             "ingest": [
