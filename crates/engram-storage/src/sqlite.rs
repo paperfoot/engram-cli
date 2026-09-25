@@ -4811,6 +4811,37 @@ impl SqliteStore {
             .map_err(StorageError::from)
     }
 
+    /// The novelty gate's candidates: open facts about ONE subject in
+    /// (diary, kb) that carry an embedding from `model`.
+    ///
+    /// Scoped by subject because a gate `Duplicate` absorbs the new fact into
+    /// the candidate before the classifier's `different_subject` rule can
+    /// run: against every fact in the kb, "Carol takes metformin" became a
+    /// confirmation of Bob's metformin and Carol had no fact at all.
+    pub fn open_fact_embeddings_for_subject(
+        &self,
+        diary: &str,
+        kb: &str,
+        subject_norm: &str,
+        model: &str,
+    ) -> Result<Vec<(Uuid, Vec<f32>)>, StorageError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, embedding FROM facts
+             WHERE diary = ?1 AND kb = ?2 AND subject_norm = ?3 AND embed_model = ?4
+                   AND embedding IS NOT NULL AND {OPEN_INTERVAL_PREDICATE}"
+        ))?;
+        let rows = stmt.query_map(params![diary, kb, subject_norm, model], |r| {
+            let id_str: String = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            Ok((
+                Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+                f32_bytes_to_vec(&blob),
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
     /// A re-asserted duplicate bumps the existing fact's confirmation count
     /// instead of inserting a second row. Confirmations feed trust weighting.
     pub fn increment_fact_confirmations(&self, id: Uuid) -> Result<(), StorageError> {

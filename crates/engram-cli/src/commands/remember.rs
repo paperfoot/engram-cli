@@ -80,6 +80,9 @@ enum ExtractionStatus {
     CallerSupplied,
     /// No OpenRouter key resolved — the loud skip.
     SkippedNoKey,
+    /// Identical content was already stored: the extractor saw it then (or
+    /// `facts backfill` still will), so the duplicate costs no LLM call.
+    SkippedDuplicate,
     /// The LLM call was attempted and failed. The memory is still stored.
     Failed(String),
     /// The facts could not be persisted, so NOTHING was — a batch is one unit
@@ -100,6 +103,7 @@ impl ExtractionStatus {
             ExtractionStatus::Disabled => "disabled",
             ExtractionStatus::CallerSupplied => "skipped_facts_json",
             ExtractionStatus::SkippedNoKey => "skipped_no_openrouter_key",
+            ExtractionStatus::SkippedDuplicate => "skipped_duplicate",
             ExtractionStatus::Failed(_) => "failed",
             // Renamed from `failed_partial_persist`: a partial persist is
             // exactly what can no longer happen.
@@ -244,6 +248,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // the argument checks above, so a bad argument is still exit 3 rather than
     // being masked by the environment.
     let write_embedder = resolve_write_embedder("remember", offline)?;
+    // Same reason: a gate threshold nobody can use is exit 2 now, not after
+    // the memory is stored and its fact batch fails.
+    crate::fact_write::gate_thresholds()?;
 
     // The KB budget guards PAID calls: cloud embedding, and LLM extraction /
     // adjudication (which run whenever an OpenRouter key resolves and
@@ -331,8 +338,21 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 validity_updated = ctx.store.set_memory_valid_until(existing, vu)?;
             }
             let facts_source_kind = facts_source_kind(caller_batch_committed, false);
+            // `chunks` and `fact_extraction` are always-present in the
+            // published schema; this envelope used to omit both. The flags
+            // keep their main-path meaning; otherwise extraction was skipped
+            // because the content is not new.
+            let status = if no_extract_facts {
+                ExtractionStatus::Disabled
+            } else if facts_json.is_some() && !force_extract_facts {
+                ExtractionStatus::CallerSupplied
+            } else {
+                ExtractionStatus::SkippedDuplicate
+            };
             let mut meta = Metadata::default();
             meta.add("deduplicated", true);
+            meta.add("chunks_stored", 0);
+            meta.add("fact_extraction", status.as_str());
             meta.add("existing_id", existing.to_string());
             if validity_updated {
                 meta.add("valid_until_updated", true);
@@ -343,6 +363,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             meta.add("handle", crate::commands::memory::render_handle(existing));
             meta.add("facts_added", outcome.added);
             meta.add("facts_source_kind", facts_source_kind);
+            for (name, counts) in outcome.counters() {
+                meta.add(name, counts);
+            }
             print_success(
                 ctx.format,
                 json!({
@@ -351,13 +374,16 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     "stored": false,
                     "deduplicated": true,
                     "valid_until_updated": validity_updated,
+                    "chunks": 0,
                     "kb": kb,
+                    "fact_extraction": status.as_str(),
                     "facts_added": outcome.added,
                     "facts_source_kind": facts_source_kind,
                     "facts_deduped": outcome.deduped,
                     "conflicts": outcome.conflicts,
                     "adjudication_needed": outcome.queued,
                     "date_parse_warnings": outcome.date_warnings,
+                    "plan_notes": outcome.plan_notes,
                     "reason": "identical content already stored in this kb/diary; nothing re-embedded",
                 }),
                 meta,
@@ -636,11 +662,17 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     }
     let facts_source_kind = facts_source_kind(caller_batch_committed, extraction_batch_committed);
 
+    let counters = outcome.counters();
     let facts_added = outcome.added;
     let conflicts = outcome.conflicts;
     let adjudication_needed = outcome.queued;
     let facts_deduped = outcome.deduped;
     let date_warnings = outcome.date_warnings;
+    // The planner's non-fatal reports: an unreadable `valid_until`, an ending
+    // with nothing open, a prior ruling applied instead of asked again. They
+    // were collected and dropped here, so a replayed caller decision changed
+    // the store with no trace in the answer.
+    let plan_notes = outcome.plan_notes;
 
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -671,6 +703,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     meta.add("date_parse_warnings", date_warnings.len());
     meta.add("fact_extraction", status.as_str());
     meta.add("facts_source_kind", facts_source_kind);
+    for (name, counts) in counters {
+        meta.add(name, counts);
+    }
     let note = status.note(&kb);
     if let Some(note) = &note {
         meta.add("fact_extraction_note", note.clone());
@@ -705,6 +740,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             "facts_added": facts_added,
             "facts_deduped": facts_deduped,
             "date_parse_warnings": date_warnings,
+            "plan_notes": plan_notes,
             "conflicts": conflicts,
             "adjudication_needed": adjudication_needed,
         }),
