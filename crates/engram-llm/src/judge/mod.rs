@@ -8,7 +8,8 @@
 //! state is ingested once and the questions run in parallel server-side.
 //!
 //! The seam later code writes against:
-//! - [`Judge`] — the provider trait.
+//! - [`Judge`] — the provider trait (TypeSafe direct or via OpenRouter, and
+//!   the offline [`stub::StubJudge`]).
 //! - [`questions`] — the ONE module holding every question text, criterion and
 //!   threshold. Nothing else in engram writes question wording.
 //! - [`ask_batched`] — splits an oversized request, runs the parts with
@@ -17,9 +18,29 @@
 //!   that id, never a default value.
 //! - [`lexical`] — the deterministic grounding rules (numbers, word overlap)
 //!   the judge is compared against and falls back to.
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), engram_llm::judge::JudgeError> {
+//! use engram_llm::judge::{ask_batched, questions, stub::StubJudge};
+//!
+//! let judge = StubJudge::parse("0.9").expect("valid stub spec");
+//! let claim = questions::fact_as_claim("Ana", "lives_in", "Lisbon");
+//! let request = questions::grounding_request(
+//!     "Ana moved to Lisbon in March.",
+//!     &[("fact-1".to_string(), claim)],
+//! );
+//! let response = ask_batched(&judge, &request).await?;
+//! match questions::grounding_verdict(response.noul("fact-1")?) {
+//!     questions::Grounding::Supported => { /* admit */ }
+//!     questions::Grounding::Uncertain => { /* keep today's behaviour, log it */ }
+//!     questions::Grounding::Unsupported => { /* reject */ }
+//! }
+//! # Ok(()) }
+//! ```
 
 pub mod lexical;
 pub mod questions;
+pub mod stub;
 
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
