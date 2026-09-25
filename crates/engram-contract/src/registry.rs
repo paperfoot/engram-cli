@@ -625,6 +625,18 @@ const RECALL_METADATA: &[FieldSpec] = &[
         doc: "what the read actually looked at: { kbs, diary, origin, chunks_considered }",
         always: false,
     },
+    FieldSpec {
+        name: "token_budget",
+        ty: Ty::Int,
+        doc: "the --layer's budget for returned CONTENT: the first --top-k hits are always returned, later ones only while they fit it",
+        always: true,
+    },
+    FieldSpec {
+        name: "tokens_used",
+        ty: Ty::Int,
+        doc: "approximate tokens of the returned results' content only — not of the response, which also carries answer_context, provenance and handles and is several times larger",
+        always: true,
+    },
 ];
 
 const REMEMBER_FLAGS: &[FlagSpec] = &[
