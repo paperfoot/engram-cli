@@ -50,6 +50,46 @@ pub const GROUNDING_FALSE: &str =
 /// claims are written by annotators, not by an extraction model.
 pub const GROUNDING_ADMIT_P: f32 = 0.5;
 
+/// Admit a claim or fact compile extracted from a chunk at P(supported) >=
+/// this.
+///
+/// Compile-extraction eval (compile's own extraction call over 100 SciFact
+/// abstracts: 313 Opus-supported claims/facts, 535 adversarial rewrites of
+/// them, AUC 0.99; `benchmarks/jev-grounding-compile-extracted-20260925T1030.json`):
+/// - p >= 0.9 keeps 100% of supported claims and 98.9% of supported facts,
+///   and admits 1.3% of the rewrites (lexical rule: 99%). Direction flips and
+///   negations: none admitted; association->causation 12%, hedge removed
+///   14%, prior-study attribution 10% (the classes lower cuts let through:
+///   56%, 29%, 30% at 0.5).
+///
+/// Extracted claims sit near-verbatim on their chunk, so the high cut costs
+/// almost no recall; SciFact's annotator paraphrases are why the general
+/// default above is lower.
+pub const COMPILE_ADMIT_P: f32 = 0.9;
+
+/// Admit a SAFETY-relation fact (takes_medication, allergic_to,
+/// diagnosed_with) that engram's own extractor pulled from a memory at
+/// P(supported) >= this. Other extracted facts are annotated, never gated.
+///
+/// Remember-extraction eval (161 facts from 60 LoCoMo windows + 20 health
+/// notes, Opus labels; `benchmarks/jev-grounding-remember-20260925T1030.json`,
+/// rendered with [`fact_as_claim_with_state`]):
+/// - safety relations only at 0.5: 0 true facts dropped; blocks the
+///   fabricated "allergic_to ibuprofen" (p 0.04, from "avoid ibuprofen with
+///   the kidney issue") and "takes_medication paracetamol" (0.31, from
+///   "paracetamol is fine");
+/// - gating every fact at 0.5 instead drops 7 true facts (mostly "prefers
+///   X", which the judge reads literally) to block 6 more.
+pub const REMEMBER_SAFETY_ADMIT_P: f32 = 0.5;
+
+/// On-mode admission: the number rule stays in code and is checked by the
+/// caller; this is only the probability cut the evals above measured. No
+/// uncertainty band here: a band that fell back to the lexical rule would
+/// readmit exactly what the rule gets wrong.
+pub fn admits(p: f32, threshold: f32) -> bool {
+    p >= threshold
+}
+
 /// Values within this distance of [`GROUNDING_ADMIT_P`] (0.45..=0.55) are
 /// [`Grounding::Uncertain`]: identical requests are not bit-identical (22 of
 /// 30 nouls moved between two sends, mean |delta| 0.018, max 0.12), so a cut
@@ -88,6 +128,29 @@ pub fn grounding_request(passage: &str, claims: &[(String, String)]) -> JudgeReq
 pub fn fact_as_claim(subject: &str, predicate: &str, object: &str) -> String {
     let predicate = predicate.trim().replace('_', " ");
     [subject.trim(), predicate.trim(), object.trim()]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A fact with its extracted state as the sentence the text supports.
+/// `ended` renders "Ana no longer takes medication metformin": rendering a
+/// cessation as the ongoing claim made the judge reject every correct one
+/// (p 0.01-0.24 in the remember eval); this form scored them 0.78-0.98 and
+/// lifted AUC from 0.72 to 0.79.
+pub fn fact_as_claim_with_state(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    ended: bool,
+) -> String {
+    if !ended {
+        return fact_as_claim(subject, predicate, object);
+    }
+    let predicate = predicate.trim().replace('_', " ");
+    [subject.trim(), "no longer", predicate.trim(), object.trim()]
         .iter()
         .filter(|part| !part.is_empty())
         .copied()
@@ -275,6 +338,26 @@ pub fn decide_pair(answers: &PairAnswers) -> PairSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ended_fact_reads_as_a_cessation() {
+        assert_eq!(
+            fact_as_claim_with_state("Ana", "takes_medication", "metformin", true),
+            "Ana no longer takes medication metformin"
+        );
+        assert_eq!(
+            fact_as_claim_with_state("Ana", "takes_medication", "metformin", false),
+            fact_as_claim("Ana", "takes_medication", "metformin")
+        );
+    }
+
+    #[test]
+    fn site_thresholds_admit_at_the_measured_cut() {
+        assert!(admits(0.9, COMPILE_ADMIT_P));
+        assert!(!admits(0.89, COMPILE_ADMIT_P));
+        assert!(admits(0.5, REMEMBER_SAFETY_ADMIT_P));
+        assert!(!admits(0.31, REMEMBER_SAFETY_ADMIT_P));
+    }
     use crate::judge::Answer;
     use std::collections::BTreeMap;
 

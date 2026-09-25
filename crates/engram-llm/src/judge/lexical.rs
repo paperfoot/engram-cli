@@ -102,9 +102,60 @@ pub fn fact_grounded_lexically(subject: &str, _predicate: &str, object: &str, ch
         .all(|w| chunk_words.contains(&w))
 }
 
+/// Is a fact's object itself a negation ("no blood thinners", "none",
+/// "celiac disease negative", "ruled out appendicitis")?
+///
+/// A member of a safety SET (a medication, an allergy, a diagnosis) is never
+/// a negation: "Sam takes_medication no blood thinners" is an extraction that
+/// put "Sam takes no blood thinners" into the wrong shape, and `state` would
+/// list "no blood thinners" as a medication. The judge cannot see this — the
+/// text does say it (p 0.82 and 0.91 in the remember eval) — so the shape is
+/// checked here. Callers apply it to set-valued safety relations only (a
+/// blood type of "O negative" is a value, not a negation).
+pub fn negated_object(object: &str) -> bool {
+    let o = object.trim().to_lowercase();
+    const LEADING: [&str; 7] = [
+        "no ",
+        "not ",
+        "never ",
+        "without ",
+        "negative for ",
+        "ruled out ",
+        "none",
+    ];
+    o == "none"
+        || o == "nothing"
+        || LEADING.iter().any(|p| o.starts_with(p))
+        || o.ends_with(" negative")
+        || o.ends_with(" ruled out")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_negation_is_never_a_safety_set_member() {
+        for o in [
+            "no blood thinners",
+            "None",
+            "celiac disease negative",
+            "ruled out appendicitis",
+            "not allergic",
+            "negative for HIV",
+        ] {
+            assert!(negated_object(o), "{o}");
+        }
+        for o in [
+            "metformin 500 mg",
+            "penicillin",
+            "type 2 diabetes",
+            "nonsteroidal anti-inflammatories",
+            "notch inhibitor",
+        ] {
+            assert!(!negated_object(o), "{o}");
+        }
+    }
 
     #[test]
     fn grounding_gate_rejects_invented_numbers() {
