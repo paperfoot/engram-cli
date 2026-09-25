@@ -263,18 +263,54 @@ impl AdjudicationCounters {
     }
 }
 
+pub const DUP_THRESHOLD_ENV: &str = "ENGRAM_FACT_DUP_THRESHOLD";
+pub const NOVEL_THRESHOLD_ENV: &str = "ENGRAM_FACT_NOVEL_THRESHOLD";
+
 /// Thresholds for the novelty gate, env-overridable so they can be tuned on
 /// the bench harness without a rebuild.
-fn gate_thresholds() -> (f32, f32) {
-    let dup = std::env::var("ENGRAM_FACT_DUP_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(engram_graph::gate::DEFAULT_DUP_THRESHOLD);
-    let novel = std::env::var("ENGRAM_FACT_NOVEL_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(engram_graph::gate::DEFAULT_NOVEL_THRESHOLD);
-    (dup, novel)
+///
+/// A value that does not parse, is not a cosine in [-1, 1], or leaves no
+/// uncertain band (novel >= dup) is a `Config` error. It used to fall back
+/// to the default in silence, so a tuning run measured the default while
+/// its operator believed the override was live. Write surfaces call this
+/// before they store anything, so the error lands before a half-write.
+pub fn gate_thresholds() -> Result<(f32, f32), CliError> {
+    parse_gate_thresholds(
+        std::env::var(DUP_THRESHOLD_ENV).ok().as_deref(),
+        std::env::var(NOVEL_THRESHOLD_ENV).ok().as_deref(),
+    )
+}
+
+/// `gate_thresholds` over explicit values; blank reads as unset.
+fn parse_gate_thresholds(dup: Option<&str>, novel: Option<&str>) -> Result<(f32, f32), CliError> {
+    let read = |name: &str, raw: Option<&str>, default: f32| {
+        let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+            return Ok(default);
+        };
+        match raw.parse::<f32>() {
+            Ok(v) if (-1.0..=1.0).contains(&v) => Ok(v),
+            _ => Err(CliError::Config(format!(
+                "{name}='{raw}' is not a cosine similarity in [-1, 1]; fix or unset it"
+            ))),
+        }
+    };
+    let dup = read(
+        DUP_THRESHOLD_ENV,
+        dup,
+        engram_graph::gate::DEFAULT_DUP_THRESHOLD,
+    )?;
+    let novel = read(
+        NOVEL_THRESHOLD_ENV,
+        novel,
+        engram_graph::gate::DEFAULT_NOVEL_THRESHOLD,
+    )?;
+    if novel >= dup {
+        return Err(CliError::Config(format!(
+            "{NOVEL_THRESHOLD_ENV} ({novel}) must be below {DUP_THRESHOLD_ENV} ({dup}): the \
+             novelty gate needs an uncertain band between them; fix or unset them"
+        )));
+    }
+    Ok((dup, novel))
 }
 
 /// When this fact became true, in the bi-temporal sense the v6 schema models.
@@ -1043,7 +1079,7 @@ async fn prepare(
                     &embedder.model(),
                 )?
             };
-            let (dup_t, novel_t) = gate_thresholds();
+            let (dup_t, novel_t) = gate_thresholds()?;
             outcome.gate.ran += 1;
             match novelty_gate(&emb, &existing, dup_t, novel_t) {
                 GateDecision::Duplicate { fact_id, .. } => {
@@ -1568,6 +1604,36 @@ mod tests {
         assert_eq!(Autonomy::parse("assisted").unwrap(), Autonomy::Assisted);
         assert_eq!(Autonomy::parse("strict").unwrap(), Autonomy::Strict);
         assert!(Autonomy::parse("yolo").is_err());
+    }
+
+    #[test]
+    fn a_gate_threshold_nobody_can_use_is_a_config_error_not_the_default() {
+        let defaults = (
+            engram_graph::gate::DEFAULT_DUP_THRESHOLD,
+            engram_graph::gate::DEFAULT_NOVEL_THRESHOLD,
+        );
+        assert_eq!(parse_gate_thresholds(None, None).unwrap(), defaults);
+        assert_eq!(
+            parse_gate_thresholds(Some(" "), Some("")).unwrap(),
+            defaults
+        );
+        assert_eq!(
+            parse_gate_thresholds(Some("0.9"), Some("-0.2")).unwrap(),
+            (0.9, -0.2)
+        );
+        for (dup, novel) in [
+            (Some("abc"), None),
+            (None, Some("0.7x")),
+            (Some("1.5"), None),
+            (Some("NaN"), None),
+            (None, Some("-2")),
+            (Some("0.5"), Some("0.5")),
+            (Some("0.3"), None),
+        ] {
+            let err = parse_gate_thresholds(dup, novel).unwrap_err();
+            assert!(matches!(err, CliError::Config(_)), "{dup:?} {novel:?}");
+            assert_eq!(err.exit_code(), 2);
+        }
     }
 
     fn extracted(predicate: &str, object: &str, valid_from: Option<&str>) -> ExtractedFact {

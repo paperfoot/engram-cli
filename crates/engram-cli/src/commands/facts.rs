@@ -1071,6 +1071,9 @@ pub async fn backfill(
         Some(kb_label.as_str())
     };
     let llm = crate::fact_llm::resolve()?;
+    // Before the sweep, not per memory: a bad threshold would otherwise fail
+    // every batch and read as N transient failures.
+    crate::fact_write::gate_thresholds()?;
     let (total, pending_total) = ctx
         .store
         .fact_extraction_coverage(kb_filter, diary_filter)?;

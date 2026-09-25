@@ -599,3 +599,54 @@ fn a_gate_duplicate_never_crosses_subjects() {
     assert_eq!(again["metadata"]["gate"]["duplicate"], 1, "{again}");
     assert_eq!(again["data"]["facts_added"], 0, "{again}");
 }
+
+// ----- B9: a gate threshold nobody can use is a config error ---------------
+
+#[test]
+fn an_unusable_gate_threshold_is_exit_2_before_anything_is_stored() {
+    let tmp = store();
+    for (name, value) in [
+        ("ENGRAM_FACT_DUP_THRESHOLD", "abc"),
+        ("ENGRAM_FACT_DUP_THRESHOLD", "1.5"),
+        // Leaves no uncertain band under the default novel threshold (0.65).
+        ("ENGRAM_FACT_DUP_THRESHOLD", "0.30"),
+    ] {
+        let out = engram(tmp.path())
+            .env(name, value)
+            .args([
+                "remember",
+                "Ana takes metformin 500 mg.",
+                "--kb",
+                "personal",
+                "--facts-json",
+                &med("metformin 500 mg"),
+                "--json",
+            ])
+            .assert()
+            .code(2)
+            .get_output()
+            .stderr
+            .clone();
+        let err: Value = serde_json::from_slice(&out).expect("JSON error");
+        assert_eq!(err["error"]["exit_code"], 2, "{name}={value}: {err}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ENGRAM_FACT_"),
+            "the message names the variable: {err}"
+        );
+    }
+    let listed = run_json(&mut engram(tmp.path()), &["memory", "list", "--diary", "*"]);
+    assert_eq!(
+        listed["data"]["memories"].as_array().map(Vec::len),
+        Some(0),
+        "{listed}"
+    );
+
+    engram(tmp.path())
+        .env("ENGRAM_FACT_NOVEL_THRESHOLD", "0.99")
+        .args(["facts", "backfill", "--kb", "personal", "--json"])
+        .assert()
+        .code(2);
+}

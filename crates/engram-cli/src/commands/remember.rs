@@ -244,6 +244,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // the argument checks above, so a bad argument is still exit 3 rather than
     // being masked by the environment.
     let write_embedder = resolve_write_embedder("remember", offline)?;
+    // Same reason: a gate threshold nobody can use is exit 2 now, not after
+    // the memory is stored and its fact batch fails.
+    crate::fact_write::gate_thresholds()?;
 
     // The KB budget guards PAID calls: cloud embedding, and LLM extraction /
     // adjudication (which run whenever an OpenRouter key resolves and
