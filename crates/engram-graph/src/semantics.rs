@@ -1068,6 +1068,11 @@ pub enum PlanNote {
         key: String,
         verdict: DecisionVerdict,
     },
+    /// The machine adjudicator gave no verdict (an error, a timeout, a reply
+    /// that is not one). `reason` is a word the applier chose, never the reply.
+    AdjudicationFailed {
+        reason: &'static str,
+    },
 }
 
 impl PlanNote {
@@ -1077,6 +1082,7 @@ impl PlanNote {
             PlanNote::ValidUntilBeforeValidFrom { .. } => "valid_until_before_valid_from",
             PlanNote::EndWithoutOpenInterval { .. } => "end_without_open_interval",
             PlanNote::ReplayApplied { .. } => "replay_applied",
+            PlanNote::AdjudicationFailed { .. } => "adjudication_failed",
         }
     }
 
@@ -1094,6 +1100,10 @@ impl PlanNote {
             PlanNote::ReplayApplied { key, verdict } => format!(
                 "a prior decision ({}) on {key} was applied instead of asking again",
                 verdict.as_str()
+            ),
+            PlanNote::AdjudicationFailed { reason } => format!(
+                "the adjudicator gave no verdict ({reason}); every pair it was asked about stays \
+                 queued for the caller"
             ),
         }
     }

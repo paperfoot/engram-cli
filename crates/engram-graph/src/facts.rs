@@ -156,6 +156,17 @@ pub enum FactExtractionError {
         column: usize,
         response_bytes: usize,
     },
+    /// The adjudicator answered with well-formed JSON that is not a verdict:
+    /// an unknown action, or a `supersede` that names nothing. Same leak rule
+    /// as `Parse` — a reason word and a size, never the reply.
+    #[error(
+        "adjudicator reply is not a verdict: {reason} ({response_bytes} bytes of model output \
+         withheld)"
+    )]
+    NotAVerdict {
+        reason: &'static str,
+        response_bytes: usize,
+    },
 }
 
 /// The extraction system prompt, anchored to the date of the memory being
@@ -339,8 +350,12 @@ pub enum AdjudicationAction {
     RejectNew,
 }
 
-/// Resolve an uncertain conflict with one LLM call. `new_fact` and each
-/// candidate are rendered as "id | subject predicate object (context)".
+/// Resolve an uncertain conflict with one LLM call. `new_fact` is rendered as
+/// "subject predicate object", each candidate as "id | subject predicate
+/// object".
+///
+/// `Err` means NO verdict — a failed call or a reply that is not one — and
+/// the caller must treat it as "nobody decided", never as `Coexist`.
 pub async fn adjudicate<L: ChatLlm + ?Sized>(
     llm: &L,
     new_fact: &str,
@@ -366,9 +381,15 @@ EXISTING facts:
     parse_adjudication_output(&resp.content)
 }
 
-/// Parse the adjudicator's JSON, tolerating fences and prose. Unparseable or
-/// unknown responses fail closed to `Coexist` — the safe outcome is keeping
-/// both facts (contested) rather than destroying one on a garbled verdict.
+/// Parse the adjudicator's JSON, tolerating fences and prose.
+///
+/// Anything that is not a verdict is an `Err`: garbage, an empty reply (a
+/// provider's `content: null`), an unknown action, a `supersede` naming no
+/// ids. This used to answer `Ok(Coexist)`, and `Coexist` is not a neutral
+/// value — the applier CLEARS the queue on it, so a garbled reply deleted the
+/// very questions it had been asked, safety ones included, and reported
+/// success. "Could not tell" and "the model said they coexist" are different
+/// answers and now have different types.
 pub fn parse_adjudication_output(content: &str) -> Result<AdjudicationAction, FactExtractionError> {
     let trimmed = content.trim();
     let start = trimmed.find('{').unwrap_or(0);
@@ -381,14 +402,19 @@ pub fn parse_adjudication_output(content: &str) -> Result<AdjudicationAction, Fa
         #[serde(default)]
         ids: Vec<String>,
     }
-    let Ok(raw) = serde_json::from_str::<Raw>(json) else {
-        return Ok(AdjudicationAction::Coexist);
+    let raw =
+        serde_json::from_str::<Raw>(json).map_err(|e| describe_parse_failure(&e, content.len()))?;
+    let not_a_verdict = |reason| FactExtractionError::NotAVerdict {
+        reason,
+        response_bytes: content.len(),
     };
-    Ok(match raw.action.as_str() {
-        "supersede" if !raw.ids.is_empty() => AdjudicationAction::Supersede(raw.ids),
-        "reject_new" => AdjudicationAction::RejectNew,
-        _ => AdjudicationAction::Coexist,
-    })
+    match raw.action.as_str() {
+        "supersede" if raw.ids.is_empty() => Err(not_a_verdict("supersede_without_ids")),
+        "supersede" => Ok(AdjudicationAction::Supersede(raw.ids)),
+        "coexist" => Ok(AdjudicationAction::Coexist),
+        "reject_new" => Ok(AdjudicationAction::RejectNew),
+        _ => Err(not_a_verdict("unknown_action")),
+    }
 }
 
 #[cfg(test)]
@@ -523,17 +549,37 @@ mod tests {
     }
 
     #[test]
-    fn adjudication_supersede_without_ids_fails_closed_to_coexist() {
-        let a = parse_adjudication_output(r#"{"action":"supersede","ids":[]}"#).unwrap();
+    fn adjudication_parses_coexist() {
+        let a = parse_adjudication_output(r#"{"action":"coexist"}"#).unwrap();
         assert_eq!(a, AdjudicationAction::Coexist);
     }
 
+    /// "Could not tell" is not "coexist": the applier clears the queue on
+    /// `Coexist`, so reading a non-verdict as one deleted the questions.
     #[test]
-    fn adjudication_garbage_fails_closed_to_coexist() {
-        assert_eq!(
-            parse_adjudication_output("I think they conflict").unwrap(),
-            AdjudicationAction::Coexist
-        );
+    fn a_reply_that_is_not_a_verdict_is_an_error_never_coexist() {
+        for raw in [
+            r#"{"action":"supersede","ids":[]}"#,
+            r#"{"action":"supersede"}"#,
+            r#"{"action":"merge"}"#,
+            "I think they conflict",
+            "",
+            "   ",
+            "{}",
+        ] {
+            assert!(
+                parse_adjudication_output(raw).is_err(),
+                "{raw:?} must not parse as a verdict"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_verdict_never_echoes_the_reply() {
+        let raw = format!(r#"{{"action":"{LEAK_SENTINEL}"}}"#);
+        let rendered = parse_adjudication_output(&raw).unwrap_err().to_string();
+        assert!(!rendered.contains(LEAK_SENTINEL), "{rendered}");
+        assert!(rendered.contains("unknown_action"), "{rendered}");
     }
 
     #[test]

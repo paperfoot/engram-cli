@@ -39,7 +39,7 @@ use engram_core::types::{Fact, FactType, SourceKind};
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::facts::{
     adjudicate, canonical_predicate, date_valued_predicate, normalize, AdjudicationAction,
-    ExtractedFact,
+    ExtractedFact, FactExtractionError,
 };
 use engram_graph::gate::{novelty_gate, GateDecision};
 use engram_graph::semantics::{
@@ -856,7 +856,9 @@ pub async fn write_fact(
 /// queued pairs on medical content, fewer everywhere else.
 ///
 /// A failed adjudication is not an error: the pairs stay queued, which is what
-/// `assisted` would have done anyway.
+/// `assisted` would have done anyway, and the envelope says so
+/// (`adjudication_failed`). It used to read as `Coexist`, which clears the
+/// queue — every judge outage silently deleted the questions it was asked.
 async fn adjudicate_plan(
     llm: &dyn ChatLlm,
     text: &str,
@@ -879,9 +881,18 @@ async fn adjudicate_plan(
     if rendered.is_empty() {
         return;
     }
-    let action = adjudicate(llm, text, &rendered)
-        .await
-        .unwrap_or(AdjudicationAction::Coexist);
+    let action = match adjudicate(llm, text, &rendered).await {
+        Ok(action) => action,
+        Err(e) => {
+            // Logged, never echoed into the envelope: the error is sanitized,
+            // but the note only needs to say that nobody decided.
+            tracing::warn!("adjudication gave no verdict; the pairs stay queued: {e}");
+            plan.notes.push(PlanNote::AdjudicationFailed {
+                reason: failure_reason(&e),
+            });
+            return;
+        }
+    };
     match action {
         AdjudicationAction::RejectNew => {
             plan.insert = None;
@@ -917,6 +928,16 @@ async fn adjudicate_plan(
                 }
             }
             plan.queue = kept;
+        }
+    }
+}
+
+/// Why a judge gave no verdict, as a stable word for the envelope.
+fn failure_reason(e: &FactExtractionError) -> &'static str {
+    match e {
+        FactExtractionError::Llm(_) => "llm_error",
+        FactExtractionError::Parse { .. } | FactExtractionError::NotAVerdict { .. } => {
+            "not_a_verdict"
         }
     }
 }
