@@ -12,6 +12,12 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
     let cohere = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere").is_some();
     let openrouter =
         crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter").is_some();
+    let typesafe =
+        crate::commands::config::resolve_secret("TYPESAFE_API_KEY", "keys.typesafe").is_some();
+    // Offline, like the rest of doctor: modes and route from settings only.
+    // A shadow/on site with no route is a warning inside the block; an
+    // invalid setting fails `ok`, because every judged command would exit 2.
+    let judge = crate::judge::status();
     let schema_version = ctx.store.schema_version()?;
     let profiles = ctx.store.embedding_profiles(None)?;
     let embedding_consistent = profiles.iter().all(|(model, dims, prompt, _)| {
@@ -43,7 +49,8 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
         && schema_version >= 4
         && embedding_consistent
         && daemon_port_available
-        && integrity_report.as_ref().map(|r| r.ok).unwrap_or(true);
+        && integrity_report.as_ref().map(|r| r.ok).unwrap_or(true)
+        && judge.errors.is_empty();
 
     print_success(
         ctx.format,
@@ -53,6 +60,7 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
                 "gemini": if gemini { "present" } else { "missing" },
                 "cohere": if cohere { "present" } else { "missing" },
                 "openrouter": if openrouter { "present" } else { "missing" },
+                "typesafe": if typesafe { "present" } else { "missing" },
                 // Presence is not health: a key can sit at zero prepaid
                 // credits and still look "present". The live per-key probe
                 // (one tiny embed per key, including fallbacks) lives in
@@ -70,6 +78,7 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
                 "extraction_model": extraction_model,
                 "synthesis_model": synthesis_model,
             },
+            "judge": judge,
             "embedding": {
                 "expected_model": DEFAULT_MODEL,
                 "expected_dimensions": DEFAULT_DIMS,
