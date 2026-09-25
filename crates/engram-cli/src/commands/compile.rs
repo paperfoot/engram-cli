@@ -14,6 +14,7 @@ use crate::fact_write::{
 use crate::output::{print_success, Metadata};
 use engram_core::types::SourceKind;
 use engram_graph::facts::ExtractedFact;
+use engram_llm::judge::lexical::{claim_grounded_lexically, word_set};
 use engram_llm::openrouter::{OpenRouterClient, DEFAULT_EXTRACTION_MODEL, DEFAULT_SYNTHESIS_MODEL};
 use engram_llm::{ChatLlm, ChatMessage};
 use serde::{Deserialize, Serialize};
@@ -838,7 +839,7 @@ async fn insert_llm_evidence(
         // exists to prevent. We require (a) every number in the claim to
         // appear in the chunk, and (b) meaningful lexical overlap with the
         // chunk.
-        if !claim_grounded_in_chunk(content, &chunk.content) {
+        if !claim_grounded_lexically(content, &chunk.content) {
             tracing::warn!(
                 "compiler: dropped ungrounded LLM claim for chunk {}: {:?}",
                 chunk.chunk_id,
@@ -976,7 +977,7 @@ async fn insert_llm_evidence(
         }
         // Grounded like claims: the fact's subject and object must be
         // supported by the chunk before the write path ever sees it.
-        if !claim_grounded_in_chunk(&format!("{subject} {object}"), &chunk.content) {
+        if !claim_grounded_lexically(&format!("{subject} {object}"), &chunk.content) {
             stats.llm_facts_rejected += 1;
             continue;
         }
@@ -1170,61 +1171,6 @@ fn first_balanced_object(text: &str) -> Option<&str> {
     None
 }
 
-/// A number's canonical digit string (drops separators/sign) for matching.
-fn numeric_tokens(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for c in text.chars() {
-        if c.is_ascii_digit() || (c == '.' && !cur.is_empty()) {
-            cur.push(c);
-        } else {
-            if cur.chars().any(|c| c.is_ascii_digit()) {
-                out.push(cur.trim_matches('.').to_string());
-            }
-            cur.clear();
-        }
-    }
-    if cur.chars().any(|c| c.is_ascii_digit()) {
-        out.push(cur.trim_matches('.').to_string());
-    }
-    out
-}
-
-/// Is an LLM-extracted claim actually grounded in its source chunk?
-///
-/// Two requirements, both cheap and deterministic:
-/// 1. Every numeric value in the claim must appear in the chunk (so the model
-///    cannot invent a dosage, p-value, or effect size).
-/// 2. The claim's content words must overlap the chunk enough that it is
-///    plausibly a restatement of it, not a free-floating assertion.
-fn claim_grounded_in_chunk(claim: &str, chunk: &str) -> bool {
-    let chunk_lower = chunk.to_ascii_lowercase();
-    let chunk_nums = numeric_tokens(&chunk_lower);
-    for n in numeric_tokens(&claim.to_ascii_lowercase()) {
-        if n.len() >= 2 && !chunk_nums.iter().any(|c| c == &n) {
-            return false;
-        }
-    }
-    // Lexical overlap on content words (length >= 4 to skip stopwords).
-    let chunk_words: HashSet<String> = word_set(&chunk_lower)
-        .into_iter()
-        .filter(|w| w.len() >= 4)
-        .collect();
-    let claim_words: Vec<String> = word_set(&claim.to_ascii_lowercase())
-        .into_iter()
-        .filter(|w| w.len() >= 4)
-        .collect();
-    if claim_words.is_empty() {
-        return true; // nothing substantive to verify (rare)
-    }
-    let overlap = claim_words
-        .iter()
-        .filter(|w| chunk_words.contains(*w))
-        .count();
-    let ratio = overlap as f32 / claim_words.len() as f32;
-    ratio >= 0.5
-}
-
 fn extraction_prompt(kb: &str, chunk: &engram_storage::ChunkRecord) -> String {
     format!(
         "KB: {kb}\nChunk id: {chunk_id}\nDocument id: {document_id}\nSection: {section}\nSource: {source}\n\nExtract evidence from the chunk below.\nReturn JSON only with this shape:\n{{\"claims\":[{{\"content\":\"short factual claim with numbers if present\",\"evidence_level\":\"review|meta_analysis|rct|human_observational|animal|in_vitro|preprint|news|opinion|unknown\",\"confidence\":0.0}}],\"entities\":[{{\"name\":\"canonical entity\",\"kind\":\"person|organization|gene_or_protein|drug|place|event|method|species|dataset|concept\",\"aliases\":[\"other spellings of the SAME entity in this chunk\"]}}],\"relations\":[{{\"from\":\"entity\",\"to\":\"entity\",\"predicate\":\"typed_relation\",\"weight\":1.0,\"evidence\":\"the sentence this relation came from\"}}],\"takeaways\":[\"short cited takeaway\"],\"facts\":[{{\"subject\":\"entity\",\"predicate\":\"snake_case_relation\",\"object\":\"value or entity\",\"confidence\":0.0}}]}}\nPeople matter: type every human as \"person\", give their full name as `name` and shorter forms (first name only, possessive, titled) as `aliases`. Never emit a pronoun, contraction (\"She's\", \"I'm\"), weekday, month, or bare common word as an entity.\nFor two people, prefer these predicates: introduced_by (from = the person who was introduced, to = the introducer), friend_of, married_to, dating, family_of, works_with, colleague_of, investor_in, client_of, met_at, knows.\nEvery claim and fact must be directly supported by this chunk. Emit a fact only for a stable, checkable assertion (a dosage, a target, an effect direction), not vague prose. Do not invent citations.\n\nChunk:\n{content}",
@@ -1312,16 +1258,6 @@ fn first_sentence(text: &str) -> Option<engram_ingest::sentences::Sentence> {
     engram_ingest::sentences::segment(text)
         .into_iter()
         .find(|s| s.text.len() > 30)
-}
-
-/// Tokenize into lowercase word tokens for word-boundary matching. Avoids the
-/// substring bug where "rat" matched "temperature"/"literature" and "cell"
-/// matched "excellent", mislabeling most chunks' evidence level.
-fn word_set(text: &str) -> HashSet<String> {
-    text.split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(|w| w.to_ascii_lowercase())
-        .collect()
 }
 
 fn infer_evidence_level(text: &str) -> &'static str {
@@ -1475,26 +1411,6 @@ mod tests {
         // A place is never a person, however strong the surrounding cue.
         assert_eq!(infer_entity_kind("London", true), "concept");
         assert_eq!(infer_entity_kind("Islam", true), "concept");
-    }
-
-    #[test]
-    fn grounding_gate_rejects_invented_numbers() {
-        let chunk = "Rapamycin extended median lifespan by 14% in treated mice.";
-        // Same numbers + overlap → grounded.
-        assert!(claim_grounded_in_chunk(
-            "Rapamycin extended lifespan by 14% in mice.",
-            chunk
-        ));
-        // Invented number 34% not in chunk → rejected.
-        assert!(!claim_grounded_in_chunk(
-            "Rapamycin extended lifespan by 34% in mice.",
-            chunk
-        ));
-        // No lexical overlap → rejected even with no numbers.
-        assert!(!claim_grounded_in_chunk(
-            "Metformin improves insulin sensitivity substantially.",
-            chunk
-        ));
     }
 
     #[test]
