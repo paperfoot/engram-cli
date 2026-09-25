@@ -555,3 +555,47 @@ fn the_metadata_counts_what_the_gate_and_the_judge_did() {
         json!({"safety_member_change": 1})
     );
 }
+
+// ----- B4: a gate duplicate is a restatement about the SAME subject --------
+
+/// `remember --facts-json` with a novelty gate loose enough that the offline
+/// stub's vectors for two people on the same drug read as duplicates.
+fn gated(store: &std::path::Path, subject: &str, predicate: &str) -> Value {
+    let facts = json!([{ "subject": subject, "predicate": predicate, "object": "metformin" }]);
+    run_json(
+        engram(store)
+            .env("ENGRAM_FACT_DUP_THRESHOLD", "0.30")
+            .env("ENGRAM_FACT_NOVEL_THRESHOLD", "0.10"),
+        &[
+            "remember",
+            &format!("{subject} {predicate} metformin."),
+            "--kb",
+            "personal",
+            "--facts-json",
+            &facts.to_string(),
+        ],
+    )
+}
+
+/// The report's repro: Carol's metformin was absorbed as a confirmation of
+/// Bob's, and Carol had no fact at all.
+#[test]
+fn a_gate_duplicate_never_crosses_subjects() {
+    let tmp = store();
+    let bob = gated(tmp.path(), "Bob Smith", "takes_medication");
+    assert_eq!(bob["data"]["facts_added"], 1, "{bob}");
+    let carol = gated(tmp.path(), "Carol Diaz", "takes_medication");
+    assert_eq!(carol["data"]["facts_added"], 1, "{carol}");
+    assert_eq!(carol["data"]["facts_deduped"], 0, "{carol}");
+    assert_eq!(carol["metadata"]["gate"]["duplicate"], 0, "{carol}");
+    for who in ["Bob Smith", "Carol Diaz"] {
+        let facts = facts_for(tmp.path(), who);
+        assert_eq!(facts.len(), 1, "{who}: {facts:?}");
+    }
+
+    // Within one subject the gate still does its job: the same statement
+    // under a relation the registry does not know is absorbed.
+    let again = gated(tmp.path(), "Bob Smith", "uses");
+    assert_eq!(again["metadata"]["gate"]["duplicate"], 1, "{again}");
+    assert_eq!(again["data"]["facts_added"], 0, "{again}");
+}

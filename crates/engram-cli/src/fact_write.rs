@@ -1020,13 +1020,29 @@ async fn prepare(
     let mut others: Vec<(Fact, f32)> = Vec::new();
     if let Some(embedder) = w.embedder {
         if siblings.is_empty() {
-            // The novelty gate answers "is this new to the store at all", so
-            // it only runs when nothing on this relation could answer it —
-            // the same shape, and the same cost, as write-path v2.
+            // The novelty gate answers "is this already stored about THIS
+            // subject", so it only runs when nothing on this relation could
+            // answer it. Its candidates are the subject's own open facts: a
+            // `Duplicate` absorbs the new fact before the classifier runs, so
+            // a candidate about someone else made Carol's medication a
+            // confirmation of Bob's. It also keeps the scan to one subject's
+            // vectors instead of decoding every open fact in the kb per fact.
             let emb = embed_fact_text(embedder, cache, &text).await?;
-            let existing = ctx
-                .store
-                .active_fact_embeddings(diary, kb, &embedder.model())?;
+            let existing = if observation.queue_everything {
+                // `ENGRAM_FACT_QUEUE_ALL` rebuilds the pre-triage write path
+                // for `facts triage`'s tests, and that path's reach was the
+                // whole kb: its cross-subject "conflicts" are part of the
+                // backlog triage exists to drain.
+                ctx.store
+                    .active_fact_embeddings(diary, kb, &embedder.model())?
+            } else {
+                ctx.store.open_fact_embeddings_for_subject(
+                    diary,
+                    kb,
+                    &observation.subject_norm,
+                    &embedder.model(),
+                )?
+            };
             let (dup_t, novel_t) = gate_thresholds();
             outcome.gate.ran += 1;
             match novelty_gate(&emb, &existing, dup_t, novel_t) {
