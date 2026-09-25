@@ -112,5 +112,6 @@ pub fn render(rt: &RuntimeContext<'_>) -> Value {
         "envelope_detail": c.envelope,
         "env_vars": c.env_vars,
         "global_flags": c.global_flags,
+        "schema_unavailable": c.schema_unavailable,
     })
 }

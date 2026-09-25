@@ -23,7 +23,8 @@ fn store_is_untouched(sb: &Sandbox) -> bool {
         .is_none()
 }
 
-/// All thirty of them, one process each. The generator and the binary must
+/// Every registered command, one process each (`contract_coverage.rs` holds
+/// the same line for every clap leaf, including the declared gaps). The generator and the binary must
 /// agree byte for byte, or `--schema` is a second, quietly diverging source.
 #[test]
 fn every_registered_command_answers_its_own_schema_path() {

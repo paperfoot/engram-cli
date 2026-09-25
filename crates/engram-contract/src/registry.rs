@@ -3044,3 +3044,52 @@ pub const COMMANDS: &[CommandSpec] = &[
         examples: &["engram serve --host 127.0.0.1 --port 8768", "engramd --store /tmp/scratch-store"],
     },
 ];
+
+/// Commands the contract knows of and deliberately leaves undescribed: their
+/// removal is under review (next-cycle plan P0.2), and a full transcription of
+/// a surface that may be deleted is work spent polishing it. `--help` is the
+/// reference for their flags; discovery says `schema_available: false`.
+pub const SCHEMA_UNAVAILABLE: &[UnavailableSpec] = &[
+    UnavailableSpec {
+        path: "research",
+        summary: "Evidence-first research retrieval pass: query_plan, answer_context, evidence leads and citation readiness.",
+        usage: "engram research <query> [--kb <name> | --all-kbs] [--top-k <n>] [--profile cloud_quality|fast|offline]",
+        destructive: false,
+    },
+    UnavailableSpec {
+        path: "wiki",
+        summary: "Inspect generated domain wiki pages.",
+        usage: "engram wiki [path] [--kb <name>]",
+        destructive: false,
+    },
+    UnavailableSpec {
+        path: "graph neighbors",
+        summary: "An entity's graph neighbours, closest first; --typed-only drops co-mention edges.",
+        usage: "engram graph neighbors <entity> [--kb <name>] [--hops 1|2] [--typed-only] [--limit <n>]",
+        destructive: false,
+    },
+    UnavailableSpec {
+        path: "entities list",
+        summary: "Entities by mention count.",
+        usage: "engram entities list [--kb <name>|'*'] [--limit <n>] [--min-mentions <n>] [--cursor <token>]",
+        destructive: false,
+    },
+    UnavailableSpec {
+        path: "entities show",
+        summary: "One entity's details.",
+        usage: "engram entities show <name> [--kb <name>|'*']",
+        destructive: false,
+    },
+    UnavailableSpec {
+        path: "chunks repair",
+        summary: "Merge degenerate sub-threshold chunks into their neighbours and re-embed them. Idempotent.",
+        usage: "engram chunks repair (--kb <name> | --all-kbs) [--dry-run]",
+        destructive: false,
+    },
+    UnavailableSpec {
+        path: "bench",
+        summary: "Run a benchmark suite against fixtures and datasets; never opens the user's store unless --kb names one.",
+        usage: "engram bench [mini|mini-fts|personal|scientific-mini|longmemeval|longmemeval-qa|locomo-plus|mab|litqa2|beir|biogen] [--limit <n>]",
+        destructive: false,
+    },
+];

@@ -475,6 +475,15 @@ fn emit(value: &Value, format: OutputFormat) -> Result<(), CliError> {
 /// followed is a loop with a confident tone — which is exactly what this
 /// invocation used to be.
 fn print_schema(path: &str, format: OutputFormat) -> Result<(), CliError> {
+    if let Some(u) = engram_contract::unavailable(path) {
+        return Err(CliError::BadInputHint {
+            message: format!(
+                "`{}` has no schema by design (schema_available: false) — usage: {}",
+                u.path, u.usage
+            ),
+            suggestion: format!("run `engram {} --help` for its flags", u.path),
+        });
+    }
     match engram_contract::jsonschema::schema_for(path) {
         Some(schema) => emit(&schema, format),
         None => {

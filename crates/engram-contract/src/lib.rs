@@ -31,6 +31,7 @@ pub fn contract() -> &'static Contract {
         schema_version: registry::SCHEMA_VERSION,
         envelope: registry::ENVELOPE,
         commands: registry::COMMANDS,
+        schema_unavailable: registry::SCHEMA_UNAVAILABLE,
         global_flags: registry::GLOBAL_FLAGS,
         exit_codes: registry::EXIT_CODES,
         error_codes: registry::ERROR_CODES,
@@ -46,6 +47,15 @@ pub fn command(path: &str) -> Option<&'static CommandSpec> {
     cs.iter()
         .find(|c| c.path == path)
         .or_else(|| cs.iter().find(|c| c.aliases.contains(&path)))
+}
+
+/// `Some` when the path names a command the contract knows of but does not
+/// describe. Disjoint from [`command`]: a path is one or the other.
+pub fn unavailable(path: &str) -> Option<&'static UnavailableSpec> {
+    contract()
+        .schema_unavailable
+        .iter()
+        .find(|u| u.path == path)
 }
 
 /// Every enumerated vocabulary the contract pins, by name.

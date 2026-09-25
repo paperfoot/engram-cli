@@ -119,6 +119,18 @@ impl CommandSpec {
     }
 }
 
+/// A command the binary has and the contract deliberately does not describe:
+/// a surface whose removal is under review, where transcribing its prose would
+/// polish something that may go. Discovery says so — `schema_available: false`
+/// and a usage line — rather than letting an agent learn it from an exit 3.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnavailableSpec {
+    pub path: &'static str,
+    pub summary: &'static str,
+    pub usage: &'static str,
+    pub destructive: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvVarSpec {
     pub name: &'static str,
@@ -154,6 +166,7 @@ pub struct Contract {
     pub schema_version: u32,
     pub envelope: EnvelopeSpec,
     pub commands: &'static [CommandSpec],
+    pub schema_unavailable: &'static [UnavailableSpec],
     pub global_flags: &'static [FlagSpec],
     pub exit_codes: &'static [(u8, &'static str)],
     pub error_codes: &'static [ErrorCodeSpec],
