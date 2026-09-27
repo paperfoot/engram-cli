@@ -731,7 +731,9 @@ pub struct FactBatch<'a> {
 ///   Other extracted facts are written and annotated: gating them drops true
 ///   preferences the judge reads literally.
 /// - `shadow`: written exactly as `off`, annotated.
-/// - A caller's fact (`--facts-json`) is never dropped: it is annotated only.
+/// - A caller's fact (`--facts-json`) is never dropped, so it is never sent
+///   to the judge either: that would carry the memory to a third party for
+///   a verdict nothing uses. It is annotated `not_judged` / `caller_asserted`.
 ///   The caller has the conversation; the judge has one memory.
 /// - No answer (a failed call, a dropped question) writes as before and is
 ///   counted as `judge_failed`: an outage must not delete facts.
@@ -794,10 +796,12 @@ async fn ground_batch(
     let id = |i: usize| format!("f{i}");
 
     let judge = batch.grounding;
+    // Only extracted facts can be dropped, so only they are asked about: a
+    // caller's batch makes no request at all.
     let claims: Vec<(String, String)> = facts
         .iter()
         .enumerate()
-        .filter(|(_, (_, _, negated))| !negated)
+        .filter(|(_, (_, _, negated))| extracted && !negated)
         .map(|(i, (claim, _, _))| (id(i), claim.clone()))
         .collect();
     let response = match judge {
@@ -841,6 +845,8 @@ async fn ground_batch(
             "negated_object"
         } else if judge.is_none() {
             continue;
+        } else if !extracted {
+            "caller_asserted"
         } else if p.is_none() {
             counts.judge_failed += 1;
             "judge_failed"
@@ -855,8 +861,6 @@ async fn ground_batch(
             "shadow"
         } else if supported == Some(true) {
             "supported"
-        } else if !extracted {
-            "caller_asserted"
         } else {
             "not_a_safety_relation"
         };

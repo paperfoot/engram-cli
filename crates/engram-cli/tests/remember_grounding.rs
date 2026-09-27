@@ -5,7 +5,7 @@
 //! ibuprofen with the kidney issue" (judge p 0.04 on the remember eval). With
 //! `judge.grounding = on` an extracted SAFETY-set fact is written only when
 //! the judge admits it; everything else is annotated. A caller's fact is never
-//! dropped. The negated-object rule runs in every mode, with no judge.
+//! dropped, and never sent to the judge. The negated-object rule runs in every mode, with no judge.
 //!
 //! Offline: extraction is `ENGRAM_FACT_LLM_STUB`, the judge is
 //! `ENGRAM_JUDGE_STUB` (rules keyed by substrings of the rendered claim), and
@@ -136,12 +136,14 @@ fn on_keeps_a_non_safety_extracted_fact_the_judge_doubts_and_annotates_it() {
 }
 
 #[test]
-fn a_caller_fact_is_never_dropped_whatever_the_judge_says() {
+fn a_caller_fact_is_never_sent_to_the_judge_nor_dropped() {
     let tmp = store();
+    // A string rule on a noul fails any call made with it: had the caller's
+    // fact been asked about, it would come back judge_failed.
     let v = run_json(
         engram(tmp.path())
             .env("ENGRAM_JUDGE_GROUNDING", "on")
-            .env("ENGRAM_JUDGE_STUB", r#"{"*": 0.01}"#),
+            .env("ENGRAM_JUDGE_STUB", r#"{"*": "x"}"#),
         &[
             "remember",
             "Sam mentioned the latex gloves at the clinic.",
@@ -154,9 +156,13 @@ fn a_caller_fact_is_never_dropped_whatever_the_judge_says() {
     assert_eq!(v["data"]["facts_added"], 1, "{v}");
     let entry = entry_for(&grounding(&v), "latex").clone();
     assert_eq!(entry["source_kind"], "user_stated");
-    assert_eq!(entry["verdict"], "unsupported");
+    assert_eq!(entry["verdict"], "not_judged");
+    assert!(entry["p"].is_null(), "{entry}");
     assert_eq!(entry["action"], "written");
     assert_eq!(entry["reason"], "caller_asserted");
+    let counts = &v["metadata"]["grounding"];
+    assert_eq!(counts["judged"], 0, "{v}");
+    assert_eq!(counts["judge_failed"], 0, "{v}");
     assert_eq!(
         objects(tmp.path(), "Sam"),
         BTreeSet::from(["allergic_to latex".to_string()])
