@@ -631,6 +631,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         caller_batch_committed = true;
     }
     if !extracted.is_empty() || marker.is_some() {
+        let dropped_before = outcome.grounding_counts.dropped();
         let plan = FactBatchPlan {
             memory_id: memory.id,
             kb: &kb,
@@ -661,7 +662,10 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 detail: failure.error.to_string(),
             };
         } else {
-            extraction_batch_committed = !extracted.is_empty();
+            // Only if a triple got past grounding: a batch whose every fact
+            // was dropped left this memory with no extracted facts.
+            let dropped = outcome.grounding_counts.dropped() - dropped_before;
+            extraction_batch_committed = extracted.len() > dropped;
         }
     }
     let facts_source_kind = facts_source_kind(caller_batch_committed, extraction_batch_committed);

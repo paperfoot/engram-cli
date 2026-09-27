@@ -102,6 +102,20 @@ fn on_drops_an_unsupported_extracted_allergy_and_keeps_a_supported_one() {
     assert_eq!(counts["judged"], 2, "{v}");
     assert_eq!(counts["dropped_by_judge"], 1, "{v}");
     assert_eq!(counts["judge_failed"], 0, "{v}");
+    assert_eq!(v["data"]["facts_source_kind"], "agent_extracted", "{v}");
+}
+
+#[test]
+fn a_memory_whose_every_extracted_fact_was_dropped_claims_no_provenance() {
+    let tmp = store();
+    let v = remember_extracted(
+        tmp.path(),
+        "Sam should avoid ibuprofen.",
+        r#"[{"subject":"Sam","predicate":"allergic_to","object":"ibuprofen"}]"#,
+        Some(("on", r#"{"*": 0.04}"#)),
+    );
+    assert_eq!(v["data"]["facts_added"], 0, "{v}");
+    assert!(v["data"]["facts_source_kind"].is_null(), "{v}");
 }
 
 #[test]

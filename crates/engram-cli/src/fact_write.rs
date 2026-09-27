@@ -240,6 +240,11 @@ pub struct GroundingCounters {
 }
 
 impl GroundingCounters {
+    /// Facts grounding kept out of the store, by either rule.
+    pub fn dropped(&self) -> usize {
+        self.dropped_by_judge + self.dropped_negated_object
+    }
+
     fn merge(&mut self, o: GroundingCounters) {
         self.judged += o.judged;
         self.dropped_by_judge += o.dropped_by_judge;
