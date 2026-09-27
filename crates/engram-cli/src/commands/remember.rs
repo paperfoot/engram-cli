@@ -253,16 +253,18 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     crate::fact_write::gate_thresholds()?;
     let grounding = GroundingJudge::resolve(offline)?;
 
-    // The KB budget guards PAID calls: cloud embedding, and LLM extraction /
+    // The KB budget guards PAID calls: cloud embedding, LLM extraction /
     // adjudication (which run whenever an OpenRouter key resolves and
-    // --no-extract-facts was not passed). A fully offline write spends
+    // --no-extract-facts was not passed), and the grounding judge (resolved
+    // only when grounding is shadow/on and a judge is reachable, and it
+    // grounds --facts-json batches too). A fully offline write spends
     // nothing, so a zero spend cap must not block it — a free operation
     // failing with a budget error is a new failure mode with no money
     // behind it.
     let extraction_may_spend = !no_extract_facts
         && crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
             .is_some();
-    if write_embedder.cloud || extraction_may_spend {
+    if write_embedder.cloud || extraction_may_spend || grounding.is_some() {
         crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     }
 
