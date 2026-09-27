@@ -394,3 +394,29 @@ fn on_the_judge_decides_a_safety_cessation() {
     assert_eq!(shadow["llm_facts_rejected"], 1, "{shadow}");
     assert_eq!(shadow["judge_facts_judge_only_admitted"], 1, "{shadow}");
 }
+
+/// Found in review: `numbers_ok` skips one-digit numbers, so an invented
+/// "warfarin 5 mg" against a note saying 2 mg was stored with the judge off
+/// and with it on at 0.95.
+#[test]
+fn an_invented_one_digit_dose_is_refused_in_every_mode() {
+    for mode in ["off", "on"] {
+        let s = store();
+        seed(s.path(), "Ana takes warfarin 2 mg daily after her surgery.");
+        let script = extractor(&[(
+            "warfarin 2 mg",
+            &fact("Ana", "takes_medication", "warfarin 5 mg"),
+        )]);
+        let stats = compile(
+            s.path(),
+            &script,
+            &[
+                ("ENGRAM_JUDGE_GROUNDING", mode),
+                ("ENGRAM_JUDGE_STUB", r#"{"*": 0.95}"#),
+            ],
+        );
+        assert_eq!(stats["llm_facts"], 0, "{mode}: {stats}");
+        assert_eq!(stats["llm_facts_rejected"], 1, "{mode}: {stats}");
+        assert!(medications(s.path()).is_empty(), "{mode}");
+    }
+}

@@ -17,7 +17,8 @@ use engram_core::relations::{canonical_relation, cessation_of, relation_spec};
 use engram_core::types::SourceKind;
 use engram_graph::facts::ExtractedFact;
 use engram_llm::judge::lexical::{
-    claim_grounded_lexically, fact_grounded_lexically, negated_object, numbers_ok, word_set,
+    claim_grounded_lexically, fact_grounded_lexically, negated_object, numbers_ok, numeric_tokens,
+    word_set,
 };
 use engram_llm::judge::{ask_many, questions, Judge, JudgeError, BATCH_CONCURRENCY};
 use engram_llm::openrouter::{OpenRouterClient, DEFAULT_EXTRACTION_MODEL, DEFAULT_SYNTHESIS_MODEL};
@@ -1262,7 +1263,7 @@ fn ground_evidence(
         let negated = negated_safety_member(predicate, object);
         let lexical = fact_grounded_in_chunk(subject, predicate, object, text);
         let sentence = questions::fact_as_claim(subject, predicate, object);
-        let numbers = numbers_ok(&sentence, text);
+        let numbers = numbers_ok(&sentence, text) && object_numbers_in_chunk(object, text);
         let p = p_of(fact_id(i));
         let judge = p.map(|p| judge_admits(p, numbers) && !negated);
         let admitted = stats.admit(Item::Fact, mode, lexical, judge);
@@ -1287,8 +1288,20 @@ fn ground_evidence(
 /// may admit a safety cessation.
 fn fact_grounded_in_chunk(subject: &str, predicate: &str, object: &str, chunk: &str) -> bool {
     fact_grounded_lexically(subject, predicate, object, chunk)
+        && object_numbers_in_chunk(object, chunk)
         && !negated_safety_member(predicate, object)
         && safety_relation(predicate) != Some(true)
+}
+
+/// Every number in a fact's object is in the chunk, single digits included.
+/// `numbers_ok` lets one-digit numbers through (so "took 5 pills" can match
+/// "five pills"), which admitted an invented "warfarin 5 mg" against "2 mg";
+/// a fact object is a stored value, and a dose is a number to get right.
+fn object_numbers_in_chunk(object: &str, chunk: &str) -> bool {
+    let chunk_numbers = numeric_tokens(chunk);
+    numeric_tokens(object)
+        .iter()
+        .all(|n| chunk_numbers.contains(n))
 }
 
 /// A medication, allergy or diagnosis that is a negation ("takes_medication:
@@ -1816,5 +1829,22 @@ mod tests {
         }
         // A cessation outside the safety sets is still the lexical rule's.
         assert!(fact_grounded_in_chunk("Ana", "moved_from", "Paris", chunk));
+    }
+
+    #[test]
+    fn a_one_digit_number_in_a_fact_object_must_be_the_chunks_own() {
+        let chunk = "Ana takes warfarin 2 mg daily.";
+        assert!(fact_grounded_in_chunk(
+            "Ana",
+            "takes_medication",
+            "warfarin 2 mg",
+            chunk
+        ));
+        assert!(!fact_grounded_in_chunk(
+            "Ana",
+            "takes_medication",
+            "warfarin 5 mg",
+            chunk
+        ));
     }
 }
