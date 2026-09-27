@@ -82,6 +82,7 @@ pub const FACT_EXTRACTION: &[&str] = &[
     "disabled",
     "skipped_facts_json",
     "skipped_no_openrouter_key",
+    "skipped_duplicate",
     "failed",
     "failed_persist",
 ];
@@ -773,10 +774,34 @@ const REMEMBER_DATA: &[FieldSpec] = &[
         always: true,
     },
     FieldSpec {
+        name: "handle",
+        ty: Ty::Str,
+        doc: HANDLE_ID_DOC,
+        always: true,
+    },
+    FieldSpec {
         name: "stored",
         ty: Ty::Bool,
         doc: "false when an exact duplicate made this a no-op",
         always: true,
+    },
+    FieldSpec {
+        name: "deduplicated",
+        ty: Ty::Bool,
+        doc: "dedup path only: always true there, with `reason` saying what matched",
+        always: false,
+    },
+    FieldSpec {
+        name: "reason",
+        ty: Ty::Str,
+        doc: "dedup path only: identical content already stored in this kb/diary; nothing re-embedded",
+        always: false,
+    },
+    FieldSpec {
+        name: "embed_truncation_note",
+        ty: Ty::Nullable(&Ty::Str),
+        doc: "non-null when a chunk was longer than the embedder's input window, so its tail was not embedded (chunking.max_chars was raised past it); stored path only",
+        always: false,
     },
     FieldSpec {
         name: "valid_until_updated",
@@ -787,7 +812,7 @@ const REMEMBER_DATA: &[FieldSpec] = &[
     FieldSpec {
         name: "chunks",
         ty: Ty::Int,
-        doc: "chunks written for this memory",
+        doc: "chunks written by this call; 0 on the dedup path (stored: false), where nothing is re-embedded",
         always: true,
     },
     FieldSpec {
@@ -805,7 +830,7 @@ const REMEMBER_DATA: &[FieldSpec] = &[
     FieldSpec {
         name: "fact_extraction",
         ty: Ty::Enum(FACT_EXTRACTION),
-        doc: "ALWAYS check this before assuming facts were captured. `failed_persist` means the LLM returned facts but the batch could not be stored — a batch is one unit of work, so NO fact was stored, no extraction marker was recorded, and `facts backfill` will retry the whole memory",
+        doc: "ALWAYS check this before assuming facts were captured. `failed_persist` means the LLM returned facts but the batch could not be stored — a batch is one unit of work, so NO fact was stored, no extraction marker was recorded, and `facts backfill` will retry the whole memory. `skipped_duplicate`: identical content was already stored, so this call ran no extraction (its facts came from the first store, or `facts backfill` will extract them)",
         always: true,
     },
     FieldSpec {
@@ -827,6 +852,12 @@ const REMEMBER_DATA: &[FieldSpec] = &[
         always: false,
     },
     FieldSpec {
+        name: "facts_source_kind",
+        ty: Ty::Nullable(&Ty::Str),
+        doc: "provenance of the facts this call committed: user_stated (--facts-json), agent_extracted, or mixed; null when no fact batch committed",
+        always: true,
+    },
+    FieldSpec {
         name: "conflicts",
         ty: Ty::Array(&Ty::Object),
         doc: "contradictions this write touched",
@@ -842,6 +873,51 @@ const REMEMBER_DATA: &[FieldSpec] = &[
         name: "date_parse_warnings",
         ty: Ty::Array(&Ty::Object),
         doc: "a supplied valid_from that could not be read as a date. The fact was still stored, dated from the memory (event_time, else when it was recorded), never from the clock. Fix the source: valid_from must be YYYY-MM-DD or RFC3339",
+        always: false,
+    },
+    FieldSpec {
+        name: "plan_notes",
+        ty: Ty::Array(&Ty::Object),
+        doc: "non-fatal planner reports, each {kind, subject, predicate, detail}. kind: unreadable_valid_until, valid_until_before_valid_from, end_without_open_interval, replay_applied (a prior ruling was applied instead of asking again); under --autonomy full only: adjudication_failed (the judge gave no verdict), adjudication_kept_safety (the judge answered coexist, reject_new or supersede on a safety question, which only the caller may settle), adjudication_stale (the store changed after judging, so the verdict was not applied), adjudication_not_asked (the pair arose after judging, e.g. between two facts of this batch, so no judge saw it). In every adjudication_* case the pairs are still in adjudication_needed",
+        always: false,
+    },
+];
+
+/// Measurement counters the fact write path reports (remember, memory add,
+/// facts backfill).
+const FACT_WRITE_COUNTERS_DOC_GATE: &str = "measurement: what the novelty gate did, one count per fact that reached it — {ran, skipped_has_siblings (the subject+relation already had facts, gate not run), duplicate (absorbed as a restatement of the same subject's fact on another relation; never when either side is a safety relation — that is counted as uncertain and the classifier decides), novel, uncertain, uncertain_candidates}";
+const FACT_WRITE_COUNTERS_DOC_QUEUED: &str = "measurement: questions handed to you in adjudication_needed, counted by the classifier rule that queued them ({rule: count}; {} when none)";
+const FACT_WRITE_COUNTERS_DOC_ADJ: &str = "measurement: the --autonomy full judge — {calls, failed (no verdict), supersede, coexist, reject_new, stale (verdict not applied: the store changed), not_asked (observations whose pairs arose after judging, e.g. inside one batch; kept queued), pairs_in, pairs_closed, pairs_kept}; all zero under assisted and strict";
+
+const REMEMBER_METADATA: &[FieldSpec] = &[
+    FieldSpec {
+        name: "elapsed_ms",
+        ty: Ty::Int,
+        doc: "wall time measured in dispatch",
+        always: true,
+    },
+    FieldSpec {
+        name: "fact_extraction",
+        ty: Ty::Enum(FACT_EXTRACTION),
+        doc: "same value as data.fact_extraction",
+        always: false,
+    },
+    FieldSpec {
+        name: "gate",
+        ty: Ty::Object,
+        doc: FACT_WRITE_COUNTERS_DOC_GATE,
+        always: false,
+    },
+    FieldSpec {
+        name: "queued_by_rule",
+        ty: Ty::Object,
+        doc: FACT_WRITE_COUNTERS_DOC_QUEUED,
+        always: false,
+    },
+    FieldSpec {
+        name: "adjudication",
+        ty: Ty::Object,
+        doc: FACT_WRITE_COUNTERS_DOC_ADJ,
         always: false,
     },
 ];
@@ -2681,12 +2757,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         }],
         flags: REMEMBER_FLAGS,
         data: REMEMBER_DATA,
-        metadata: &[FieldSpec {
-            name: "elapsed_ms",
-            ty: Ty::Int,
-            doc: "wall time measured in dispatch",
-            always: true,
-        }],
+        metadata: REMEMBER_METADATA,
         statuses: &["success", "error"],
         exit_codes: &[0, 1, 2, 3, 4],
         rules: &[
@@ -2808,7 +2879,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: &[ArgSpec { name: "content", ty: Ty::Str, required: true, doc: "what to remember" }],
         flags: REMEMBER_FLAGS,
         data: REMEMBER_DATA,
-        metadata: ELAPSED_ONLY,
+        metadata: REMEMBER_METADATA,
         statuses: &["success", "error"],
         exit_codes: &[0, 1, 2, 3, 4],
         rules: &[
@@ -3034,6 +3105,7 @@ pub const COMMANDS: &[CommandSpec] = &[
             FieldSpec { name: "adjudication_needed", ty: Ty::Array(&Ty::Object), doc: "unresolved conflicts, each with a `resolve` object (program + args + allowed_actions). A sweep can queue a lot at once — handle them, do not bulk-supersede", always: false },
             FieldSpec { name: "date_parse_warnings", ty: Ty::Array(&Ty::Object), doc: "extractor dates that could not be read; those facts were dated from their own memory, never from the sweep's clock. One array for the whole run, so match entries by subject/predicate", always: false },
             FieldSpec { name: "dry_run", ty: Ty::Bool, doc: "--dry-run only, with `pending`, `already_processed`, `would_process` and `llm_available` instead of the counters above", always: false },
+            FieldSpec { name: "plan_notes", ty: Ty::Array(&Ty::Object), doc: "non-fatal planner reports for the whole run, each {kind, subject, predicate, detail}; same kinds as `remember`'s plan_notes", always: false },
         ],
         metadata: &[
             FieldSpec { name: "elapsed_ms", ty: Ty::Int, doc: "wall time measured in dispatch", always: true },
@@ -3041,6 +3113,9 @@ pub const COMMANDS: &[CommandSpec] = &[
             FieldSpec { name: "processed", ty: Ty::Int, doc: "memories extracted from", always: false },
             FieldSpec { name: "extraction_model", ty: Ty::Str, doc: "the model that produced the triples", always: false },
             FieldSpec { name: "embedder_degraded", ty: Ty::Str, doc: "present when a fallback key served the run", always: false },
+            FieldSpec { name: "gate", ty: Ty::Object, doc: FACT_WRITE_COUNTERS_DOC_GATE, always: false },
+            FieldSpec { name: "queued_by_rule", ty: Ty::Object, doc: FACT_WRITE_COUNTERS_DOC_QUEUED, always: false },
+            FieldSpec { name: "adjudication", ty: Ty::Object, doc: FACT_WRITE_COUNTERS_DOC_ADJ, always: false },
         ],
         statuses: &["success", "error"],
         exit_codes: &[0, 1, 2, 3, 4],

@@ -780,3 +780,62 @@ fn the_status_commands_answer_with_exactly_their_documented_fields() {
         assert_eq!(live, named, "{path}: live data keys vs the contract");
     }
 }
+
+/// What the fact write path reports is what `remember`'s contract names: the
+/// gate, queue and adjudication counters in metadata, and on the dedup path a
+/// `fact_extraction` value the published vocabulary contains. A value outside
+/// the enum fails every agent that validates against the schema.
+#[test]
+fn remember_reports_only_documented_fact_write_fields() {
+    let sb = Sandbox::new();
+    let spec = documented("remember");
+    let meta_names: Vec<&str> = spec.metadata.iter().map(|f| f.name).collect();
+    let run = |content: &str| {
+        let out = sb
+            .cmd()
+            .args([
+                "remember",
+                content,
+                "--kb",
+                "personal",
+                "--offline",
+                "--json",
+            ])
+            .output()
+            .expect("remember");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Sandbox::json(&out)
+    };
+    // No OpenRouter key in the sandbox: extraction is skipped, never called.
+    let first = run("Ana plays the cello.");
+    for counter in ["gate", "queued_by_rule", "adjudication"] {
+        assert!(
+            first["metadata"].get(counter).is_some(),
+            "{counter} not emitted"
+        );
+        assert!(
+            meta_names.contains(&counter),
+            "{counter} emitted, not documented"
+        );
+    }
+    let again = run("Ana plays the cello.");
+    assert_eq!(again["data"]["stored"], false, "{again}");
+    let status = again["data"]["fact_extraction"].as_str().unwrap();
+    assert_eq!(status, "skipped_duplicate");
+    assert!(
+        engram_contract::registry::FACT_EXTRACTION.contains(&status),
+        "fact_extraction {status:?} is not in the published vocabulary"
+    );
+    for (path, v) in [("stored", &first), ("dedup", &again)] {
+        for field in v["data"].as_object().unwrap().keys() {
+            assert!(
+                data_field_names("remember").contains(&field.as_str()),
+                "{path} data.{field} is not documented"
+            );
+        }
+    }
+}

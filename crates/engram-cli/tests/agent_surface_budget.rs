@@ -67,14 +67,17 @@ fn one_command_costs_a_fraction_of_the_manifest() {
 }
 
 /// 146,595 bytes at 0.4.1; the transcriptions that made every command
-/// pullable brought it to about 168 KB. It shrinks when the hand-written
-/// prose moves into the registry (plan B1/C2), not before.
+/// pullable brought it to about 168 KB. The judge block, the offline guards
+/// and the fact write path's plan_notes and counters (documented once, printed
+/// under both `remember` and `memory add`) brought it to 178,895 bytes. It
+/// shrinks when the hand-written prose moves into the registry (plan B1/C2),
+/// not before.
 #[test]
 fn the_full_manifest_does_not_grow_back() {
     within(
         "agent-info",
         bytes(&Sandbox::new(), &["agent-info"]),
-        168 * KIB,
+        180 * KIB,
     );
 }
 
