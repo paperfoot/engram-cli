@@ -154,6 +154,34 @@ fn mode_from(
     }
 }
 
+/// The fix for a config error this module raised, or `None` for any other
+/// message. A bad mode names its env var or config key first (see
+/// [`mode_from`]); a bad stub names [`STUB_ENV`] first. Neither is fixed by
+/// probing keys, so neither gets `config check` advice.
+pub fn config_error_suggestion(message: &str) -> Option<String> {
+    for site in JudgeSite::ALL {
+        let (env, key) = (site.env_var(), site.config_key());
+        if message.starts_with(&format!("{env}=")) {
+            return Some(format!(
+                "set {env} to off|shadow|on, or unset it (it overrides config), then rerun the \
+                 engram command; to turn the judge off, unset it and run `engram config set {key} off`"
+            ));
+        }
+        if message.starts_with(&format!("{key} =")) {
+            return Some(format!(
+                "{key} takes off|shadow|on: run `engram config set {key} off` (or shadow or on), \
+                 then rerun the engram command"
+            ));
+        }
+    }
+    message.starts_with(STUB_ENV).then(|| {
+        format!(
+            "{STUB_ENV} is a test seam: unset it outside tests, or give it a JSON number or \
+             object of rules, then rerun the engram command"
+        )
+    })
+}
+
 /// Where judge calls would go. Holds the key only until the judge is built.
 enum Route {
     Stub(StubJudge),
@@ -501,6 +529,40 @@ mod tests {
         assert!(warnings_for(&modes, None).is_empty());
         assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("none")).is_empty());
         assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("stub")).is_empty());
+    }
+
+    #[test]
+    fn a_bad_mode_or_stub_gets_its_own_fix_not_a_key_probe() {
+        // CliError::suggestion sees the message without "config error: ".
+        let inner = |e: CliError| match e {
+            CliError::Config(m) => m,
+            other => panic!("{other:?}"),
+        };
+        let site = JudgeSite::Grounding;
+        let env = mode_from(site, Some("true"), no_file).unwrap_err();
+        let env = inner(env);
+        let s = config_error_suggestion(&env).unwrap();
+        assert!(
+            s.contains("ENGRAM_JUDGE_GROUNDING") && s.contains("off|shadow|on"),
+            "{s}"
+        );
+        assert!(s.contains("`engram config set judge.grounding off`"), "{s}");
+        let file = mode_from(
+            JudgeSite::Dedupe,
+            None,
+            file(toml::Value::String("yes".into())),
+        )
+        .unwrap_err();
+        let file = inner(file);
+        let s = config_error_suggestion(&file).unwrap();
+        assert!(s.contains("off|shadow|on"), "{s}");
+        assert!(s.contains("`engram config set judge.dedupe off`"), "{s}");
+        let stub = route_from(Some("nope"), false, false, none, none)
+            .err()
+            .unwrap();
+        let stub = inner(stub);
+        assert!(config_error_suggestion(&stub).unwrap().contains(STUB_ENV));
+        assert!(config_error_suggestion("config root is not a table").is_none());
     }
 
     #[test]

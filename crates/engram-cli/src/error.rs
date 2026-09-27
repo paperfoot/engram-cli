@@ -231,6 +231,11 @@ impl CliError {
                 engram_graph::gate::DEFAULT_NOVEL_THRESHOLD
                 )
             }
+            // A bad judge mode or ENGRAM_JUDGE_STUB (judge.rs): a key probe
+            // cannot fix a typo in a setting either.
+            Config(m) if crate::judge::config_error_suggestion(m).is_some() => {
+                crate::judge::config_error_suggestion(m).unwrap_or_default()
+            }
             Config(_) => {
                 "run `engram config check` — it live-probes every configured key and names the one that failed"
                     .to_string()
@@ -469,6 +474,20 @@ mod tests {
             .suggestion()
             .unwrap();
         assert!(!stub.contains("THRESHOLD"), "{stub}");
+    }
+
+    #[test]
+    fn a_bad_judge_mode_is_not_sent_to_probe_keys() {
+        let e = CliError::Config(
+            "ENGRAM_JUDGE_GROUNDING=\"true\" is not a judge mode; expected off, shadow or on"
+                .into(),
+        );
+        let s = e.suggestion().unwrap();
+        assert!(s.contains("off|shadow|on"), "{s}");
+        assert!(s.contains("`engram config set judge.grounding off`"), "{s}");
+        assert!(!s.contains("config check"), "{s}");
+        let e = CliError::Config("ENGRAM_JUDGE_STUB is not a valid spec: x".into());
+        assert!(!e.suggestion().unwrap().contains("config check"));
     }
 
     #[test]
