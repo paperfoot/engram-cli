@@ -184,21 +184,27 @@ Not yet published to crates.io or Homebrew — install from source.
 
 `engram update --check --json` reports the current/latest version, detected install source, release URL, and runnable upgrade command. `engram update --json` runs the package-manager update only when `update.mode=auto` and an update is available. Configure with `update.mode`, `update.channel`, and optional `update.install_source` (or the matching `ENGRAM_UPDATE_*` env vars). The crates.io package name is `paperfoot-engram` (the binary is still `engram`); `engram` and `engram-cli` are both already owned by other projects on crates.io. That is the name `engram update` checks against, and the Homebrew formula it checks is `paperfoot/tap/engram`.
 
-### Configure keys
+### Requirements and providers
+
+| Provider | Env var / config key | Powers | Needed? | Without it | Balance visible to engram |
+|---|---|---|---|---|---|
+| Gemini | `GEMINI_API_KEY` / `keys.gemini`; fallbacks `GEMINI_API_KEY_FALLBACKS` / `keys.gemini_fallbacks` | embeddings for every write and cloud recall | **required** | writes refuse (exit 2), cloud recall is refused; only `--offline` stub vectors | no (no balance API) |
+| OpenRouter | `OPENROUTER_API_KEY` / `keys.openrouter` | fact extraction on `remember`, `compile --llm`, the judge's OpenRouter route | recommended | memories are stored without facts (`fact_extraction: skipped_no_openrouter_key`, or `failed` when the key or credit is dead); `engram facts backfill` catches up later | yes: the smaller of the key's remaining limit and the account's remaining credit |
+| Cohere | `COHERE_API_KEY` / `keys.cohere` | rerank in `cloud_quality` recall | recommended | recall runs unreranked (lower precision). A broken key makes recall fail; `ENGRAM_RERANK_PROVIDER=none` recalls without rerank | no |
+| TypeSafe | `TYPESAFE_API_KEY` / `keys.typesafe` | the optional judge, direct route | optional | nothing while judge sites are off; a `shadow`/`on` site routes through OpenRouter | no (no usage or balance endpoint) |
 
 ```bash
-# Required for real hybrid retrieval. Free tier at https://aistudio.google.com/apikey
-engram config set keys.gemini $GEMINI_API_KEY
+engram config set keys.gemini $GEMINI_API_KEY          # https://aistudio.google.com/apikey
+engram config set keys.openrouter $OPENROUTER_API_KEY  # https://openrouter.ai/settings/keys
+engram config set keys.cohere $COHERE_API_KEY          # https://dashboard.cohere.com/api-keys
 
-# Default reranker for cloud_quality recall. https://dashboard.cohere.com/api-keys
-engram config set keys.cohere $COHERE_API_KEY
-
-# Optional for fact extraction / synthesis paths.
-engram config set keys.openrouter $OPENROUTER_API_KEY
-
-engram config check
-# -> gemini/cohere configured; doctor checks OpenRouter when compiler mode needs it
+engram config check --json   # live probe of every configured key, fallbacks included
+engram doctor --json         # the same provider list offline, presence only
 ```
+
+`config check --json` returns one `providers` entry per key: `role`, `configured` (source `env` | `config_file` | `unset`, masked value), `live` (`ok` | `invalid` | `denied` | `quota_exhausted` | `no_credit` | `unreachable` | `probe_error` | `not_probed`), `balance` (`{remaining_usd, source}` for OpenRouter, `"not_exposed_by_provider"` for the rest), `severity`, `degrades`, and `fix`, a command or URL to act on. `next_steps` lists every fix, errors first. A dead primary Gemini key with a working fallback is a warning that names the fallback engram is running on. OpenRouter credit below $1 is a warning, and at $0 the key reports `no_credit`. When any command reports a provider error, run `engram config check --json` and follow `fix`. Each probe costs almost nothing: one tiny embed per Gemini key, two free OpenRouter reads, one Cohere search unit, one TypeSafe Noul (about 270 input tokens). `doctor` never touches the network.
+
+**TypeSafe privacy.** The judge is opt-in, and every judge site defaults to `off`. When a site is set to `shadow` or `on`, the memory text it judges is sent to TypeSafe, either directly or through OpenRouter. TypeSafe offers zero data retention only to enterprise customers. Its terms are in the [Data Processing Agreement](https://typesafe.ai/legal/data-processing).
 
 Keys are resolved in order: **explicit env var → config TOML → none**. Config file is written with `0600` perms (user-only). `engram config show` and `engram doctor --json` never print full secrets. Without Gemini, a cloud profile is refused (exit 2) rather than answered from the 64-dim offline stub, and `remember`/`memory add`/`edit` refuse to WRITE stub vectors for the same reason — a store half stub- and half cloud-embedded serves nothing until a full `engram reindex`. Ask for the stub on purpose: `--profile offline` on a read, `--offline` on a write. Useful for CI, unusable for real quality.
 
