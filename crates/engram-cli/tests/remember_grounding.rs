@@ -257,6 +257,26 @@ fn a_judge_that_does_not_answer_writes_as_before_and_says_so() {
 }
 
 #[test]
+fn a_judge_call_that_errors_writes_as_before_and_says_so() {
+    let tmp = store();
+    // A string rule on a noul makes the stub fail the whole call with
+    // InvalidResponse: the transport/parse error path, not an unanswered one.
+    let v = remember_extracted(
+        tmp.path(),
+        KIDNEY,
+        KIDNEY_FACTS,
+        Some(("on", r#"{"*": "x"}"#)),
+    );
+    assert_eq!(v["data"]["facts_added"], 2, "{v}");
+    for entry in grounding(&v) {
+        assert_eq!(entry["action"], "written", "{entry}");
+        assert_eq!(entry["reason"], "judge_failed", "{entry}");
+    }
+    assert_eq!(v["metadata"]["grounding"]["judge_failed"], 2, "{v}");
+    assert_eq!(v["metadata"]["grounding"]["judged"], 0, "{v}");
+}
+
+#[test]
 fn shadow_writes_exactly_what_off_writes() {
     let extraction = r#"[
         {"subject":"Sam","predicate":"allergic_to","object":"ibuprofen"},
