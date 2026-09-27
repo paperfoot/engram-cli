@@ -251,21 +251,15 @@ fn an_unreadable_end_date_is_reported_and_never_closes_anything() {
     );
 }
 
-/// Two assertions this lane makes that no surface publishes yet.
+/// Two assertions about what the surfaces publish.
 ///
 /// 1. `plan_notes` — the planner's non-fatal reports (an unreadable
-///    `valid_until`, a cessation with nothing to close, a replayed decision).
-///    `FactWriteOutcome` carries them; `remember`/`facts backfill` do not yet
-///    render them, and those files are write-surfaces'.
-/// 2. the active/historic split in `facts show`, which still keys off
-///    `superseded_by IS NULL`, so a row closed with `reason: stopped` reads as
-///    active. That is the `is_open_fact()` sweep (CD-2), a named wave-3
-///    integration gate.
-///
-/// Both are one-line wirings in files this lane does not own, and both are in
-/// its `cross_lane_patches`. Un-`#[ignore]` at the integration gate.
+///    `valid_until`, a cessation with nothing to close, a replayed decision)
+///    reach the `remember` envelope instead of dying in `FactWriteOutcome`.
+/// 2. the active/historic split in `facts show` follows the interval
+///    (`is_open_fact()`), so a row closed with `reason: stopped` — which has no
+///    successor — reads as history, not as a current medication.
 #[test]
-#[ignore = "blocked: write-surfaces must render outcome.plan_notes; read-surfaces owes the is_open_fact() sweep in facts show"]
 fn the_envelope_reports_a_plan_note_and_show_buckets_a_closed_interval_as_historic() {
     let tmp = store();
     let v = remember_facts(
@@ -292,4 +286,43 @@ fn the_envelope_reports_a_plan_note_and_show_buckets_a_closed_interval_as_histor
     let shown = facts_show(tmp.path(), "Ana");
     assert_eq!(shown["data"]["active_count"], 0, "{shown}");
     assert_eq!(shown["data"]["historic_count"], 1, "{shown}");
+}
+
+/// `facts backfill` writes through the same planner as `remember`, so it
+/// reports the same notes: a sweep that dropped an unreadable end date must
+/// say so, or the operator re-runs it forever wondering why nothing closed.
+#[test]
+fn backfill_reports_plan_notes_too() {
+    let tmp = store();
+    run_json(
+        &mut engram(tmp.path()),
+        &[
+            "remember",
+            "Ana was on metformin until some time last year.",
+            "--kb",
+            "personal",
+            "--no-extract-facts",
+        ],
+    );
+    let v = run_json(
+        engram(tmp.path()).env(
+            "ENGRAM_FACT_LLM_STUB",
+            r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin",
+                 "valid_until":"some time last year"}]"#,
+        ),
+        &["facts", "backfill", "--kb", "personal"],
+    );
+    assert_eq!(v["data"]["facts_added"], 1, "{v}");
+    let notes = v["data"]["plan_notes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        notes.iter().any(|n| n["kind"] == "unreadable_valid_until"),
+        "{v}"
+    );
+    // And the same measurement counters as `remember`.
+    assert_eq!(v["metadata"]["gate"]["ran"], 1, "{v}");
+    assert_eq!(v["metadata"]["adjudication"]["calls"], 0, "{v}");
+    assert!(v["metadata"]["queued_by_rule"].is_object(), "{v}");
 }

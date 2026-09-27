@@ -472,6 +472,32 @@ fn an_absorbed_observation_closes_nothing_on_its_way_out() {
     assert!(p.queue.is_empty());
 }
 
+/// The same contract for a discard decided OUTSIDE the planner (a machine
+/// adjudicator's `reject_new`): the birthday the caller's correction would
+/// have closed stays open, and no replay is reported for a write that never
+/// happens.
+#[test]
+fn absorbing_after_planning_withdraws_every_effect_of_the_observation() {
+    let mut extracted = stored("Ana", "birthday", "1990-04-13", "1990-04-13");
+    extracted.source_kind = SourceKind::AgentExtracted;
+    let mut stated = stored("Ana", "birthday", "1990-04-14", "1990-04-14");
+    stated.source_kind = SourceKind::UserStated;
+    let mut p = plan(&observation_of(&stated), std::slice::from_ref(&extracted));
+    assert_eq!(p.closes.len(), 1, "a person's correction closes the guess");
+
+    p.confirm.push(extracted.id);
+    p.notes.push(PlanNote::ReplayApplied {
+        key: "k".into(),
+        verdict: DecisionVerdict::CloseOld,
+    });
+    p.absorb("semantic_llm");
+    assert!(p.insert.is_none());
+    assert!(p.closes.is_empty(), "{:?}", p.closes);
+    assert!(p.confirm.is_empty() && p.queue.is_empty() && p.replays.is_empty());
+    assert!(p.notes.is_empty(), "{:?}", p.notes);
+    assert_eq!(p.absorbed, Some("semantic_llm"));
+}
+
 #[test]
 fn a_backdated_assertion_inside_a_closed_window_is_settled() {
     let stopped = closed(
