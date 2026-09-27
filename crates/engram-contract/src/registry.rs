@@ -3849,7 +3849,7 @@ pub const COMMANDS: &[CommandSpec] = &[
             FieldSpec { name: "gemini_keys_probed", ty: Ty::Object, doc: "`<primary|fallback_N> (<masked key>)` -> ok | quota_or_credits_depleted | invalid_or_revoked | unreachable | probe_error; empty when no key is set", always: true },
             FieldSpec { name: "cohere", ty: Ty::Str, doc: "configured (optional) | missing (optional)", always: true },
             FieldSpec { name: "openrouter", ty: Ty::Str, doc: "configured or missing, with the features the key serves in parentheses (fact extraction, compiler, judge fallback route)", always: true },
-            FieldSpec { name: "typesafe", ty: Ty::Str, doc: "configured or missing: the TypeSafe judge key, presence only (no live probe)", always: true },
+            FieldSpec { name: "typesafe", ty: Ty::Str, doc: "configured or missing, with a parenthetical note (`configured (judge, direct)`, `missing (optional; the judge can go through OpenRouter)`): the TypeSafe judge key, presence only (no live probe). Test the prefix, not equality with `configured`", always: true },
             FieldSpec { name: "judge", ty: Ty::Object, doc: "same block as `config show`: { grounding, adjudicate, dedupe: off|shadow|on (null when that setting is invalid), route: typesafe|openrouter|stub|none (null when ENGRAM_JUDGE_STUB is malformed), warnings, errors }", always: true },
             FieldSpec { name: "ok", ty: Ty::Bool, doc: "true only when a Gemini key is configured AND one key in the chain served the probe", always: true },
             FieldSpec { name: "summary", ty: Ty::Str, doc: "one line naming the retrieval stack these keys give", always: true },
