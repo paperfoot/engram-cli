@@ -87,7 +87,17 @@ fn doctor_masks_configured_keys_and_sends_the_agent_to_config_check() {
     let out = sb
         .cmd()
         .env("GEMINI_API_KEY", gemini)
-        .env("OPENROUTER_API_KEY", openrouter)
+        .env(
+            "OPENROUTER_API_KEY",
+            "TYPESAFE_API_KEY",
+            "GEMINI_API_KEY_FALLBACKS",
+            "ENGRAM_JUDGE_STUB",
+            "ENGRAM_JUDGE_GROUNDING",
+            "ENGRAM_JUDGE_ADJUDICATE",
+            "ENGRAM_JUDGE_DEDUPE",
+            "ENGRAM_JUDGE_LOG",
+            openrouter,
+        )
         .args(["doctor", "--json"])
         .output()
         .expect("doctor");

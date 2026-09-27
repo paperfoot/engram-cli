@@ -1279,7 +1279,17 @@ fn memory_aliases_roundtrip_and_skip_extraction_loudly_without_a_key() {
     let (tmp, mut add) = with_isolated_home();
     // ENGRAM_BENCH_FORCE_STUB (set by engram()) stands in for "no key": the
     // fact layer must refuse to reach the network, and say so.
-    add.env("OPENROUTER_API_KEY", "fake-key-that-should-not-be-used");
+    add.env(
+        "OPENROUTER_API_KEY",
+        "TYPESAFE_API_KEY",
+        "GEMINI_API_KEY_FALLBACKS",
+        "ENGRAM_JUDGE_STUB",
+        "ENGRAM_JUDGE_GROUNDING",
+        "ENGRAM_JUDGE_ADJUDICATE",
+        "ENGRAM_JUDGE_DEDUPE",
+        "ENGRAM_JUDGE_LOG",
+        "fake-key-that-should-not-be-used",
+    );
     let out = add
         .args([
             "memory",

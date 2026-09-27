@@ -21,6 +21,13 @@ fn keyless(home: &Path) -> Command {
         "GEMINI_API_KEY",
         "COHERE_API_KEY",
         "OPENROUTER_API_KEY",
+        "TYPESAFE_API_KEY",
+        "GEMINI_API_KEY_FALLBACKS",
+        "ENGRAM_JUDGE_STUB",
+        "ENGRAM_JUDGE_GROUNDING",
+        "ENGRAM_JUDGE_ADJUDICATE",
+        "ENGRAM_JUDGE_DEDUPE",
+        "ENGRAM_JUDGE_LOG",
         "ENGRAM_EMBED_FAIL",
     ] {
         cmd.env_remove(k);

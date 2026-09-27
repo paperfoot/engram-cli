@@ -42,7 +42,14 @@ impl Store {
         cmd.env("ENGRAM_STORE", self.dir.path())
             .env_remove("GEMINI_API_KEY")
             .env_remove("COHERE_API_KEY")
-            .env_remove("OPENROUTER_API_KEY");
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("TYPESAFE_API_KEY")
+            .env_remove("GEMINI_API_KEY_FALLBACKS")
+            .env_remove("ENGRAM_JUDGE_STUB")
+            .env_remove("ENGRAM_JUDGE_GROUNDING")
+            .env_remove("ENGRAM_JUDGE_ADJUDICATE")
+            .env_remove("ENGRAM_JUDGE_DEDUPE")
+            .env_remove("ENGRAM_JUDGE_LOG");
         cmd
     }
 
@@ -130,6 +137,13 @@ impl Daemon {
             .env_remove("GEMINI_API_KEY")
             .env_remove("COHERE_API_KEY")
             .env_remove("OPENROUTER_API_KEY")
+            .env_remove("TYPESAFE_API_KEY")
+            .env_remove("GEMINI_API_KEY_FALLBACKS")
+            .env_remove("ENGRAM_JUDGE_STUB")
+            .env_remove("ENGRAM_JUDGE_GROUNDING")
+            .env_remove("ENGRAM_JUDGE_ADJUDICATE")
+            .env_remove("ENGRAM_JUDGE_DEDUPE")
+            .env_remove("ENGRAM_JUDGE_LOG")
             .env_remove("ENGRAM_BENCH_FORCE_STUB")
             // Off unless a test asks for it: a background compile firing in the
             // middle of an unrelated assertion is a flake generator.
