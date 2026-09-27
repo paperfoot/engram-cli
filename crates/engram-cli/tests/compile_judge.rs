@@ -321,3 +321,76 @@ fn the_judge_log_records_every_judged_item() {
     assert!(inverted["p"].as_f64().unwrap() < 0.2, "{inverted}");
     assert_eq!(lines.iter().filter(|l| l["kind"] == "fact").count(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// A cessation ends an open safety member, so the lexical rule never admits one.
+// ---------------------------------------------------------------------------
+
+/// A true medication compiled from its note, then a later note that only
+/// mentions the drug, which the extractor reads as `stopped_taking`. Two
+/// compiles, so no chunk-order race decides which fact is written first.
+fn seed_cessation(store: &Path) -> String {
+    seed(store, "Ana takes metformin 500 mg daily for her diabetes.");
+    let stats = compile(
+        store,
+        &extractor(&[(
+            "for her diabetes",
+            &fact("Ana", "takes_medication", "metformin"),
+        )]),
+        &[],
+    );
+    assert_eq!(stats["llm_facts"], 1, "{stats}");
+    seed(
+        store,
+        "At lunch Ana talked about metformin prices at the pharmacy.",
+    );
+    extractor(&[(
+        "metformin prices",
+        &fact("Ana", "stopped_taking", "metformin"),
+    )])
+}
+
+/// Found in review: "stopped_taking" is not a safety relation by name, and
+/// the subject+object rule cannot see a predicate, so this note's cessation
+/// reached the writer, which closed the true medication when both facts came
+/// from one compile (`state Ana`: no_open_values).
+#[test]
+fn off_a_safety_cessation_is_refused() {
+    let s = store();
+    let script = seed_cessation(s.path());
+    let stats = compile(s.path(), &script, &[]);
+    assert_eq!(stats["llm_facts"], 0, "{stats}");
+    assert_eq!(stats["llm_facts_queued"], 0, "{stats}");
+    assert_eq!(stats["llm_facts_rejected"], 1, "{stats}");
+    assert_eq!(medications(s.path()), vec!["metformin"]);
+}
+
+/// With the judge on, the judge decides a cessation (refused at 0.1, passed
+/// to the writer at 0.95); shadow keeps off's refusal and counts the
+/// disagreement.
+#[test]
+fn on_the_judge_decides_a_safety_cessation() {
+    let judged = |mode: &str, judge: &str| {
+        let s = store();
+        let script = seed_cessation(s.path());
+        compile(
+            s.path(),
+            &script,
+            &[
+                ("ENGRAM_JUDGE_GROUNDING", mode),
+                ("ENGRAM_JUDGE_STUB", judge),
+            ],
+        )
+    };
+    let refused = judged("on", r#"{"stopped": 0.1, "*": 0.95}"#);
+    assert_eq!(refused["llm_facts_rejected"], 1, "{refused}");
+    assert_eq!(refused["judge_facts_rejected_by_both"], 1, "{refused}");
+
+    let admitted = judged("on", r#"{"*": 0.95}"#);
+    assert_eq!(admitted["llm_facts_rejected"], 0, "{admitted}");
+    assert_eq!(admitted["judge_facts_judge_only_admitted"], 1, "{admitted}");
+
+    let shadow = judged("shadow", r#"{"*": 0.95}"#);
+    assert_eq!(shadow["llm_facts_rejected"], 1, "{shadow}");
+    assert_eq!(shadow["judge_facts_judge_only_admitted"], 1, "{shadow}");
+}

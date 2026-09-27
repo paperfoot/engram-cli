@@ -13,7 +13,7 @@ use crate::fact_write::{
 };
 use crate::judge::{JudgeMode, JudgeSite};
 use crate::output::{print_success, Metadata};
-use engram_core::relations::{canonical_relation, relation_spec};
+use engram_core::relations::{canonical_relation, cessation_of, relation_spec};
 use engram_core::types::SourceKind;
 use engram_graph::facts::ExtractedFact;
 use engram_llm::judge::lexical::{
@@ -1280,9 +1280,15 @@ fn ground_evidence(
 /// store `state` serves. Every subject and object token must be in the chunk:
 /// the claim rule's four-character floor let "Bob diagnosed_with HIV" through
 /// against a weather note, because it left nothing to check.
+///
+/// It never admits the END of a medication, allergy or diagnosis
+/// ("stopped_taking metformin"): it cannot see the predicate, so a note that
+/// only mentions the drug would close a true, open medication. Only the judge
+/// may admit a safety cessation.
 fn fact_grounded_in_chunk(subject: &str, predicate: &str, object: &str, chunk: &str) -> bool {
     fact_grounded_lexically(subject, predicate, object, chunk)
         && !negated_safety_member(predicate, object)
+        && safety_relation(predicate) != Some(true)
 }
 
 /// A medication, allergy or diagnosis that is a negation ("takes_medication:
@@ -1290,8 +1296,18 @@ fn fact_grounded_in_chunk(subject: &str, predicate: &str, object: &str, chunk: &
 /// the judge objects; the shape is wrong, and `state` would list "no blood
 /// thinners" as a medication. Checked in every judge mode.
 fn negated_safety_member(predicate: &str, object: &str) -> bool {
-    let spec = relation_spec(&canonical_relation(predicate));
-    spec.is_set_valued() && spec.is_safety() && negated_object(object)
+    safety_relation(predicate).is_some() && negated_object(object)
+}
+
+/// `Some(is_cessation)` when the predicate writes a set-valued safety
+/// relation, resolved as the fact writer resolves it: a cessation
+/// ("stopped_taking", "recovered_from") first, then the canonical relation.
+/// Compiled facts carry no `state`, so the predicate is the only way one ends.
+fn safety_relation(predicate: &str) -> Option<bool> {
+    let cessation = cessation_of(predicate);
+    let relation = cessation.map_or_else(|| canonical_relation(predicate), str::to_string);
+    let spec = relation_spec(&relation);
+    (spec.is_set_valued() && spec.is_safety()).then_some(cessation.is_some())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1779,5 +1795,26 @@ mod tests {
             "takes_medication",
             "metformin 500 mg"
         ));
+        // Resolved as the writer resolves it: a cessation is its relation.
+        assert!(negated_safety_member("stopped_taking", "none"));
+    }
+
+    #[test]
+    fn the_lexical_rule_never_ends_a_safety_member() {
+        let chunk = "At lunch Ana talked about metformin prices and her Paris move.";
+        assert!(fact_grounded_in_chunk(
+            "Ana",
+            "takes_medication",
+            "metformin",
+            chunk
+        ));
+        for ends in ["stopped_taking", "no_longer_allergic", "recovered_from"] {
+            assert!(
+                !fact_grounded_in_chunk("Ana", ends, "metformin", chunk),
+                "{ends}"
+            );
+        }
+        // A cessation outside the safety sets is still the lexical rule's.
+        assert!(fact_grounded_in_chunk("Ana", "moved_from", "Paris", chunk));
     }
 }
