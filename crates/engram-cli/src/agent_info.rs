@@ -150,7 +150,13 @@ fn manifest() -> Value {
         "env_overrides": {
             "GEMINI_API_KEY": "Google Gemini embedding key (required for hybrid retrieval)",
             "COHERE_API_KEY": "Cohere rerank key (optional, improves R@1)",
-            "OPENROUTER_API_KEY": "Optional extraction/synthesis key for compiler and fact extraction",
+            "OPENROUTER_API_KEY": "Fact extraction (on by default in remember / memory add), the LLM compiler, and the judge's fallback route (TypeSafe JEV via OpenRouter). Config: keys.openrouter.",
+            "TYPESAFE_API_KEY": "Optional. TypeSafe JEV judge key; the preferred judge route (direct API). Without it the judge goes through OPENROUTER_API_KEY. Used only by judge sites set to shadow or on. Config: keys.typesafe.",
+            "ENGRAM_JUDGE_*": "The three judge sites below are read and reported (`config show`, `config check`, `doctor`: each site's mode, the route, warnings and errors), but in this build no command consults the judge yet: setting a site changes no write or read. An invalid value is reported in `judge.errors` and makes `doctor` ok false.",
+            "ENGRAM_JUDGE_GROUNDING": "off|shadow|on, default off. Will check extracted facts/claims against their source text with the calibrated judge; shadow asks and logs but keeps today's behaviour, on uses the verdict. Config: judge.grounding.",
+            "ENGRAM_JUDGE_ADJUDICATE": "off|shadow|on, default off. Will ask the judge whether a new fact contradicts or ends an existing one; a verdict never overrides the safety-relation rules. Not the `--autonomy full` adjudicator, which uses the OpenRouter extraction LLM. Config: judge.adjudicate.",
+            "ENGRAM_JUDGE_DEDUPE": "off|shadow|on, default off. Will ask the judge whether a new fact restates an existing one. Config: judge.dedupe.",
+            "ENGRAM_JUDGE_STUB": "Test seam: a scripted offline judge (a JSON number, or an object mapping an instruction substring to an answer, \"*\" fallback). Beats every key, --offline and ENGRAM_BENCH_FORCE_STUB. Never set in production.",
             "ENGRAM_COMPILER_EXTRACTION_MODEL": "Compiler extraction model slug (default google/gemini-3.5-flash-lite)",
             "ENGRAM_COMPILER_SYNTHESIS_MODEL": "Compiler synthesis model slug (default google/gemini-3.6-flash; a reasoning model — completion budget includes its thinking tokens)",
             "ENGRAM_COMPILER_LLM": "Set true to make `engram compile --all` use the LLM compiler by default",
@@ -184,7 +190,11 @@ fn manifest() -> Value {
             "update.install_source": "Optional override when binary path detection is ambiguous.",
             "update.github_repo": "Repository for release checks and standalone release downloads.",
             "update.crate": "crates.io package for cargo install upgrades.",
-            "update.homebrew_formula": "Homebrew formula for brew upgrades."
+            "update.homebrew_formula": "Homebrew formula for brew upgrades.",
+            "judge.grounding": "off|shadow|on, default off. Env ENGRAM_JUDGE_GROUNDING overrides. A judge request sends the memory text to TypeSafe (direct or via OpenRouter). `engram config show` / `engram doctor` print every site's mode and the route.",
+            "judge.adjudicate": "off|shadow|on, default off. Env ENGRAM_JUDGE_ADJUDICATE overrides.",
+            "judge.dedupe": "off|shadow|on, default off. Env ENGRAM_JUDGE_DEDUPE overrides.",
+            "keys.typesafe": "TypeSafe JEV judge key (optional; env TYPESAFE_API_KEY overrides)."
         },
         "agent_decision_rules": {
             "what_is_true_now": [

@@ -746,3 +746,37 @@ fn the_store_flag_is_documented_globally_and_accepted_everywhere() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The status commands answer with exactly the fields their contract names.
+/// A block added to `config show` / `config check` / `doctor` (the judge's
+/// modes and route, the TypeSafe key) is invisible to an agent until the
+/// contract lists it; this fails in the commit that adds it. Keyless, so
+/// `config check` probes nothing.
+#[test]
+fn the_status_commands_answer_with_exactly_their_documented_fields() {
+    let sb = Sandbox::new();
+    for path in ["config show", "config check", "doctor"] {
+        let out = sb
+            .cmd()
+            .args(path.split_whitespace())
+            .arg("--json")
+            .output()
+            .expect(path);
+        assert!(
+            out.status.success(),
+            "{path}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = Sandbox::json(&out);
+        let mut live: Vec<&str> = v["data"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{path}: data is not an object"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        live.sort();
+        let mut named = data_field_names(path);
+        named.sort();
+        assert_eq!(live, named, "{path}: live data keys vs the contract");
+    }
+}
