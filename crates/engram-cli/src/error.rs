@@ -216,6 +216,15 @@ impl CliError {
                     .to_string()
             }
             BadInputHint { suggestion, .. } | ConfigHint { suggestion, .. } => suggestion.clone(),
+            // Both gate-threshold messages (fact_write.rs
+            // `parse_gate_thresholds`) begin with the variable's name; a key
+            // probe cannot fix a typo in one of them.
+            Config(m) if m.starts_with("ENGRAM_FACT_") => format!(
+                "fix or unset the ENGRAM_FACT_*_THRESHOLD variable the message names, then rerun \
+                 the engram command; unset, the novelty gate uses dup {} and novel {}",
+                engram_graph::gate::DEFAULT_DUP_THRESHOLD,
+                engram_graph::gate::DEFAULT_NOVEL_THRESHOLD
+            ),
             Config(_) => {
                 "run `engram config check` — it live-probes every configured key and names the one that failed"
                     .to_string()
@@ -437,6 +446,19 @@ mod tests {
                 "the old non-advice came back"
             );
         }
+    }
+
+    #[test]
+    fn a_bad_gate_threshold_is_not_sent_to_probe_keys() {
+        let e = CliError::Config(
+            "ENGRAM_FACT_DUP_THRESHOLD='x' is not a cosine similarity in [-1, 1]; fix or unset it"
+                .into(),
+        );
+        let s = e.suggestion().unwrap();
+        assert!(s.contains("ENGRAM_FACT_") && s.contains("0.95"), "{s}");
+        assert!(!s.contains("config check"), "{s}");
+        let other = CliError::Config("x".into()).suggestion().unwrap();
+        assert!(other.contains("config check"), "{other}");
     }
 
     #[test]
