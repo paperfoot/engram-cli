@@ -1,5 +1,6 @@
 //! `engram doctor` — configuration and store diagnostics.
 
+use crate::commands::config::providers::ProviderStatus;
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
@@ -19,6 +20,7 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
     // the block; an invalid setting fails `ok`, because every judged
     // command would exit 2.
     let judge = crate::judge::status();
+    let providers = crate::commands::config::providers::offline();
     let schema_version = ctx.store.schema_version()?;
     let profiles = ctx.store.embedding_profiles(None)?;
     let embedding_consistent = profiles.iter().all(|(model, dims, prompt, _)| {
@@ -63,12 +65,16 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
                 "openrouter": if openrouter { "present" } else { "missing" },
                 "typesafe": if typesafe { "present" } else { "missing" },
                 // Presence is not health: a key can sit at zero prepaid
-                // credits and still look "present". The live per-key probe
-                // (one tiny embed per key, including fallbacks) lives in
+                // credits and still look "present". The live probes live in
                 // `config check`, which doctor points at rather than dialling
                 // the network itself — doctor must stay useful offline.
-                "note": "presence only; run `engram config check` for a live per-key probe (ok | quota_or_credits_depleted | invalid_or_revoked), including fallback keys",
+                "note": "presence only; run `engram config check --json` for a live probe of every key, fallbacks included (live: ok | invalid | denied | quota_exhausted | no_credit | unreachable | probe_error)",
             },
+            // The `config check` provider model with every key `not_probed`:
+            // role, key source (masked), what degrades without it, and a fix
+            // for each provider that is unset or unchecked.
+            "providers": providers.iter().map(ProviderStatus::to_json).collect::<Vec<_>>(),
+            "next_steps": crate::commands::config::providers::next_steps(&providers),
             "db": {
                 "path": ctx.store.path().to_string_lossy(),
                 "schema_version": schema_version,

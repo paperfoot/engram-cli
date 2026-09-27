@@ -11,6 +11,8 @@ use engram_storage::paths;
 use serde_json::json;
 use std::io::Write;
 
+pub(crate) mod providers;
+
 fn mask_key(key: &str) -> String {
     // Threshold 16, matching GeminiEmbedder::mask: at 12, head-6 + tail-4
     // left only 2 characters hidden.
@@ -231,78 +233,31 @@ pub fn set(ctx: &AppContext, key: String, value: String) -> Result<(), CliError>
 }
 
 pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
-    let file_cfg = read_toml().unwrap_or(toml::Value::Table(toml::value::Table::new()));
-    let gemini = has_key("GEMINI_API_KEY", &file_cfg, "keys.gemini");
-    let cohere = has_key("COHERE_API_KEY", &file_cfg, "keys.cohere");
-    let openrouter = has_key("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
-    let typesafe = has_key("TYPESAFE_API_KEY", &file_cfg, "keys.typesafe");
-
-    // LIVE per-key probe. "Configured" is not "working": a key can be
-    // syntactically present while its AI Studio project sits at zero prepaid
-    // credits, and the free models-list endpoint answers 200 for such a key —
-    // only a real embed call tells the truth. One 5-character embed per key,
-    // a fraction of a thousandth of a cent, so `config check` can say which
-    // key in the chain will actually serve.
-    let mut gemini_keys: Vec<(String, String)> = Vec::new();
-    if let Some(primary) = resolve_secret("GEMINI_API_KEY", "keys.gemini") {
-        gemini_keys.push(("primary".to_string(), primary));
-    }
-    for (i, k) in gemini_fallback_keys().into_iter().enumerate() {
-        gemini_keys.push((format!("fallback_{}", i + 1), k));
-    }
-    // Concurrent probes on ONE shared client: serial fresh-client probes made
-    // an offline machine wait up to 20s PER KEY in the chain.
-    let probe_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .ok();
-    let mut probes = serde_json::Map::new();
-    let mut any_key_serves = gemini_keys.is_empty();
-    let mut join = tokio::task::JoinSet::new();
-    for (i, (_, key)) in gemini_keys.iter().enumerate() {
-        let client = probe_client.clone();
-        let key = key.clone();
-        join.spawn(async move { (i, probe_gemini_key(client.as_ref(), &key).await) });
-    }
-    let mut probe_results: Vec<&'static str> = vec!["probe_error"; gemini_keys.len()];
-    while let Some(res) = join.join_next().await {
-        if let Ok((i, status)) = res {
-            probe_results[i] = status;
-        }
-    }
-    for ((label, key), status) in gemini_keys.iter().zip(probe_results) {
-        if status == "ok" {
-            any_key_serves = true;
-        }
-        probes.insert(format!("{label} ({})", mask_key(key)), json!(status));
-    }
+    // LIVE probes, one per configured key, unset providers never dialled.
+    // "Configured" is not "working": a key can be present while its project
+    // is denied, out of quota or out of credit, and only a real call says so.
+    let statuses = providers::probed().await;
+    let configured = |name: &str| {
+        statuses
+            .iter()
+            .any(|s| s.name == name && s.source != "unset")
+    };
+    let gemini = configured("gemini");
+    let cohere = configured("cohere");
 
     print_success(
         ctx.format,
         json!({
-            "gemini": if gemini { "configured" } else { "missing" },
-            "gemini_keys_probed": probes,
-            "cohere": if cohere { "configured (optional)" } else { "missing (optional)" },
-            // Not "compiler optional": `remember` extracts facts through
-            // OpenRouter by default, so without it no facts are stored.
-            "openrouter": if openrouter {
-                "configured (fact extraction, compiler, judge)"
-            } else {
-                "missing (no fact extraction or compiler; judge only via TypeSafe)"
-            },
-            "typesafe": if typesafe {
-                "configured (judge, direct)"
-            } else {
-                "missing (optional; the judge can go through OpenRouter)"
-            },
+            // Configured is not working: "ok" is true only when a key in
+            // the Gemini chain actually SERVED the live probe. An agent
+            // branching on this contract must not proceed on a dead chain.
+            "ok": gemini && providers::gemini_serves(&statuses),
+            "providers": statuses.iter().map(providers::ProviderStatus::to_json).collect::<Vec<_>>(),
+            "next_steps": providers::next_steps(&statuses),
             // Presence only, no live probe. `route` is what a judged command
             // would use; `warnings` names a site set to shadow or on with
             // no route or on the test stub.
             "judge": crate::judge::status(),
-            // Configured is not working: "ok" is true only when a key in
-            // the chain actually SERVED the live probe. An agent branching on
-            // this contract must not proceed on a depleted chain.
-            "ok": gemini && any_key_serves,
             "summary": if gemini {
                 if cohere { "hybrid_gemini + cohere" } else { "hybrid_gemini (no rerank)" }
             } else {
@@ -313,51 +268,6 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
         |data| println!("{}", serde_json::to_string_pretty(data).unwrap()),
     );
     Ok(())
-}
-
-/// One cheap embedContent against a single key. Statuses are deliberately a
-/// closed vocabulary an agent can branch on.
-async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'static str {
-    let Some(client) = client else {
-        return "probe_error";
-    };
-    match gemini_probe(client, key).send().await {
-        Err(_) => "unreachable",
-        Ok(resp) => match resp.status().as_u16() {
-            200 => "ok",
-            429 => "quota_or_credits_depleted",
-            400 | 401 | 403 => "invalid_or_revoked",
-            _ => "probe_error",
-        },
-    }
-}
-
-/// The probe request. The key rides in a header, never the URL: reqwest
-/// puts the URL in its error text, so a `?key=` URL leaks the key wherever
-/// an error is shown.
-fn gemini_probe(client: &reqwest::Client, key: &str) -> reqwest::RequestBuilder {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
-        engram_embed::gemini::DEFAULT_MODEL
-    );
-    client.post(url).header("x-goog-api-key", key).json(&json!({
-        "content": {"parts": [{"text": "probe"}]},
-        "outputDimensionality": 8,
-    }))
-}
-
-fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
-    if env_secret(env).is_some() {
-        return true;
-    }
-    let mut cur = file;
-    for part in path.split('.') {
-        match cur.get(part) {
-            Some(next) => cur = next,
-            None => return false,
-        }
-    }
-    cur.as_str().map(|s| !s.is_empty()).unwrap_or(false)
 }
 
 /// Split a fallback-key list: comma- or whitespace-separated, trimmed,
@@ -509,22 +419,12 @@ mod tests {
         let empty = "ENGRAM_TEST_EMPTY_KEY_3F9C1B";
         std::env::set_var(empty, "");
         for env in [unset, empty] {
-            assert!(!has_key(env, &file, "keys.typesafe"), "{env}");
             assert_eq!(
                 describe_key_source(env, &file, "keys.typesafe"),
                 json!({ "source": "unset" }),
                 "{env}"
             );
         }
-    }
-
-    #[test]
-    fn the_gemini_probe_sends_its_key_in_a_header_not_the_url() {
-        let key = "AIzaFAKEPROBEKEY0123456789";
-        let req = gemini_probe(&reqwest::Client::new(), key).build().unwrap();
-        assert_eq!(req.url().query(), None);
-        assert!(!req.url().as_str().contains(key));
-        assert_eq!(req.headers()["x-goog-api-key"], key);
     }
 
     #[test]
