@@ -416,6 +416,42 @@ fn a_listing_reports_returned_total_verdict_and_scope() {
     );
 }
 
+/// Reads span every KB since 0.3.x, and `facts show` was the one that still
+/// defaulted to `default`: a fact filed under `personal` answered "0 facts",
+/// with `origin: flag` although no flag was passed. `state` found it.
+#[test]
+fn facts_show_without_kb_finds_a_fact_filed_under_personal() {
+    let sb = Sandbox::new();
+    let facts = r#"[{"subject":"Ana","predicate":"lives_in","object":"Lisbon"}]"#;
+    let out = sb
+        .cmd()
+        .args([
+            "remember",
+            "Ana lives in Lisbon.",
+            "--kb",
+            "personal",
+            "--offline",
+        ])
+        .args(["--facts-json", facts])
+        .output()
+        .expect("remember");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = sb
+        .cmd()
+        .args(["facts", "show", "Ana"])
+        .output()
+        .expect("facts show");
+    assert!(out.status.success());
+    let v = Sandbox::json(&out);
+    let active = v["data"]["active"].as_array().expect("active facts");
+    assert_eq!(active.len(), 1, "{v}");
+    assert_eq!(v["metadata"]["scope"]["origin"], "all_kbs");
+}
+
 /// `state` is the command whose whole promise is that an absent answer is an
 /// ANSWER: exit 0, `no_match`, and a reason naming the miss.
 #[test]
@@ -474,6 +510,123 @@ fn every_provenance_block_carries_observed_at_and_snippet() {
             );
         }
     }
+}
+
+/// Recall against its own published schema: every `data` field the contract
+/// calls always-present is present, on both spellings. `kb` and `kb_scope`
+/// were promised at the top of `data` from the day the contract landed and
+/// only ever emitted one level down — an agent that trusted the schema read
+/// `null`. And the three notes that say nothing unless something happened
+/// are absent, not `null`, as the contract says.
+#[test]
+fn live_recall_output_satisfies_its_own_schema() {
+    let sb = Sandbox::new();
+    remember(&sb, "Ana moved to Lisbon in March and loves the tram");
+    let schema = engram_contract::jsonschema::schema_for("recall").unwrap();
+    let required = schema["properties"]["output"]["properties"]["data"]["required"]
+        .as_array()
+        .expect("required data fields");
+    let spellings: [&[&str]; 2] = [
+        &["recall", "Lisbon", "--profile", "offline"],
+        &["memory", "search", "Lisbon", "--profile", "offline"],
+    ];
+    for argv in spellings {
+        let out = sb.cmd().args(argv).output().expect("recall");
+        assert!(out.status.success(), "{argv:?}");
+        let v = Sandbox::json(&out);
+        for key in required {
+            let key = key.as_str().unwrap();
+            assert!(
+                v["data"].get(key).is_some(),
+                "{argv:?} omits `data.{key}`, which its schema requires"
+            );
+        }
+        assert_eq!(v["data"]["kb"], v["metadata"]["kb"], "{argv:?}");
+        assert_eq!(v["data"]["kb_scope"], "all_kbs", "{argv:?}");
+        for quiet in ["diary_isolation", "temporal_scope", "expiry"] {
+            assert!(
+                v["data"]["metadata"].get(quiet).is_none(),
+                "{argv:?} prints `data.metadata.{quiet}: null` on a call it says nothing about"
+            );
+        }
+    }
+}
+
+/// Scores are computed in `f32` and were printed widened to `f64`:
+/// `0.9200000166893005` for a stored `0.92`. Every score, confidence and
+/// threshold an agent reads is now four decimal places at most — on recall,
+/// on state (including a caller-supplied six-decimal confidence), and on the
+/// absence block a near-miss subject gets.
+#[test]
+fn no_serialized_score_carries_more_than_4_decimals() {
+    const SCORES: &[&str] = &[
+        "score",
+        "rerank_score",
+        "top_score",
+        "threshold",
+        "confidence",
+        "resolution_score",
+        "extraction",
+        "source_kind",
+        "confirmations",
+        "staleness",
+        "contested",
+    ];
+    fn walk(v: &Value, key: &str, seen: &mut usize, context: &str) {
+        match v {
+            Value::Object(map) => map.iter().for_each(|(k, v)| walk(v, k, seen, context)),
+            Value::Array(items) => items.iter().for_each(|v| walk(v, key, seen, context)),
+            Value::Number(n) if SCORES.contains(&key) && n.is_f64() => {
+                *seen += 1;
+                let text = n.to_string();
+                let decimals = text.split_once('.').map_or(0, |(_, d)| d.len());
+                assert!(
+                    decimals <= 4 && !text.contains('e'),
+                    "{context}: `{key}` printed as {text}"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let sb = Sandbox::new();
+    remember(&sb, "Sarah prefers async standups; sync only for incidents");
+    remember(&sb, "The pricing model is annual only, decided in March");
+    let facts =
+        r#"[{"subject":"Ana","predicate":"lives_in","object":"Lisbon","confidence":0.123456}]"#;
+    let out = sb
+        .cmd()
+        .args([
+            "remember",
+            "Ana lives in Lisbon",
+            "--kb",
+            "personal",
+            "--offline",
+        ])
+        .args(["--facts-json", facts])
+        .output()
+        .expect("remember");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut seen = 0;
+    // `Anna` is a fuzzy match (resolution_score); `Zed` is an absence with a
+    // threshold, a top score and scored nearest subjects.
+    let probes: [&[&str]; 4] = [
+        &["recall", "pricing standups", "--profile", "offline"],
+        &["state", "Ana"],
+        &["state", "Anna"],
+        &["state", "Zed"],
+    ];
+    for argv in probes {
+        let out = sb.cmd().args(argv).output().expect("probe");
+        assert!(out.status.success(), "{argv:?}");
+        walk(&Sandbox::json(&out), "", &mut seen, &argv.join(" "));
+    }
+    assert!(seen > 5, "the fixture printed only {seen} scores to check");
 }
 
 // --- the taxonomy and the vocabularies --------------------------------------
@@ -592,4 +745,107 @@ fn the_store_flag_is_documented_globally_and_accepted_everywhere() {
         "--store was rejected: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// The status commands answer with exactly the fields their contract names.
+/// A block added to `config show` / `config check` / `doctor` (the judge's
+/// modes and route, the TypeSafe key) is invisible to an agent until the
+/// contract lists it; this fails in the commit that adds it. Keyless, so
+/// `config check` probes nothing.
+#[test]
+fn the_status_commands_answer_with_exactly_their_documented_fields() {
+    let sb = Sandbox::new();
+    for path in ["config show", "config check", "doctor"] {
+        let out = sb
+            .cmd()
+            .args(path.split_whitespace())
+            .arg("--json")
+            .output()
+            .expect(path);
+        assert!(
+            out.status.success(),
+            "{path}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = Sandbox::json(&out);
+        let mut live: Vec<&str> = v["data"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{path}: data is not an object"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        live.sort();
+        let mut named = data_field_names(path);
+        named.sort();
+        assert_eq!(live, named, "{path}: live data keys vs the contract");
+        // The contract tells agents to test the prefix of these notes.
+        if path == "config check" {
+            for key in ["gemini", "cohere", "openrouter", "typesafe"] {
+                let s = v["data"][key].as_str().unwrap_or_default();
+                assert!(
+                    s.starts_with("configured") || s.starts_with("missing"),
+                    "{path}: data.{key} = {s:?}"
+                );
+            }
+        }
+    }
+}
+
+/// What the fact write path reports is what `remember`'s contract names: the
+/// gate, queue and adjudication counters in metadata, and on the dedup path a
+/// `fact_extraction` value the published vocabulary contains. A value outside
+/// the enum fails every agent that validates against the schema.
+#[test]
+fn remember_reports_only_documented_fact_write_fields() {
+    let sb = Sandbox::new();
+    let spec = documented("remember");
+    let meta_names: Vec<&str> = spec.metadata.iter().map(|f| f.name).collect();
+    let run = |content: &str| {
+        let out = sb
+            .cmd()
+            .args([
+                "remember",
+                content,
+                "--kb",
+                "personal",
+                "--offline",
+                "--json",
+            ])
+            .output()
+            .expect("remember");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Sandbox::json(&out)
+    };
+    // No OpenRouter key in the sandbox: extraction is skipped, never called.
+    let first = run("Ana plays the cello.");
+    for counter in ["gate", "queued_by_rule", "adjudication"] {
+        assert!(
+            first["metadata"].get(counter).is_some(),
+            "{counter} not emitted"
+        );
+        assert!(
+            meta_names.contains(&counter),
+            "{counter} emitted, not documented"
+        );
+    }
+    let again = run("Ana plays the cello.");
+    assert_eq!(again["data"]["stored"], false, "{again}");
+    let status = again["data"]["fact_extraction"].as_str().unwrap();
+    assert_eq!(status, "skipped_duplicate");
+    assert!(
+        engram_contract::registry::FACT_EXTRACTION.contains(&status),
+        "fact_extraction {status:?} is not in the published vocabulary"
+    );
+    for (path, v) in [("stored", &first), ("dedup", &again)] {
+        for field in v["data"].as_object().unwrap().keys() {
+            assert!(
+                data_field_names("remember").contains(&field.as_str()),
+                "{path} data.{field} is not documented"
+            );
+        }
+    }
 }
