@@ -449,11 +449,7 @@ fn a_known_subject_with_no_data_for_a_relation_is_not_unknown() {
         "Ada takes metformin.",
         &med("Ada Example", "metformin", "2024-01-01"),
     );
-    let v = state(
-        dir.path(),
-        "Ada Example",
-        &["--relation", "allergic_to"],
-    );
+    let v = state(dir.path(), "Ada Example", &["--relation", "allergic_to"]);
     assert_eq!(v["data"]["verdict"], json!("no_match"));
     assert_eq!(v["data"]["resolved_from"], json!("exact"));
     let absence = &v["data"]["absence"];
@@ -467,7 +463,9 @@ fn a_known_subject_with_no_data_for_a_relation_is_not_unknown() {
         "no cutoff rejected anything — scores here would be fabricated: {v}"
     );
     assert!(
-        absence["nearest_subjects"].as_array().is_none_or(|n| n.is_empty()),
+        absence["nearest_subjects"]
+            .as_array()
+            .is_none_or(|n| n.is_empty()),
         "'did you mean ada' under an answer about ada argues with itself: {v}"
     );
 }
