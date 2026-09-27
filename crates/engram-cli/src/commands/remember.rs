@@ -25,7 +25,7 @@ use crate::error::CliError;
 use crate::fact_llm::FactLlm;
 use crate::fact_write::{
     write_fact_batch, Autonomy, FactBatch, FactBatchError, FactExtractionMarker, FactWriteCtx,
-    FactWriteOutcome, MemoryTime,
+    FactWriteOutcome, GroundingJudge, MemoryTime,
 };
 use crate::output::{print_success, Metadata};
 use crate::retrieval::{resolve_write_embedder, WriteEmbedder};
@@ -251,6 +251,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // Same reason: a gate threshold nobody can use is exit 2 now, not after
     // the memory is stored and its fact batch fails.
     crate::fact_write::gate_thresholds()?;
+    let grounding = GroundingJudge::resolve(offline)?;
 
     // The KB budget guards PAID calls: cloud embedding, and LLM extraction /
     // adjudication (which run whenever an OpenRouter key resolves and
@@ -323,6 +324,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     embedder: write_embedder.embedder.as_ref(),
                     facts: &caller_facts,
                     marker: None,
+                    source_text: &content,
+                    grounding: grounding.as_ref(),
                     // The caller asserted these, on the retry path exactly as
                     // on the first run: dedup must not downgrade provenance.
                     source_kind: SourceKind::UserStated,
@@ -366,9 +369,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             for (name, counts) in outcome.counters() {
                 meta.add(name, counts);
             }
-            print_success(
-                ctx.format,
-                json!({
+            let mut data = json!({
                     "id": existing.to_string(),
                     "handle": crate::commands::memory::render_handle(existing),
                     "stored": false,
@@ -385,16 +386,15 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     "date_parse_warnings": outcome.date_warnings,
                     "plan_notes": outcome.plan_notes,
                     "reason": "identical content already stored in this kb/diary; nothing re-embedded",
-                }),
-                meta,
-                |data| {
-                    println!(
-                        "Duplicate of {existing} — nothing re-stored ({} facts attached, use \
+            });
+            with_grounding(&mut data, outcome.grounding);
+            print_success(ctx.format, data, meta, |data| {
+                println!(
+                    "Duplicate of {existing} — nothing re-stored ({} facts attached, use \
                          --allow-duplicate to force a second memory)",
-                        data["facts_added"]
-                    )
-                },
-            );
+                    data["facts_added"]
+                )
+            });
             return Ok(());
         }
     }
@@ -621,6 +621,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             embedder: embedder.as_ref(),
             facts: &caller_facts,
             marker: None,
+            source_text: &content,
+            grounding: grounding.as_ref(),
             source_kind: SourceKind::UserStated,
         };
         if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
@@ -642,6 +644,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             embedder: embedder.as_ref(),
             facts: &extracted,
             marker,
+            source_text: &content,
+            grounding: grounding.as_ref(),
             source_kind: SourceKind::AgentExtracted,
         };
         if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
@@ -673,6 +677,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // were collected and dropped here, so a replayed caller decision changed
     // the store with no trace in the answer.
     let plan_notes = outcome.plan_notes;
+    let grounding = outcome.grounding;
 
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -724,9 +729,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         );
     }
 
-    print_success(
-        ctx.format,
-        json!({
+    let mut data = json!({
             "id": memory.id,
             "handle": crate::commands::memory::render_handle(memory.id),
             "stored": true,
@@ -743,20 +746,27 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             "plan_notes": plan_notes,
             "conflicts": conflicts,
             "adjudication_needed": adjudication_needed,
-        }),
-        meta,
-        |_| {
-            println!(
-                "Stored memory {} ({} chunks, {} facts, {} conflicts, {} queued for resolution)",
-                memory.id,
-                chunks_stored,
-                facts_added,
-                conflicts.len(),
-                adjudication_needed.len()
-            )
-        },
-    );
+    });
+    with_grounding(&mut data, grounding);
+    print_success(ctx.format, data, meta, |_| {
+        println!(
+            "Stored memory {} ({} chunks, {} facts, {} conflicts, {} queued for resolution)",
+            memory.id,
+            chunks_stored,
+            facts_added,
+            conflicts.len(),
+            adjudication_needed.len()
+        )
+    });
     Ok(())
+}
+
+/// `data.facts_grounding`, only when grounding judged a fact or dropped one:
+/// off, and with nothing dropped, the envelope is unchanged.
+pub(crate) fn with_grounding(data: &mut serde_json::Value, grounding: Vec<serde_json::Value>) {
+    if !grounding.is_empty() {
+        data["facts_grounding"] = json!(grounding);
+    }
 }
 
 /// Everything one memory's fact batch needs. Bundled so the duplicate-content
@@ -775,6 +785,9 @@ struct FactBatchPlan<'a> {
     embedder: &'a dyn Embedder,
     facts: &'a [ExtractedFact],
     marker: Option<FactExtractionMarker<'a>>,
+    /// The memory text, which the facts are grounded against.
+    source_text: &'a str,
+    grounding: Option<&'a GroundingJudge>,
     /// Who claims these triples. `UserStated` for `--facts-json`,
     /// `AgentExtracted` for what the extractor produced — the whole point of
     /// splitting one run into two batches.
@@ -814,6 +827,8 @@ async fn persist_facts(
     let batch = FactBatch {
         facts: plan.facts,
         marker: plan.marker,
+        source_text: plan.source_text,
+        grounding: plan.grounding,
     };
     write_fact_batch(ctx, &write_ctx, &batch, outcome).await
 }

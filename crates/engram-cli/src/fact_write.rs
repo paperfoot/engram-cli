@@ -15,6 +15,10 @@
 //! 5. apply: insert, confirm, close, queue — in that order, inside the
 //!    caller's transaction.
 //!
+//! Before any of that, a batch is GROUNDED against the memory it came from
+//! (see [`GroundingJudge`]): an extracted safety fact the text does not
+//! support never reaches the planner.
+//!
 //! WHY THE SPLIT. The classifier used to live here, and the arity it used was
 //! derived from "does this predicate have a slot policy" — so
 //! `takes_medication` was a single-valued slot and five concurrent
@@ -32,6 +36,7 @@
 
 use crate::context::AppContext;
 use crate::error::CliError;
+use crate::judge::{judge_mode, record_judge_usage, resolve_judge, JudgeMode, JudgeSite};
 use chrono::{DateTime, Utc};
 use engram_core::interval::{may_close, CloseAuthority, CloseReason, CloseVerdict, Interval};
 use engram_core::relations::{canonical_relation, cessation_of, member_identity, relation_spec};
@@ -48,6 +53,11 @@ use engram_graph::semantics::{
     Observation, ObservationState, PlanNote, PlannedClose, PlannedConflict, SemanticKey,
     UnknownAutonomy, WritePlan, SEMANTIC_KEY_VERSION,
 };
+use engram_llm::judge::lexical::{negated_object, numbers_ok};
+use engram_llm::judge::questions::{
+    admits, fact_as_claim_with_state, grounding_request, REMEMBER_SAFETY_ADMIT_P,
+};
+use engram_llm::judge::{ask_batched, Judge};
 use engram_llm::ChatLlm;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -171,6 +181,12 @@ pub struct FactWriteOutcome {
     pub queued_by_rule: BTreeMap<&'static str, usize>,
     /// Measurement: what the `--autonomy full` judge was asked and answered.
     pub adjudication: AdjudicationCounters,
+    /// One entry per fact the grounding judge saw, plus every fact dropped
+    /// by the negated-object rule (see [`GroundingJudge`]). A dropped fact is
+    /// listed with its triple so the caller can re-supply it with
+    /// `--facts-json` if it is true.
+    pub grounding: Vec<serde_json::Value>,
+    pub grounding_counts: GroundingCounters,
 }
 
 impl FactWriteOutcome {
@@ -193,15 +209,44 @@ impl FactWriteOutcome {
             *self.queued_by_rule.entry(rule).or_default() += n;
         }
         self.adjudication.merge(other.adjudication);
+        self.grounding.extend(other.grounding);
+        self.grounding_counts.merge(other.grounding_counts);
     }
 
     /// The measurement counters, for a command's `metadata`.
-    pub fn counters(&self) -> [(&'static str, serde_json::Value); 3] {
+    pub fn counters(&self) -> [(&'static str, serde_json::Value); 4] {
         [
             ("gate", json!(self.gate)),
             ("queued_by_rule", json!(self.queued_by_rule)),
             ("adjudication", json!(self.adjudication)),
+            ("grounding", json!(self.grounding_counts)),
         ]
+    }
+}
+
+/// What grounding did, one count per fact unless named otherwise.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct GroundingCounters {
+    /// Facts the judge answered.
+    pub judged: usize,
+    pub dropped_by_judge: usize,
+    pub dropped_negated_object: usize,
+    /// Facts sent to the judge that came back unanswered (a failed call
+    /// leaves every one of them unanswered). They are written as before.
+    pub judge_failed: usize,
+    /// Summed over the judge responses.
+    pub input_tokens: u64,
+    pub cost_usd: f64,
+}
+
+impl GroundingCounters {
+    fn merge(&mut self, o: GroundingCounters) {
+        self.judged += o.judged;
+        self.dropped_by_judge += o.dropped_by_judge;
+        self.dropped_negated_object += o.dropped_negated_object;
+        self.judge_failed += o.judge_failed;
+        self.input_tokens += o.input_tokens;
+        self.cost_usd += o.cost_usd;
     }
 }
 
@@ -653,6 +698,186 @@ pub struct FactBatch<'a> {
     /// `--no-extract-facts`, no key): the memory must stay in the backfill
     /// queue in that case, so it earns no marker even on success.
     pub marker: Option<FactExtractionMarker<'a>>,
+    /// The memory text the facts came from: the passage they are grounded
+    /// against.
+    pub source_text: &'a str,
+    /// `None`: no judge is asked (grounding is off, or nothing can answer);
+    /// only the negated-object rule runs.
+    pub grounding: Option<&'a GroundingJudge>,
+}
+
+/// The grounding judge for `remember`, `memory add` and `facts backfill`: is
+/// each fact supported by the memory it was taken from?
+///
+/// Engram's own extractor invents facts. On the remember eval (161 facts,
+/// `benchmarks/jev-grounding-remember-20260925T1030.json`) 16% were
+/// unsupported, 22% on health notes: "Sam allergic_to ibuprofen" from "avoid
+/// ibuprofen with the kidney issue", "takes_medication paracetamol" from
+/// "paracetamol is fine". They reached `state` unchecked. The rules, per
+/// fact:
+///
+/// - Every mode, no judge needed: an EXTRACTED fact on a safety set
+///   (takes_medication, allergic_to, diagnosed_with) whose object is a
+///   negation ("no blood thinners") is dropped. The text does say it, so the
+///   judge passes it; the shape is wrong, and `state` would list "no blood
+///   thinners" as a medication.
+/// - `on`: an extracted safety-set fact is written only if its numbers are
+///   in the text and the judge admits it at [`REMEMBER_SAFETY_ADMIT_P`].
+///   Other extracted facts are written and annotated: gating them drops true
+///   preferences the judge reads literally.
+/// - `shadow`: written exactly as `off`, annotated.
+/// - A caller's fact (`--facts-json`) is never dropped: it is annotated only.
+///   The caller has the conversation; the judge has one memory.
+/// - No answer (a failed call, a dropped question) writes as before and is
+///   counted as `judge_failed`: an outage must not delete facts.
+///
+/// One request per batch, sent before the write lock is taken.
+pub struct GroundingJudge {
+    mode: JudgeMode,
+    judge: Box<dyn Judge>,
+}
+
+impl GroundingJudge {
+    /// The grounding judge a command should use, or `None` when grounding is
+    /// off or no judge is reachable (no key, `--offline`,
+    /// `ENGRAM_BENCH_FORCE_STUB`). Resolve once per command, before anything
+    /// is written: a bad setting is exit 2, not a half-write.
+    pub fn resolve(offline: bool) -> Result<Option<Self>, CliError> {
+        let mode = judge_mode(JudgeSite::Grounding)?;
+        if mode == JudgeMode::Off {
+            return Ok(None);
+        }
+        Ok(resolve_judge(offline)?.map(|judge| GroundingJudge { mode, judge }))
+    }
+}
+
+/// Is a relation a safety SET? The only relations grounding may drop from:
+/// a blood type of "O negative" is a value, not a negation, and the eval
+/// measured the cut on these three.
+fn is_safety_set(relation: &str) -> bool {
+    let spec = relation_spec(relation);
+    spec.is_safety() && spec.is_set_valued()
+}
+
+/// GATHER, before the embeddings and the adjudication calls: which of
+/// `batch.facts` may be written. Reports into `outcome`.
+async fn ground_batch(
+    ctx: &AppContext,
+    w: &FactWriteCtx<'_>,
+    batch: &FactBatch<'_>,
+    outcome: &mut FactWriteOutcome,
+) -> Vec<bool> {
+    let extracted = w.source_kind == SourceKind::AgentExtracted;
+    // The claim is the fact as it will be stored: a cessation predicate
+    // names its base relation, and an ended fact reads "no longer".
+    let facts: Vec<(String, bool, bool)> = batch
+        .facts
+        .iter()
+        .map(|ef| {
+            let cessation = cessation_of(&ef.predicate);
+            let relation = match cessation {
+                Some(r) => r.to_string(),
+                None => canonical_relation(&ef.predicate),
+            };
+            let ended = cessation.is_some() || ef.says_ended();
+            let claim = fact_as_claim_with_state(&ef.subject, &relation, &ef.object, ended);
+            let safety = is_safety_set(&relation);
+            let negated = extracted && safety && negated_object(&ef.object);
+            (claim, safety, negated)
+        })
+        .collect();
+    let id = |i: usize| format!("f{i}");
+
+    let judge = batch.grounding;
+    let claims: Vec<(String, String)> = facts
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, negated))| !negated)
+        .map(|(i, (claim, _, _))| (id(i), claim.clone()))
+        .collect();
+    let response = match judge {
+        Some(g) if !claims.is_empty() => {
+            let request = grounding_request(batch.source_text, &claims);
+            match ask_batched(g.judge.as_ref(), &request).await {
+                Ok(r) => {
+                    record_judge_usage(
+                        ctx,
+                        JudgeSite::Grounding.operation(),
+                        &r,
+                        Some(w.kb),
+                        Some(w.diary),
+                    );
+                    outcome.grounding_counts.input_tokens += r.input_tokens;
+                    outcome.grounding_counts.cost_usd += r.cost_usd;
+                    Some(r)
+                }
+                Err(e) => {
+                    // Logged, never echoed: the facts are written as before.
+                    tracing::warn!("grounding judge gave no answer; facts written unjudged: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let counts = &mut outcome.grounding_counts;
+    let mut keep = Vec::with_capacity(facts.len());
+    for (i, (ef, (claim, safety, negated))) in batch.facts.iter().zip(&facts).enumerate() {
+        let p = response.as_ref().and_then(|r| r.noul(&id(i)).ok());
+        let numbers = numbers_ok(claim, batch.source_text);
+        let supported = p.map(|p| numbers && admits(p, REMEMBER_SAFETY_ADMIT_P));
+        let unsupported_extracted_safety = extracted && *safety && supported == Some(false);
+        let drop = *negated
+            || (unsupported_extracted_safety && judge.is_some_and(|g| g.mode == JudgeMode::On));
+        keep.push(!drop);
+        let reason = if *negated {
+            counts.dropped_negated_object += 1;
+            "negated_object"
+        } else if judge.is_none() {
+            continue;
+        } else if p.is_none() {
+            counts.judge_failed += 1;
+            "judge_failed"
+        } else if drop {
+            counts.dropped_by_judge += 1;
+            if numbers {
+                "unsupported_safety_fact"
+            } else {
+                "number_not_in_text"
+            }
+        } else if unsupported_extracted_safety {
+            "shadow"
+        } else if supported == Some(true) {
+            "supported"
+        } else if !extracted {
+            "caller_asserted"
+        } else {
+            "not_a_safety_relation"
+        };
+        if p.is_some() {
+            counts.judged += 1;
+        }
+        outcome.grounding.push(json!({
+            "index": i,
+            "memory_id": w.memory_id.to_string(),
+            "source_kind": w.source_kind.as_str(),
+            "subject": ef.subject,
+            "predicate": ef.predicate,
+            "object": ef.object,
+            "claim": claim,
+            "verdict": match supported {
+                Some(true) => "supported",
+                Some(false) => "unsupported",
+                None => "not_judged",
+            },
+            // Three places: f32 widened to JSON prints 0.019999999552965164.
+            "p": p.map(|p| (f64::from(p) * 1000.0).round() / 1000.0),
+            "action": if drop { "dropped" } else { "written" },
+            "reason": reason,
+        }));
+    }
+    keep
 }
 
 /// Which fact aborted a batch, and why.
@@ -695,8 +920,9 @@ impl FactBatchError {
 /// memories; removing it means the batch commits or it never happened.
 ///
 /// Everything network-bound is paid for BEFORE the transaction opens: the
-/// embeddings (see [`FactEmbedCache`]) and, under `--autonomy full`, every
-/// judge call (see [`gather_judgements`]). The adjudication call used to await
+/// grounding call (see [`GroundingJudge`]), the embeddings (see
+/// [`FactEmbedCache`]) and, under `--autonomy full`, every judge call (see
+/// [`gather_judgements`]). The adjudication call used to await
 /// INSIDE `BEGIN IMMEDIATE`, and with a provider's retry policy that held the
 /// write lock for minutes — every concurrent `remember`, daemon job and
 /// `facts resolve` then failed on busy_timeout.
@@ -713,15 +939,28 @@ pub async fn write_fact_batch(
     outcome: &mut FactWriteOutcome,
 ) -> Result<(), FactBatchError> {
     let total = batch.facts.len();
+    let mut scratch = FactWriteOutcome::default();
+    // Grounding first: a dropped fact costs no embedding and no adjudication.
+    let keep = ground_batch(ctx, w, batch, &mut scratch).await;
+    let (facts, original): (Vec<ExtractedFact>, Vec<usize>) = batch
+        .facts
+        .iter()
+        .zip(&keep)
+        .enumerate()
+        .filter(|(_, (_, keep))| **keep)
+        .map(|(i, (ef, _))| (ef.clone(), i))
+        .unzip();
+    // Indices below are into `facts`; a failure names the fact by its place
+    // in the batch the caller sent.
     let fail = |index: usize, error: CliError| FactBatchError {
-        index,
+        index: original.get(index).copied().unwrap_or(total),
         total,
         error,
     };
 
     let cache = match w.embedder {
         Some(embedder) => {
-            let texts = batch_embed_texts(ctx, w, batch.facts);
+            let texts = batch_embed_texts(ctx, w, &facts);
             FactEmbedCache::warm(embedder, &texts)
                 .await
                 .map_err(|e| fail(0, e))?
@@ -730,19 +969,18 @@ pub async fn write_fact_batch(
     };
 
     let judged = match (w.autonomy, w.llm) {
-        (Autonomy::Full, Some(llm)) => gather_judgements(ctx, w, batch.facts, &cache, llm)
+        (Autonomy::Full, Some(llm)) => gather_judgements(ctx, w, &facts, &cache, llm)
             .await
             .map_err(|(i, e)| fail(i, e))?,
         _ => Vec::new(),
     };
 
     ctx.store.begin_immediate().map_err(|e| fail(0, e.into()))?;
-    let mut scratch = FactWriteOutcome::default();
     let mut failed: Option<(usize, CliError)> = None;
-    for (i, ef) in batch.facts.iter().enumerate() {
+    for (i, ef) in facts.iter().enumerate() {
         let verdict = judged.get(i).and_then(Option::as_ref);
         if let Err(e) = write_judged_fact(ctx, w, ef, &cache, verdict, &mut scratch).await {
-            tracing::warn!("fact {} of {total} failed to persist: {e}", i + 1);
+            tracing::warn!("fact {} of {total} failed to persist: {e}", original[i] + 1);
             failed = Some((i, e));
             break;
         }
