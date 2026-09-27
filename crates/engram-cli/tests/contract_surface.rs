@@ -778,6 +778,16 @@ fn the_status_commands_answer_with_exactly_their_documented_fields() {
         let mut named = data_field_names(path);
         named.sort();
         assert_eq!(live, named, "{path}: live data keys vs the contract");
+        // The contract tells agents to test the prefix of these notes.
+        if path == "config check" {
+            for key in ["gemini", "cohere", "openrouter", "typesafe"] {
+                let s = v["data"][key].as_str().unwrap_or_default();
+                assert!(
+                    s.starts_with("configured") || s.starts_with("missing"),
+                    "{path}: data.{key} = {s:?}"
+                );
+            }
+        }
     }
 }
 
