@@ -365,6 +365,14 @@ impl JudgeResponse {
     }
 }
 
+/// An answer as the decimal the provider sent, for anything that writes it
+/// out. Widening the f32 directly writes 0.9 as 0.8999999761581543, which
+/// falls below a 0.9 threshold for whoever calibrates on the output; the
+/// shortest f32 repr round-trips the wire value.
+pub fn wire_decimal(p: f32) -> f64 {
+    p.to_string().parse().unwrap_or(p as f64)
+}
+
 /// Judge failures. None of them carries the API key or the request body: the
 /// state is someone's memory, and error strings reach agents' stdout.
 #[derive(Debug, thiserror::Error)]
@@ -534,6 +542,19 @@ mod tests {
 
     fn noul(text: &str) -> Question {
         Question::noul(json!(text))
+    }
+
+    #[test]
+    fn a_written_answer_is_the_providers_decimal() {
+        for (p, text) in [
+            (0.9f32, "0.9"),
+            (0.01, "0.01"),
+            (0.97, "0.97"),
+            (1.0, "1.0"),
+        ] {
+            assert_eq!(json!({ "p": wire_decimal(p) })["p"].to_string(), text);
+        }
+        assert_ne!(json!(f64::from(0.9f32)).to_string(), "0.9");
     }
 
     #[test]

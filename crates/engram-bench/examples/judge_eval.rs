@@ -29,7 +29,7 @@ use engram_llm::judge::lexical::{claim_grounded_lexically, numbers_ok};
 use engram_llm::judge::questions::{self, FactTriple, PairAnswers};
 use engram_llm::judge::stub::StubJudge;
 use engram_llm::judge::typesafe::{TypeSafeJudge, TypeSafeRoute};
-use engram_llm::judge::{ask_many, Judge, JudgeRequest, JudgeResponse};
+use engram_llm::judge::{ask_many, wire_decimal as wire, Judge, JudgeRequest, JudgeResponse};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -129,13 +129,6 @@ fn text(v: &Value, field: &str) -> Result<String, Error> {
         Value::Null => Err(format!("missing field `{field}`").into()),
         other => Ok(other.to_string()),
     }
-}
-
-/// An answer as the decimal the provider sent. Widening the f32 directly
-/// writes 0.9 as 0.8999999761581543, which falls below a 0.9 threshold in
-/// score.py; the shortest f32 repr round-trips the wire value.
-fn wire(p: f32) -> f64 {
-    p.to_string().parse().unwrap_or(p as f64)
 }
 
 fn triple(v: &Value) -> Result<FactTriple, Error> {

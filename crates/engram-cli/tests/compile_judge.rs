@@ -302,8 +302,8 @@ fn the_judge_log_records_every_judged_item() {
             ("ENGRAM_JUDGE_LOG", log.to_str().unwrap()),
         ],
     );
-    let lines: Vec<Value> = std::fs::read_to_string(&log)
-        .expect("log written")
+    let raw = std::fs::read_to_string(&log).expect("log written");
+    let lines: Vec<Value> = raw
         .lines()
         .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
         .collect();
@@ -318,7 +318,11 @@ fn the_judge_log_records_every_judged_item() {
     assert_eq!(inverted["lexical"], true);
     // Shadow: what was stored, which is the lexical decision.
     assert_eq!(inverted["admitted"], true);
-    assert!(inverted["p"].as_f64().unwrap() < 0.2, "{inverted}");
+    // The provider's decimal, not the widened f32 (0.10000000149011612):
+    // a user calibrating a 0.9 cut on this log must see 0.9 as 0.9.
+    assert_eq!(inverted["p"].as_f64(), Some(0.1), "{inverted}");
+    assert!(raw.contains(r#""p":0.95"#), "{raw}");
+    assert!(!raw.contains("0.100000001"), "{raw}");
     assert_eq!(lines.iter().filter(|l| l["kind"] == "fact").count(), 2);
 }
 

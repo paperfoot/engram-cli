@@ -20,7 +20,7 @@ use engram_llm::judge::lexical::{
     claim_grounded_lexically, fact_grounded_lexically, negated_object, numbers_ok, numeric_tokens,
     word_set,
 };
-use engram_llm::judge::{ask_many, questions, Judge, JudgeError, BATCH_CONCURRENCY};
+use engram_llm::judge::{ask_many, questions, wire_decimal, Judge, JudgeError, BATCH_CONCURRENCY};
 use engram_llm::openrouter::{OpenRouterClient, DEFAULT_EXTRACTION_MODEL, DEFAULT_SYNTHESIS_MODEL};
 use engram_llm::{ChatLlm, ChatMessage};
 use serde::{Deserialize, Serialize};
@@ -1257,7 +1257,8 @@ fn ground_evidence(
         if let (Some(file), Some(p), Some(v)) = (log.as_mut(), p, verdicts) {
             let line = json!({
                 "site": "compile", "kind": kind, "chunk_id": chunk.chunk_id, "text": item,
-                "lexical": lexical, "numbers_ok": numbers, "p": p, "admitted": admitted,
+                "lexical": lexical, "numbers_ok": numbers, "p": wire_decimal(p),
+                "admitted": admitted,
                 "mode": mode.as_str(), "model": v.model,
             });
             let _ = writeln!(file, "{line}");
