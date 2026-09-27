@@ -50,6 +50,16 @@ fn bare_cmd_in(home: &Path) -> Command {
     cmd.env_remove("GEMINI_API_KEY");
     cmd.env_remove("COHERE_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
+    cmd.env_remove("GEMINI_API_KEY_FALLBACKS");
+    for judge in [
+        "TYPESAFE_API_KEY",
+        "ENGRAM_JUDGE_STUB",
+        "ENGRAM_JUDGE_GROUNDING",
+        "ENGRAM_JUDGE_ADJUDICATE",
+        "ENGRAM_JUDGE_DEDUPE",
+    ] {
+        cmd.env_remove(judge);
+    }
     cmd.env_remove("RUST_LOG");
     // stderr is a pipe under a test harness anyway; pinning the seam means the
     // machine-readable branch is what these tests observe, not an accident of

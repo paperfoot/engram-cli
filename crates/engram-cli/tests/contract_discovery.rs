@@ -208,7 +208,12 @@ fn bench_mini_fts_opens_no_store_on_the_default_path() {
             .env_remove("GEMINI_API_KEY")
             .env_remove("GEMINI_API_KEY_FALLBACKS")
             .env_remove("COHERE_API_KEY")
-            .env_remove("OPENROUTER_API_KEY");
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("TYPESAFE_API_KEY")
+            .env_remove("ENGRAM_JUDGE_STUB")
+            .env_remove("ENGRAM_JUDGE_GROUNDING")
+            .env_remove("ENGRAM_JUDGE_ADJUDICATE")
+            .env_remove("ENGRAM_JUDGE_DEDUPE");
         c
     };
 
