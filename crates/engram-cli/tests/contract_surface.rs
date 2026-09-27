@@ -778,15 +778,25 @@ fn the_status_commands_answer_with_exactly_their_documented_fields() {
         let mut named = data_field_names(path);
         named.sort();
         assert_eq!(live, named, "{path}: live data keys vs the contract");
-        // The contract tells agents to test the prefix of these notes.
-        if path == "config check" {
-            for key in ["gemini", "cohere", "openrouter", "typesafe"] {
-                let s = v["data"][key].as_str().unwrap_or_default();
+        // Every provider entry says where its key came from, and every
+        // problem comes with a fix an agent can act on.
+        if path == "config check" || path == "doctor" {
+            let providers = v["data"]["providers"].as_array().expect("providers");
+            for p in ["gemini", "openrouter", "cohere", "typesafe"] {
+                let entry = providers
+                    .iter()
+                    .find(|e| e["provider"] == p)
+                    .unwrap_or_else(|| panic!("{path}: no {p} entry"));
+                let source = entry["configured"]["source"].as_str().unwrap_or_default();
                 assert!(
-                    s.starts_with("configured") || s.starts_with("missing"),
-                    "{path}: data.{key} = {s:?}"
+                    ["env", "config_file", "unset"].contains(&source),
+                    "{path}: {p} source {source:?}"
                 );
+                if entry["severity"] != "ok" {
+                    assert!(entry["fix"].is_string(), "{path}: {p} has no fix");
+                }
             }
+            assert!(v["data"]["next_steps"].is_array(), "{path}: next_steps");
         }
     }
 }
