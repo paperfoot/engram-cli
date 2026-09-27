@@ -218,13 +218,19 @@ impl CliError {
             BadInputHint { suggestion, .. } | ConfigHint { suggestion, .. } => suggestion.clone(),
             // Both gate-threshold messages (fact_write.rs
             // `parse_gate_thresholds`) begin with the variable's name; a key
-            // probe cannot fix a typo in one of them.
-            Config(m) if m.starts_with("ENGRAM_FACT_") => format!(
+            // probe cannot fix a typo in one of them. Match the two names, not
+            // the `ENGRAM_FACT_` prefix: the LLM stub's error shares it.
+            Config(m)
+                if m.starts_with(crate::fact_write::DUP_THRESHOLD_ENV)
+                    || m.starts_with(crate::fact_write::NOVEL_THRESHOLD_ENV) =>
+            {
+                format!(
                 "fix or unset the ENGRAM_FACT_*_THRESHOLD variable the message names, then rerun \
                  the engram command; unset, the novelty gate uses dup {} and novel {}",
                 engram_graph::gate::DEFAULT_DUP_THRESHOLD,
                 engram_graph::gate::DEFAULT_NOVEL_THRESHOLD
-            ),
+                )
+            }
             Config(_) => {
                 "run `engram config check` — it live-probes every configured key and names the one that failed"
                     .to_string()
@@ -459,6 +465,10 @@ mod tests {
         assert!(!s.contains("config check"), "{s}");
         let other = CliError::Config("x".into()).suggestion().unwrap();
         assert!(other.contains("config check"), "{other}");
+        let stub = CliError::Config("ENGRAM_FACT_LLM_STUB is not a valid script: x".into())
+            .suggestion()
+            .unwrap();
+        assert!(!stub.contains("THRESHOLD"), "{stub}");
     }
 
     #[test]
