@@ -25,6 +25,7 @@ use engram_llm::{ChatLlm, ChatMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write as _;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompileStats {
@@ -1119,8 +1120,13 @@ fn fact_id(i: usize) -> String {
 
 /// P(supported) for every claim and fact of one chunk, by question id.
 struct ChunkVerdicts {
+    model: String,
     p: HashMap<String, f32>,
 }
+
+/// Set to a path, appends one JSON line per judged item to that local file,
+/// to calibrate the admit threshold on a user's own corpus.
+const JUDGE_LOG_ENV: &str = "ENGRAM_JUDGE_LOG";
 
 /// One grounding request per chunk (its claims, and its facts as sentences),
 /// [`BATCH_CONCURRENCY`] chunks at a time. A chunk whose request failed or
@@ -1172,7 +1178,10 @@ async fn judge_chunks(
                 .iter()
                 .map(|(id, _)| Ok((id.clone(), resp.noul(id)?)))
                 .collect::<Result<_, JudgeError>>()?;
-            Ok(ChunkVerdicts { p })
+            Ok(ChunkVerdicts {
+                model: resp.model,
+                p,
+            })
         });
         match decided {
             Ok(v) => verdicts[i] = Some(v),
@@ -1209,13 +1218,35 @@ fn ground_evidence(
     let p_of = |id: String| verdicts.and_then(|v| v.p.get(&id).copied());
     let judge_admits =
         |p: f32, numbers: bool| numbers && questions::admits(p, questions::COMPILE_ADMIT_P);
+    let mut log = verdicts
+        .and_then(|_| std::env::var_os(JUDGE_LOG_ENV))
+        .and_then(|path| {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path);
+            file.map_err(|e| tracing::warn!("{JUDGE_LOG_ENV}: {e}"))
+                .ok()
+        });
+    let mut log_item = |kind: &str, item: &str, lexical, numbers, p: Option<f32>, admitted| {
+        if let (Some(file), Some(p), Some(v)) = (log.as_mut(), p, verdicts) {
+            let line = json!({
+                "site": "compile", "kind": kind, "chunk_id": chunk.chunk_id, "text": item,
+                "lexical": lexical, "numbers_ok": numbers, "p": p, "admitted": admitted,
+                "mode": mode.as_str(), "model": v.model,
+            });
+            let _ = writeln!(file, "{line}");
+        }
+    };
 
     for (i, claim) in std::mem::take(&mut evidence.claims).into_iter().enumerate() {
         let lexical = claim_grounded_lexically(&claim.content, text);
         let numbers = numbers_ok(&claim.content, text);
         let p = p_of(claim_id(i));
         let judge = p.map(|p| judge_admits(p, numbers));
-        if stats.admit(Item::Claim, mode, lexical, judge) {
+        let admitted = stats.admit(Item::Claim, mode, lexical, judge);
+        log_item("claim", &claim.content, lexical, numbers, p, admitted);
+        if admitted {
             evidence.claims.push(claim);
         } else {
             tracing::warn!(
@@ -1230,10 +1261,13 @@ fn ground_evidence(
         let (subject, predicate, object) = (&fact.subject, &fact.predicate, &fact.object);
         let negated = negated_safety_member(predicate, object);
         let lexical = fact_grounded_in_chunk(subject, predicate, object, text);
-        let numbers = numbers_ok(&questions::fact_as_claim(subject, predicate, object), text);
+        let sentence = questions::fact_as_claim(subject, predicate, object);
+        let numbers = numbers_ok(&sentence, text);
         let p = p_of(fact_id(i));
         let judge = p.map(|p| judge_admits(p, numbers) && !negated);
-        if stats.admit(Item::Fact, mode, lexical, judge) {
+        let admitted = stats.admit(Item::Fact, mode, lexical, judge);
+        log_item("fact", &sentence, lexical, numbers, p, admitted);
+        if admitted {
             evidence.facts.push(fact);
         } else {
             stats.llm_facts_rejected += 1;

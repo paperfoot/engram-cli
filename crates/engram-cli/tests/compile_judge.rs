@@ -285,3 +285,39 @@ fn off_never_reads_the_judge_settings_and_no_route_runs_as_off() {
     assert_eq!(stats["judge_claims_admitted_by_both"], 0, "{stats}");
     assert_eq!(stats["llm_claims"], 2, "{stats}");
 }
+
+/// `ENGRAM_JUDGE_LOG` gets one line per judged item: the calibration record
+/// for a user's own corpus, never part of the command's output.
+#[test]
+fn the_judge_log_records_every_judged_item() {
+    let s = store();
+    seed_corpus(s.path());
+    let log = s.path().join("judge.jsonl");
+    compile(
+        s.path(),
+        &corpus_extractor(),
+        &[
+            ("ENGRAM_JUDGE_GROUNDING", "shadow"),
+            ("ENGRAM_JUDGE_STUB", JUDGE),
+            ("ENGRAM_JUDGE_LOG", log.to_str().unwrap()),
+        ],
+    );
+    let lines: Vec<Value> = std::fs::read_to_string(&log)
+        .expect("log written")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
+        .collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    let inverted = lines
+        .iter()
+        .find(|l| l["text"] == "Rapamycin decreased mortality compared with placebo.")
+        .expect("the inverted claim is logged");
+    assert_eq!(inverted["site"], "compile");
+    assert_eq!(inverted["kind"], "claim");
+    assert_eq!(inverted["mode"], "shadow");
+    assert_eq!(inverted["lexical"], true);
+    // Shadow: what was stored, which is the lexical decision.
+    assert_eq!(inverted["admitted"], true);
+    assert!(inverted["p"].as_f64().unwrap() < 0.2, "{inverted}");
+    assert_eq!(lines.iter().filter(|l| l["kind"] == "fact").count(), 2);
+}
