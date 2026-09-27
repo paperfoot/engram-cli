@@ -1,0 +1,309 @@
+{
+ "suite": "jev-grounding-remember",
+ "rendering": {
+  "plain": {
+   "suite": "jev-grounding",
+   "source": "remember-plain.jsonl",
+   "pairs": 161,
+   "labels": {
+    "SUPPORT": 135,
+    "NEI": 26
+   },
+   "missing": 0,
+   "summary": {
+    "cost_usd": 0.0017729880000000003,
+    "errors": [],
+    "failed_requests": 0,
+    "input_tokens": 42214,
+    "latency_ms_p50": 236,
+    "latency_ms_p95": 632,
+    "missing_answers": 0,
+    "model": "jev-1.13.0",
+    "requests": 62,
+    "route": "typesafe"
+   },
+   "auc": {
+    "judge": 0.7199,
+    "num+judge": 0.7199,
+    "lexical": 0.4792
+   },
+   "lexical": {
+    "precision_supported": 0.8322,
+    "recall_supported": 0.8815,
+    "contradict_admitted": 0.0,
+    "nei_admitted": 0.9231
+   },
+   "numbers_ok_only": {
+    "precision_supported": 0.8385,
+    "recall_supported": 1.0,
+    "contradict_admitted": 0.0,
+    "nei_admitted": 1.0
+   },
+   "thresholds": {
+    "0.3": {
+     "judge": {
+      "precision_supported": 0.8621,
+      "recall_supported": 0.9259,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.7692
+     },
+     "num+judge": {
+      "precision_supported": 0.8621,
+      "recall_supported": 0.9259,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.7692
+     }
+    },
+    "0.5": {
+     "judge": {
+      "precision_supported": 0.8662,
+      "recall_supported": 0.9111,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.7308
+     },
+     "num+judge": {
+      "precision_supported": 0.8662,
+      "recall_supported": 0.9111,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.7308
+     }
+    },
+    "0.6": {
+     "judge": {
+      "precision_supported": 0.8633,
+      "recall_supported": 0.8889,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.7308
+     },
+     "num+judge": {
+      "precision_supported": 0.8633,
+      "recall_supported": 0.8889,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.7308
+     }
+    },
+    "0.7": {
+     "judge": {
+      "precision_supported": 0.8647,
+      "recall_supported": 0.8519,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6923
+     },
+     "num+judge": {
+      "precision_supported": 0.8647,
+      "recall_supported": 0.8519,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6923
+     }
+    },
+    "0.8": {
+     "judge": {
+      "precision_supported": 0.873,
+      "recall_supported": 0.8148,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6154
+     },
+     "num+judge": {
+      "precision_supported": 0.873,
+      "recall_supported": 0.8148,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6154
+     }
+    },
+    "0.9": {
+     "judge": {
+      "precision_supported": 0.9159,
+      "recall_supported": 0.7259,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.3462
+     },
+     "num+judge": {
+      "precision_supported": 0.9159,
+      "recall_supported": 0.7259,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.3462
+     }
+    }
+   },
+   "run": {
+    "cost_usd": 0.0017729880000000003,
+    "errors": [],
+    "failed_requests": 0,
+    "input_tokens": 42214,
+    "latency_ms_p50": 236,
+    "latency_ms_p95": 632,
+    "missing_answers": 0,
+    "model": "jev-1.13.0",
+    "requests": 62,
+    "route": "typesafe",
+    "summary": true
+   }
+  },
+  "state": {
+   "suite": "jev-grounding",
+   "source": "remember-state.jsonl",
+   "pairs": 161,
+   "labels": {
+    "SUPPORT": 135,
+    "NEI": 26
+   },
+   "missing": 0,
+   "summary": {
+    "cost_usd": 0.0017739960000000003,
+    "errors": [],
+    "failed_requests": 0,
+    "input_tokens": 42238,
+    "latency_ms_p50": 252,
+    "latency_ms_p95": 658,
+    "missing_answers": 0,
+    "model": "jev-1.13.0",
+    "requests": 62,
+    "route": "typesafe"
+   },
+   "auc": {
+    "judge": 0.789,
+    "num+judge": 0.789,
+    "lexical": 0.4829
+   },
+   "lexical": {
+    "precision_supported": 0.8333,
+    "recall_supported": 0.8889,
+    "contradict_admitted": 0.0,
+    "nei_admitted": 0.9231
+   },
+   "numbers_ok_only": {
+    "precision_supported": 0.8385,
+    "recall_supported": 1.0,
+    "contradict_admitted": 0.0,
+    "nei_admitted": 1.0
+   },
+   "thresholds": {
+    "0.3": {
+     "judge": {
+      "precision_supported": 0.8667,
+      "recall_supported": 0.963,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.7692
+     },
+     "num+judge": {
+      "precision_supported": 0.8667,
+      "recall_supported": 0.963,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.7692
+     }
+    },
+    "0.5": {
+     "judge": {
+      "precision_supported": 0.8767,
+      "recall_supported": 0.9481,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6923
+     },
+     "num+judge": {
+      "precision_supported": 0.8767,
+      "recall_supported": 0.9481,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6923
+     }
+    },
+    "0.6": {
+     "judge": {
+      "precision_supported": 0.8741,
+      "recall_supported": 0.9259,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6923
+     },
+     "num+judge": {
+      "precision_supported": 0.8741,
+      "recall_supported": 0.9259,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6923
+     }
+    },
+    "0.7": {
+     "judge": {
+      "precision_supported": 0.8759,
+      "recall_supported": 0.8889,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6538
+     },
+     "num+judge": {
+      "precision_supported": 0.8759,
+      "recall_supported": 0.8889,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.6538
+     }
+    },
+    "0.8": {
+     "judge": {
+      "precision_supported": 0.8819,
+      "recall_supported": 0.8296,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.5769
+     },
+     "num+judge": {
+      "precision_supported": 0.8819,
+      "recall_supported": 0.8296,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.5769
+     }
+    },
+    "0.9": {
+     "judge": {
+      "precision_supported": 0.9167,
+      "recall_supported": 0.7333,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.3462
+     },
+     "num+judge": {
+      "precision_supported": 0.9167,
+      "recall_supported": 0.7333,
+      "contradict_admitted": 0.0,
+      "nei_admitted": 0.3462
+     }
+    }
+   },
+   "run": {
+    "cost_usd": 0.0017739960000000003,
+    "errors": [],
+    "failed_requests": 0,
+    "input_tokens": 42238,
+    "latency_ms_p50": 252,
+    "latency_ms_p95": 658,
+    "missing_answers": 0,
+    "model": "jev-1.13.0",
+    "requests": 62,
+    "route": "typesafe",
+    "summary": true
+   }
+  }
+ },
+ "gate_policies_state_rendering": {
+  "no_gate": {
+   "kept_true": 135,
+   "admitted_false": 26
+  },
+  "all_facts_p>=0.5": {
+   "kept_true": 128,
+   "admitted_false": 18,
+   "blocked_false": 8,
+   "dropped_true": 7
+  },
+  "all_facts_p>=0.3": {
+   "kept_true": 130,
+   "admitted_false": 20,
+   "blocked_false": 6,
+   "dropped_true": 5
+  },
+  "safety_relations_only_p>=0.5": {
+   "kept_true": 135,
+   "admitted_false": 24,
+   "blocked_false": 2
+  }
+ },
+ "notes": [
+  "161 facts from remember's verbatim extraction (FACT_EXTRACTION_PROMPT + DATE CONTEXT, gemini-3.5-flash-lite) over 60 LoCoMo windows + 20 handwritten health notes; Opus 5.5 labels.",
+  "State-aware rendering ('S no longer P O' for state=ended) lifts AUC 0.72 -> 0.79 and keeps every correct cessation (plain rendering scored them 0.01-0.24).",
+  "Safety-relations-only gating at p>=0.5 drops 0 true facts and blocks the fabricated 'allergic_to ibuprofen' (p 0.04) and 'takes paracetamol' (0.31); malformed negated objects ('no blood thinners', 'celiac disease negative') are judged supported because the text says them -- a deterministic object check catches those, not the judge."
+ ]
+}

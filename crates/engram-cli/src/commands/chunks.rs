@@ -23,7 +23,7 @@ use crate::commands::usage::{estimated_tokens_for_texts, gemini_embed_cost_usd};
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Metadata};
-use engram_embed::stub::StubEmbedder;
+use crate::retrieval::WriteEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_ingest::chunker::{enforce_max_chunk_chars, enforce_min_chunk_chars, PendingChunk};
 use engram_ingest::memory::ChunkPolicy;
@@ -85,6 +85,7 @@ pub async fn repair(
     kb: Option<String>,
     all_kbs: bool,
     dry_run: bool,
+    offline: bool,
 ) -> Result<(), CliError> {
     if kb.is_none() && !all_kbs {
         return Err(CliError::BadInput(
@@ -152,7 +153,7 @@ pub async fn repair(
     let mut reembedded = 0usize;
     let mut model = String::from("none");
     if !dry_run && !plans.is_empty() {
-        let (m, n) = apply(ctx, &plans, kb.as_deref()).await?;
+        let (m, n) = apply(ctx, &plans, kb.as_deref(), offline).await?;
         model = m;
         reembedded = n;
     }
@@ -220,21 +221,21 @@ async fn apply(
     ctx: &AppContext,
     plans: &[RepairPlan],
     kb: Option<&str>,
+    offline: bool,
 ) -> Result<(String, usize), CliError> {
-    let force_stub = crate::commands::config::stub_forced();
-    let gemini_key = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini");
-    let have_gemini = !force_stub && gemini_key.is_some();
+    let WriteEmbedder {
+        embedder,
+        cloud: have_gemini,
+        model,
+        dims,
+        prompt_format,
+    } = crate::retrieval::resolve_write_embedder("chunks repair", offline)?;
 
     let texts: Vec<&str> = plans
         .iter()
         .flat_map(|p| p.after.iter().map(|c| c.text.as_str()))
         .collect();
 
-    let embedder: Box<dyn Embedder> = if have_gemini {
-        Box::new(crate::retrieval::cloud_gemini(gemini_key.unwrap()))
-    } else {
-        Box::new(StubEmbedder::default())
-    };
     // Embed BEFORE tearing anything down: a transient embed failure must never
     // strand a memory with no chunks (invisible to recall, unrecoverable).
     let embeddings = embedder
@@ -248,9 +249,6 @@ async fn apply(
             texts.len()
         )));
     }
-    let model = embedder.model();
-    let dims = embedder.dimensions();
-    let prompt_format = embedder.prompt_format().to_string();
     crate::commands::chunks::warn_on_truncation(ctx, embedder.as_ref(), &texts, "chunks repair");
 
     let mut cursor = 0usize;

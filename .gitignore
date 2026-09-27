@@ -29,5 +29,6 @@ engram-skill.zip
 data/litqa2/
 data/beir/
 data/scifact/
+data/pairs/
 benchmarks/litqa2-*.json
 benchmarks/beir-*.json

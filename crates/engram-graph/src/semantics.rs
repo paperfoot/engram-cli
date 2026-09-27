@@ -1068,6 +1068,25 @@ pub enum PlanNote {
         key: String,
         verdict: DecisionVerdict,
     },
+    /// The machine adjudicator gave no verdict (an error, a timeout, a reply
+    /// that is not one). `reason` is a word the applier chose, never the reply.
+    AdjudicationFailed {
+        reason: &'static str,
+    },
+    /// The machine adjudicator answered `coexist`, `reject_new` or
+    /// `supersede` on a safety pair. None is its to give: the pair stays
+    /// queued and the caller's observation is kept.
+    AdjudicationKeptSafety {
+        action: &'static str,
+    },
+    /// Under `--autonomy full` the pairs queued here are not the pairs the
+    /// judge was asked about — the store moved between judging (outside the
+    /// write lock) and writing — so no verdict applies and they stay queued.
+    AdjudicationStale,
+    /// Under `--autonomy full` these pairs appeared only after judging —
+    /// typically against an earlier fact of the same batch — so no judge was
+    /// asked about them and they stay queued.
+    AdjudicationNotAsked,
 }
 
 impl PlanNote {
@@ -1077,6 +1096,10 @@ impl PlanNote {
             PlanNote::ValidUntilBeforeValidFrom { .. } => "valid_until_before_valid_from",
             PlanNote::EndWithoutOpenInterval { .. } => "end_without_open_interval",
             PlanNote::ReplayApplied { .. } => "replay_applied",
+            PlanNote::AdjudicationFailed { .. } => "adjudication_failed",
+            PlanNote::AdjudicationKeptSafety { .. } => "adjudication_kept_safety",
+            PlanNote::AdjudicationStale => "adjudication_stale",
+            PlanNote::AdjudicationNotAsked => "adjudication_not_asked",
         }
     }
 
@@ -1095,6 +1118,24 @@ impl PlanNote {
                 "a prior decision ({}) on {key} was applied instead of asking again",
                 verdict.as_str()
             ),
+            PlanNote::AdjudicationFailed { reason } => format!(
+                "the adjudicator gave no verdict ({reason}); every pair it was asked about stays \
+                 queued for the caller"
+            ),
+            PlanNote::AdjudicationKeptSafety { action } => format!(
+                "the adjudicator answered {action} on a safety relation; only the caller may \
+                 settle a safety question, so it stays queued and the observation is kept"
+            ),
+            PlanNote::AdjudicationStale => {
+                "the store changed between adjudication and this write, \
+                 so no verdict applies; the pairs stay queued for the caller"
+                    .to_string()
+            }
+            PlanNote::AdjudicationNotAsked => {
+                "these pairs arose after adjudication (an earlier fact of this batch, or a \
+                 concurrent write), so no adjudicator was asked; they stay queued for the caller"
+                    .to_string()
+            }
         }
     }
 
@@ -1402,11 +1443,11 @@ fn dispatch(
             if verdict.rule == "restates_closed_interval" {
                 // Re-opening a window someone deliberately ended is the one
                 // thing this arm exists to prevent.
-                absorb(plan, "restates_closed_interval");
+                plan.absorb("restates_closed_interval");
             }
         }
         ConflictClass::Duplicate => {
-            absorb(plan, "duplicate_object");
+            plan.absorb("duplicate_object");
             plan.confirm.push(old_view.fact.id);
         }
         ConflictClass::SupersedeOld => {
@@ -1460,20 +1501,31 @@ fn dispatch(
     Ok(())
 }
 
-/// The observation turned out to be news to nobody, so NOTHING it implied
-/// survives.
-///
-/// Clearing the rest of the plan is not tidiness. An earlier sibling can
-/// already have planned a close — "Ana lives in Paris" arrives, closes the
-/// open London interval, and is then absorbed by a Paris interval that was
-/// deliberately ended in 2020. Keeping the close would retire the current
-/// value on the strength of an assertion the planner just discarded.
-fn absorb(plan: &mut WritePlan, rule: &'static str) {
-    plan.insert = None;
-    plan.closes.clear();
-    plan.queue.clear();
-    plan.replays.clear();
-    plan.absorbed = Some(rule);
+impl WritePlan {
+    /// The observation turned out to be news to nobody, so NOTHING it implied
+    /// survives.
+    ///
+    /// Clearing the rest of the plan is not tidiness. An earlier sibling can
+    /// already have planned a close — "Ana lives in Paris" arrives, closes the
+    /// open London interval, and is then absorbed by a Paris interval that was
+    /// deliberately ended in 2020. Keeping the close would retire the current
+    /// value on the strength of an assertion the planner just discarded.
+    ///
+    /// Public because the planner is not the only thing that discards an
+    /// observation: a machine adjudicator's `reject_new` used to hand-roll
+    /// half of this, kept the closes, and retired a birthday "on behalf of" a
+    /// fact that was never written — a `closed_by` pointing at no row.
+    pub fn absorb(&mut self, rule: &'static str) {
+        self.insert = None;
+        self.confirm.clear();
+        self.closes.clear();
+        self.queue.clear();
+        self.replays.clear();
+        // A withdrawn replay must not be reported as applied.
+        self.notes
+            .retain(|n| !matches!(n, PlanNote::ReplayApplied { .. }));
+        self.absorbed = Some(rule);
+    }
 }
 
 type PairContext<'a, 'f> = (

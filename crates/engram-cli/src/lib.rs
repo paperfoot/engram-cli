@@ -14,6 +14,7 @@ pub mod engine;
 pub mod error;
 pub mod fact_llm;
 pub mod fact_write;
+pub mod judge;
 pub mod output;
 pub mod read_surface;
 pub mod respond;
@@ -187,9 +188,11 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             exclude,
             max_files,
             all,
+            offline,
         } => {
             commands::ingest::run(
                 &ctx, path, mode, diary, kb, compile, dry_run, include, exclude, max_files, all,
+                offline,
             )
             .await
         }
@@ -575,7 +578,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 all_kbs,
                 dry_run,
-            } => commands::chunks::repair(&ctx, kb, all_kbs, dry_run).await,
+                offline,
+            } => commands::chunks::repair(&ctx, kb, all_kbs, dry_run, offline).await,
         },
     }
 }

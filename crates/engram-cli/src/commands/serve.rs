@@ -2007,6 +2007,9 @@ async fn ingest_api(body: &str) -> Result<serde_json::Value, CliError> {
     if req.all.unwrap_or(false) {
         command.arg("--all");
     }
+    if req.offline.unwrap_or(false) {
+        command.arg("--offline");
+    }
     if let Some(max_files) = req.max_files {
         command.arg("--max-files").arg(max_files.to_string());
     }
@@ -2126,6 +2129,9 @@ struct IngestRequest {
     exclude: Option<Vec<String>>,
     max_files: Option<usize>,
     all: Option<bool>,
+    /// Explicit stub opt-in, mirroring the CLI --offline flag; keyless
+    /// ingest without it is a config error, never a silent stub.
+    offline: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

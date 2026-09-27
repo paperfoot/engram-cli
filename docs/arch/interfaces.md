@@ -89,8 +89,11 @@ Event payloads v2 (changes vs v1 marked ←):
 - `fact.observed` (fact_id, subject, subject_norm, relation, object, object_norm, valid_from,
   valid_until?, confidence, source_memory_id, content_hash, source_kind)
 - `fact.interval_closed` (fact_id, valid_until, closed_by?, reason, **authority**,
-  **sets_superseded_by**) ← [R2: CM-2 — the projection columns `closed_by`/`close_reason`/
+  **sets_superseded_by**, resolution?) ← [R2: CM-2 — the projection columns `closed_by`/`close_reason`/
   `close_authority` and the `superseded_by` compat write must be rebuildable from this one event]
+  `resolution` is the audit tag naming the rule or judge that closed the interval (e.g. `slot_lww`,
+  `semantic_llm`); rebuild restores it with `COALESCE(payload.resolution, row)`, and it is never read
+  as authority (added on exp/jev-judge, the one journal change that branch allows).
 - `fact.confirmed` (fact_id)
 - `conflict.opened` (conflict_id, new_fact_id, old_fact_id, detector, rule, score?,
   **decision_key**, **member_key**, **registry_version**) ← [IN-18]

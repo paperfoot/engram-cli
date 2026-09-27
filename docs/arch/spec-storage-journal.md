@@ -773,7 +773,7 @@ Replay dispatch (`crates/engram-storage/src/rebuild.rs`), by `EventKind`:
 | event | effect |
 |---|---|
 | `fact.observed` | INSERT the `facts` row; `diary`/`kb` from the event columns, everything else from the payload |
-| `fact.interval_closed` | UPDATE `valid_until`, `close_reason`, `close_authority`, `closed_by`; also `superseded_by`/`superseded_at` when `sets_superseded_by` is true [R2] |
+| `fact.interval_closed` | UPDATE `valid_until`, `close_reason`, `close_authority`, `closed_by`; also `superseded_by`/`superseded_at` when `sets_superseded_by` is true [R2]; `resolution = COALESCE(payload.resolution, row)`: an event without the field keeps the row's tag, and close authority never derives from it |
 | `fact.confirmed` | `confirmations = confirmations + 1` |
 | `derivation.ran` | UPSERT `derivations` + `fact_extraction_log` |
 | `conflict.opened` | INSERT the queue row, `status='open'` |

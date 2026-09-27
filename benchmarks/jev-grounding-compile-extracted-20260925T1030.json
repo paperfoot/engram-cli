@@ -1,0 +1,212 @@
+{
+ "suite": "jev-grounding-compile-extracted",
+ "source": "extracted.jsonl",
+ "pairs": 883,
+ "labels": {
+  "SUPPORT": 313,
+  "NEI": 35,
+  "CONTRADICT": 535
+ },
+ "missing": 0,
+ "summary": {
+  "cost_usd": 0.0063437219999999996,
+  "errors": [],
+  "failed_requests": 0,
+  "input_tokens": 151041,
+  "latency_ms_p50": 252,
+  "latency_ms_p95": 680,
+  "missing_answers": 0,
+  "model": "jev-1.13.0",
+  "requests": 97,
+  "route": "typesafe"
+ },
+ "auc": {
+  "judge": 0.9895,
+  "num+judge": 0.9863,
+  "lexical": 0.5019
+ },
+ "lexical": {
+  "precision_supported": 0.3554,
+  "recall_supported": 0.9968,
+  "contradict_admitted": 0.9925,
+  "nei_admitted": 1.0
+ },
+ "numbers_ok_only": {
+  "precision_supported": 0.3554,
+  "recall_supported": 0.9968,
+  "contradict_admitted": 0.9925,
+  "nei_admitted": 1.0
+ },
+ "thresholds": {
+  "0.3": {
+   "judge": {
+    "precision_supported": 0.8151,
+    "recall_supported": 1.0,
+    "contradict_admitted": 0.0692,
+    "nei_admitted": 0.9714
+   },
+   "num+judge": {
+    "precision_supported": 0.8146,
+    "recall_supported": 0.9968,
+    "contradict_admitted": 0.0692,
+    "nei_admitted": 0.9714
+   }
+  },
+  "0.5": {
+   "judge": {
+    "precision_supported": 0.8302,
+    "recall_supported": 1.0,
+    "contradict_admitted": 0.0561,
+    "nei_admitted": 0.9714
+   },
+   "num+judge": {
+    "precision_supported": 0.8298,
+    "recall_supported": 0.9968,
+    "contradict_admitted": 0.0561,
+    "nei_admitted": 0.9714
+   }
+  },
+  "0.6": {
+   "judge": {
+    "precision_supported": 0.8459,
+    "recall_supported": 1.0,
+    "contradict_admitted": 0.0449,
+    "nei_admitted": 0.9429
+   },
+   "num+judge": {
+    "precision_supported": 0.8455,
+    "recall_supported": 0.9968,
+    "contradict_admitted": 0.0449,
+    "nei_admitted": 0.9429
+   }
+  },
+  "0.7": {
+   "judge": {
+    "precision_supported": 0.8599,
+    "recall_supported": 1.0,
+    "contradict_admitted": 0.0374,
+    "nei_admitted": 0.8857
+   },
+   "num+judge": {
+    "precision_supported": 0.8595,
+    "recall_supported": 0.9968,
+    "contradict_admitted": 0.0374,
+    "nei_admitted": 0.8857
+   }
+  },
+  "0.8": {
+   "judge": {
+    "precision_supported": 0.8764,
+    "recall_supported": 0.9968,
+    "contradict_admitted": 0.0262,
+    "nei_admitted": 0.8571
+   },
+   "num+judge": {
+    "precision_supported": 0.8761,
+    "recall_supported": 0.9936,
+    "contradict_admitted": 0.0262,
+    "nei_admitted": 0.8571
+   }
+  },
+  "0.9": {
+   "judge": {
+    "precision_supported": 0.9017,
+    "recall_supported": 0.9968,
+    "contradict_admitted": 0.0131,
+    "nei_admitted": 0.7714
+   },
+   "num+judge": {
+    "precision_supported": 0.9014,
+    "recall_supported": 0.9936,
+    "contradict_admitted": 0.0131,
+    "nei_admitted": 0.7714
+   }
+  }
+ },
+ "by_kind_admitted": {
+  "claim/NEI": {
+   "n": 9,
+   "p>=0.5": 1.0,
+   "p>=0.8": 0.889,
+   "p>=0.9": 0.778
+  },
+  "claim/SUPPORT": {
+   "n": 220,
+   "p>=0.5": 1.0,
+   "p>=0.8": 1.0,
+   "p>=0.9": 1.0
+  },
+  "fact/NEI": {
+   "n": 26,
+   "p>=0.5": 0.962,
+   "p>=0.8": 0.846,
+   "p>=0.9": 0.769
+  },
+  "fact/SUPPORT": {
+   "n": 93,
+   "p>=0.5": 1.0,
+   "p>=0.8": 0.989,
+   "p>=0.9": 0.989
+  },
+  "perturbation/CONTRADICT/association_to_causation": {
+   "n": 25,
+   "p>=0.5": 0.56,
+   "p>=0.8": 0.24,
+   "p>=0.9": 0.12
+  },
+  "perturbation/CONTRADICT/direction_flip": {
+   "n": 117,
+   "p>=0.5": 0.0,
+   "p>=0.8": 0.0,
+   "p>=0.9": 0.0
+  },
+  "perturbation/CONTRADICT/hedge_removed": {
+   "n": 14,
+   "p>=0.5": 0.286,
+   "p>=0.8": 0.214,
+   "p>=0.9": 0.143
+  },
+  "perturbation/CONTRADICT/negation": {
+   "n": 170,
+   "p>=0.5": 0.0,
+   "p>=0.8": 0.0,
+   "p>=0.9": 0.0
+  },
+  "perturbation/CONTRADICT/population_or_species": {
+   "n": 111,
+   "p>=0.5": 0.009,
+   "p>=0.8": 0.0,
+   "p>=0.9": 0.0
+  },
+  "perturbation/CONTRADICT/prior_study_attribution": {
+   "n": 20,
+   "p>=0.5": 0.3,
+   "p>=0.8": 0.15,
+   "p>=0.9": 0.1
+  },
+  "perturbation/CONTRADICT/subject_object_swap": {
+   "n": 78,
+   "p>=0.5": 0.064,
+   "p>=0.8": 0.026,
+   "p>=0.9": 0.0
+  }
+ },
+ "run": {
+  "cost_usd": 0.0063437219999999996,
+  "errors": [],
+  "failed_requests": 0,
+  "input_tokens": 151041,
+  "latency_ms_p50": 252,
+  "latency_ms_p95": 680,
+  "missing_answers": 0,
+  "model": "jev-1.13.0",
+  "requests": 97,
+  "route": "typesafe",
+  "summary": true
+ },
+ "notes": [
+  "Claims and facts from compile's verbatim extraction call (google/gemini-3.5-flash-lite) over 100 SciFact abstracts, labelled by Opus 5.5; CONTRADICT = 535 adversarial perturbations each re-checked by Opus.",
+  "NEI (35) is the noisy stratum: a 50-item spot-check found Opus stricter than the passage on 8/15 of these (benchmarks/jev-grounding-spotcheck-20260925.json).",
+  "Evaluated through crates/engram-bench/examples/judge_eval.rs, i.e. the shipped questions module, direct route jev-1.13.0."
+ ]
+}

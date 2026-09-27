@@ -136,6 +136,15 @@ pub fn caller_overruled_machine(window: &[EventRow]) -> Vec<LessonCandidate> {
             if let (Some(key), Some(verdict)) =
                 (payload_str(e, "semantic_key"), payload_str(e, "verdict"))
             {
+                // A `void` rules on nothing: it records that a question was
+                // merged away, or which judge was consulted on one
+                // (`judge:<name>`, fact_write.rs `record_judgement`). Read as
+                // a ruling, every caller answer after a failed, stale or
+                // safety-refused judge became a false "caller overruled
+                // machine" lesson.
+                if verdict == "void" {
+                    continue;
+                }
                 machine.insert(key.to_string(), (verdict.to_string(), e.id));
             }
         }
@@ -509,6 +518,26 @@ mod tests {
         assert_eq!(out[0].trigger, "conflict_lives_in");
         assert_eq!(out[0].evidence.len(), 2, "both sides are the evidence");
         assert!(out[0].summary.contains("ada example"));
+    }
+
+    #[test]
+    fn a_void_machine_row_is_not_a_ruling() {
+        let k = key("ada example", "lives_in");
+        let window = vec![
+            event(
+                1,
+                EventKind::DecisionRecorded,
+                t(0),
+                json!({ "semantic_key": k, "verdict": "void", "authority": "machine" }),
+            ),
+            event(
+                2,
+                EventKind::DecisionRecorded,
+                t(1),
+                json!({ "semantic_key": k, "verdict": "keep_both", "authority": "caller" }),
+            ),
+        ];
+        assert!(caller_overruled_machine(&window).is_empty());
     }
 
     #[test]

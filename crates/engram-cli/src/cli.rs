@@ -256,6 +256,13 @@ Examples:
         /// Confirm full recursive directory ingest when no filters are provided.
         #[arg(long)]
         all: bool,
+
+        /// Embed with the deterministic offline stub instead of Gemini.
+        /// Without this flag an ingest with no Gemini key is a config error
+        /// (exit 2), never a silent 64-dim stub. Same flag as
+        /// `remember --offline`.
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Inspect and manage ingested source documents.
@@ -624,6 +631,11 @@ pub enum ChunksCommand {
         /// Report what would change without writing or embedding anything.
         #[arg(long)]
         dry_run: bool,
+        /// Re-embed with the deterministic offline stub instead of Gemini.
+        /// Without a key this is required: keyless repair used to write stub
+        /// vectors next to cloud ones. Same flag as `reindex --offline`.
+        #[arg(long)]
+        offline: bool,
     },
 }
 
