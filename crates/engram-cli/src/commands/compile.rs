@@ -767,23 +767,47 @@ async fn gather_llm(
     let chunks = ctx.store.list_chunks_for_kb(kb)?;
     let max_chunks = options.max_llm_chunks.unwrap_or(chunks.len());
     let in_scope = &chunks[..max_chunks.min(chunks.len())];
-    let mut extracted = Vec::new();
-    for chunk in in_scope {
-        let prompt = extraction_prompt(kb, chunk);
-        let response = extraction_llm
-            .chat(&[
-                ChatMessage::system(
-                    "Extract cited scientific/domain evidence. Return one JSON object only.",
-                ),
-                ChatMessage::user(prompt.clone()),
-            ])
-            .await
+    // Extractions run BATCH_CONCURRENCY at a time; the first failure drops
+    // the set, which aborts the calls still in flight.
+    let extraction_llm: std::sync::Arc<dyn ChatLlm> = extraction_llm.into();
+    let mut pending = tokio::task::JoinSet::new();
+    let mut responses = Vec::with_capacity(in_scope.len());
+    let mut queued = in_scope.iter().enumerate();
+    loop {
+        while pending.len() < BATCH_CONCURRENCY {
+            let Some((i, chunk)) = queued.next() else {
+                break;
+            };
+            let (llm, prompt) = (extraction_llm.clone(), extraction_prompt(kb, chunk));
+            pending.spawn(async move {
+                let messages = [
+                    ChatMessage::system(
+                        "Extract cited scientific/domain evidence. Return one JSON object only.",
+                    ),
+                    ChatMessage::user(prompt.clone()),
+                ];
+                (i, prompt, llm.chat(&messages).await)
+            });
+        }
+        let Some(joined) = pending.join_next().await else {
+            break;
+        };
+        let (i, prompt, response) =
+            joined.map_err(|e| CliError::Transient(format!("compiler extraction failed: {e}")))?;
+        let response = response
             .map_err(|e| CliError::Transient(format!("compiler extraction failed: {e}")))?;
+        // Recorded as it lands, so a later failure still leaves the spend.
         // A stub spends nothing and must not write an `openrouter` usage row —
         // the budget guard would then count it against a real cap.
         if live {
             record_compiler_usage(ctx, kb, "compiler_extract", &response, &prompt);
         }
+        responses.push((i, response));
+    }
+    responses.sort_by_key(|(i, _)| *i);
+    let mut extracted = Vec::new();
+    for (i, response) in responses {
+        let chunk = &in_scope[i];
         match parse_llm_evidence(&response.content) {
             Ok(evidence) => extracted.push((chunk, tidy(evidence))),
             Err(e) => tracing::warn!(
