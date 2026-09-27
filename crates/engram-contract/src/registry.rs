@@ -407,7 +407,7 @@ pub const INVARIANTS: &[&str] = &[
     "An empty read is an answer: read verdict, then absence.reason, then metadata.scope before saying nothing is stored.",
     "A read without --kb spans every KB; add --kb only to exclude the others, never to find something.",
     "Destructive commands refuse without --confirm (exit 3); run --dry-run first where the command has one.",
-    "Without a Gemini key, cloud reads and every embedding write except `ingest` and `chunks repair` (which still embed with the stub silently) are config_error (exit 2); --profile offline (reads) and --offline (writes) ask for the stub on purpose. `embedder_degraded` means a fallback key served: the call worked, and the primary key needs attention (`engram config check`).",
+    "Without a Gemini key, cloud reads and every embedding write are config_error (exit 2), except `facts backfill`, whose novelty-gate fact vectors still fall back to the stub silently; --profile offline (reads) and --offline (writes) ask for the stub on purpose. `embedder_degraded` means a fallback key served: the call worked, and the primary key needs attention (`engram config check`).",
     "Errors are JSON on stderr with code, message and suggestion; exit 1 and 4 are retryable, 2 and 3 are not.",
     "Discovery: `engram --help` lists commands, `engram agent-info --command <path>` describes one, `--schema <path>` is its JSON Schema, `--index` lists every path, and bare `agent-info` is the full manifest.",
 ];
@@ -2589,6 +2589,15 @@ const INGEST_FLAGS: &[FlagSpec] = &[
         required: false,
         doc: "confirm a full recursive directory ingest with no other scope",
     },
+    FlagSpec {
+        name: "offline",
+        cli_long: "offline",
+        aliases: &[],
+        ty: Ty::Bool,
+        default: Some("false"),
+        required: false,
+        doc: "embed with the 64-dim offline stub on purpose; keyless without it is config_error (exit 2)",
+    },
 ];
 
 const BUDGET_KB_FLAG: FlagSpec = FlagSpec {
@@ -3039,6 +3048,7 @@ pub const COMMANDS: &[CommandSpec] = &[
             "This spends real money: one LLM call per unprocessed memory. Pair an unscoped sweep with --dry-run or --limit, and expect exit 2 with no OpenRouter key and exit 4 at a `engram budget` cap.",
             "It is idempotent — memories with facts or an extraction marker are skipped — so a --limit'ed run resumes where the last one stopped.",
             "An `edit` that reported `reextraction: \"pending\"` is exactly what this command is for.",
+            "KNOWN GAP: without a Gemini key the new facts' vectors are embedded with the 64-dim offline stub, silently; there is no --offline guard here yet.",
         ],
         examples: &[
             "engram facts backfill --dry-run --json",
@@ -4001,7 +4011,7 @@ pub const COMMANDS: &[CommandSpec] = &[
             "For a directory: run --dry-run first with any obvious --include/--exclude, inspect data.matched_files, then repeat the same scope without --dry-run and with a sensible --max-files. Use --all only when the user asked for the whole folder or the preview matched it.",
             "Idempotent per kb and source path: a file whose content is unchanged is skipped (skipped_existing); a file that CHANGED replaces its earlier version rather than going stale.",
             "Config defaults (ingest.include, ingest.exclude, ingest.max_files, ingest.require_scope, or their ENGRAM_INGEST_* env vars) apply only when the flag is absent; keep the flags in task logs when a task has a specific scope.",
-            "KNOWN GAP: without a Gemini key, ingest embeds with the 64-dim offline stub and says so only in metadata.embedder. A cloud run respects `engram budget` (exit 4 at the cap).",
+            "Without a Gemini key and without --offline, ingest is `config_error` (exit 2) and stores nothing; --dry-run needs no key. A cloud run respects `engram budget` (exit 4 at the cap).",
             "--compile is checked after the files are stored: a value other than none|evidence exits 3 with the files already ingested.",
         ],
         examples: &[
@@ -4242,7 +4252,7 @@ pub const SCHEMA_UNAVAILABLE: &[UnavailableSpec] = &[
     UnavailableSpec {
         path: "chunks repair",
         summary: "Merge degenerate sub-threshold chunks into their neighbours and re-embed them. Idempotent.",
-        usage: "engram chunks repair (--kb <name> | --all-kbs) [--dry-run]",
+        usage: "engram chunks repair (--kb <name> | --all-kbs) [--dry-run] [--offline]",
         destructive: false,
     },
     UnavailableSpec {

@@ -77,6 +77,48 @@ fn every_clap_leaf_has_a_contract_entry_or_a_declared_gap() {
     );
 }
 
+/// The long flags clap accepts on `path`, global ones (`--json`, `--store`,
+/// ...) and hidden ones excluded, sorted.
+fn clap_flags(path: &str) -> Vec<String> {
+    let root = Cli::command();
+    let globals: Vec<&str> = root.get_arguments().filter_map(|a| a.get_long()).collect();
+    let mut cmd = &root;
+    for token in path.split_whitespace() {
+        cmd = cmd.find_subcommand(token).expect("a clap leaf");
+    }
+    let mut out: Vec<String> = cmd
+        .get_arguments()
+        .filter(|a| !a.is_hide_set())
+        .filter_map(|a| a.get_long())
+        .filter(|l| !globals.contains(l) && *l != "help")
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every flag a described command parses is in its contract, and every flag
+/// the contract lists parses. The leaf walk above cannot see a flag added to
+/// an existing command: `ingest --offline` and `chunks repair --offline`
+/// changed what a keyless run does and reached the manifest only by hand.
+#[test]
+fn every_described_command_lists_exactly_the_flags_clap_parses() {
+    let mut drift = Vec::new();
+    for spec in engram_contract::contract().commands {
+        let mut documented: Vec<String> =
+            spec.flags.iter().map(|f| f.cli_long.to_string()).collect();
+        documented.sort();
+        let parsed = clap_flags(spec.path);
+        if documented != parsed {
+            drift.push(format!(
+                "{}: contract {documented:?}, clap {parsed:?}",
+                spec.path
+            ));
+        }
+    }
+    assert!(drift.is_empty(), "flag drift:\n{}", drift.join("\n"));
+}
+
 #[test]
 fn every_contract_path_and_alias_parses_in_clap() {
     let c = engram_contract::contract();
