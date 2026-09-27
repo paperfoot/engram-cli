@@ -77,7 +77,16 @@ impl StubJudge {
         Ok(match question {
             Question::Noul { .. } => match rule {
                 None => None,
-                Some(Rule::Number(p)) => Some(Answer::Noul(*p as f32)),
+                // A number rule also scripts score levels, so the spec
+                // cannot be range-checked when parsed; a noul it answers must
+                // be a probability, as the provider's must.
+                Some(Rule::Number(p)) if *p <= 1.0 => Some(Answer::Noul(*p as f32)),
+                Some(Rule::Number(_)) => {
+                    return Err(JudgeError::InvalidResponse {
+                        provider: "stub",
+                        message: format!("the rule for noul `{id}` is not a probability in [0, 1]"),
+                    })
+                }
                 Some(Rule::Option(_)) => {
                     return Err(JudgeError::InvalidResponse {
                         provider: "stub",
@@ -149,12 +158,7 @@ impl Judge for StubJudge {
         let mut answers = BTreeMap::new();
         for (id, question) in &request.questions {
             if let Some(answer) = self.answer(id, question)? {
-                if let Answer::Noul(p) = answer {
-                    // A noul is a probability whatever the script says.
-                    answers.insert(id.clone(), Answer::Noul(p.clamp(0.0, 1.0)));
-                } else {
-                    answers.insert(id.clone(), answer);
-                }
+                answers.insert(id.clone(), answer);
             }
         }
         Ok(JudgeResponse {
@@ -226,6 +230,19 @@ mod tests {
             (a.restates, a.same_slot, a.contradicts, a.old_ended),
             (0.0, 0.98, 0.9, 0.1)
         );
+    }
+
+    #[tokio::test]
+    async fn a_noul_rule_above_one_is_an_invalid_response_not_a_clamp() {
+        let judge = StubJudge::parse(r#"{"penicillin": 2, "*": 0.5}"#).unwrap();
+        let req =
+            questions::grounding_request("p", &[("x".into(), "Ana allergic to penicillin".into())]);
+        assert!(matches!(
+            judge.ask(&req).await,
+            Err(JudgeError::InvalidResponse { .. })
+        ));
+        let req = questions::grounding_request("p", &[("y".into(), "Ana lives in Lisbon".into())]);
+        assert_eq!(judge.ask(&req).await.unwrap().noul("y").unwrap(), 0.5);
     }
 
     #[tokio::test]

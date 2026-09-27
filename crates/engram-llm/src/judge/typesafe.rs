@@ -302,9 +302,15 @@ fn parse_response(text: &str, provider: &'static str) -> Result<WireResponse, Ju
     let mut answers = BTreeMap::new();
     for (id, a) in body.answers {
         let answer = match a {
+            // A noul is P(yes) and is compared to a threshold as is: 1.3
+            // would admit anything, -0.1 block anything. Out of range, the
+            // body is not an answer; the caller falls back as for any bad
+            // response.
             WireAnswer::Noul { noul } => {
-                if !noul.is_finite() {
-                    return Err(invalid(format!("noul `{id}` is not a number")));
+                if !is_probability(noul) {
+                    return Err(invalid(format!(
+                        "noul `{id}` is not a probability in [0, 1]"
+                    )));
                 }
                 Answer::Noul(noul as f32)
             }
@@ -312,14 +318,21 @@ fn parse_response(text: &str, provider: &'static str) -> Result<WireResponse, Ju
                 choice,
                 probabilities,
                 confidence,
-            } => Answer::Choice {
-                choice,
-                confidence: confidence as f32,
-                probabilities: probabilities
-                    .into_iter()
-                    .map(|(k, v)| (k, v as f32))
-                    .collect(),
-            },
+            } => {
+                if !probabilities.values().all(|p| is_probability(*p)) {
+                    return Err(invalid(format!(
+                        "choice `{id}` has a probability outside [0, 1]"
+                    )));
+                }
+                Answer::Choice {
+                    choice,
+                    confidence: confidence as f32,
+                    probabilities: probabilities
+                        .into_iter()
+                        .map(|(k, v)| (k, v as f32))
+                        .collect(),
+                }
+            }
             WireAnswer::Score {
                 score,
                 confidence,
@@ -332,6 +345,11 @@ fn parse_response(text: &str, provider: &'static str) -> Result<WireResponse, Ju
                         .map_err(|_| invalid(format!("score `{id}` has a non-index level key")))?;
                     if i >= 10 {
                         return Err(invalid(format!("score `{id}` has level {i}")));
+                    }
+                    if !is_probability(p) {
+                        return Err(invalid(format!(
+                            "score `{id}` has a probability outside [0, 1]"
+                        )));
                     }
                     if levels.len() <= i {
                         levels.resize(i + 1, 0.0);
@@ -352,6 +370,11 @@ fn parse_response(text: &str, provider: &'static str) -> Result<WireResponse, Ju
         answers,
         usage: body.usage,
     })
+}
+
+/// NaN fails too.
+fn is_probability(p: f64) -> bool {
+    (0.0..=1.0).contains(&p)
 }
 
 /// The provider's diagnosis from the STRUCTURED error fields, never the raw
@@ -526,6 +549,37 @@ mod tests {
             "usage":{"input_tokens":333,"output_tokens":21,"cost":0.0000139}}"#;
         let usage = parse_response(text, "openrouter").unwrap().usage.unwrap();
         assert_eq!(usage.cost, Some(0.0000139));
+    }
+
+    #[test]
+    fn a_probability_outside_0_1_is_an_invalid_response_never_an_answer() {
+        let noul = |v: &str| format!(r#"{{"answers":{{"n":{{"type":"noul","noul":{v}}}}}}}"#);
+        for bad in ["1.3", "-0.1", "1.0000001"] {
+            match parse_response(&noul(bad), "typesafe") {
+                Err(JudgeError::InvalidResponse { message, .. }) => {
+                    assert!(
+                        message.contains("`n`") && message.contains("[0, 1]"),
+                        "{message}"
+                    );
+                    assert!(!message.contains(bad), "{message}");
+                }
+                Ok(_) => panic!("{bad} was accepted"),
+                Err(other) => panic!("{bad}: {other}"),
+            }
+        }
+        for ok in ["0", "1", "0.0", "1.0", "0.5"] {
+            assert!(parse_response(&noul(ok), "typesafe").is_ok(), "{ok}");
+        }
+        let choice = r#"{"answers":{"c":{"type":"choice","choice":"a","confidence":0.9,"probabilities":{"a":1.4,"b":-0.4}}}}"#;
+        assert!(matches!(
+            parse_response(choice, "typesafe"),
+            Err(JudgeError::InvalidResponse { .. })
+        ));
+        let score = r#"{"answers":{"s":{"type":"score","score":1.0,"confidence":0.5,"probabilities":{"0":-0.2,"1":1.2}}}}"#;
+        assert!(matches!(
+            parse_response(score, "typesafe"),
+            Err(JudgeError::InvalidResponse { .. })
+        ));
     }
 
     #[test]
