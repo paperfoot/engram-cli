@@ -19,7 +19,7 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_write::{
     classify_pair, write_fact_batch, Autonomy, ClassifyMode, ConflictClass, FactBatch,
-    FactExtractionMarker, FactWriteCtx, FactWriteOutcome, MemoryTime, Verdict,
+    FactExtractionMarker, FactWriteCtx, FactWriteOutcome, GroundingJudge, MemoryTime, Verdict,
 };
 use crate::output::{print_success, Listing, Metadata, Scope};
 use crate::read_surface::{self, CursorKey};
@@ -1146,6 +1146,8 @@ pub async fn backfill(
     // sweep is checked against the global budget.
     crate::commands::budget::enforce_budget(ctx, kb_filter)?;
     let model = llm.model();
+    // Same grounding as `remember`: backfill runs the same extractor.
+    let grounding = GroundingJudge::resolve(false)?;
 
     // The novelty gate must use the same embedder family the fact
     // embeddings were written with — same rule as `remember`.
@@ -1219,6 +1221,8 @@ pub async fn backfill(
                 source: "backfill",
                 content_hash: &marker_hash,
             }),
+            source_text: &memory.content,
+            grounding: grounding.as_ref(),
         };
         // Same rule as `remember`: the facts and the marker that retires this
         // memory from the queue commit together, so a failed memory keeps
@@ -1273,9 +1277,7 @@ pub async fn backfill(
         meta.add("embedder_degraded", note.clone());
         eprintln!("warning: {note}");
     }
-    print_success(
-        ctx.format,
-        json!({
+    let mut data = json!({
             "kb": kb_label,
             "diary": diary_filter,
             "memories_total": total,
@@ -1290,19 +1292,18 @@ pub async fn backfill(
             "date_parse_warnings": outcome.date_warnings,
             "plan_notes": outcome.plan_notes,
             "extraction_model": model,
-        }),
-        meta,
-        |_| {
-            println!(
-                "Backfilled {processed} memories in kb {kb_label}: {} facts added, {} deduped, \
+    });
+    crate::commands::remember::with_grounding(&mut data, std::mem::take(&mut outcome.grounding));
+    print_success(ctx.format, data, meta, |_| {
+        println!(
+            "Backfilled {processed} memories in kb {kb_label}: {} facts added, {} deduped, \
                  {} queued for resolution ({} still pending)",
-                outcome.added,
-                outcome.deduped,
-                outcome.queued.len(),
-                remaining.max(0),
-            );
-        },
-    );
+            outcome.added,
+            outcome.deduped,
+            outcome.queued.len(),
+            remaining.max(0),
+        );
+    });
     Ok(())
 }
 
