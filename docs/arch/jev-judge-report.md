@@ -25,8 +25,15 @@ shipped questions module, so the evaluated wording is the wording engram sends.
 | Eval set | Labels | Lexical rule (today) | JEV |
 |---|---|---|---|
 | SciFact, 1,189 claim/abstract pairs | human | P 0.587 / R 0.756; admits **69%** of contradicting claims | AUC 0.965; p≥0.5: P 0.944 / R 0.827, admits 2.3% |
-| compile's own extraction, 100 abstracts (313 supported + 535 adversarial rewrites + 35 unsupported) | Opus 5.5, 50 spot-checked | AUC 0.50; admits **99%** of rewrites | AUC 0.99; p≥0.9 keeps 100% of claims / 98.9% of facts, admits 1.3% of rewrites |
-| remember's own extraction, 161 facts (60 LoCoMo windows + 20 health notes) | Opus 5.5 | no check at all; 16% of facts unsupported (22% on health notes) | AUC 0.79 (state-aware rendering); safety relations only at p≥0.5: 0 true facts dropped, fabricated allergy/medication blocked |
+| compile's own extraction, 100 abstracts (313 supported + 535 adversarial rewrites + 35 unsupported) | Opus 5.5, 50 spot-checked | AUC 0.50; admits **99%** of rewrites and all 35 real unsupported items | AUC 0.99 on rewrites; p≥0.9 keeps 100% of claims / 98.9% of facts, admits 1.3% of rewrites — but still admits **29 of 35 (83%)** of what the extractor itself got wrong (AUC 0.82 on that stratum) |
+| remember's own extraction, 161 facts (60 LoCoMo windows + 20 health notes) | Opus 5.5 | no check at all; 16% of facts unsupported (22% on health notes) | AUC 0.79 (state-aware rendering); safety relations only at p≥0.5: 0 of 22 true safety facts dropped; of 8 unsupported safety facts the judge blocks 2 and the negated-object rule 2, **4 get through** (e.g. "no longer diagnosed with appendicitis" p 0.97 from "ruled out" — stored as a past, not active, diagnosis) |
+
+**Read these numbers with two caveats.** First, the thresholds, the
+"no longer" fact wording and the negated-object rule were all chosen on the
+same eval sets they are reported on; there is no held-out split, so treat
+them as in-sample. Second, the synthetic rewrites are the easy case: on the
+extractor's real mistakes the judge helps (it is better than the lexical rule
+on every stratum) but misses most of them at the shipped cut.
 
 Rewrites JEV still admits at p≥0.9: association→causation 12%, hedge
 removed 14%, prior-study attribution 10%. Direction flips, negations and
@@ -60,8 +67,8 @@ the adjudicator: MAB conflict resolution is retrieval + answering.
 
 | | today's LLM adjudicator (verbatim) | JEV signals + a code rule |
 |---|---|---|
-| engram-semantics pairs (48) | 43/48 | **48/48** |
-| mined MAB single-value updates (100) | 87/100 | 76/100 — every miss is a second citizenship/language/employer, which engram's registry treats as set-valued anyway |
+| engram-semantics pairs (48) | 43/48 | 48/48 with a hand-picked rule — fitted to these 48 items (hundreds of threshold settings reach 48/48), so not evidence of generalisation |
+| mined MAB single-value updates (100) | 87/100 | 76/100 with that rule; misses are second citizenships/languages/employers, which engram's registry treats as set-valued anyway. An independent grid search found settings reaching 48/48 and 88/100 |
 | signal AUCs | — | restates 1.00, same_slot 1.00, contradicts 0.97, old_ended 0.99 |
 | latency p50 | 1.9 s | 0.24 s |
 
@@ -89,7 +96,7 @@ per-passage score), but the floor is Phase 6 and response-v2 work.
 
 | Flag | Recommendation | Why |
 |---|---|---|
-| `judge.grounding` | **on** for your store (owner decision); shadow first for a week if you want your own numbers via `ENGRAM_JUDGE_LOG` | Blocks fabricated safety facts on both write paths; drops nothing true in the evals; fails soft |
+| `judge.grounding` | **shadow** first with `ENGRAM_JUDGE_LOG`, then **on** (owner decision) | Better than today's rules on every stratum, drops no true safety fact in the evals, fails soft — but the remember cut rests on 30 in-sample items and most real extraction mistakes still pass, so measure on your own store first |
 | `judge.adjudicate` | **off** (not wired) | Low-volume site; the fail-closed fixes matter more than the judge. Research argues for deleting `--autonomy full` instead |
 | `judge.dedupe` | **off** (not wired) | Low volume after the gate fix |
 | rerank | not built | Needs a Cohere-vs-JEV run on conversational recall first |
@@ -115,6 +122,19 @@ per-passage score), but the floor is Phase 6 and response-v2 work.
 - Compile makes every provider call before its write transaction opens.
 
 Tests: 1,213 → 1,391 passing, 0 failing.
+
+## Independent review
+
+A separate Opus agent reproduced every eval with the live judge
+(`/Users/dev/.claude/subagent-results/jev-final-review-2026-09-27.md`):
+all headline numbers within run-to-run noise, request and token counts exact.
+Verdict GO-with-fixes; no blockers. Confirmed: grounding never drops or closes
+a caller fact or a safety interval; zero outbound connections from the test
+suite with fake keys and every judge site on; no key in any output. Its four
+report corrections are folded in above; its code findings (unwired sites
+accepting `on` silently, judge-setting error advice, out-of-range
+probabilities, caller facts sent to TypeSafe for nothing, log rounding) are
+fixed in follow-up commits.
 
 ## Open for the owner
 
