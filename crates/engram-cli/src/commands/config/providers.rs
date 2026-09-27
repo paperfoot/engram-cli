@@ -63,7 +63,7 @@ impl Provider {
             Self::Gemini => "without a serving key, remember/ingest refuse to write (exit 2) and cloud recall is refused; only --offline / --profile offline stub vectors work",
             Self::OpenRouter => "remember stores memories without facts (fact_extraction: skipped_no_openrouter_key, or failed when the key is broken), `compile --llm` fails, and a shadow/on judge site has no route unless TypeSafe is keyed",
             Self::Cohere => "unset: recall runs unreranked (reranker passthrough, lower precision); a broken key makes recall fail unless ENGRAM_RERANK_PROVIDER=none",
-            Self::TypeSafe => "nothing while judge sites are off; a shadow/on site routes through OpenRouter instead",
+            Self::TypeSafe => "unset: nothing, and a shadow/on judge site routes through OpenRouter; keyed but broken: every judged call on a shadow/on site fails, because a keyed TypeSafe route never falls back to OpenRouter",
         }
     }
 
@@ -118,7 +118,8 @@ impl Live {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Ok,
-    /// Configured but not probed (doctor): presence is not health.
+    /// Configured but not probed (doctor): presence is not health. Also an
+    /// OpenRouter key whose account balance it may not read.
     Unchecked,
     Warning,
     Error,
@@ -139,7 +140,10 @@ impl Severity {
 pub enum Balance {
     NotExposed,
     /// OpenRouter: the smaller of the key's remaining limit and the
-    /// account's remaining credit, with both parts shown.
+    /// account's remaining credit, with both parts shown. `source` is
+    /// `account`, `key_limit`, or `key_limit_only` when the account balance
+    /// is not visible to this key — then `remaining_usd` is only an upper
+    /// bound.
     Usd {
         remaining_usd: f64,
         source: &'static str,
@@ -387,26 +391,41 @@ fn assemble(slots: Vec<Slot>, mut probe_of: impl FnMut(&Slot) -> Probe) -> Vec<P
             }
         })
         .collect();
-    advise(&mut out);
+    advise(&mut out, judge_active());
     out
+}
+
+/// True when some judge site is in shadow or on (an invalid setting counts
+/// as off here; `judge.errors` reports it).
+fn judge_active() -> bool {
+    use crate::judge::JudgeMode::{On, Shadow};
+    let j = crate::judge::status();
+    [j.grounding, j.adjudicate, j.dedupe]
+        .iter()
+        .any(|m| matches!(m, Some(Shadow | On)))
 }
 
 /// Fill `severity` and `fix` for every status. The Gemini chain is judged as
 /// a chain: a dead primary with a serving fallback is a warning (engram
-/// still embeds), a chain with no serving key is an error.
-pub fn advise(statuses: &mut [ProviderStatus]) {
+/// still embeds), a chain with no serving key is an error. `judge_active`:
+/// some judge site is shadow or on, so a broken TypeSafe key is an error.
+pub fn advise(statuses: &mut [ProviderStatus], judge_active: bool) {
     let serving_fallback = statuses
         .iter()
         .find(|s| s.is_fallback() && s.live == Live::Ok)
         .map(|s| s.name.trim_start_matches("gemini_fallback_").to_string());
     for s in statuses.iter_mut() {
-        let (severity, fix) = judge_one(s, serving_fallback.as_deref());
+        let (severity, fix) = judge_one(s, serving_fallback.as_deref(), judge_active);
         s.severity = severity;
         s.fix = fix;
     }
 }
 
-fn judge_one(s: &ProviderStatus, serving_fallback: Option<&str>) -> (Severity, Option<String>) {
+fn judge_one(
+    s: &ProviderStatus,
+    serving_fallback: Option<&str>,
+    judge_active: bool,
+) -> (Severity, Option<String>) {
     let p = s.provider;
     if s.source == "unset" {
         return match p {
@@ -451,14 +470,25 @@ fn judge_one(s: &ProviderStatus, serving_fallback: Option<&str>) -> (Severity, O
         return low_credit(s);
     }
     let cause = failure_fix(s);
-    if p != Provider::Gemini {
-        let severity = if p == Provider::TypeSafe {
-            // Judge sites default off and fall back to OpenRouter.
-            Severity::Warning
-        } else {
+    if p == Provider::TypeSafe {
+        // A resolvable TypeSafe key always takes the direct route and never
+        // retries through OpenRouter, so a broken key fails every judged
+        // call — an error once a site is shadow/on, a warning while all are
+        // off (judge sites default off).
+        let severity = if judge_active {
             Severity::Error
+        } else {
+            Severity::Warning
         };
-        return (severity, Some(cause));
+        return (
+            severity,
+            Some(format!(
+                "{cause}; or clear it (`engram config set keys.typesafe \"\"` and unset TYPESAFE_API_KEY) so judged calls route through OpenRouter"
+            )),
+        );
+    }
+    if p != Provider::Gemini {
+        return (Severity::Error, Some(cause));
     }
     if s.is_fallback() {
         return (
@@ -482,7 +512,11 @@ fn judge_one(s: &ProviderStatus, serving_fallback: Option<&str>) -> (Severity, O
 
 /// A live-ok OpenRouter key with little or no effective credit. Zero is
 /// folded into `no_credit` by [`openrouter_live`]; here only "low" remains.
+/// An account balance this key may not read is `unchecked`, never `ok`: a
+/// $15 key limit on a $0.14 account is exactly the silent failure this
+/// model exists to catch.
 fn low_credit(s: &ProviderStatus) -> (Severity, Option<String>) {
+    let account_hidden = "OpenRouter's account balance is not visible to this key (GET /api/v1/credits needs a management key)";
     match &s.balance {
         Some(Balance::Usd {
             remaining_usd,
@@ -496,12 +530,28 @@ fn low_credit(s: &ProviderStatus) -> (Severity, Option<String>) {
                 top_up_openrouter(source)
             )),
         ),
+        Some(Balance::Usd {
+            remaining_usd,
+            source: "key_limit_only",
+            ..
+        }) => (
+            Severity::Unchecked,
+            Some(format!(
+                "{account_hidden}, so ${remaining_usd:.2} is only the key's own limit: check the account at https://openrouter.ai/settings/credits and top up if it is near $0 — when it runs out remember stores memories without facts (fact_extraction: failed); run `engram facts backfill --kb <kb>` afterwards"
+            )),
+        ),
+        Some(Balance::Unknown) => (
+            Severity::Unchecked,
+            Some(format!(
+                "{account_hidden} and the key has no limit: check the account at https://openrouter.ai/settings/credits and top up if it is near $0 — when it runs out remember stores memories without facts (fact_extraction: failed)"
+            )),
+        ),
         _ => (Severity::Ok, None),
     }
 }
 
 fn top_up_openrouter(source: &str) -> String {
-    let action = if source == "key_limit" {
+    let action = if source.starts_with("key_limit") {
         "raise this key's credit limit at https://openrouter.ai/settings/keys"
     } else {
         "top up at https://openrouter.ai/settings/credits"
@@ -536,7 +586,7 @@ fn failure_fix(s: &ProviderStatus) -> String {
             Provider::Cohere => format!("Cohere billing is blocked (402): fix it at {}; until then set ENGRAM_RERANK_PROVIDER=none so recall runs unreranked", p.console()),
             _ => format!("no credit left (402): add credit at {}", p.console()),
         },
-        Live::Unreachable => format!("{} did not answer within {}s: check the network and re-run `engram config check --json`", p.name(), PROBE_TIMEOUT.as_secs()),
+        Live::Unreachable => format!("{} could not be reached (network, DNS, proxy, or no answer within {}s): check connectivity and re-run `engram config check --json`", p.name(), PROBE_TIMEOUT.as_secs()),
         Live::ProbeError => format!(
             "{} answered HTTP {}: re-run `engram config check --json`; if it persists check the provider's status page",
             p.name(),
@@ -617,7 +667,9 @@ pub fn openrouter_balance(key: Option<f64>, account: Option<f64>) -> Balance {
     let (remaining_usd, source) = match (key, account) {
         (Some(k), Some(a)) if k < a => (k, "key_limit"),
         (_, Some(a)) => (a, "account"),
-        (Some(k), None) => (k, "key_limit"),
+        // `/credits` refused (documented as management-key only): the key
+        // limit is all this key can see, not the effective balance.
+        (Some(k), None) => (k, "key_limit_only"),
         (None, None) => return Balance::Unknown,
     };
     Balance::Usd {
@@ -865,6 +917,57 @@ mod tests {
             Balance::Usd { source: "account", remaining_usd, .. } if remaining_usd == 3.0
         ));
         assert_eq!(openrouter_account_remaining(&json!({"data": {}})), None);
+        // `/credits` refused: the key limit is shown, but labelled as all
+        // this key can see.
+        assert!(matches!(
+            openrouter_balance(Some(15.0), None),
+            Balance::Usd {
+                source: "key_limit_only",
+                account_remaining_usd: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_account_balance_the_key_cannot_read_is_unchecked_not_ok() {
+        // The $0.14 incident seen through a key refused `/credits`: the $15
+        // key limit must not read as a healthy balance.
+        let mut limited = status("openrouter", Provider::OpenRouter, Live::Ok);
+        limited.balance = Some(openrouter_balance(Some(15.0), None));
+        let mut unlimited = status("openrouter", Provider::OpenRouter, Live::Ok);
+        unlimited.balance = Some(openrouter_balance(None, None));
+        let mut low_limit = status("openrouter", Provider::OpenRouter, Live::Ok);
+        low_limit.balance = Some(openrouter_balance(Some(0.4), None));
+        let mut all = vec![limited, unlimited, low_limit];
+        advise(&mut all, false);
+        for s in &all[..2] {
+            assert_eq!(s.severity, Severity::Unchecked);
+            let fix = s.fix.as_deref().unwrap();
+            assert!(
+                fix.contains("management key") && fix.contains("openrouter.ai/settings/credits"),
+                "{fix}"
+            );
+        }
+        assert_eq!(all[0].to_json()["balance"]["source"], "key_limit_only");
+        // A low key limit is still a low-credit warning.
+        assert_eq!(all[2].severity, Severity::Warning);
+        assert_eq!(next_steps(&all).len(), 3);
+    }
+
+    #[test]
+    fn a_broken_typesafe_key_is_an_error_once_a_judge_site_is_live() {
+        // A keyed TypeSafe route never falls back to OpenRouter.
+        for (active, want) in [(false, Severity::Warning), (true, Severity::Error)] {
+            let mut one = vec![status("typesafe", Provider::TypeSafe, Live::Invalid)];
+            advise(&mut one, active);
+            assert_eq!(one[0].severity, want);
+            let fix = one[0].fix.as_deref().unwrap();
+            assert!(
+                fix.contains("config set keys.typesafe") && fix.contains("through OpenRouter"),
+                "{fix}"
+            );
+        }
     }
 
     #[test]
@@ -883,7 +986,7 @@ mod tests {
         let mut dry = status("openrouter", Provider::OpenRouter, Live::NoCredit);
         dry.balance = Some(zero);
         let mut all = vec![low, plenty, dry];
-        advise(&mut all);
+        advise(&mut all, false);
         assert_eq!(all[0].severity, Severity::Warning);
         let fix = all[0].fix.as_deref().unwrap();
         assert!(
@@ -903,7 +1006,7 @@ mod tests {
             status("gemini_fallback_1", Provider::Gemini, Live::QuotaExhausted),
             status("gemini_fallback_2", Provider::Gemini, Live::Ok),
         ];
-        advise(&mut chain);
+        advise(&mut chain, false);
         assert_eq!(chain[0].severity, Severity::Warning);
         let fix = chain[0].fix.as_deref().unwrap();
         assert!(
@@ -924,7 +1027,7 @@ mod tests {
             status("gemini", Provider::Gemini, Live::Denied),
             status("gemini_fallback_1", Provider::Gemini, Live::Unreachable),
         ];
-        advise(&mut dead);
+        advise(&mut dead, false);
         assert_eq!(dead[0].severity, Severity::Error);
         assert!(!gemini_serves(&dead));
         assert!(next_steps(&dead)[0].starts_with("gemini (error): "));
@@ -948,14 +1051,14 @@ mod tests {
                 Live::NotProbed,
             ] {
                 let mut one = vec![status(p.name(), p, live)];
-                advise(&mut one);
+                advise(&mut one, false);
                 assert_ne!(one[0].severity, Severity::Ok, "{p:?} {live:?}");
                 let fix = one[0].fix.clone().unwrap_or_default();
                 assert!(fix.len() > 20, "{p:?} {live:?}: {fix}");
             }
             let mut unset = vec![status(p.name(), p, Live::NotProbed)];
             unset[0].source = "unset";
-            advise(&mut unset);
+            advise(&mut unset, false);
             assert!(unset[0].fix.is_some(), "{p:?} unset");
         }
     }
