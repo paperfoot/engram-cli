@@ -38,6 +38,13 @@ that told the agent to load a 36k-token manifest.
   keyless `ingest` and `chunks repair` embed with the stub silently; both
   now refuse like `remember`. `facts backfill` is the one write that still
   does, and its contract says so.
+- The contract describes the judge block and TypeSafe key in `config show`,
+  `config check` and `doctor`, and everything the fact write path reports
+  (`plan_notes`, the gate / queue / adjudication counters, `handle`,
+  `skipped_duplicate`); a dedup `remember` answered with a `fact_extraction`
+  value its own enum did not contain.
+- A bad `ENGRAM_FACT_*_THRESHOLD` suggests fixing or unsetting that variable,
+  not `engram config check`, which probes keys and cannot see it.
 - `facts show` spans every KB and diary by default, like `facts list` and
   `state`. It read only `default`, so a fact filed under `personal` came back
   as zero facts with `origin: flag` although no flag was passed.
