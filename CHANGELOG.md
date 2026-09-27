@@ -31,8 +31,9 @@ that told the agent to load a 36k-token manifest.
   suites that read a KB do.
 - `recall` puts `kb` and `kb_scope` in `data`, as its schema always said, and
   omits `diary_isolation`, `temporal_scope` and `expiry` from
-  `data.metadata` when they are null. Scores and confidences print at four
-  decimal places (`0.92`, not `0.9200000166893005`).
+  `data.metadata` when they are null. Its scores and confidences, and
+  those in `state` and in absences, print at four decimal places (`0.92`,
+  not `0.9200000166893005`); `facts show` and `facts list` do not yet.
 - The contract lists exactly the flags each command parses, and a test holds
   it there. `ingest --offline` was missing, and the manifest still said
   keyless `ingest` and `chunks repair` embed with the stub silently; both
