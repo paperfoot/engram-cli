@@ -105,6 +105,13 @@ impl JudgeSite {
         }
     }
 
+    /// Whether any command in this build asks the judge for this site.
+    /// Adjudicate and dedupe are read and reported only: setting them to
+    /// shadow or on changes nothing, and status says so.
+    pub fn consulted(self) -> bool {
+        matches!(self, JudgeSite::Grounding)
+    }
+
     /// The usage-ledger operation for this site's judge calls.
     pub fn operation(self) -> &'static str {
         match self {
@@ -272,7 +279,7 @@ pub struct JudgeStatus {
     /// Settings that make judged commands exit 2.
     pub errors: Vec<String>,
     /// A site in shadow or on with no route (it runs without the judge),
-    /// or answered by the test stub.
+    /// answered by the test stub, or not consulted by any command.
     pub warnings: Vec<String>,
 }
 
@@ -303,30 +310,39 @@ pub fn status() -> JudgeStatus {
     }
 }
 
-/// `modes` in [`JudgeSite::ALL`] order. A site in shadow or on warns when
-/// no judge answers it, or when the test stub does. An unresolvable route
-/// is an error, already reported, not a reason to warn.
+/// `modes` in [`JudgeSite::ALL`] order. A site no command consults warns
+/// whenever it is shadow or on, whatever the route: a key would not make it
+/// do anything. A consulted site in shadow or on warns when no judge answers
+/// it, or when the test stub does. An unresolvable route is an error,
+/// already reported, not a reason to warn.
 fn warnings_for(modes: &[Option<JudgeMode>], route: Option<&str>) -> Vec<String> {
     let why = match route {
-        Some("none") => {
+        Some("none") => Some(
             "no judge is reachable, so the site runs without it: set TYPESAFE_API_KEY (or \
              `engram config set keys.typesafe <KEY>`) or OPENROUTER_API_KEY; --offline and \
-             ENGRAM_BENCH_FORCE_STUB also disable the judge"
-        }
-        Some("stub") => {
+             ENGRAM_BENCH_FORCE_STUB also disable the judge",
+        ),
+        Some("stub") => Some(
             "ENGRAM_JUDGE_STUB is set, so scripted answers stand in for the judge: unset it \
-             outside tests"
-        }
-        _ => return Vec::new(),
+             outside tests",
+        ),
+        _ => None,
     };
     JudgeSite::ALL
         .iter()
         .zip(modes)
-        .filter_map(|(site, mode)| match mode {
-            Some(m @ (JudgeMode::Shadow | JudgeMode::On)) => {
-                Some(format!("{} is {} but {why}", site.config_key(), m.as_str()))
+        .filter_map(|(site, mode)| {
+            let m = match mode {
+                Some(m @ (JudgeMode::Shadow | JudgeMode::On)) => m.as_str(),
+                _ => return None,
+            };
+            let key = site.config_key();
+            if !site.consulted() {
+                return Some(format!(
+                    "{key} is {m} but no command consults it in this build; it has no effect"
+                ));
             }
-            _ => None,
+            why.map(|why| format!("{key} is {m} but {why}"))
         })
         .collect()
 }
@@ -485,6 +501,31 @@ mod tests {
         assert!(warnings_for(&modes, None).is_empty());
         assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("none")).is_empty());
         assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("stub")).is_empty());
+    }
+
+    #[test]
+    fn an_unconsulted_site_in_shadow_or_on_always_warns_and_never_asks_for_a_key() {
+        let modes = [None, Some(JudgeMode::On), Some(JudgeMode::Shadow)];
+        for route in [
+            Some("typesafe"),
+            Some("openrouter"),
+            Some("none"),
+            Some("stub"),
+            None,
+        ] {
+            let w = warnings_for(&modes, route);
+            assert_eq!(w.len(), 2, "{route:?}: {w:?}");
+            assert_eq!(
+                w[0],
+                "judge.adjudicate is on but no command consults it in this build; it has no effect"
+            );
+            assert_eq!(
+                w[1],
+                "judge.dedupe is shadow but no command consults it in this build; it has no effect"
+            );
+            assert!(w.iter().all(|w| !w.contains("KEY")), "{w:?}");
+        }
+        assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("typesafe")).is_empty());
     }
 
     fn response(provider: &'static str) -> JudgeResponse {
