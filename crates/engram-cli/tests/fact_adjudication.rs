@@ -561,7 +561,6 @@ fn a_failed_judgement_is_journaled_as_failed() {
 /// ruled `void` and the caller ruled `keep_both`" — exactly on the questions
 /// this lane routes to the caller (a failed, stale or safety-refused judge).
 #[test]
-#[ignore = "needs cross-lane patch F: reflect.rs caller_overruled_machine must skip void decisions"]
 fn a_caller_answering_after_the_judge_overrules_nobody() {
     let tmp = store();
     remember_facts(
