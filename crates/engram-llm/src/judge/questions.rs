@@ -171,6 +171,73 @@ pub fn grounding_verdict(p: f32) -> Grounding {
 }
 
 // ---------------------------------------------------------------------------
+// Relevance: does a recalled passage help answer the query?
+// ---------------------------------------------------------------------------
+
+/// Plain wording, as the September evals favoured: no edge-case criteria.
+/// "helps answer", not "answers": with "answers" the judge read every
+/// passage of a multi-session question ("how much did I spend in total
+/// on...") as failing on its own, and a 0.1 floor cost 8 points of hit@5 on
+/// the LongMemEval slice below; "helps answer" cost none.
+pub const RELEVANCE_QUESTION: &str =
+    "Does `passage` contain information that helps answer `query`?";
+
+/// A recall result is kept at P(helps) >= this; when none is, recall
+/// abstains. In-sample (no held-out split), real judge, this wording, the
+/// memory date in the instructions:
+///
+/// - `engram bench personal` (37 positives, 6 negative controls; before =
+///   no judge): negative controls abstain 0% -> 83% (5/6) on both the
+///   offline and the Gemini profile; positive hit@5 0.919 -> 1.000 offline
+///   (dropping junk lifts the gold) and 1.000 -> 1.000 on Gemini; hit@1
+///   0.622 -> 0.838 offline, 0.892 -> 0.919 on Gemini.
+/// - LongMemEval oracle, 50 questions (25 answerable, 25 `_abs`), Gemini
+///   profile through `engram recall`: answerable hit@5 1.000 -> 1.000;
+///   48% of `_abs` questions abstain (they are partial-premise: the store
+///   holds half of what they ask, so returning it is not wrong).
+///
+/// On bench personal, negatives score 0.01-0.04 except one near miss at 0.22 (a memory about
+/// the same contract); the lowest true answer scored 0.27-0.33. A higher
+/// floor (0.25) abstains on all six negatives but costs 4-20 points of
+/// LongMemEval hit@5 between 0.2 and 0.3.
+pub const RELEVANCE_FLOOR: f32 = 0.15;
+
+/// A passage is cut to this many characters before it is judged: a wiki page
+/// can run to pages, and the answer to a recall query sits in its opening
+/// far more often than past it.
+pub const RELEVANCE_PASSAGE_CHARS: usize = 2_000;
+
+/// One passage to judge: its question id, its text and, when it comes from
+/// a memory, that memory's date (`YYYY-MM-DD`: when it happened, else when
+/// it was written down).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelevancePassage<'a> {
+    pub id: String,
+    pub text: &'a str,
+    pub date: Option<String>,
+}
+
+/// One request per recall: state = the query, one noul per passage, the
+/// passage (and its date) riding in the question's own instructions.
+/// Answers come back keyed by passage id.
+///
+/// The date is there because a memory's text rarely names its own month:
+/// without it "what happened in February?" scored the right memories
+/// 0.05-0.44 on `bench personal`.
+pub fn relevance_request(query: &str, passages: &[RelevancePassage<'_>]) -> JudgeRequest {
+    let mut request = JudgeRequest::new(json!({ "query": query }));
+    for p in passages {
+        let passage: String = p.text.chars().take(RELEVANCE_PASSAGE_CHARS).collect();
+        let mut instructions = json!({ "passage": passage, "question": RELEVANCE_QUESTION });
+        if let Some(date) = &p.date {
+            instructions["date"] = json!(date);
+        }
+        request.push(p.id.clone(), Question::noul(instructions));
+    }
+    request
+}
+
+// ---------------------------------------------------------------------------
 // Pair judge: a new fact against existing facts (dedupe and adjudication).
 // ---------------------------------------------------------------------------
 
@@ -376,6 +443,43 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&req.questions_wire()).unwrap(),
             r#"{"c1":{"type":"noul","instructions":{"claim":"Rapamycin extends lifespan.","question":"Does `passage` directly support `claim`?"},"criteria":{"true":"The passage states or directly implies the claim.","false":"The passage does not state the claim, contradicts it, or only discusses the topic."}}}"#
+        );
+    }
+
+    #[test]
+    fn relevance_wording_is_pinned_and_passages_ride_in_instructions() {
+        let long = "x".repeat(RELEVANCE_PASSAGE_CHARS + 50);
+        let req = relevance_request(
+            "Where does Noemi work?",
+            &[
+                RelevancePassage {
+                    id: "r0".to_string(),
+                    text: "Noemi joined Halden Labs.",
+                    date: Some("2025-02-03".to_string()),
+                },
+                RelevancePassage {
+                    id: "r1".to_string(),
+                    text: long.as_str(),
+                    date: None,
+                },
+            ],
+        );
+        req.validate().unwrap();
+        assert_eq!(
+            serde_json::to_string(&req.state).unwrap(),
+            r#"{"query":"Where does Noemi work?"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&req.questions[0].1).unwrap(),
+            r#"{"type":"noul","instructions":{"date":"2025-02-03","passage":"Noemi joined Halden Labs.","question":"Does `passage` contain information that helps answer `query`?"}}"#
+        );
+        let Question::Noul { instructions, .. } = &req.questions[1].1 else {
+            panic!("noul expected");
+        };
+        assert!(instructions.get("date").is_none());
+        assert_eq!(
+            instructions["passage"].as_str().unwrap().chars().count(),
+            RELEVANCE_PASSAGE_CHARS
         );
     }
 

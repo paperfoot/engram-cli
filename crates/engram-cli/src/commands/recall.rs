@@ -8,7 +8,7 @@ use crate::read_surface::{self, RequestShape};
 use crate::respond;
 use crate::retrieval::{
     hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
-    HybridParams, RecallMode, RetrievalProfile,
+    HybridParams, RecallMode, RelevanceJudge, RetrievalProfile,
 };
 use chrono::{DateTime, Utc};
 use engram_core::layers::approx_tokens;
@@ -119,6 +119,9 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     // drifted, and research and the daemon kept silently falling back to the
     // 64-dim stub long after recall stopped.
     let backends = resolve_retrieval_backends(&ctx.store, profile_enum, scope.as_deref())?;
+    // Resolved before any paid call, so a bad `judge.relevance` is exit 2
+    // with nothing spent. `--profile offline` promises zero network.
+    let relevance_judge = RelevanceJudge::resolve(profile_enum == RetrievalProfile::Offline)?;
     let outcome = hybrid_recall(
         &ctx.store,
         backends.embedder.as_ref(),
@@ -127,9 +130,29 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     )
     .await?;
 
-    let results = outcome.results;
+    let mut results = outcome.results;
     let notes = outcome.notes;
     let stats = outcome.stats;
+    let fused_any = !results.is_empty();
+
+    // Judged before the layer budget, so the budget is spent on passages
+    // that answer the query rather than on the ones they displaced.
+    let relevance = match &relevance_judge {
+        Some(judge) => {
+            let report = judge.apply(&ctx.store, &query, &mut results).await;
+            if let Some(response) = &report.response {
+                crate::judge::record_judge_usage(
+                    ctx,
+                    crate::judge::JudgeSite::Relevance.operation(),
+                    response,
+                    scope.as_deref(),
+                    if diary == "*" { None } else { Some(&diary) },
+                );
+            }
+            Some(report)
+        }
+        None => None,
+    };
 
     // The memory-layer token budget trims the returned set to fit an agent's
     // context window. But it must never silently return FEWER than the caller's
@@ -178,7 +201,8 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     let answer_context = render_answer_context(layered.iter().copied());
     let results_json: Vec<_> = layered
         .iter()
-        .map(|r| json!({
+        .map(|r| {
+            let mut v = json!({
             "id": r.id.to_string(),
             // The id a mutator accepts. `id` keeps its meaning (the row's own
             // id, which for a chunk hit is a chunk id) and this is the one to
@@ -199,7 +223,13 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
                 "source": c.source,
             })).collect::<Vec<_>>(),
             "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
-        }))
+            });
+            // Present only when the relevance judge answered for this row.
+            if let Some(p) = r.relevance {
+                v["relevance"] = json!(engram_llm::judge::wire_decimal(p));
+            }
+            v
+        })
         .collect();
 
     let query_tokens_estimated = estimated_tokens(&query);
@@ -208,7 +238,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     } else {
         0.0
     };
-    let cohere_search_units = if backends.use_cohere() && !results.is_empty() {
+    let cohere_search_units = if backends.use_cohere() && fused_any {
         1.0
     } else {
         0.0
@@ -235,7 +265,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             }),
         )?;
     }
-    if backends.use_cohere() && !results.is_empty() {
+    if backends.use_cohere() && fused_any {
         ctx.store.record_usage_event(
             "cohere",
             "recall_rerank",
@@ -300,6 +330,12 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     meta.add("embed_prompt_format", backends.prompt_format.clone());
     meta.add("reranker", backends.reranker_label.clone());
     meta.add("rrf_k", rrf_k);
+    if let Some(report) = &relevance {
+        meta.add("relevance", report.to_json());
+        if let Some(e) = &report.error {
+            eprintln!("warning: {e}");
+        }
+    }
     meta.add("layer", format!("{:?}", layer_enum).to_lowercase());
     meta.add("token_budget", budget);
     meta.add("tokens_used", used_tokens);
@@ -344,7 +380,16 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     } else {
         stats.kbs_searched.clone()
     };
-    let verdict = if empty {
+    let verdict = if let Some(report) = relevance.as_ref().filter(|r| r.abstained) {
+        // Candidates were found and every one was judged not to answer: a
+        // real cutoff rejected real candidates, so the certificate names it.
+        Verdict::NoMatch(read_surface::absence_below_cutoff(
+            &stats,
+            searched_kbs,
+            report.top_relevance,
+            report.floor,
+        ))
+    } else if empty {
         let shape = request_shape(&ctx.store, &diary, since_dt.is_some() || until_dt.is_some())?;
         Verdict::NoMatch(read_surface::absence_from(&stats, searched_kbs, shape))
     } else {

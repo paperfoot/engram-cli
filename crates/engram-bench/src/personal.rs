@@ -1277,6 +1277,9 @@ pub struct RetrievedItem {
     pub dataset_id: Option<String>,
     pub kind: String,
     pub score: f32,
+    /// P(answers the query) from the relevance judge, when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<f32>,
 }
 
 /// Collapse a chunk-level ranking to a memory-level one: a memory that
@@ -1409,6 +1412,10 @@ pub struct QueryResult {
     pub abstained: bool,
     pub top_score: Option<f32>,
     pub top_retrieved: Vec<String>,
+    /// Every retrieved item with its judged relevance, when the relevance
+    /// judge ran: enough to re-score any floor offline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judged: Vec<RetrievedItem>,
     pub latency_ms: u64,
 }
 
@@ -1513,6 +1520,11 @@ pub fn aggregate(
                 .take(5)
                 .map(|slot| slot.clone().unwrap_or_else(|| "-".to_string()))
                 .collect(),
+            judged: if run.retrieved.iter().any(|r| r.relevance.is_some()) {
+                run.retrieved.clone()
+            } else {
+                Vec::new()
+            },
             latency_ms: run.latency_ms,
         });
     }
@@ -1768,21 +1780,25 @@ mod tests {
                 dataset_id: Some("m1".into()),
                 kind: "chunk".into(),
                 score: 1.0,
+                relevance: None,
             },
             RetrievedItem {
                 dataset_id: Some("m1".into()),
                 kind: "chunk".into(),
                 score: 0.9,
+                relevance: None,
             },
             RetrievedItem {
                 dataset_id: None,
                 kind: "entity".into(),
                 score: 0.8,
+                relevance: None,
             },
             RetrievedItem {
                 dataset_id: Some("m2".into()),
                 kind: "chunk".into(),
                 score: 0.7,
+                relevance: None,
             },
         ];
         let collapsed = collapse_to_memories(&items);
@@ -1833,6 +1849,7 @@ mod tests {
                     dataset_id: (*h != "-").then(|| (*h).to_string()),
                     kind: "chunk".into(),
                     score: 1.0 - i as f32 / 10.0,
+                    relevance: None,
                 })
                 .collect(),
             retrieved_legacy_default: None,
@@ -1891,6 +1908,7 @@ mod tests {
             dataset_id: Some("x".into()),
             kind: "chunk".into(),
             score: 1.0,
+            relevance: None,
         }]);
         let report = aggregate(
             &[r],

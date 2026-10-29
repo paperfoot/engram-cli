@@ -523,6 +523,10 @@ async fn run_personal(
 
     let store = SqliteStore::open_in_memory()?;
     let seeded = personal::seed_store(&store, embedder.as_ref()).await?;
+    // `judge.relevance` applies here as on `recall`, so the suite measures
+    // what recall returns. The offline embedder does not imply an offline
+    // judge: the judge is what this run may be measuring.
+    let relevance_judge = crate::retrieval::RelevanceJudge::resolve(false)?;
 
     let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
         .ok()
@@ -544,7 +548,7 @@ async fn run_personal(
         };
 
         let start = Instant::now();
-        let results = hybrid_recall(
+        let mut results = hybrid_recall(
             &store,
             embedder.as_ref(),
             reranker.as_deref(),
@@ -566,6 +570,9 @@ async fn run_personal(
             },
         )
         .await?;
+        if let Some(judge) = &relevance_judge {
+            judge.apply(&store, q.text, &mut results.results).await;
+        }
         let latency_ms = start.elapsed().as_millis() as u64;
         let retrieved = to_items(&results.results, &seeded);
 
@@ -628,6 +635,13 @@ async fn run_personal(
     meta.add("profile", profile_enum.as_str());
     meta.add("embedder", embedder.model());
     meta.add("reranker", reranker_name);
+    // Which recall the numbers describe: judged or not.
+    meta.add(
+        "relevance_judge",
+        relevance_judge
+            .as_ref()
+            .map_or("off", |j| j.mode().as_str()),
+    );
     meta.add("memories_seeded", report.memories_seeded);
     meta.add("queries_evaluated", report.queries_evaluated);
     if let Some(path) = &save {
@@ -655,6 +669,7 @@ fn to_items(
             dataset_id: seeded.dataset_id_for(&r.id).map(|s| s.to_string()),
             kind: r.kind.clone(),
             score: r.score,
+            relevance: r.relevance,
         })
         .collect()
 }
@@ -1915,6 +1930,7 @@ mod tests {
                     dataset_id: Some((*h).to_string()),
                     kind: "chunk".into(),
                     score: 0.5,
+                    relevance: None,
                 })
                 .collect(),
             retrieved_legacy_default: None,

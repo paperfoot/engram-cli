@@ -241,7 +241,8 @@ pub struct Absence {
     pub searched_kbs: Vec<String>,
     pub searched_chunks: usize,
     /// `no_chunks_in_scope` | `filtered_by_window` | `filtered_by_diary` |
-    /// `no_candidate_matched` | `trimmed_by_layer_budget` | `subject_not_found`
+    /// `no_candidate_matched` | `no_candidate_above_cutoff` |
+    /// `trimmed_by_layer_budget` | `subject_not_found`
     /// | `no_open_values`
     pub reason: &'static str,
     pub nearest_subjects: Vec<NearestSubject>,

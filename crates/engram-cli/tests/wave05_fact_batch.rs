@@ -29,6 +29,7 @@ fn point_at_home(cmd: &mut Command, home: &std::path::Path) {
     cmd.env_remove("ENGRAM_JUDGE_GROUNDING");
     cmd.env_remove("ENGRAM_JUDGE_ADJUDICATE");
     cmd.env_remove("ENGRAM_JUDGE_DEDUPE");
+    cmd.env_remove("ENGRAM_JUDGE_RELEVANCE");
     cmd.env_remove("ENGRAM_JUDGE_LOG");
     cmd.env_remove("ENGRAM_FACT_LLM_STUB");
     cmd.env_remove("ENGRAM_FACT_WRITE_FAIL");

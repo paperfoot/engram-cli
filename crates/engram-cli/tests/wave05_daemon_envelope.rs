@@ -396,6 +396,7 @@ fn the_envelope_trims_only_the_edges_of_a_body() {
         citations: Vec::new(),
         sources: Vec::new(),
         provenance: Default::default(),
+        relevance: None,
     };
     let ctx = render_answer_context([&padded]);
     let lines: Vec<&str> = ctx.lines().collect();

@@ -16,7 +16,10 @@
 //!   `keys.openrouter`), else none.
 //!
 //! A judge request carries a memory to a third party, and engram stores
-//! personal and medical memories, so every site defaults to `off`.
+//! personal and medical memories, so every site defaults to `off` except
+//! `relevance`: without it recall cannot say "nothing stored answers this".
+//! It sends only the passages a recall returns, and only when a TypeSafe or
+//! OpenRouter key is set; `engram config set judge.relevance off` stops it.
 
 use crate::commands::config;
 use crate::context::AppContext;
@@ -72,13 +75,16 @@ pub enum JudgeSite {
     Adjudicate,
     /// Does a new fact restate an existing one?
     Dedupe,
+    /// Does a recalled passage answer the query?
+    Relevance,
 }
 
 impl JudgeSite {
-    pub const ALL: [JudgeSite; 3] = [
+    pub const ALL: [JudgeSite; 4] = [
         JudgeSite::Grounding,
         JudgeSite::Adjudicate,
         JudgeSite::Dedupe,
+        JudgeSite::Relevance,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -86,6 +92,7 @@ impl JudgeSite {
             JudgeSite::Grounding => "grounding",
             JudgeSite::Adjudicate => "adjudicate",
             JudgeSite::Dedupe => "dedupe",
+            JudgeSite::Relevance => "relevance",
         }
     }
 
@@ -94,6 +101,7 @@ impl JudgeSite {
             JudgeSite::Grounding => "ENGRAM_JUDGE_GROUNDING",
             JudgeSite::Adjudicate => "ENGRAM_JUDGE_ADJUDICATE",
             JudgeSite::Dedupe => "ENGRAM_JUDGE_DEDUPE",
+            JudgeSite::Relevance => "ENGRAM_JUDGE_RELEVANCE",
         }
     }
 
@@ -102,6 +110,7 @@ impl JudgeSite {
             JudgeSite::Grounding => "judge.grounding",
             JudgeSite::Adjudicate => "judge.adjudicate",
             JudgeSite::Dedupe => "judge.dedupe",
+            JudgeSite::Relevance => "judge.relevance",
         }
     }
 
@@ -109,7 +118,17 @@ impl JudgeSite {
     /// Adjudicate and dedupe are read and reported only: setting them to
     /// shadow or on changes nothing, and status says so.
     pub fn consulted(self) -> bool {
-        matches!(self, JudgeSite::Grounding)
+        matches!(self, JudgeSite::Grounding | JudgeSite::Relevance)
+    }
+
+    /// The mode when neither env nor config sets one. Relevance is on: its
+    /// eval cleared the bar (see `questions::RELEVANCE_FLOOR`), and without
+    /// it recall cannot abstain at all.
+    pub fn default_mode(self) -> JudgeMode {
+        match self {
+            JudgeSite::Relevance => JudgeMode::On,
+            _ => JudgeMode::Off,
+        }
     }
 
     /// The usage-ledger operation for this site's judge calls.
@@ -118,11 +137,12 @@ impl JudgeSite {
             JudgeSite::Grounding => "judge_grounding",
             JudgeSite::Adjudicate => "judge_adjudicate",
             JudgeSite::Dedupe => "judge_dedupe",
+            JudgeSite::Relevance => "judge_relevance",
         }
     }
 }
 
-/// The mode for `site`: env, then config.toml, then `off`.
+/// The mode for `site`: env, then config.toml, then the site's default.
 pub fn judge_mode(site: JudgeSite) -> Result<JudgeMode, CliError> {
     let env = std::env::var(site.env_var()).ok();
     mode_from(site, env.as_deref(), || {
@@ -145,8 +165,8 @@ fn mode_from(
         return JudgeMode::parse(v).ok_or_else(|| invalid(format!("{}={v:?}", site.env_var())));
     }
     match file()? {
-        None => Ok(JudgeMode::Off),
-        Some(toml::Value::String(s)) if s.trim().is_empty() => Ok(JudgeMode::Off),
+        None => Ok(site.default_mode()),
+        Some(toml::Value::String(s)) if s.trim().is_empty() => Ok(site.default_mode()),
         Some(toml::Value::String(s)) => {
             JudgeMode::parse(&s).ok_or_else(|| invalid(format!("{} = {s:?}", site.config_key())))
         }
@@ -301,6 +321,7 @@ pub struct JudgeStatus {
     pub grounding: Option<JudgeMode>,
     pub adjudicate: Option<JudgeMode>,
     pub dedupe: Option<JudgeMode>,
+    pub relevance: Option<JudgeMode>,
     /// The route a networked command would take (see [`route_name`]);
     /// `null` when `ENGRAM_JUDGE_STUB` is malformed (see `errors`).
     pub route: Option<&'static str>,
@@ -332,6 +353,7 @@ pub fn status() -> JudgeStatus {
         grounding: modes[0],
         adjudicate: modes[1],
         dedupe: modes[2],
+        relevance: modes[3],
         route,
         warnings: warnings_for(&modes, route),
         errors,
@@ -428,6 +450,38 @@ mod tests {
             mode_from(site, None, file(toml::Value::String(String::new()))).unwrap(),
             JudgeMode::Off
         );
+    }
+
+    #[test]
+    fn relevance_alone_defaults_on_and_off_still_turns_it_off() {
+        assert_eq!(
+            mode_from(JudgeSite::Relevance, None, no_file).unwrap(),
+            JudgeMode::On
+        );
+        assert_eq!(
+            mode_from(JudgeSite::Relevance, Some(" "), no_file).unwrap(),
+            JudgeMode::On
+        );
+        assert_eq!(
+            mode_from(JudgeSite::Relevance, Some("off"), no_file).unwrap(),
+            JudgeMode::Off
+        );
+        assert_eq!(
+            mode_from(
+                JudgeSite::Relevance,
+                None,
+                file(toml::Value::String("off".into()))
+            )
+            .unwrap(),
+            JudgeMode::Off
+        );
+        for site in [
+            JudgeSite::Grounding,
+            JudgeSite::Adjudicate,
+            JudgeSite::Dedupe,
+        ] {
+            assert_eq!(mode_from(site, None, no_file).unwrap(), JudgeMode::Off);
+        }
     }
 
     #[test]
