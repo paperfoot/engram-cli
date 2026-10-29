@@ -25,22 +25,41 @@ fn seeded() -> Store {
     store
 }
 
+/// Submit an inline backfill that can actually finish offline: the job's
+/// `facts backfill` subprocess inherits this env, and a scripted extractor
+/// that finds nothing stands in for OpenRouter.
+fn submit_backfill(store: &Store) -> Value {
+    let out = store
+        .engram()
+        .env("ENGRAM_BENCH_FORCE_STUB", "1")
+        .env("ENGRAM_FACT_LLM_STUB", "[]")
+        .args(["jobs", "submit", "--kind", "backfill", "--kb", "default", "--json"])
+        .output()
+        .expect("engram runs");
+    assert!(
+        out.status.success(),
+        "submit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("json")
+}
+
 #[test]
 fn submit_runs_inline_when_no_daemon_is_listening() {
     let store = seeded();
-    let out = store.seed(&["jobs", "submit", "--kind", "compile", "--kb", "default"]);
+    let out = submit_backfill(&store);
     assert_eq!(
         out["data"]["job"]["status"], "completed",
         "with no scheduler the submitting process runs the job itself: {out}"
     );
-    assert_eq!(out["data"]["job"]["kind"], "compile");
+    assert_eq!(out["data"]["job"]["kind"], "backfill");
 }
 
 #[test]
 fn detach_without_a_daemon_says_nothing_will_run_it() {
     let store = seeded();
     let out = store.seed(&[
-        "jobs", "submit", "--kind", "compile", "--kb", "default", "--detach",
+        "jobs", "submit", "--kind", "backfill", "--kb", "default", "--detach",
     ]);
     assert_eq!(out["data"]["job"]["status"], "queued", "{out}");
     let warning = out["data"]["warning"].as_str().unwrap_or_default();
@@ -54,18 +73,18 @@ fn detach_without_a_daemon_says_nothing_will_run_it() {
 fn submit_is_idempotent_per_kind_and_kb() {
     let store = seeded();
     let first = store.seed(&[
-        "jobs", "submit", "--kind", "compile", "--kb", "default", "--detach",
+        "jobs", "submit", "--kind", "backfill", "--kb", "default", "--detach",
     ]);
     let id = first["data"]["job"]["id"].as_str().unwrap().to_string();
     let second = store.seed(&[
-        "jobs", "submit", "--kind", "compile", "--kb", "default", "--detach",
+        "jobs", "submit", "--kind", "backfill", "--kb", "default", "--detach",
     ]);
     assert_eq!(second["data"]["already_live"], true, "{second}");
-    assert_eq!(second["data"]["job"]["id"], id, "one compile, one row");
+    assert_eq!(second["data"]["job"]["id"], id, "one job, one row");
     let s = store.open();
     let (_, total) = s
         .list_jobs(&JobFilter {
-            kind: Some("compile".into()),
+            kind: Some("backfill".into()),
             limit: 50,
             ..Default::default()
         })
@@ -76,46 +95,19 @@ fn submit_is_idempotent_per_kind_and_kb() {
 #[test]
 fn an_unknown_kind_is_refused_at_submit_time() {
     let store = seeded();
-    let out = store
-        .engram()
-        .args([
-            "jobs", "submit", "--kind", "reflect", "--kb", "default", "--json",
-        ])
-        .output()
-        .expect("engram runs");
-    assert!(!out.status.success());
-    let text = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        text.contains("unknown job kind"),
-        "reflect is reserved for wave 5 — a named refusal beats a queued row \
-         nothing will ever claim: {text}"
-    );
-}
-
-#[test]
-fn a_legacy_compile_does_not_trip_the_live_index() {
-    // `jobs submit --detach` leaves a `queued` row. The legacy synchronous
-    // path abandons only `running` rows, so without the widened abandon the
-    // very next `engram compile` fails on `idx_jobs_live` with a raw
-    // `UNIQUE constraint failed`.
-    let store = seeded();
-    store.seed(&[
-        "jobs", "submit", "--kind", "compile", "--kb", "default", "--detach",
-    ]);
-    let out = store.seed(&["compile", "--kb", "default", "--all"]);
-    assert!(out["data"]["job_id"].is_string(), "{out}");
-    let s = store.open();
-    let (rows, _) = s
-        .list_jobs(&JobFilter {
-            limit: 50,
-            ..Default::default()
-        })
-        .expect("list");
-    let live = rows
-        .iter()
-        .filter(|r| r.status == "queued" || r.status == "running")
-        .count();
-    assert!(live <= 1, "at most one live job per (kind, kb): {rows:#?}");
+    // `reflect` is reserved for wave 5; `compile` was removed with the
+    // derived layer. Either way a named refusal beats a queued row nothing
+    // will ever claim.
+    for kind in ["reflect", "compile"] {
+        let out = store
+            .engram()
+            .args(["jobs", "submit", "--kind", kind, "--kb", "default", "--json"])
+            .output()
+            .expect("engram runs");
+        assert!(!out.status.success(), "{kind}");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(text.contains("unknown job kind"), "{kind}: {text}");
+    }
 }
 
 #[test]
@@ -184,7 +176,7 @@ fn jobs_list_works_on_a_store_that_predates_the_new_columns() {
 #[test]
 fn the_legacy_job_shape_is_unchanged() {
     let store = seeded();
-    store.seed(&["compile", "--kb", "default", "--all"]);
+    store.seed(&["jobs", "submit", "--kind", "backfill", "--kb", "default"]);
     let out = store.seed(&["jobs", "list", "--all-kbs"]);
     let job = &out["data"]["jobs"][0];
     for field in [
@@ -201,7 +193,7 @@ fn the_legacy_job_shape_is_unchanged() {
             "field `{field}` must survive wave 4: {job}"
         );
     }
-    assert_eq!(job["kind"], "compile", "additive fields land alongside");
+    assert_eq!(job["kind"], "backfill", "additive fields land alongside");
 }
 
 #[test]
@@ -318,7 +310,7 @@ fn a_lease_cannot_be_stolen_while_it_is_live() {
 #[test]
 fn the_job_lifecycle_is_journalled() {
     let store = seeded();
-    let out = store.seed(&["jobs", "submit", "--kind", "compile", "--kb", "default"]);
+    let out = submit_backfill(&store);
     let id: uuid::Uuid = out["data"]["job"]["id"]
         .as_str()
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
@@ -333,10 +325,6 @@ fn the_job_lifecycle_is_journalled() {
     use engram_core::events::EventKind::*;
     assert!(kinds.contains(&JobSubmitted), "{kinds:?}");
     assert!(kinds.contains(&JobCompleted), "{kinds:?}");
-    assert!(
-        kinds.contains(&CompileRan),
-        "a compile that ran is a compile that ran: {kinds:?}"
-    );
 }
 
 #[test]
@@ -385,7 +373,7 @@ fn the_http_surface_submits_reads_and_cancels() {
 
     let (status, body) = daemon.post(
         "/v1/jobs",
-        &json!({ "kind": "compile", "kb": "default" }).to_string(),
+        &json!({ "kind": "backfill", "kb": "default" }).to_string(),
     );
     assert_eq!(status, 200, "{body}");
     let id = body["data"]["job"]["id"]
@@ -421,7 +409,7 @@ fn cancelling_a_finished_job_is_bad_input_not_a_resolve_race() {
     // branching on `error.code` must not have adjudication and job lifecycle
     // collapsed into one value.
     let store = seeded();
-    let out = store.seed(&["jobs", "submit", "--kind", "compile", "--kb", "default"]);
+    let out = submit_backfill(&store);
     let id = out["data"]["job"]["id"].as_str().unwrap().to_string();
     let daemon = Daemon::start(&store);
     let (status, body) = daemon.post(&format!("/v1/jobs/{id}/cancel"), "");
@@ -433,25 +421,5 @@ fn cancelling_a_finished_job_is_bad_input_not_a_resolve_race() {
             .unwrap_or_default()
             .contains("completed"),
         "the refusal names the current status: {body}"
-    );
-}
-
-#[test]
-fn compile_async_returns_a_handle_and_the_default_stays_synchronous() {
-    let store = seeded();
-    let daemon = Daemon::start(&store);
-    let (status, body) = daemon.post(
-        "/v1/compile",
-        &json!({ "kb": "default", "async": true }).to_string(),
-    );
-    assert_eq!(status, 200, "{body}");
-    assert!(body["data"]["job"]["id"].is_string(), "{body}");
-
-    let (status, body): (u16, Value) =
-        daemon.post("/v1/compile", &json!({ "kb": "default" }).to_string());
-    assert_eq!(status, 200, "{body}");
-    assert!(
-        body["data"]["job_id"].is_string() && body["data"]["compile"].is_object(),
-        "the synchronous shape is unchanged: {body}"
     );
 }

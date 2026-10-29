@@ -193,12 +193,10 @@ fn memory_search_honors_expiry_too() {
     assert_eq!(result_contents(&v).len(), 1);
 }
 
-/// Forgetting the expired source must not REPUBLISH it: `forget` leaves
-/// wiki/entity/relation aggregates in place until recompile, so the KB gate
-/// has to keep constraining on the forgotten expired memory until a compile
-/// has completed after its deletion (re-gate finding 1).
+/// Forgetting the expired source must not REPUBLISH it through any recall
+/// mode (re-gate finding 1).
 #[test]
-fn forgetting_an_expired_memory_does_not_republish_it_through_derived_layers() {
+fn forgetting_an_expired_memory_does_not_republish_it() {
     let home = tempfile::tempdir().unwrap();
     let v = run_json(
         &home,
@@ -210,24 +208,17 @@ fn forgetting_an_expired_memory_does_not_republish_it_through_derived_layers() {
         ],
     );
     let id = v["data"]["id"].as_str().expect("memory id").to_string();
-    // Compile so derived aggregates exist, then forget the source.
-    engram_in(&home)
-        .args(["compile", "--kb", "default", "--all"])
-        .arg("--json")
-        .assert()
-        .success();
     engram_in(&home)
         .args(["forget", &id, "--confirm"])
         .arg("--json")
         .assert()
         .success();
-    // Before any recompile, explore-mode recall must not serve the forgotten
-    // expired content back through wiki/entity/relation projections.
+    // `explore` is a legacy mode name; it must not reach forgotten content.
     let v = run_json(&home, &["recall", "quokkavault", "--mode", "explore"]);
     assert_eq!(
         result_contents(&v).len(),
         0,
-        "forgotten expired content leaked through derived layers: {:?}",
+        "forgotten expired content leaked back: {:?}",
         result_contents(&v)
     );
 }
@@ -298,11 +289,10 @@ fn expired_hits_cannot_starve_a_small_lexical_pool() {
 }
 
 /// `--include-expired` lifts the validity withholding, and ONLY that: a
-/// FORGOTTEN expired memory whose derived artifacts have not been recompiled
-/// away stays quarantined — "show me expired" is not "show me retracted"
-/// (gate round 3, High).
+/// FORGOTTEN expired memory stays gone — "show me expired" is not "show me
+/// retracted" (gate round 3, High).
 #[test]
-fn include_expired_does_not_expose_forgotten_derived_content() {
+fn include_expired_does_not_expose_forgotten_content() {
     let home = tempfile::tempdir().unwrap();
     let v = run_json(
         &home,
@@ -315,17 +305,12 @@ fn include_expired_does_not_expose_forgotten_derived_content() {
     );
     let id = v["data"]["id"].as_str().expect("memory id").to_string();
     engram_in(&home)
-        .args(["compile", "--kb", "default", "--all"])
-        .arg("--json")
-        .assert()
-        .success();
-    engram_in(&home)
         .args(["forget", &id, "--confirm"])
         .arg("--json")
         .assert()
         .success();
-    // The forgotten sentence must not come back through wiki/entity/relation
-    // projections even when the caller opts into expired content.
+    // The forgotten sentence must not come back even when the caller opts
+    // into expired content.
     let v = run_json(
         &home,
         &[

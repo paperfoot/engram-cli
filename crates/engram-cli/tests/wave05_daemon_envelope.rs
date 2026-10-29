@@ -280,25 +280,6 @@ fn daemon_recall_escapes_a_stored_opening_and_closing_tag() {
 }
 
 #[test]
-fn daemon_research_uses_the_same_envelope() {
-    // Until now no test anywhere covered the daemon's copy of
-    // `render_answer_context` on either endpoint.
-    let tmp = tempfile::tempdir().expect("tmp dir");
-    seed_forged(tmp.path());
-    let daemon = start_daemon(tmp.path());
-    let v = post_ok(
-        daemon.port,
-        "/v1/research",
-        &format!("{{\"query\":\"{FORGED_QUERY}\",\"profile\":\"offline\"}}"),
-    );
-    assert_eq!(v["data"]["status"], "success", "{v}");
-    let ctx = answer_context(&v);
-    assert_forged_payload_is_quarantined(&ctx);
-    let (_, bodies) = partition_envelope(&ctx);
-    assert!(bodies[0].contains("&lt;/engram-result>"), "{ctx}");
-}
-
-#[test]
 fn the_forged_text_survives_verbatim_inside_the_element() {
     // Quarantining is not censorship: the user's memory comes back whole, it
     // just comes back as data. A "fix" that strips the payload fails here.

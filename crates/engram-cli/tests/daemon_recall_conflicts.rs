@@ -136,20 +136,3 @@ fn the_resolve_command_is_one_runnable_command() {
         );
     }
 }
-
-#[test]
-fn research_keeps_its_shape() {
-    // `/v1/research` moved onto the pooled reader and the shared envelope this
-    // wave; it must answer byte-for-byte what wave 0.5 pinned.
-    let store = contested_store();
-    let daemon = Daemon::start(&store);
-    let (status, body) = daemon.post(
-        "/v1/research",
-        r#"{"query":"Carol","profile":"offline","kb":"default"}"#,
-    );
-    assert_eq!(status, 200, "{body}");
-    let meta = &body["data"]["metadata"];
-    assert_eq!(meta["embed_model"], "stub-64", "{body}");
-    assert_eq!(meta["embed_dims"], 64, "{body}");
-    assert!(body["data"]["answer_context"].is_string(), "{body}");
-}

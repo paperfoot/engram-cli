@@ -176,7 +176,7 @@ fn the_descriptor_is_written_while_serving_and_a_dead_one_is_ignored() {
     // The daemon was killed, so the descriptor is stale. Any command that
     // consults it must delete it rather than wait forever for a scheduler that
     // does not exist.
-    let submitted = store.seed(&["jobs", "submit", "--kind", "compile", "--kb", "default"]);
+    let submitted = store.seed(&["jobs", "submit", "--kind", "backfill", "--kb", "default"]);
     assert!(
         submitted["data"]["job"]["status"].is_string(),
         "a stale descriptor must not make submit hang: {submitted}"

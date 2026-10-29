@@ -1,11 +1,11 @@
 //! Wave 0.5 — the daemon answers the same request the CLI does.
 //!
-//! Three defects, one file. `/v1/recall` and `/v1/research` accepted a blank
-//! query and paid a provider to embed it; `/v1/recall` accepted `since`,
-//! `until` and `layer` and silently dropped them, so a caller who believed they
-//! had scoped a window was answered from the whole store; and `/v1/research`
-//! reported neither the embed model nor its dimensions, so a 64-dim stub
-//! downgrade was indistinguishable from 1536-dim cloud retrieval.
+//! Three defects, one file. `/v1/recall` accepted a blank query and paid a
+//! provider to embed it; it accepted `since`, `until` and `layer` and silently
+//! dropped them, so a caller who believed they had scoped a window was
+//! answered from the whole store; and it must report the embed model and its
+//! dimensions, so a 64-dim stub downgrade is distinguishable from 1536-dim
+//! cloud retrieval.
 //!
 //! Deviation from the `wave0_provider_parity` idiom, stated once: the daemon
 //! still starts with `GEMINI_API_KEY`, `COHERE_API_KEY` and
@@ -201,17 +201,6 @@ fn daemon_recall_refuses_a_whitespace_query() {
 }
 
 #[test]
-fn daemon_research_refuses_an_empty_and_a_whitespace_query() {
-    // Both endpoints, one rule.
-    let tmp = tempfile::tempdir().expect("tmp dir");
-    let daemon = start_daemon(tmp.path(), &[]);
-    for blank in ["{\"query\":\"\"}", "{\"query\":\"   \"}"] {
-        let (status, body) = post(daemon.port, "/v1/research", blank);
-        assert_blank_query_refused(status, &body);
-    }
-}
-
-#[test]
 fn an_empty_query_is_refused_before_the_provider_and_before_the_budget() {
     // The ORDERING is the contract. A typo must not be reported as a key
     // problem (which sends the caller to fix their config) and must not be
@@ -303,53 +292,6 @@ fn daemon_recall_honours_since_and_until() {
         "{found:?}"
     );
     assert!(!found.iter().any(|c| c.contains("new crew")), "{found:?}");
-}
-
-#[test]
-fn a_windowed_daemon_recall_reports_what_it_withheld() {
-    // Derived content (claims, wiki pages, entities, relations) has no event
-    // time of its own, so a window cannot place it. That is a scope decision,
-    // and the response says so instead of returning a silently short answer.
-    let tmp = tempfile::tempdir().expect("tmp dir");
-    seed(
-        tmp.path(),
-        &[
-            "remember",
-            "Turmeric harvest logged at the Sintra allotment.",
-            "--kb",
-            "garden",
-            "--event-time",
-            "2026-06-15T18:00:00Z",
-            "--no-facts",
-        ],
-    );
-    let daemon = start_daemon(tmp.path(), &[]);
-
-    let (status, body) = post(
-        daemon.port,
-        "/v1/recall",
-        "{\"query\":\"turmeric harvest Sintra\",\"profile\":\"offline\",\"since\":\"2026-01-01\"}",
-    );
-    assert_eq!(status, 200, "{body}");
-    let scope = &body["data"]["metadata"]["temporal_scope"];
-    assert!(scope.is_object(), "a window must be reported: {body}");
-    assert_eq!(scope["since"], "2026-01-01T00:00:00+00:00", "{body}");
-    assert!(
-        scope["excluded_sources"].is_array(),
-        "the withheld sources must be named: {body}"
-    );
-
-    // Without a window the key stays null — the shape callers already parse.
-    let (status, body) = post(
-        daemon.port,
-        "/v1/recall",
-        "{\"query\":\"turmeric harvest Sintra\",\"profile\":\"offline\"}",
-    );
-    assert_eq!(status, 200, "{body}");
-    assert!(
-        body["data"]["metadata"]["temporal_scope"].is_null(),
-        "no window, nothing to report: {body}"
-    );
 }
 
 #[test]
@@ -495,36 +437,7 @@ fn daemon_recall_rejects_an_unknown_layer() {
 }
 
 #[test]
-fn daemon_research_reports_the_embed_model_and_dimensions() {
-    // `profile` alone cannot distinguish 1536-dim Gemini retrieval from the
-    // 64-dim offline stub — `offline` and a forced stub render the same word.
-    let tmp = tempfile::tempdir().expect("tmp dir");
-    seed(
-        tmp.path(),
-        &[
-            "remember",
-            "Rapamycin extends mouse lifespan in the ITP cohorts.",
-            "--kb",
-            "downgrade",
-            "--no-facts",
-        ],
-    );
-    let daemon = start_daemon(tmp.path(), &[]);
-    let (status, body) = post(
-        daemon.port,
-        "/v1/research",
-        "{\"query\":\"rapamycin lifespan\",\"profile\":\"offline\"}",
-    );
-    assert_eq!(status, 200, "{body}");
-    let meta = &body["data"]["metadata"];
-    assert_eq!(meta["embed_model"], "stub-64", "{body}");
-    assert_eq!(meta["embed_dims"], 64, "{body}");
-    assert!(meta["prompt_format"].is_string(), "{body}");
-}
-
-#[test]
 fn daemon_recall_still_reports_the_embed_model_and_dimensions() {
-    // Regression guard: the two endpoints must not drift apart again.
     let tmp = tempfile::tempdir().expect("tmp dir");
     seed(
         tmp.path(),

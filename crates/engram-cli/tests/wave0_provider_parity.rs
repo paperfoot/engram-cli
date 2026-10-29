@@ -1,9 +1,8 @@
 //! Wave 0.5 — provider and budget parity across every retrieval surface.
 //!
-//! A cloud profile with no Gemini key must be a loud config error on `research`
-//! and on both daemon endpoints, exactly as it already is on `recall`; and a
-//! configured spend cap must stop a paid call on every one of them. Each test
-//! below fails on `main` before the fix.
+//! A cloud profile with no Gemini key must be a loud config error on `recall`
+//! and on the daemon, and a configured spend cap must stop a paid call on
+//! both.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -165,13 +164,13 @@ fn request(
 const UNUSED_KEY: &str = "fake-key-not-used-because-the-guard-blocks-first";
 
 #[test]
-fn research_under_a_cloud_profile_without_a_key_is_a_config_error() {
-    // The core defect: `research` used to exit 0 with 64-dim stub results and
-    // no hint that retrieval quality was fiction.
+fn recall_under_a_cloud_profile_without_a_key_is_a_config_error() {
+    // The core defect: a cloud read used to exit 0 with 64-dim stub results
+    // and no hint that retrieval quality was fiction.
     let tmp = tempfile::tempdir().expect("tmp dir");
     let assert = cloud_cmd_in(tmp.path())
         .args([
-            "research",
+            "recall",
             "anything",
             "--profile",
             "cloud_quality",
@@ -191,11 +190,11 @@ fn research_under_a_cloud_profile_without_a_key_is_a_config_error() {
 }
 
 #[test]
-fn research_offline_profile_without_a_key_still_works() {
-    // The explicit stub opt-in survives (mirror of the recall test).
+fn recall_offline_profile_without_a_key_still_works() {
+    // The explicit stub opt-in survives.
     let tmp = tempfile::tempdir().expect("tmp dir");
     cloud_cmd_in(tmp.path())
-        .args(["research", "anything", "--profile", "offline", "--json"])
+        .args(["recall", "anything", "--profile", "offline", "--json"])
         .assert()
         .success();
 }
@@ -210,7 +209,7 @@ fn a_falsy_stub_flag_does_not_force_the_stub() {
     for falsy in ["0", "false", ""] {
         let out = cloud_cmd_in(tmp.path())
             .env("ENGRAM_BENCH_FORCE_STUB", falsy)
-            .args(["research", "anything", "--json"])
+            .args(["recall", "anything", "--json"])
             .assert()
             .failure()
             .code(2)
@@ -229,12 +228,12 @@ fn a_falsy_stub_flag_does_not_force_the_stub() {
 }
 
 #[test]
-fn research_under_the_bench_stub_flag_still_uses_the_stub() {
+fn recall_under_the_bench_stub_flag_still_uses_the_stub() {
     // ENGRAM_BENCH_FORCE_STUB stays a silent opt-in — the invariant the whole
     // existing CLI suite runs on.
     let tmp = tempfile::tempdir().expect("tmp dir");
     let out = stub_cmd_in(tmp.path())
-        .args(["research", "anything", "--json"])
+        .args(["recall", "anything", "--json"])
         .assert()
         .success()
         .get_output()
@@ -245,8 +244,8 @@ fn research_under_the_bench_stub_flag_still_uses_the_stub() {
 }
 
 #[test]
-fn research_stops_at_a_zero_budget_before_paying() {
-    // Budget parity on the CLI research surface: the guard fires before the
+fn recall_stops_at_a_zero_budget_before_paying() {
+    // Budget parity on the CLI recall surface: the guard fires before the
     // first paid call, so the fake key is never used.
     let tmp = tempfile::tempdir().expect("tmp dir");
     stub_cmd_in(tmp.path())
@@ -264,7 +263,7 @@ fn research_stops_at_a_zero_budget_before_paying() {
 
     let assert = cloud_cmd_in(tmp.path())
         .env("GEMINI_API_KEY", UNUSED_KEY)
-        .args(["research", "anything", "--kb", "capped", "--json"])
+        .args(["recall", "anything", "--kb", "capped", "--json"])
         .assert()
         .failure()
         .code(4);
@@ -288,24 +287,6 @@ fn daemon_recall_without_a_key_returns_a_config_error_not_stub_results() {
     assert_eq!(body["error"]["code"], "config_error", "{body}");
     assert_eq!(body["error"]["exit_code"], 2, "{body}");
     assert!(body["data"].is_null(), "no results were invented: {body}");
-}
-
-#[test]
-fn daemon_research_without_a_key_returns_the_same_config_error() {
-    // Both endpoints, one rule.
-    let tmp = tempfile::tempdir().expect("tmp dir");
-    let daemon = start_daemon(tmp.path(), &[]);
-    let (status, body) = request(
-        daemon.port,
-        "POST",
-        "/v1/research",
-        Some("{\"query\":\"anything\"}"),
-    )
-    .expect("daemon answers");
-    assert_eq!(status, 400, "{body}");
-    assert_eq!(body["error"]["code"], "config_error", "{body}");
-    assert_eq!(body["error"]["exit_code"], 2, "{body}");
-    assert!(body["data"].is_null(), "{body}");
 }
 
 #[test]

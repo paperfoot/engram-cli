@@ -146,10 +146,7 @@ impl Daemon {
             .env_remove("ENGRAM_JUDGE_DEDUPE")
             .env_remove("ENGRAM_JUDGE_RELEVANCE")
             .env_remove("ENGRAM_JUDGE_LOG")
-            .env_remove("ENGRAM_BENCH_FORCE_STUB")
-            // Off unless a test asks for it: a background compile firing in the
-            // middle of an unrelated assertion is a flake generator.
-            .env("ENGRAM_SLEEP_COMPILE", "0");
+            .env_remove("ENGRAM_BENCH_FORCE_STUB");
         for (k, v) in env {
             cmd.env(k, v);
         }

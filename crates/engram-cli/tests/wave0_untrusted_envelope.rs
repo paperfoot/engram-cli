@@ -196,31 +196,6 @@ fn an_attacker_chosen_kb_name_cannot_forge_result_attributes() {
 }
 
 #[test]
-fn research_uses_the_same_quarantine_envelope() {
-    // `--profile offline` keeps this green once a cloud profile without a key
-    // becomes a hard error on `research` too.
-    let home = tempfile::tempdir().expect("tmp dir");
-    run_json(
-        &home,
-        &["remember", FORGED, "--kb", "quarantine", "--no-facts"],
-    );
-
-    let v = run_json(
-        &home,
-        &[
-            "research",
-            "quokkavault protocol",
-            "--kb",
-            "quarantine",
-            "--profile",
-            "offline",
-        ],
-    );
-    assert_eq!(v["data"]["status"], "success", "{v}");
-    assert_forged_payload_is_quarantined(&answer_context(&v));
-}
-
-#[test]
 fn a_recall_with_no_results_carries_an_empty_answer_context() {
     // Nothing retrieved means nothing to quarantine: no orphan notice, and a
     // `no_results` response keeps the shape callers already parse.
