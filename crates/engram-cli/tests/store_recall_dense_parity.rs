@@ -221,6 +221,7 @@ async fn recall(seeded: &Seeded, query: &str) -> RecallOutcome {
             mode: RecallMode::Evidence,
             graph_hops: 0,
             allow_mixed_embeddings: false,
+            defer_doc_cap: false,
         },
     )
     .await

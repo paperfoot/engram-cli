@@ -309,3 +309,45 @@ fn the_judge_refills_past_a_full_page_of_misses() {
     assert_eq!(v["data"]["verdict"], "results", "{v}");
     assert_eq!(contents(&v), vec![ELIAS.to_string()], "{v}");
 }
+
+/// Three short passages from one document; the first two do not answer and
+/// the third does. The per-document diversity cap (two per document) ran
+/// before the judge, so the third was gone before anyone asked about it and
+/// recall said no_candidate_above_cutoff. With the judge active the cap now
+/// runs after judging and counts only passages that survive it.
+#[test]
+fn the_diversity_cap_counts_only_passages_the_judge_kept() {
+    let tmp = store();
+    let doc = tmp.path().join("field-notes.md");
+    std::fs::write(
+        &doc,
+        "# Field notes\n\n\
+         ## Weather\n\nNoemi Varkoni logged rain over Ghent all week.\n\n\
+         ## Lab\n\nNoemi Varkoni repainted the Halden Labs corridor.\n\n\
+         ## Gear\n\nNoemi Varkoni keeps her climbing gear in the blue van.\n",
+    )
+    .unwrap();
+    run_json(
+        &mut engram(tmp.path()),
+        &["ingest", doc.to_str().unwrap(), "--kb", "personal"],
+    );
+    let mut cmd = engram(tmp.path());
+    cmd.env("ENGRAM_JUDGE_RELEVANCE", "on")
+        .env("ENGRAM_JUDGE_STUB", r#"{"climbing gear": 0.9, "*": 0.01}"#);
+    let v = run_json(
+        &mut cmd,
+        &[
+            "recall",
+            "Noemi Varkoni rain Ghent Halden corridor",
+            "--kb",
+            "personal",
+        ],
+    );
+    assert_eq!(v["data"]["verdict"], "results", "{v}");
+    let got = contents(&v);
+    assert!(
+        got.iter().any(|c| c.contains("climbing gear")),
+        "the answer, third in its document, is returned: {v}"
+    );
+    assert!(got.iter().all(|c| !c.contains("rain")), "{v}");
+}

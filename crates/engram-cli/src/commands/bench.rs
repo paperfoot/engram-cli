@@ -425,6 +425,7 @@ async fn run_scientific_mini(format: OutputFormat) -> Result<(), CliError> {
                 mode: RecallMode::Evidence,
                 graph_hops: 1,
                 allow_mixed_embeddings: false,
+                defer_doc_cap: false,
             },
         )
         .await?
@@ -571,6 +572,7 @@ async fn run_personal(
                 mode: RecallMode::Evidence,
                 graph_hops: 1,
                 allow_mixed_embeddings: false,
+                defer_doc_cap: relevance_judge.is_some(),
             },
         )
         .await?;
@@ -607,6 +609,7 @@ async fn run_personal(
                     mode: RecallMode::Evidence,
                     graph_hops: 1,
                     allow_mixed_embeddings: false,
+                    defer_doc_cap: false,
                 },
             )
             .await?;

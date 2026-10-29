@@ -121,6 +121,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         mode: recall_mode,
         graph_hops,
         allow_mixed_embeddings,
+        defer_doc_cap: relevance_judge.is_some(),
     };
 
     // Provider choice, the missing-key hard error and the spend guardrail all

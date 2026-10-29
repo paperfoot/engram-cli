@@ -1712,6 +1712,7 @@ async fn research_body(store: &SqliteStore, body: &str) -> Result<serde_json::Va
         mode: RecallMode::Explore,
         graph_hops: 2,
         allow_mixed_embeddings: req.allow_mixed_embeddings.unwrap_or(false),
+        defer_doc_cap: false,
     };
     let outcome = hybrid_recall(
         store,
@@ -1853,6 +1854,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
         mode,
         graph_hops: req.graph_hops.unwrap_or(1),
         allow_mixed_embeddings: req.allow_mixed_embeddings.unwrap_or(false),
+        defer_doc_cap: false,
     };
     let outcome = hybrid_recall(
         store,

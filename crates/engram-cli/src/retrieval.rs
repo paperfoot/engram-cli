@@ -728,6 +728,11 @@ pub struct HybridParams<'a> {
     pub mode: RecallMode,
     pub graph_hops: u8,
     pub allow_mixed_embeddings: bool,
+    /// Leave the per-document diversity cap ([`max_per_doc`]) to the caller.
+    /// Set when the relevance judge runs: it applies the cap after judging,
+    /// counting only passages it kept, so two misses from one document can
+    /// no longer crowd out that document's answer before it is judged.
+    pub defer_doc_cap: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -905,7 +910,9 @@ impl RelevanceJudge {
     /// Walk the reranked pool `results` in batches, one judge request each,
     /// until `top_k` results survive (under `on`, survivors are those at or
     /// above the floor) or the pool is exhausted, all within one overall
-    /// deadline. On an error or the deadline, the candidates not yet judged
+    /// deadline. The pool arrives uncapped (`HybridParams::defer_doc_cap`):
+    /// the per-document cap applies here, to survivors only, and a candidate
+    /// whose document is already full is skipped unjudged. On an error or the deadline, the candidates not yet judged
     /// fill the remaining slots unjudged: recall never abstains while one
     /// remains. `results` keeps its order and ends at most `top_k` long.
     /// `store` supplies each memory's date.
@@ -930,8 +937,29 @@ impl RelevanceJudge {
         let deadline = tokio::time::Instant::now() + self.deadline;
         let mut pending: std::collections::VecDeque<HybridResult> = results.drain(..).collect();
         let mut kept: Vec<HybridResult> = Vec::with_capacity(top_k);
+        let cap = max_per_doc();
+        let mut per_doc: HashMap<Uuid, usize> = HashMap::new();
+        // Counts `r` against its document's quota; false when it is full.
+        let admit = |r: &HybridResult, per_doc: &mut HashMap<Uuid, usize>| match doc_of(r) {
+            Some(doc) => {
+                let seen = per_doc.entry(doc).or_insert(0);
+                *seen < cap && {
+                    *seen += 1;
+                    true
+                }
+            }
+            None => true,
+        };
+        let full = |r: &HybridResult, per_doc: &HashMap<Uuid, usize>| {
+            doc_of(r).is_some_and(|d| per_doc.get(&d).is_some_and(|&n| n >= cap))
+        };
         let mut asked = 0usize;
-        while kept.len() < top_k && !pending.is_empty() {
+        loop {
+            // Never pay to judge a passage its document has no room for.
+            pending.retain(|r| !full(r, &per_doc));
+            if kept.len() >= top_k || pending.is_empty() {
+                break;
+            }
             let size = (top_k - kept.len())
                 .max(RELEVANCE_BATCH)
                 .min(MAX_QUESTIONS_PER_REQUEST)
@@ -965,13 +993,16 @@ impl RelevanceJudge {
                     }
                     report.kept_on_prefix += 1;
                 }
-                kept.push(r);
+                if admit(&r, &mut per_doc) {
+                    kept.push(r);
+                }
             }
         }
         // Whatever the judge never saw fills what is left, unjudged.
         while kept.len() < top_k {
             match pending.pop_front() {
-                Some(r) => kept.push(r),
+                Some(r) if admit(&r, &mut per_doc) => kept.push(r),
+                Some(_) => {}
                 None => break,
             }
         }
@@ -1047,6 +1078,27 @@ fn merge_response(total: &mut Option<JudgeResponse>, next: JudgeResponse) {
 /// passage, so it may be reported but never used to drop it.
 pub fn judged_on_prefix(content: &str) -> bool {
     content.chars().nth(RELEVANCE_PASSAGE_CHARS).is_some()
+}
+
+/// Diversity cap: keep at most this many results per source document so a
+/// few near-duplicate passages from one paper can't crowd out other papers
+/// (this lifts paper-level recall). Tune via ENGRAM_RERANK_MAX_PER_DOC; 0 =
+/// unlimited (legacy behaviour).
+pub fn max_per_doc() -> usize {
+    const DEFAULT_MAX_PER_DOC: usize = 2;
+    match std::env::var("ENGRAM_RERANK_MAX_PER_DOC")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => DEFAULT_MAX_PER_DOC,
+    }
+}
+
+/// The document a result counts against for [`max_per_doc`].
+fn doc_of(r: &HybridResult) -> Option<Uuid> {
+    r.citations.first().and_then(|c| c.document_id)
 }
 
 /// A memory's date as the judge reads it: when it happened, else when it was
@@ -1490,19 +1542,7 @@ where
             .await?
     };
 
-    // Diversity cap: keep at most N chunks per source document so a few
-    // near-duplicate passages from one paper can't crowd out other papers
-    // (this lifts paper-level recall). Tune via ENGRAM_RERANK_MAX_PER_DOC;
-    // 0 = unlimited (legacy behaviour).
-    const DEFAULT_MAX_PER_DOC: usize = 2;
-    let max_per_doc = match std::env::var("ENGRAM_RERANK_MAX_PER_DOC")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        Some(0) => usize::MAX,
-        Some(n) => n,
-        None => DEFAULT_MAX_PER_DOC,
-    };
+    let max_per_doc = max_per_doc();
 
     let using_reranker = reranker.is_some();
     let mut results = Vec::with_capacity(params.top_k);
@@ -1559,7 +1599,7 @@ where
 
         if let Some(doc) = citations.first().and_then(|cit| cit.document_id) {
             let seen = per_doc.entry(doc).or_insert(0);
-            if *seen >= max_per_doc {
+            if *seen >= max_per_doc && !params.defer_doc_cap {
                 continue;
             }
             *seen += 1;
@@ -1945,6 +1985,32 @@ mod tests {
             judge: Box::new(engram_llm::judge::stub::StubJudge::parse(spec).unwrap()),
             deadline: RELEVANCE_DEADLINE,
         }
+    }
+
+    /// With the cap deferred to the judge, it still holds: at most
+    /// `max_per_doc` survivors per document, the rest of the page filled from
+    /// other documents.
+    #[tokio::test]
+    async fn the_deferred_cap_still_holds_and_skips_full_documents() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let doc = Uuid::new_v4();
+        let mut results: Vec<HybridResult> = (0..4)
+            .map(|i| {
+                let mut r = result("chunk", "personal", &format!("same doc {i}"));
+                r.citations = vec![SourceCitation {
+                    document_id: Some(doc),
+                    ..citation(None, None)
+                }];
+                r
+            })
+            .collect();
+        results.push(result("chunk", "personal", "a memory of its own"));
+        let judge = stub_judge(JudgeMode::On, "0.9");
+        let report = judge.apply(&store, "anything", &mut results, 10).await;
+        let got: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(got.len(), max_per_doc() + 1, "{got:?}");
+        assert_eq!(got.last(), Some(&"a memory of its own"));
+        assert_eq!(report.judged, 5, "one batch covers the page");
     }
 
     /// A judge that never answers, like a provider stuck in retries.

@@ -59,6 +59,7 @@ pub async fn run(
         mode: RecallMode::Explore,
         graph_hops: 2,
         allow_mixed_embeddings,
+        defer_doc_cap: false,
     };
 
     // Same rule the CLI recall path applies: a cloud profile with no key is a
