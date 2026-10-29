@@ -240,3 +240,22 @@ fn the_judge_filters_before_the_top_k_cut() {
     assert_eq!(v["data"]["verdict"], "results", "{v}");
     assert_eq!(contents(&v), vec![ELIAS.to_string()], "{v}");
 }
+
+/// `bench personal --profile offline` promises no network. It resolved the
+/// judge as if online, so a configured TypeSafe key sent every query and
+/// its passages out and made the offline suite nondeterministic. The proxy
+/// points at a dead port so a regression fails fast instead of calling out.
+#[test]
+fn the_offline_benchmark_never_reaches_a_judge() {
+    let tmp = store();
+    let mut cmd = engram(tmp.path());
+    cmd.env_remove("ENGRAM_BENCH_FORCE_STUB")
+        .env("TYPESAFE_API_KEY", "ts-test-not-a-key")
+        .env("ENGRAM_JUDGE_RELEVANCE", "on")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9");
+    let v = run_json(&mut cmd, &["bench", "personal", "--profile", "offline"]);
+    assert_eq!(v["data"]["profile"], "offline", "{v}");
+    assert_eq!(v["metadata"]["relevance_judge"], "off", "{v}");
+}

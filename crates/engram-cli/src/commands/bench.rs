@@ -524,9 +524,9 @@ async fn run_personal(
     let store = SqliteStore::open_in_memory()?;
     let seeded = personal::seed_store(&store, embedder.as_ref()).await?;
     // `judge.relevance` applies here as on `recall`, so the suite measures
-    // what recall returns. The offline embedder does not imply an offline
-    // judge: the judge is what this run may be measuring.
-    let relevance_judge = crate::retrieval::RelevanceJudge::resolve(false)?;
+    // what recall returns, and like `recall --profile offline` the offline
+    // profile never reaches a networked judge (the test stub still answers).
+    let relevance_judge = crate::retrieval::RelevanceJudge::resolve(!use_cloud)?;
 
     let rrf_k: f32 = std::env::var("ENGRAM_RRF_K")
         .ok()
