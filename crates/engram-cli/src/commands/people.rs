@@ -18,8 +18,24 @@ use serde_json::{json, Value};
 
 /// Relations per person in the list view.
 const LIST_RELATIONS: usize = 5;
-/// Upper bound on facts pulled for one person in the show view.
-const SHOW_RELATIONS: usize = 200;
+/// Every fact about a person: the count, the aliases and the page agree.
+const ALL: usize = usize::MAX;
+
+/// Words that make a name an organisation's, whatever its shape.
+const ORGANISATION_WORDS: &[&str] = &[
+    "ag", "ai", "bank", "capital", "clinic", "co", "company", "corp", "corporation", "foundation",
+    "fund", "gmbh", "group", "holdings", "hospital", "inc", "institute", "lab", "labs", "llc",
+    "ltd", "partners", "pte", "studio", "studios", "technologies", "tech", "university",
+    "ventures",
+];
+
+/// Reads as a person's name: the graph crate's check, minus organisation words.
+fn person_name(name: &str) -> bool {
+    engram_graph::people::looks_like_person_name(name)
+        && !name
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| ORGANISATION_WORDS.contains(&w.to_lowercase().as_str()))
+}
 
 pub fn list(
     ctx: &AppContext,
@@ -42,13 +58,13 @@ pub fn list(
     };
     let (people, total) = ctx
         .store
-        .list_people(kb_filter, limit, offset, min_mentions, &engram_graph::people::looks_like_person_name)?;
+        .list_people(kb_filter, limit, offset, min_mentions, &person_name)?;
 
     let mut rows = Vec::with_capacity(people.len());
     for person in &people {
         let facts = ctx
             .store
-            .person_facts(&person.kb, &person.name_norm, SHOW_RELATIONS)?;
+            .person_facts(&person.kb, &person.name_norm, ALL)?;
         let edges = edges(person, &facts);
         rows.push(json!({
             "name": person.name,
@@ -133,7 +149,7 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
     let kb_filter = if kb == "*" { None } else { Some(kb.as_str()) };
     let matches = ctx
         .store
-        .resolve_person(kb_filter, &name, &engram_graph::people::looks_like_person_name)?;
+        .resolve_person(kb_filter, &name, &person_name)?;
     let Some(primary) = matches.first().cloned() else {
         let scope = if kb == "*" {
             "any kb".to_string()
@@ -149,7 +165,7 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
     for person in matches {
         let facts = ctx
             .store
-            .person_facts(&person.kb, &person.name_norm, SHOW_RELATIONS)?;
+            .person_facts(&person.kb, &person.name_norm, ALL)?;
         per_kb.push((person, facts));
     }
 

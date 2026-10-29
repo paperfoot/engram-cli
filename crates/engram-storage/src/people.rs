@@ -86,10 +86,25 @@ fn canon(f: &Fact) -> String {
     canonical_relation(&f.predicate)
 }
 
-fn subject_is_person(canon: &str) -> bool {
-    PERSON_LINKS.contains(&canon)
+/// Facts organisations have too (an email, an investment, a business
+/// partner). They make their subject or object a person only when the name
+/// reads as a person's.
+const NEEDS_A_NAME: &[&str] = &[
+    "has_email",
+    "has_phone_number",
+    "client_of",
+    "investor_in",
+    "met_at",
+    "partner_of",
+    "works_with",
+    "collaborates_with",
+];
+
+fn subject_is_person(f: &Fact, canon: &str, is_name: PersonName) -> bool {
+    (PERSON_LINKS.contains(&canon)
         || PERSON_ATTRIBUTES.contains(&canon)
-        || ALIAS_PREDICATES.contains(&canon)
+        || ALIAS_PREDICATES.contains(&canon))
+        && (!NEEDS_A_NAME.contains(&canon) || is_name(&f.subject))
 }
 
 /// Decides whether a bare value reads as a person's name. The CLI passes
@@ -98,7 +113,8 @@ fn subject_is_person(canon: &str) -> bool {
 pub type PersonName<'a> = &'a dyn Fn(&str) -> bool;
 
 fn object_is_person(f: &Fact, canon: &str, is_name: PersonName) -> bool {
-    PERSON_LINKS.contains(&canon) || (OBJECT_MAY_BE_PERSON.contains(&canon) && is_name(&f.object))
+    (PERSON_LINKS.contains(&canon) && (!NEEDS_A_NAME.contains(&canon) || is_name(&f.object)))
+        || (OBJECT_MAY_BE_PERSON.contains(&canon) && is_name(&f.object))
 }
 
 /// Does this fact belong on `norm`'s page?
@@ -141,7 +157,7 @@ impl SqliteStore {
         let mut people: BTreeMap<(String, String), String> = BTreeMap::new();
         for f in &facts {
             let c = canon(f);
-            if subject_is_person(&c) && !f.subject_norm.is_empty() {
+            if subject_is_person(f, &c, is_name) && !f.subject_norm.is_empty() {
                 people
                     .entry((f.kb.clone(), f.subject_norm.clone()))
                     .or_insert_with(|| f.subject.clone());
@@ -449,6 +465,17 @@ mod tests {
         fact(&store, m, "Alice Smith", "has_nickname", "Ace");
         fact(&store, m, "Bob Jones", "also_known_as", "Ace");
         assert!(store.resolve_person(None, "ace", &name).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_organisation_with_an_email_or_an_investment_is_not_a_person() {
+        let store = seeded();
+        let m = memory_of(&store);
+        fact(&store, m, "Acme Labs", "has_email", "support@example.com");
+        fact(&store, m, "Acme Capital", "investor_in", "Example Labs");
+        let not_org = |v: &str| name(v) && !v.contains("Acme") && !v.contains("Labs");
+        let (people, _) = store.list_people(None, 50, 0, 1, &not_org).unwrap();
+        assert!(people.iter().all(|p| !p.name.contains("Acme")), "{people:?}");
     }
 
     #[test]

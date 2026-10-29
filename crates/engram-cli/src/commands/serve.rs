@@ -1326,6 +1326,12 @@ impl Server {
                 })
             })
             .await?;
+        if !crate::engine::jobs::JOB_KINDS.contains(&job.kind.as_str()) {
+            return Err(CliError::BadInput(format!(
+                "job {id} is a `{}` job, and engram no longer runs that kind; nothing to resume",
+                job.kind
+            )));
+        }
         let llm = job
             .params
             .get("llm")

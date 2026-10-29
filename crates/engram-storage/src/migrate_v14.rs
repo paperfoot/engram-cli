@@ -105,6 +105,22 @@ pub struct RelationCopyReport {
     pub backup_path: Option<PathBuf>,
 }
 
+#[derive(Default)]
+struct SlotState {
+    open: bool,
+    latest_close: Option<DateTime<Utc>>,
+}
+
+struct Candidate {
+    rel: TypedRelation,
+    predicate: String,
+    subject_norm: String,
+    object_norm: String,
+    memory_id: Uuid,
+    diary: String,
+    valid_from: Option<DateTime<Utc>>,
+}
+
 struct TypedRelation {
     id: String,
     kb: String,
@@ -213,6 +229,8 @@ impl SqliteStore {
             .collect::<Result<_, _>>()?;
         drop(stmt);
 
+        // Phase 1: which links are person links with a live source.
+        let mut candidates: Vec<Candidate> = Vec::new();
         for rel in rows {
             debug_assert!(!UNTYPED.contains(&rel.predicate.as_str()));
             report.typed_relations += 1;
@@ -220,33 +238,65 @@ impl SqliteStore {
                 report.skipped_not_people += 1;
                 continue;
             }
-            let predicate = fact_predicate(&rel.predicate);
-            let subject_norm = rel.from.trim().to_lowercase();
-            let object_norm = rel.to.trim().to_lowercase();
             let Some((memory_id, diary, valid_from)) = self.live_source(&rel.provenance)? else {
                 report.skipped_no_live_source += 1;
                 continue;
             };
-            if self.fact_ever_recorded(&rel.kb, &diary, &predicate, &subject_norm, &object_norm)? {
+            candidates.push(Candidate {
+                predicate: fact_predicate(&rel.predicate),
+                subject_norm: rel.from.trim().to_lowercase(),
+                object_norm: rel.to.trim().to_lowercase(),
+                memory_id,
+                diary,
+                valid_from,
+                rel,
+            });
+        }
+        // Phase 2, newest source first: for a one-value relation the latest
+        // compiled value is the current one, and once it is a fact the older
+        // values meet it below and stay in `relations`.
+        candidates.sort_by(|a, b| {
+            b.valid_from
+                .cmp(&a.valid_from)
+                .then_with(|| a.rel.id.cmp(&b.rel.id))
+        });
+        for c in candidates {
+            if self.fact_ever_recorded(&c.rel.kb, &c.diary, &c.predicate, &c.subject_norm, &c.object_norm)? {
                 report.already_facts += 1;
                 continue;
             }
-            if relation_spec(&predicate).is_single_valued()
-                && (self.slot_recorded(&rel.kb, &diary, &predicate, &subject_norm)?
-                    || (symmetric(&predicate)
-                        && self.slot_recorded(&rel.kb, &diary, &predicate, &object_norm)?))
-            {
-                report.skipped_slot_recorded += 1;
-                continue;
+            if relation_spec(&c.predicate).is_single_valued() {
+                let mut ends = vec![&c.subject_norm];
+                if symmetric(&c.predicate) {
+                    ends.push(&c.object_norm);
+                }
+                let mut held = false;
+                for norm in ends {
+                    let slot = self.slot_state(&c.rel.kb, &c.diary, &c.predicate, norm)?;
+                    // An open value is current: the compiled one is not set
+                    // beside it. A closed one only blocks a link no newer
+                    // than its close.
+                    if slot.open
+                        || slot
+                            .latest_close
+                            .is_some_and(|closed| c.valid_from.map_or(true, |from| from <= closed))
+                    {
+                        held = true;
+                    }
+                }
+                if held {
+                    report.skipped_slot_recorded += 1;
+                    continue;
+                }
             }
             let fact = Fact {
                 id: Uuid::new_v4(),
-                source_memory_id: memory_id,
-                subject: rel.from.trim().to_string(),
-                subject_norm,
-                predicate,
-                object: rel.to.trim().to_string(),
-                object_norm,
+                source_memory_id: c.memory_id,
+                subject: c.rel.from.trim().to_string(),
+                subject_norm: c.subject_norm,
+                predicate: c.predicate,
+                object: c.rel.to.trim().to_string(),
+                object_norm: c.object_norm,
                 // The compiler's typed person links carried no confidence of
                 // their own; this is what compile wrote for an extracted fact
                 // that did not state one.
@@ -254,9 +304,9 @@ impl SqliteStore {
                 created_at: Utc::now(),
                 superseded_by: None,
                 superseded_at: None,
-                diary,
+                diary: c.diary,
                 fact_type: FactType::default(),
-                valid_from,
+                valid_from: c.valid_from,
                 valid_until: None,
                 resolution: None,
                 source_kind: SourceKind::CompileLlm,
@@ -264,36 +314,56 @@ impl SqliteStore {
                 closed_by: None,
                 close_reason: None,
                 close_authority: None,
-                kb: rel.kb.clone(),
+                kb: c.rel.kb.clone(),
             };
             self.insert_fact_row(&fact)?;
             report.copied.push(CopiedRelation {
-                relation_id: rel.id,
+                relation_id: c.rel.id,
                 fact_id: fact.id.to_string(),
             });
         }
         Ok(report)
     }
 
-    /// Does any fact in this KB and diary — open, closed or superseded — give
-    /// `norm` a value for this relation, from either end when it is symmetric?
-    fn slot_recorded(
+    /// What the facts in this KB and diary say about `norm`'s value for a
+    /// one-value relation, from either end when it is symmetric: whether one
+    /// is open, and when the latest closed one ended.
+    fn slot_state(
         &self,
         kb: &str,
         diary: &str,
         predicate: &str,
         norm: &str,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<SlotState, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT predicate, subject_norm = ?3 FROM facts
+            "SELECT predicate, subject_norm = ?3, valid_until IS NULL AND superseded_by IS NULL,
+                    COALESCE(valid_until, superseded_at, created_at)
+             FROM facts
              WHERE kb = ?1 AND diary = ?2 AND (subject_norm = ?3 OR object_norm = ?3)",
         )?;
-        let rows: Vec<(String, bool)> = stmt
-            .query_map(params![kb, diary, norm], |r| Ok((r.get(0)?, r.get(1)?)))?
+        let rows: Vec<(String, bool, bool, Option<String>)> = stmt
+            .query_map(params![kb, diary, norm], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
             .collect::<Result<_, _>>()?;
-        Ok(rows
-            .iter()
-            .any(|(p, as_subject)| fact_predicate(p) == predicate && (*as_subject || symmetric(predicate))))
+        let mut state = SlotState::default();
+        for (p, as_subject, open, ended) in rows {
+            if fact_predicate(&p) != predicate || !(as_subject || symmetric(predicate)) {
+                continue;
+            }
+            if open {
+                state.open = true;
+            } else {
+                let ended = ended
+                    .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
+                    .map(|t| t.with_timezone(&Utc))
+                    // A closed value with no readable date blocks everything:
+                    // unknown is not "older".
+                    .unwrap_or(DateTime::<Utc>::MAX_UTC);
+                state.latest_close = Some(state.latest_close.map_or(ended, |l: DateTime<Utc>| l.max(ended)));
+            }
+        }
+        Ok(state)
     }
 
     /// Mark compile jobs that can never finish as cancelled. Job bookkeeping,
@@ -359,6 +429,18 @@ impl SqliteStore {
         }))
     }
 
+    /// True when the journal holds this memory's whole life — its
+    /// `memory.written` event — and no `memory.revised` since.
+    fn text_never_revised(&self, memory_id: &str) -> Result<bool, StorageError> {
+        let (written, revised): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(kind = 'memory.written'), 0), COALESCE(SUM(kind = 'memory.revised'), 0)
+             FROM events WHERE subject_id = ?1",
+            params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(written > 0 && revised == 0)
+    }
+
     /// The memory behind the first cited chunk that still exists, with its
     /// diary and the time its event happened.
     fn live_source(
@@ -412,7 +494,14 @@ impl SqliteStore {
                     if let Some((id, diary, at, content)) = current {
                         let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
                         let sentence = flat(sentence);
-                        if !sentence.is_empty() && flat(&content).contains(&sentence) {
+                        // Containment alone cannot tell a repair from an edit
+                        // ("It is false that …" still contains the sentence),
+                        // so the journal must prove the text never changed:
+                        // written under the journal, never revised.
+                        if !sentence.is_empty()
+                            && flat(&content).contains(&sentence)
+                            && self.text_never_revised(&id)?
+                        {
                             row = Some((id, diary, at));
                         }
                     }
@@ -632,16 +721,87 @@ mod tests {
         assert_eq!(fact_rows(&store).len(), 1, "Carol stays the only spouse on record");
     }
 
-    #[test]
-    fn a_repaired_chunk_still_supports_the_link_when_the_sentence_is_unchanged() {
-        let store = seeded();
+    fn journal(store: &SqliteStore, kind: &str) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO events(id, ts, actor, kind, subject_id, payload)
+                 VALUES (?1, ?2, 'test', ?3, ?4, '{}')",
+                params![Uuid::new_v4().to_string(), Utc::now().to_rfc3339(), kind, MEMORY],
+            )
+            .unwrap();
+    }
+
+    fn cite_a_repaired_chunk(store: &SqliteStore) {
         store
             .conn
             .execute_batch(&format!(
                 "UPDATE relations SET provenance_json = '{{\"sources\":[{{\"chunk_id\":\"gone\",\"memory_id\":\"{MEMORY}\",\"sentence\":\"Lira introduced me to  Elias\"}}]}}' WHERE id = 'r1';"
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn a_repaired_chunk_still_supports_the_link_when_the_sentence_is_unchanged() {
+        let store = seeded();
+        cite_a_repaired_chunk(&store);
+        journal(&store, "memory.written");
         assert_eq!(copy(&store).copied.len(), 1);
+    }
+
+    #[test]
+    fn an_edited_memory_that_still_contains_the_sentence_is_not_trusted() {
+        let store = seeded();
+        cite_a_repaired_chunk(&store);
+        journal(&store, "memory.written");
+        journal(&store, "memory.revised");
+        assert_eq!(copy(&store).skipped_no_live_source, 1);
+        // Written before the journal existed: its history is unknown.
+        let store = seeded();
+        cite_a_repaired_chunk(&store);
+        assert_eq!(copy(&store).skipped_no_live_source, 1);
+    }
+
+    #[test]
+    fn a_compiled_value_newer_than_a_closed_one_is_copied() {
+        let store = seeded();
+        set_link(&store, "e1", "e2", "married_to");
+        // Closed long before the memory the link came from.
+        existing_fact(&store, "Elias", "married_to", "Carol", "default", false);
+        store
+            .conn
+            .execute_batch(&format!(
+                "UPDATE facts SET valid_until = '2001-01-01T00:00:00+00:00';
+                 UPDATE memories SET event_time = '2025-06-01T00:00:00+00:00' WHERE id = '{MEMORY}';"
+            ))
+            .unwrap();
+        assert_eq!(copy(&store).copied.len(), 1);
+    }
+
+    #[test]
+    fn of_two_compiled_spouses_the_newer_is_copied() {
+        let store = seeded();
+        let older = "7a0c2a1e-6d0b-4a55-9d1e-2b7c1f3e9a41";
+        let now = Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute_batch(&format!(
+                "UPDATE memories SET event_time = '2025-06-01T00:00:00+00:00' WHERE id = '{MEMORY}';
+                 INSERT INTO memories(id, content, created_at, event_time, importance, emotional_weight,
+                     access_count, stability, source_json, diary, tags_json, deleted, kb)
+                 VALUES ('{older}', 'Elias married Noemi.', '{now}', '2019-06-01T00:00:00+00:00', 5, 0, 0,
+                     1.0, '{{\"type\":\"user\"}}', 'default', '[]', 0, 'network');
+                 INSERT INTO chunks(id, memory_id, content, position) VALUES ('c9', '{older}', 'Elias married Noemi.', 0);
+                 INSERT INTO entities(id, kb, canonical_name, kind, mention_count) VALUES ('e4', 'network', 'Noemi', 'person', 1);
+                 UPDATE relations SET predicate = 'married_to' WHERE id = 'r1';
+                 INSERT INTO relations(id, kb, from_entity_id, to_entity_id, predicate, weight, created_at, provenance_json)
+                 VALUES ('r0', 'network', 'e1', 'e4', 'married_to', 1.0, '{now}',
+                         '{{\"sources\":[{{\"chunk_id\":\"c9\",\"memory_id\":\"{older}\"}}]}}');"
+            ))
+            .unwrap();
+        let report = copy(&store);
+        assert_eq!((report.copied.len(), report.skipped_slot_recorded), (1, 1));
+        assert_eq!(fact_rows(&store)[0].2, "Lira", "the 2025 spouse, not the 2019 one");
     }
 
     #[test]
