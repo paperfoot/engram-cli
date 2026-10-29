@@ -218,3 +218,25 @@ fn only_a_typesafe_key_turns_relevance_on_by_default() {
         "{v}"
     );
 }
+
+/// `--top-k 1` with an irrelevant first candidate and the answer second.
+/// The cut to top_k used to happen before the judge, so the one result was
+/// dropped and the recall said `no_match` with the answer in the pool.
+#[test]
+fn the_judge_filters_before_the_top_k_cut() {
+    let tmp = seeded();
+    let mut cmd = engram(tmp.path());
+    cmd.env("ENGRAM_JUDGE_RELEVANCE", "on")
+        .env("ENGRAM_JUDGE_STUB", r#"{"climbing gear": 0.9, "*": 0.01}"#);
+    let v = run_json(
+        &mut cmd,
+        &[
+            "recall",
+            "Noemi Varkoni Halden Labs Ghent climbing gear",
+            "--top-k",
+            "1",
+        ],
+    );
+    assert_eq!(v["data"]["verdict"], "results", "{v}");
+    assert_eq!(contents(&v), vec![ELIAS.to_string()], "{v}");
+}

@@ -103,9 +103,18 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         until: until_dt,
         include_expired,
     };
+    // Resolved before any paid call, so a bad `judge.relevance` is exit 2
+    // with nothing spent. `--profile offline` promises zero network.
+    let relevance_judge = RelevanceJudge::resolve(profile_enum == RetrievalProfile::Offline)?;
     let params = HybridParams {
         query: &query,
-        top_k,
+        // With the judge active, retrieve a wider pool: the misses are
+        // dropped before the cut to top_k, not after it.
+        top_k: if relevance_judge.is_some() {
+            RelevanceJudge::pool(top_k)
+        } else {
+            top_k
+        },
         rrf_k,
         rerank_top_n: rerank_candidates,
         filters,
@@ -119,9 +128,6 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     // drifted, and research and the daemon kept silently falling back to the
     // 64-dim stub long after recall stopped.
     let backends = resolve_retrieval_backends(&ctx.store, profile_enum, scope.as_deref())?;
-    // Resolved before any paid call, so a bad `judge.relevance` is exit 2
-    // with nothing spent. `--profile offline` promises zero network.
-    let relevance_judge = RelevanceJudge::resolve(profile_enum == RetrievalProfile::Offline)?;
     let outcome = hybrid_recall(
         &ctx.store,
         backends.embedder.as_ref(),
@@ -139,7 +145,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     // that answer the query rather than on the ones they displaced.
     let relevance = match &relevance_judge {
         Some(judge) => {
-            let report = judge.apply(&ctx.store, &query, &mut results).await;
+            let report = judge.apply(&ctx.store, &query, &mut results, top_k).await;
             if let Some(response) = &report.response {
                 crate::judge::record_judge_usage(
                     ctx,

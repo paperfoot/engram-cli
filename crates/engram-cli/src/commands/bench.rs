@@ -554,7 +554,11 @@ async fn run_personal(
             reranker.as_deref(),
             HybridParams {
                 query: q.text,
-                top_k,
+                top_k: if relevance_judge.is_some() {
+                    crate::retrieval::RelevanceJudge::pool(top_k)
+                } else {
+                    top_k
+                },
                 rrf_k,
                 rerank_top_n,
                 filters: Filters {
@@ -571,7 +575,9 @@ async fn run_personal(
         )
         .await?;
         if let Some(judge) = &relevance_judge {
-            judge.apply(&store, q.text, &mut results.results).await;
+            judge
+                .apply(&store, q.text, &mut results.results, top_k)
+                .await;
         }
         let latency_ms = start.elapsed().as_millis() as u64;
         let retrieved = to_items(&results.results, &seeded);

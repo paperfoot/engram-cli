@@ -821,6 +821,12 @@ pub struct RelevanceJudge {
     judge: Box<dyn Judge>,
 }
 
+/// With the judge active, recall retrieves at least this many candidates,
+/// judges them in one request, drops the misses and only then cuts to
+/// `--top-k`: cutting first turned an irrelevant top hit into `no_match`
+/// while the answer sat second. Small, so the one request stays small.
+pub const RELEVANCE_POOL: usize = 10;
+
 /// What the relevance judge did to one recall, for response metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct RelevanceReport {
@@ -880,10 +886,28 @@ impl RelevanceJudge {
         self.mode
     }
 
-    /// Judge every returned result in one request and, under `on`, drop the
-    /// ones below the floor. `results` keeps its order. `store` supplies each
-    /// memory's date.
+    /// How many candidates to retrieve for a recall of `top_k`, so the cut to
+    /// `top_k` happens after the misses are dropped (see [`RELEVANCE_POOL`]).
+    pub fn pool(top_k: usize) -> usize {
+        top_k.max(RELEVANCE_POOL)
+    }
+
+    /// Judge the pool [`Self::pool`] retrieved in one request, under `on`
+    /// drop the ones below the floor, then cut to `top_k`. `results` keeps
+    /// its order. `store` supplies each memory's date.
     pub async fn apply(
+        &self,
+        store: &SqliteStore,
+        query: &str,
+        results: &mut Vec<HybridResult>,
+        top_k: usize,
+    ) -> RelevanceReport {
+        let report = self.judge_pool(store, query, results).await;
+        results.truncate(top_k);
+        report
+    }
+
+    async fn judge_pool(
         &self,
         store: &SqliteStore,
         query: &str,
@@ -1875,7 +1899,7 @@ mod tests {
         ];
         let judge = stub_judge(JudgeMode::On, "0.02");
         let report = judge
-            .apply(&store, "Where does Noemi work?", &mut results)
+            .apply(&store, "Where does Noemi work?", &mut results, 10)
             .await;
         assert_eq!(results.len(), 1, "the short miss is dropped");
         assert_eq!(results[0].content, long, "the long passage is kept");
