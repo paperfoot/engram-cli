@@ -717,7 +717,7 @@ fn resolve_compiler_llms(options: &CompileOptions) -> Result<CompilerLlms, CliEr
         Box::new(
             OpenRouterClient::new(key)
                 .with_model(options.synthesis_model.clone())
-                // The default synthesis model (gemini-3.6-flash) is a
+                // The default synthesis model (gemini-3.8-flash) is a
                 // REASONING model: its thinking tokens bill against this
                 // completion budget before a word of the wiki page is
                 // written. 8192 was sized for a non-reasoning pro model and
