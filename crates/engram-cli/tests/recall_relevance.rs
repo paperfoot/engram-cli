@@ -259,3 +259,42 @@ fn the_offline_benchmark_never_reaches_a_judge() {
     assert_eq!(v["data"]["profile"], "offline", "{v}");
     assert_eq!(v["metadata"]["relevance_judge"], "off", "{v}");
 }
+
+/// `--top-k 10` with ten irrelevant candidates and the answer eleventh. A
+/// fixed pool of max(top_k, 10) judged the ten misses, dropped them and
+/// abstained with the answer one rank away. Recall now refills down the
+/// reranked pool until top_k survive or the pool is exhausted.
+#[test]
+fn the_judge_refills_past_a_full_page_of_misses() {
+    let tmp = store();
+    for i in 0..10 {
+        run_json(
+            &mut engram(tmp.path()),
+            &[
+                "remember",
+                &format!("Noemi Varkoni note {i}: Halden Labs in Ghent, meeting {i}."),
+                "--kb",
+                "personal",
+                "--no-extract-facts",
+            ],
+        );
+    }
+    run_json(
+        &mut engram(tmp.path()),
+        &["remember", ELIAS, "--kb", "personal", "--no-extract-facts"],
+    );
+    let mut cmd = engram(tmp.path());
+    cmd.env("ENGRAM_JUDGE_RELEVANCE", "on")
+        .env("ENGRAM_JUDGE_STUB", r#"{"climbing gear": 0.9, "*": 0.01}"#);
+    let v = run_json(
+        &mut cmd,
+        &[
+            "recall",
+            "Noemi Varkoni Halden Labs Ghent meeting",
+            "--top-k",
+            "10",
+        ],
+    );
+    assert_eq!(v["data"]["verdict"], "results", "{v}");
+    assert_eq!(contents(&v), vec![ELIAS.to_string()], "{v}");
+}

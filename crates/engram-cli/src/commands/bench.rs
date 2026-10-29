@@ -555,7 +555,7 @@ async fn run_personal(
             HybridParams {
                 query: q.text,
                 top_k: if relevance_judge.is_some() {
-                    crate::retrieval::RelevanceJudge::pool(top_k)
+                    crate::retrieval::RelevanceJudge::pool(top_k, rerank_top_n)
                 } else {
                     top_k
                 },

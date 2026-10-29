@@ -828,11 +828,12 @@ pub struct RelevanceJudge {
 /// the deadline the results are returned unjudged, as on a judge error.
 pub const RELEVANCE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);
 
-/// With the judge active, recall retrieves at least this many candidates,
-/// judges them in one request, drops the misses and only then cuts to
-/// `--top-k`: cutting first turned an irrelevant top hit into `no_match`
-/// while the answer sat second. Small, so the one request stays small.
-pub const RELEVANCE_POOL: usize = 10;
+/// Candidates per judge request. With the judge active, recall hands it the
+/// whole reranked pool and it walks down it in batches (the first covers
+/// `top_k`), dropping misses, until `top_k` survive or the pool runs out:
+/// cutting to top_k first turned a page of misses into `no_match` while the
+/// answer sat one rank further down.
+pub const RELEVANCE_BATCH: usize = 10;
 
 /// What the relevance judge did to one recall, for response metadata.
 #[derive(Debug, Clone, Serialize)]
@@ -897,32 +898,25 @@ impl RelevanceJudge {
         self.mode
     }
 
-    /// How many candidates to retrieve for a recall of `top_k`, so the cut to
-    /// `top_k` happens after the misses are dropped (see [`RELEVANCE_POOL`]).
-    pub fn pool(top_k: usize) -> usize {
-        top_k.max(RELEVANCE_POOL)
+    /// How many candidates to retrieve for a recall of `top_k`: the whole
+    /// reranked pool (`rerank_top_n`), so misses can be refilled from it.
+    pub fn pool(top_k: usize, rerank_top_n: usize) -> usize {
+        top_k.max(rerank_top_n)
     }
 
-    /// Judge the pool [`Self::pool`] retrieved in one request, under `on`
-    /// drop the ones below the floor, then cut to `top_k`. `results` keeps
-    /// its order. `store` supplies each memory's date.
+    /// Walk the reranked pool `results` in batches, one judge request each,
+    /// until `top_k` results survive (under `on`, survivors are those at or
+    /// above the floor) or the pool is exhausted, all within one overall
+    /// deadline. On an error or the deadline, the candidates not yet judged
+    /// fill the remaining slots unjudged: recall never abstains while one
+    /// remains. `results` keeps its order and ends at most `top_k` long.
+    /// `store` supplies each memory's date.
     pub async fn apply(
         &self,
         store: &SqliteStore,
         query: &str,
         results: &mut Vec<HybridResult>,
         top_k: usize,
-    ) -> RelevanceReport {
-        let report = self.judge_pool(store, query, results).await;
-        results.truncate(top_k);
-        report
-    }
-
-    async fn judge_pool(
-        &self,
-        store: &SqliteStore,
-        query: &str,
-        results: &mut Vec<HybridResult>,
     ) -> RelevanceReport {
         let mut report = RelevanceReport {
             mode: self.mode,
@@ -935,66 +929,118 @@ impl RelevanceJudge {
             error: None,
             response: None,
         };
-        // One request holds at most MAX_QUESTIONS_PER_REQUEST questions; a
-        // tail past that stays unjudged and is kept.
-        let n = results.len().min(MAX_QUESTIONS_PER_REQUEST);
-        if n == 0 {
-            return report;
+        let deadline = tokio::time::Instant::now() + self.deadline;
+        let mut pending: std::collections::VecDeque<HybridResult> = results.drain(..).collect();
+        let mut kept: Vec<HybridResult> = Vec::with_capacity(top_k);
+        let mut asked = 0usize;
+        while kept.len() < top_k && !pending.is_empty() {
+            let size = (top_k - kept.len())
+                .max(RELEVANCE_BATCH)
+                .min(MAX_QUESTIONS_PER_REQUEST)
+                .min(pending.len());
+            let mut batch: Vec<HybridResult> = pending.drain(..size).collect();
+            match self
+                .judge_batch(store, query, &mut batch, asked, deadline)
+                .await
+            {
+                Ok(response) => merge_response(&mut report.response, response),
+                Err(error) => {
+                    report.error = Some(error);
+                    // Unjudged, so kept: back in front of the rest.
+                    for r in batch.into_iter().rev() {
+                        pending.push_front(r);
+                    }
+                    break;
+                }
+            }
+            asked += size;
+            for r in batch {
+                if let Some(p) = r.relevance {
+                    report.judged += 1;
+                    report.top_relevance = Some(report.top_relevance.map_or(p, |b| b.max(p)));
+                }
+                let below = r.relevance.is_some_and(|p| p < RELEVANCE_FLOOR);
+                if self.mode == JudgeMode::On && below {
+                    if !judged_on_prefix(&r.content) {
+                        report.dropped += 1;
+                        continue;
+                    }
+                    report.kept_on_prefix += 1;
+                }
+                kept.push(r);
+            }
         }
-        let passages: Vec<RelevancePassage<'_>> = results[..n]
+        // Whatever the judge never saw fills what is left, unjudged.
+        while kept.len() < top_k {
+            match pending.pop_front() {
+                Some(r) => kept.push(r),
+                None => break,
+            }
+        }
+        kept.truncate(top_k);
+        report.abstained = kept.is_empty() && report.dropped > 0;
+        *results = kept;
+        report
+    }
+
+    /// One judge request for `batch`, its question ids offset by `asked` so
+    /// merged answers never collide. Sets each result's `relevance` (`None`
+    /// when unanswered or out of range). `Err` is the metadata note.
+    async fn judge_batch(
+        &self,
+        store: &SqliteStore,
+        query: &str,
+        batch: &mut [HybridResult],
+        asked: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<JudgeResponse, String> {
+        let passages: Vec<RelevancePassage<'_>> = batch
             .iter()
             .enumerate()
             .map(|(i, r)| RelevancePassage {
-                id: format!("r{i}"),
+                id: format!("r{}", asked + i),
                 text: r.content.as_str(),
                 date: memory_date(store, r.provenance.memory_id),
             })
             .collect();
         let request = relevance_request(query, &passages);
-        let asked = ask_batched(self.judge.as_ref(), &request);
-        let response = match tokio::time::timeout(self.deadline, asked).await {
+        let call = ask_batched(self.judge.as_ref(), &request);
+        let response = match tokio::time::timeout_at(deadline, call).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!("relevance judge failed; results returned unjudged: {e}");
-                report.error = Some(format!("relevance judge failed; results are unjudged: {e}"));
-                return report;
+                return Err(format!("relevance judge failed; results are unjudged: {e}"));
             }
             Err(_) => {
                 let ms = self.deadline.as_millis();
                 tracing::warn!("relevance judge took over {ms} ms; results returned unjudged");
-                report.error = Some(format!(
+                return Err(format!(
                     "relevance judge took over {ms} ms; results are unjudged"
                 ));
-                return report;
             }
         };
-        for (i, r) in results[..n].iter_mut().enumerate() {
+        for (i, r) in batch.iter_mut().enumerate() {
             // A probability outside [0, 1] is a provider fault, not a verdict.
             r.relevance = response
-                .noul(&format!("r{i}"))
+                .noul(&format!("r{}", asked + i))
                 .ok()
                 .filter(|p| (0.0..=1.0).contains(p));
         }
-        report.response = Some(response);
-        report.judged = results.iter().filter(|r| r.relevance.is_some()).count();
-        report.top_relevance = results
-            .iter()
-            .filter_map(|r| r.relevance)
-            .fold(None, |best: Option<f32>, p| {
-                Some(best.map_or(p, |b| b.max(p)))
-            });
-        if self.mode == JudgeMode::On {
-            let before = results.len();
-            let below = |r: &HybridResult| r.relevance.is_some_and(|p| p < RELEVANCE_FLOOR);
-            report.kept_on_prefix = results
-                .iter()
-                .filter(|r| below(r) && judged_on_prefix(&r.content))
-                .count();
-            results.retain(|r| !below(r) || judged_on_prefix(&r.content));
-            report.dropped = before - results.len();
-            report.abstained = results.is_empty();
+        Ok(response)
+    }
+}
+
+/// Fold one batch's response into the recall's, for the usage ledger.
+fn merge_response(total: &mut Option<JudgeResponse>, next: JudgeResponse) {
+    match total {
+        None => *total = Some(next),
+        Some(t) => {
+            t.answers.extend(next.answers);
+            t.input_tokens += next.input_tokens;
+            t.cost_usd += next.cost_usd;
+            t.latency_ms += next.latency_ms;
+            t.requests += next.requests;
         }
-        report
     }
 }
 
@@ -1936,6 +1982,73 @@ mod tests {
                 unreachable!("the deadline fires first")
             })
         }
+    }
+
+    /// Answers its first request (every passage a miss), then hangs.
+    struct MissThenHang(std::sync::atomic::AtomicUsize);
+
+    impl Judge for MissThenHang {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn model_id(&self) -> &str {
+            "miss-then-hang"
+        }
+
+        fn ask<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            request: &'life1 engram_llm::judge::JudgeRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<JudgeResponse, engram_llm::judge::JudgeError>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            let first = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let miss = engram_llm::judge::stub::StubJudge::parse("0.01").unwrap();
+            Box::pin(async move {
+                if first {
+                    return miss.ask(request).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                unreachable!("the deadline fires first")
+            })
+        }
+    }
+
+    /// The deadline hits after a page of misses: what the judge never saw
+    /// fills the page unjudged. Recall never abstains while one remains.
+    #[tokio::test]
+    async fn past_the_deadline_the_unjudged_rest_fills_the_page() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut results: Vec<HybridResult> = (0..25)
+            .map(|i| result("chunk", "personal", &format!("passage {i}")))
+            .collect();
+        let judge = RelevanceJudge {
+            mode: JudgeMode::On,
+            judge: Box::new(MissThenHang(Default::default())),
+            deadline: std::time::Duration::from_millis(50),
+        };
+        let report = judge.apply(&store, "anything", &mut results, 10).await;
+        assert_eq!(report.judged, 10);
+        assert_eq!(report.dropped, 10);
+        assert!(!report.abstained);
+        assert!(report.error.is_some());
+        let got: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+        let want: Vec<String> = (10..20).map(|i| format!("passage {i}")).collect();
+        assert_eq!(got, want);
+        assert!(
+            results.iter().all(|r| r.relevance.is_none()),
+            "marked unjudged"
+        );
     }
 
     /// An outage held already-retrieved results for the client's whole retry

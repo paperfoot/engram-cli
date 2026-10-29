@@ -111,7 +111,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         // With the judge active, retrieve a wider pool: the misses are
         // dropped before the cut to top_k, not after it.
         top_k: if relevance_judge.is_some() {
-            RelevanceJudge::pool(top_k)
+            RelevanceJudge::pool(top_k, rerank_candidates)
         } else {
             top_k
         },
