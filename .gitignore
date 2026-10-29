@@ -30,3 +30,7 @@ data/litqa2/
 data/beir/
 benchmarks/litqa2-*.json
 benchmarks/beir-*.json
+
+# Local experiment-loop config and notes
+autoresearch.toml
+program.md

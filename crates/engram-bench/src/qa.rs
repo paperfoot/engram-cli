@@ -5,9 +5,9 @@
 //!   2. A judge LLM that decides whether the answer matches the gold reference.
 //!   3. Optional RAGAS metrics (faithfulness / relevance / precision / recall).
 //!
-//! This is the benchmark that addresses the "17% correct" critique: MemPalace's
-//! published R@5=0.984 was retrieval-only; this track measures whether the LLM
-//! actually answers correctly using the retrieved context.
+//! Retrieval recall alone does not show that an agent answers correctly; this
+//! track measures whether the LLM actually answers correctly using the
+//! retrieved context.
 
 use crate::error::BenchError;
 use crate::judge::{

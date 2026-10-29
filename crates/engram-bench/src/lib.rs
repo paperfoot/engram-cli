@@ -1,7 +1,8 @@
 //! Benchmark harness.
 //!
 //! Primary target: LongMemEval (https://github.com/xiaowu0162/LongMemEval).
-//! Same benchmark MemPalace uses, so numbers are directly comparable.
+//! The standard public benchmark for agent memory, so numbers compare with
+//! published results.
 
 pub mod beir;
 pub mod biogen;

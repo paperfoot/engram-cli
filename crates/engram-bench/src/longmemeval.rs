@@ -85,7 +85,7 @@ pub fn default_oracle_path() -> PathBuf {
 }
 
 /// Default disk path for the S split (~48 sessions per question, real
-/// retrieval benchmark — this is what MemPalace's published numbers use).
+/// retrieval benchmark — the split most published results use).
 pub fn default_s_path() -> PathBuf {
     PathBuf::from("data/longmemeval/raw/s.json")
 }
