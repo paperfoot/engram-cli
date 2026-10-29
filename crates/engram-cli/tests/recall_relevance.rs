@@ -175,3 +175,46 @@ fn the_judge_sees_the_memory_date() {
     assert_eq!(v["data"]["verdict"], "results", "{v}");
     assert_eq!(v["data"]["results"][0]["relevance"].as_f64(), Some(0.9));
 }
+
+/// An OpenRouter key was set for extraction; it is not consent to send
+/// recalled passages to TypeSafe. Only a TypeSafe key turns the default on,
+/// and `config show` says which default applies.
+#[test]
+fn only_a_typesafe_key_turns_relevance_on_by_default() {
+    let tmp = store();
+    let show = |env: (&str, &str)| {
+        let mut cmd = engram(tmp.path());
+        cmd.env(env.0, env.1);
+        run_json(&mut cmd, &["config", "show"])
+    };
+    let v = show(("OPENROUTER_API_KEY", "sk-or-test"));
+    let j = &v["data"]["judge"];
+    assert_eq!(j["relevance"], "off", "{v}");
+    assert!(
+        j["relevance_source"]
+            .as_str()
+            .unwrap()
+            .starts_with("default off"),
+        "{v}"
+    );
+    let v = show(("TYPESAFE_API_KEY", "ts-test"));
+    let j = &v["data"]["judge"];
+    assert_eq!(j["relevance"], "on", "{v}");
+    assert!(
+        j["relevance_source"]
+            .as_str()
+            .unwrap()
+            .starts_with("default on"),
+        "{v}"
+    );
+    // An explicit setting opts in through the OpenRouter route.
+    let mut cmd = engram(tmp.path());
+    cmd.env("OPENROUTER_API_KEY", "sk-or-test")
+        .env("ENGRAM_JUDGE_RELEVANCE", "shadow");
+    let v = run_json(&mut cmd, &["config", "show"]);
+    assert_eq!(v["data"]["judge"]["relevance"], "shadow", "{v}");
+    assert_eq!(
+        v["data"]["judge"]["relevance_source"], "set by ENGRAM_JUDGE_RELEVANCE",
+        "{v}"
+    );
+}

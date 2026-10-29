@@ -18,8 +18,11 @@
 //! A judge request carries a memory to a third party, and engram stores
 //! personal and medical memories, so every site defaults to `off` except
 //! `relevance`: without it recall cannot say "nothing stored answers this".
-//! It sends only the passages a recall returns, and only when a TypeSafe or
-//! OpenRouter key is set; `engram config set judge.relevance off` stops it.
+//! Its default is `on` only when a TypeSafe key is configured
+//! (`TYPESAFE_API_KEY` / `keys.typesafe`): configuring TypeSafe is opting
+//! into TypeSafe. An OpenRouter key alone was set for another purpose and is
+//! not consent, so with only that key the site stays `off` until
+//! `judge.relevance` is set explicitly. See [`relevance_default`].
 
 use crate::commands::config;
 use crate::context::AppContext;
@@ -121,12 +124,13 @@ impl JudgeSite {
         matches!(self, JudgeSite::Grounding | JudgeSite::Relevance)
     }
 
-    /// The mode when neither env nor config sets one. Relevance is on: its
-    /// eval cleared the bar (see `questions::RELEVANCE_FLOOR`), and without
-    /// it recall cannot abstain at all.
-    pub fn default_mode(self) -> JudgeMode {
+    /// The mode when neither env nor config sets one. `consented`: the user
+    /// configured TypeSafe itself (see [`typesafe_consented`]). Relevance is
+    /// then on: its eval cleared the bar (see `questions::RELEVANCE_FLOOR`),
+    /// and without it recall cannot abstain at all. Every other site is off.
+    pub fn default_mode(self, consented: bool) -> JudgeMode {
         match self {
-            JudgeSite::Relevance => JudgeMode::On,
+            JudgeSite::Relevance if consented => JudgeMode::On,
             _ => JudgeMode::Off,
         }
     }
@@ -145,16 +149,54 @@ impl JudgeSite {
 /// The mode for `site`: env, then config.toml, then the site's default.
 pub fn judge_mode(site: JudgeSite) -> Result<JudgeMode, CliError> {
     let env = std::env::var(site.env_var()).ok();
-    mode_from(site, env.as_deref(), || {
-        config::config_value(site.config_key())
-    })
+    mode_from(
+        site,
+        env.as_deref(),
+        || config::config_value(site.config_key()),
+        typesafe_consented,
+    )
+}
+
+/// Whether the user opted into TypeSafe judging by configuring TypeSafe: a
+/// TypeSafe key (`TYPESAFE_API_KEY` / `keys.typesafe`) resolves, or the
+/// offline test stub stands in for the judge (nothing leaves the machine).
+/// An OpenRouter key is not consent: it was set for extraction.
+pub fn typesafe_consented() -> bool {
+    std::env::var(STUB_ENV).is_ok_and(|s| !s.trim().is_empty())
+        || config::resolve_secret("TYPESAFE_API_KEY", "keys.typesafe").is_some()
+}
+
+/// Why `judge.relevance` has the mode it has, for `config check` and
+/// `doctor`: set by env, set in config, or which default applies.
+pub fn relevance_default() -> String {
+    let site = JudgeSite::Relevance;
+    if std::env::var(site.env_var()).is_ok_and(|v| !v.trim().is_empty()) {
+        return format!("set by {}", site.env_var());
+    }
+    if matches!(config::config_value(site.config_key()), Ok(Some(toml::Value::String(s))) if !s.trim().is_empty())
+    {
+        return format!("set by {} in config.toml", site.config_key());
+    }
+    relevance_default_why(typesafe_consented())
+}
+
+fn relevance_default_why(consented: bool) -> String {
+    if consented {
+        "default on: a TypeSafe key is configured, which opts into TypeSafe judging;          `engram config set judge.relevance off` stops it"
+            .into()
+    } else {
+        "default off: no TypeSafe key is configured, and an OpenRouter key alone is not          consent to send recalled passages to TypeSafe; `engram config set judge.relevance on`          opts in through either key"
+            .into()
+    }
 }
 
 /// Pure core of [`judge_mode`], testable without process-global env.
+/// `consented` is asked only when the site's default is needed.
 fn mode_from(
     site: JudgeSite,
     env: Option<&str>,
     file: impl FnOnce() -> Result<Option<toml::Value>, CliError>,
+    consented: impl FnOnce() -> bool,
 ) -> Result<JudgeMode, CliError> {
     let invalid = |setting: String| {
         CliError::Config(format!(
@@ -165,8 +207,8 @@ fn mode_from(
         return JudgeMode::parse(v).ok_or_else(|| invalid(format!("{}={v:?}", site.env_var())));
     }
     match file()? {
-        None => Ok(site.default_mode()),
-        Some(toml::Value::String(s)) if s.trim().is_empty() => Ok(site.default_mode()),
+        None => Ok(site.default_mode(consented())),
+        Some(toml::Value::String(s)) if s.trim().is_empty() => Ok(site.default_mode(consented())),
         Some(toml::Value::String(s)) => {
             JudgeMode::parse(&s).ok_or_else(|| invalid(format!("{} = {s:?}", site.config_key())))
         }
@@ -322,6 +364,9 @@ pub struct JudgeStatus {
     pub adjudicate: Option<JudgeMode>,
     pub dedupe: Option<JudgeMode>,
     pub relevance: Option<JudgeMode>,
+    /// Why `relevance` has its mode: set by env, set in config, or which
+    /// default applies (on only when a TypeSafe key is configured).
+    pub relevance_source: String,
     /// The route a networked command would take (see [`route_name`]);
     /// `null` when `ENGRAM_JUDGE_STUB` is malformed (see `errors`).
     pub route: Option<&'static str>,
@@ -354,6 +399,7 @@ pub fn status() -> JudgeStatus {
         adjudicate: modes[1],
         dedupe: modes[2],
         relevance: modes[3],
+        relevance_source: relevance_default(),
         route,
         warnings: warnings_for(&modes, route),
         errors,
@@ -407,6 +453,50 @@ mod tests {
         Ok(None)
     }
 
+    /// [`mode_from`] with a TypeSafe key configured.
+    fn mode_ts(
+        site: JudgeSite,
+        env: Option<&str>,
+        file: impl FnOnce() -> Result<Option<toml::Value>, CliError>,
+    ) -> Result<JudgeMode, CliError> {
+        mode_from(site, env, file, || true)
+    }
+
+    #[test]
+    fn relevance_defaults_on_only_when_typesafe_itself_is_configured() {
+        let site = JudgeSite::Relevance;
+        // Only an OpenRouter key (set for extraction): no consent, off.
+        assert_eq!(
+            mode_from(site, None, no_file, || false).unwrap(),
+            JudgeMode::Off
+        );
+        assert_eq!(
+            mode_from(site, Some(" "), no_file, || false).unwrap(),
+            JudgeMode::Off
+        );
+        // A TypeSafe key is consent: on.
+        assert_eq!(
+            mode_from(site, None, no_file, || true).unwrap(),
+            JudgeMode::On
+        );
+        // An explicit setting works through either route.
+        for m in ["on", "shadow"] {
+            let want = JudgeMode::parse(m).unwrap();
+            assert_eq!(mode_from(site, Some(m), no_file, || false).unwrap(), want);
+            assert_eq!(
+                mode_from(site, None, file(toml::Value::String(m.into())), || false).unwrap(),
+                want
+            );
+        }
+        // Consent is only asked when the default is needed.
+        assert_eq!(
+            mode_from(site, Some("on"), no_file, || panic!("asked")).unwrap(),
+            JudgeMode::On
+        );
+        assert!(relevance_default_why(false).starts_with("default off"));
+        assert!(relevance_default_why(true).starts_with("default on"));
+    }
+
     fn file(v: toml::Value) -> impl FnOnce() -> Result<Option<toml::Value>, CliError> {
         move || Ok(Some(v))
     }
@@ -435,19 +525,16 @@ mod tests {
     fn env_beats_config_and_unset_is_off() {
         let site = JudgeSite::Grounding;
         let shadow = || file(toml::Value::String("shadow".into()));
-        assert_eq!(
-            mode_from(site, Some("on"), shadow()).unwrap(),
-            JudgeMode::On
-        );
-        assert_eq!(mode_from(site, None, shadow()).unwrap(), JudgeMode::Shadow);
+        assert_eq!(mode_ts(site, Some("on"), shadow()).unwrap(), JudgeMode::On);
+        assert_eq!(mode_ts(site, None, shadow()).unwrap(), JudgeMode::Shadow);
         // Blank env means unset, as for every engram setting.
         assert_eq!(
-            mode_from(site, Some("  "), shadow()).unwrap(),
+            mode_ts(site, Some("  "), shadow()).unwrap(),
             JudgeMode::Shadow
         );
-        assert_eq!(mode_from(site, None, no_file).unwrap(), JudgeMode::Off);
+        assert_eq!(mode_ts(site, None, no_file).unwrap(), JudgeMode::Off);
         assert_eq!(
-            mode_from(site, None, file(toml::Value::String(String::new()))).unwrap(),
+            mode_ts(site, None, file(toml::Value::String(String::new()))).unwrap(),
             JudgeMode::Off
         );
     }
@@ -455,19 +542,19 @@ mod tests {
     #[test]
     fn relevance_alone_defaults_on_and_off_still_turns_it_off() {
         assert_eq!(
-            mode_from(JudgeSite::Relevance, None, no_file).unwrap(),
+            mode_ts(JudgeSite::Relevance, None, no_file).unwrap(),
             JudgeMode::On
         );
         assert_eq!(
-            mode_from(JudgeSite::Relevance, Some(" "), no_file).unwrap(),
+            mode_ts(JudgeSite::Relevance, Some(" "), no_file).unwrap(),
             JudgeMode::On
         );
         assert_eq!(
-            mode_from(JudgeSite::Relevance, Some("off"), no_file).unwrap(),
+            mode_ts(JudgeSite::Relevance, Some("off"), no_file).unwrap(),
             JudgeMode::Off
         );
         assert_eq!(
-            mode_from(
+            mode_ts(
                 JudgeSite::Relevance,
                 None,
                 file(toml::Value::String("off".into()))
@@ -480,17 +567,17 @@ mod tests {
             JudgeSite::Adjudicate,
             JudgeSite::Dedupe,
         ] {
-            assert_eq!(mode_from(site, None, no_file).unwrap(), JudgeMode::Off);
+            assert_eq!(mode_ts(site, None, no_file).unwrap(), JudgeMode::Off);
         }
     }
 
     #[test]
     fn an_unknown_value_is_a_config_error_naming_the_setting() {
-        let err = mode_from(JudgeSite::Dedupe, Some("true"), no_file).unwrap_err();
+        let err = mode_ts(JudgeSite::Dedupe, Some("true"), no_file).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("ENGRAM_JUDGE_DEDUPE"), "{err}");
 
-        let err = mode_from(
+        let err = mode_ts(
             JudgeSite::Adjudicate,
             None,
             file(toml::Value::String("maybe".into())),
@@ -501,11 +588,11 @@ mod tests {
 
         // A TOML boolean is not a mode either.
         let err =
-            mode_from(JudgeSite::Grounding, None, file(toml::Value::Boolean(true))).unwrap_err();
+            mode_ts(JudgeSite::Grounding, None, file(toml::Value::Boolean(true))).unwrap_err();
         assert!(matches!(err, CliError::Config(_)));
 
         // An unreadable config file is not "off".
-        let err = mode_from(JudgeSite::Grounding, None, || {
+        let err = mode_ts(JudgeSite::Grounding, None, || {
             Err(CliError::Config("invalid TOML".into()))
         })
         .unwrap_err();
@@ -593,7 +680,7 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let site = JudgeSite::Grounding;
-        let env = mode_from(site, Some("true"), no_file).unwrap_err();
+        let env = mode_ts(site, Some("true"), no_file).unwrap_err();
         let env = inner(env);
         let s = config_error_suggestion(&env).unwrap();
         assert!(
@@ -601,7 +688,7 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("`engram config set judge.grounding off`"), "{s}");
-        let file = mode_from(
+        let file = mode_ts(
             JudgeSite::Dedupe,
             None,
             file(toml::Value::String("yes".into())),

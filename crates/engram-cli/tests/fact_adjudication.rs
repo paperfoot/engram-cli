@@ -252,7 +252,10 @@ fn a_safety_pair_is_never_sent_to_the_judge() {
             &med("metformin 1000 mg"),
             &spec,
         );
-        assert_eq!(v["data"]["facts_added"], 1, "the caller's dose is kept: {v}");
+        assert_eq!(
+            v["data"]["facts_added"], 1,
+            "the caller's dose is kept: {v}"
+        );
         assert_eq!(v["data"]["facts_deduped"], 0, "{v}");
         assert_eq!(queued(&v).len(), 1, "{v}");
         assert_eq!(queued(&v)[0]["suggested_action"], "requires_context");
