@@ -6,7 +6,7 @@ The full reference: install, keys, agent skills, the memory loop, domain knowled
 
 ```bash
 brew install paperfoot/tap/engram        # macOS / Linux
-cargo install paperfoot-engram --locked  # anywhere with Rust 1.80+
+cargo install paperfoot-engram --locked  # anywhere with Rust 1.88+
 ```
 
 One binary. No runtime, no Python, no Docker, no services. From a checkout: `cargo install --path crates/engram-cli --locked`.

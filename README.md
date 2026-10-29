@@ -45,7 +45,7 @@ engram state "Dad"          # what is true now: open facts, grouped, with source
 ```bash
 brew install paperfoot/tap/engram         # macOS / Linux
 # or
-cargo install paperfoot-engram --locked   # anywhere with Rust 1.80+
+cargo install paperfoot-engram --locked   # anywhere with Rust 1.88+
 
 engram config set keys.gemini $GEMINI_API_KEY   # embeddings (free tier works)
 engram skill install                            # teaches Claude Code, Codex and Gemini CLI to use it
