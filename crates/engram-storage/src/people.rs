@@ -285,7 +285,11 @@ mod tests {
         let store = seeded();
         let found = store.resolve_person(None, "elias").unwrap();
         assert_eq!(found[0].name, "Elias");
-        let memory = Uuid::new_v4();
+        let memory: Uuid = store
+            .conn
+            .query_row("SELECT id FROM memories LIMIT 1", [], |r| r.get::<_, String>(0))
+            .map(|id| Uuid::parse_str(&id).unwrap())
+            .unwrap();
         fact(&store, memory, "Lira Kostova", "works_at", "Example Labs");
         fact(&store, memory, "Lira Marenova", "works_at", "Example Labs");
         // "Lira" alone is a person here, so the exact match wins.
