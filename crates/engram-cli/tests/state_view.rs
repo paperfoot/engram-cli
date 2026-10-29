@@ -710,7 +710,7 @@ fn an_extracted_safety_fact_under_another_spelling_is_still_a_safety_fact() {
             "ENGRAM_FACT_LLM_STUB",
             r#"{"*":[
                 {"subject":"Rosalie Brandtke-Wendel","predicate":"is_allergic_to","object":"penicillin"},
-                {"subject":"Rosalie Brandtke-Wendel","predicate":"takes","object":"ramipril"},
+                {"subject":"Rosalie Brandtke-Wendel","predicate":"on_medication","object":"ramipril"},
                 {"subject":"Rosalie Brandtke-Wendel","predicate":"has_condition","object":"hypertension"}]}"#,
         )
         .args([
@@ -772,13 +772,13 @@ fn a_dose_change_under_another_spelling_is_still_a_safety_question() {
         dir.path(),
         "personal",
         "Elias takes metformin 500 mg daily.",
-        r#"[{"subject":"Elias","predicate":"takes","object":"metformin 500 mg daily"}]"#,
+        r#"[{"subject":"Elias","predicate":"on_medication","object":"metformin 500 mg daily"}]"#,
     );
     remember_facts(
         dir.path(),
         "personal",
         "Elias's metformin went up to 1000 mg daily.",
-        r#"[{"subject":"Elias","predicate":"takes","object":"metformin 1000 mg daily"}]"#,
+        r#"[{"subject":"Elias","predicate":"on_medication","object":"metformin 1000 mg daily"}]"#,
     );
     let v = state(dir.path(), "Elias", &["--relation", "takes_medication"]);
     let questions = v["data"]["open_questions"].as_array().cloned().unwrap();

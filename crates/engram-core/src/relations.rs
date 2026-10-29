@@ -197,9 +197,6 @@ pub fn canonical_relation(raw: &str) -> String {
         | "is_prescribed"
         | "was_prescribed"
         | "prescribed_medication"
-        | "takes"
-        | "taking"
-        | "is_taking"
         | "takes_medicine"
         | "takes_medications" => "takes_medication",
         "diagnosis"
@@ -544,9 +541,9 @@ mod tests {
             ("allergy", "allergic_to"),
             ("allergic", "allergic_to"),
             ("has_allergies", "allergic_to"),
-            ("takes", "takes_medication"),
+            ("takes_medicine", "takes_medication"),
             ("on_medication", "takes_medication"),
-            ("is-taking", "takes_medication"),
+            ("is-on-medication", "takes_medication"),
             ("prescribed", "takes_medication"),
             ("diagnosis", "diagnosed_with"),
             ("has_condition", "diagnosed_with"),
@@ -559,6 +556,11 @@ mod tests {
             let canonical = canonical_relation(raw);
             assert_eq!(canonical, want, "{raw}");
             assert!(is_safety_slot(&canonical), "{raw} must be gated");
+        }
+        // Bare verbs stay generic: "takes piano lessons" is not a medication.
+        for verb in ["takes", "taking", "is_taking"] {
+            assert_eq!(canonical_relation(verb), verb);
+            assert!(!is_safety_slot(verb), "{verb} must not be gated");
         }
         // Cessation phrasings still name the END of an interval, not a
         // relation: aliasing must not swallow them.
