@@ -179,16 +179,40 @@ pub fn canonical_relation(raw: &str) -> String {
         // spelled any other way skips every one of them and `state --relation
         // allergic_to` reports no allergy. Over-mapping costs a misfiled
         // non-medical fact; under-mapping costs an unguarded allergy.
-        "allergy" | "has_allergy" | "allergic" | "is_allergic_to" | "allergies"
-        | "has_allergies" | "allergy_to" | "has_allergy_to" | "allergic_reaction_to" => {
-            "allergic_to"
-        }
-        "medication" | "medications" | "on_medication" | "is_on_medication" | "takes_drug"
-        | "prescribed" | "is_prescribed" | "was_prescribed" | "prescribed_medication" | "takes"
-        | "taking" | "is_taking" | "takes_medicine" | "takes_medications" => "takes_medication",
-        "diagnosis" | "has_diagnosis" | "diagnosed" | "is_diagnosed_with" | "was_diagnosed_with"
-        | "has_condition" | "condition" | "medical_condition" | "has_medical_condition"
-        | "suffers_from" | "has_disease" => "diagnosed_with",
+        "allergy"
+        | "has_allergy"
+        | "allergic"
+        | "is_allergic_to"
+        | "allergies"
+        | "has_allergies"
+        | "allergy_to"
+        | "has_allergy_to"
+        | "allergic_reaction_to" => "allergic_to",
+        "medication"
+        | "medications"
+        | "on_medication"
+        | "is_on_medication"
+        | "takes_drug"
+        | "prescribed"
+        | "is_prescribed"
+        | "was_prescribed"
+        | "prescribed_medication"
+        | "takes"
+        | "taking"
+        | "is_taking"
+        | "takes_medicine"
+        | "takes_medications" => "takes_medication",
+        "diagnosis"
+        | "has_diagnosis"
+        | "diagnosed"
+        | "is_diagnosed_with"
+        | "was_diagnosed_with"
+        | "has_condition"
+        | "condition"
+        | "medical_condition"
+        | "has_medical_condition"
+        | "suffers_from"
+        | "has_disease" => "diagnosed_with",
         "has_blood_type" | "bloodtype" | "blood_group" | "has_blood_group" => "blood_type",
         "favorite_language" | "preferred_language" | "codes_in" => "prefers_language",
         _ => return p,
