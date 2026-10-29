@@ -840,6 +840,11 @@ pub const RELEVANCE_DEADLINE: std::time::Duration = std::time::Duration::from_mi
 /// answer sat one rank further down.
 pub const RELEVANCE_BATCH: usize = 10;
 
+/// The most candidates one recall asks the judge about (or `top_k`, when
+/// larger). Bounds the walk whatever `--rerank-top-n` says: past it, the
+/// remaining slots fill unjudged.
+pub const RELEVANCE_MAX_POOL: usize = 200;
+
 /// What the relevance judge did to one recall, for response metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct RelevanceReport {
@@ -901,21 +906,25 @@ impl RelevanceJudge {
         self.mode
     }
 
-    /// How many candidates to retrieve for a recall of `top_k`: the whole
-    /// reranked pool (`rerank_top_n`), so misses can be refilled from it.
+    /// How many candidates to retrieve for a recall of `top_k`: the reranked
+    /// pool (`rerank_top_n`) up to [`RELEVANCE_MAX_POOL`], so misses can be
+    /// refilled from it.
     pub fn pool(top_k: usize, rerank_top_n: usize) -> usize {
-        top_k.max(rerank_top_n)
+        top_k.max(rerank_top_n.min(RELEVANCE_MAX_POOL))
     }
 
     /// Walk the reranked pool `results` in batches, one judge request each,
     /// until `top_k` results survive (under `on`, survivors are those at or
-    /// above the floor) or the pool is exhausted, all within one overall
-    /// deadline. The pool arrives uncapped (`HybridParams::defer_doc_cap`):
-    /// the per-document cap applies here, to survivors only, and a candidate
-    /// whose document is already full is skipped unjudged. On an error or the deadline, the candidates not yet judged
-    /// fill the remaining slots unjudged: recall never abstains while one
-    /// remains. `results` keeps its order and ends at most `top_k` long.
-    /// `store` supplies each memory's date.
+    /// above the floor), the pool is exhausted, `max(top_k,
+    /// RELEVANCE_MAX_POOL)` candidates have been judged, or the deadline
+    /// passes (checked before every batch: a judge that answers instantly
+    /// cannot outrun it). The pool arrives uncapped
+    /// (`HybridParams::defer_doc_cap`): the per-document cap applies here, to
+    /// survivors only, and a candidate whose document is already full is
+    /// skipped unjudged. Whatever stops the walk early, candidates not yet
+    /// judged fill the remaining slots unjudged: recall never abstains while
+    /// one remains. One pass over the pool. `results` keeps its order and
+    /// ends at most `top_k` long. `store` supplies each memory's date.
     pub async fn apply(
         &self,
         store: &SqliteStore,
@@ -935,36 +944,34 @@ impl RelevanceJudge {
             response: None,
         };
         let deadline = tokio::time::Instant::now() + self.deadline;
-        let mut pending: std::collections::VecDeque<HybridResult> = results.drain(..).collect();
-        let mut kept: Vec<HybridResult> = Vec::with_capacity(top_k);
+        let limit = top_k.max(RELEVANCE_MAX_POOL);
         let cap = max_per_doc();
         let mut per_doc: HashMap<Uuid, usize> = HashMap::new();
-        // Counts `r` against its document's quota; false when it is full.
-        let admit = |r: &HybridResult, per_doc: &mut HashMap<Uuid, usize>| match doc_of(r) {
-            Some(doc) => {
-                let seen = per_doc.entry(doc).or_insert(0);
-                *seen < cap && {
-                    *seen += 1;
-                    true
-                }
-            }
-            None => true,
-        };
         let full = |r: &HybridResult, per_doc: &HashMap<Uuid, usize>| {
             doc_of(r).is_some_and(|d| per_doc.get(&d).is_some_and(|&n| n >= cap))
         };
+        let mut pool = std::mem::take(results).into_iter();
+        let mut kept: Vec<HybridResult> = Vec::with_capacity(top_k);
+        // A batch the judge could not answer: unjudged, first in line.
+        let mut unanswered: Vec<HybridResult> = Vec::new();
         let mut asked = 0usize;
-        loop {
-            // Never pay to judge a passage its document has no room for.
-            pending.retain(|r| !full(r, &per_doc));
-            if kept.len() >= top_k || pending.is_empty() {
+        while kept.len() < top_k && asked < limit {
+            if tokio::time::Instant::now() >= deadline {
+                report.error = Some(self.late());
                 break;
             }
             let size = (top_k - kept.len())
-                .max(RELEVANCE_BATCH)
-                .min(MAX_QUESTIONS_PER_REQUEST)
-                .min(pending.len());
-            let mut batch: Vec<HybridResult> = pending.drain(..size).collect();
+                .clamp(RELEVANCE_BATCH, MAX_QUESTIONS_PER_REQUEST)
+                .min(limit - asked);
+            // Never pay to judge a passage its document has no room for.
+            let mut batch: Vec<HybridResult> = pool
+                .by_ref()
+                .filter(|r| !full(r, &per_doc))
+                .take(size)
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
             match self
                 .judge_batch(store, query, &mut batch, asked, deadline)
                 .await
@@ -972,14 +979,11 @@ impl RelevanceJudge {
                 Ok(response) => merge_response(&mut report.response, response),
                 Err(error) => {
                     report.error = Some(error);
-                    // Unjudged, so kept: back in front of the rest.
-                    for r in batch.into_iter().rev() {
-                        pending.push_front(r);
-                    }
+                    unanswered = batch;
                     break;
                 }
             }
-            asked += size;
+            asked += batch.len();
             for r in batch {
                 if let Some(p) = r.relevance {
                     report.judged += 1;
@@ -993,23 +997,30 @@ impl RelevanceJudge {
                     }
                     report.kept_on_prefix += 1;
                 }
-                if admit(&r, &mut per_doc) {
+                if admit(&r, cap, &mut per_doc) {
                     kept.push(r);
                 }
             }
         }
-        // Whatever the judge never saw fills what is left, unjudged.
-        while kept.len() < top_k {
-            match pending.pop_front() {
-                Some(r) if admit(&r, &mut per_doc) => kept.push(r),
-                Some(_) => {}
-                None => break,
+        // Whatever the judge never saw fills what is left, unjudged; the
+        // scan stops as soon as the page is full.
+        for r in unanswered.into_iter().chain(pool) {
+            if kept.len() >= top_k {
+                break;
+            }
+            if admit(&r, cap, &mut per_doc) {
+                kept.push(r);
             }
         }
-        kept.truncate(top_k);
         report.abstained = kept.is_empty() && report.dropped > 0;
         *results = kept;
         report
+    }
+
+    fn late(&self) -> String {
+        let ms = self.deadline.as_millis();
+        tracing::warn!("relevance judge took over {ms} ms; results returned unjudged");
+        format!("relevance judge took over {ms} ms; results are unjudged")
     }
 
     /// One judge request for `batch`, its question ids offset by `asked` so
@@ -1040,13 +1051,7 @@ impl RelevanceJudge {
                 tracing::warn!("relevance judge failed; results returned unjudged: {e}");
                 return Err(format!("relevance judge failed; results are unjudged: {e}"));
             }
-            Err(_) => {
-                let ms = self.deadline.as_millis();
-                tracing::warn!("relevance judge took over {ms} ms; results returned unjudged");
-                return Err(format!(
-                    "relevance judge took over {ms} ms; results are unjudged"
-                ));
-            }
+            Err(_) => return Err(self.late()),
         };
         for (i, r) in batch.iter_mut().enumerate() {
             // A probability outside [0, 1] is a provider fault, not a verdict.
@@ -1099,6 +1104,19 @@ pub fn max_per_doc() -> usize {
 /// The document a result counts against for [`max_per_doc`].
 fn doc_of(r: &HybridResult) -> Option<Uuid> {
     r.citations.first().and_then(|c| c.document_id)
+}
+
+/// Counts `r` against its document's quota of `cap`; false when it is full.
+fn admit(r: &HybridResult, cap: usize, per_doc: &mut HashMap<Uuid, usize>) -> bool {
+    let Some(doc) = doc_of(r) else {
+        return true;
+    };
+    let seen = per_doc.entry(doc).or_insert(0);
+    if *seen >= cap {
+        return false;
+    }
+    *seen += 1;
+    true
 }
 
 /// A memory's date as the judge reads it: when it happened, else when it was
@@ -2011,6 +2029,54 @@ mod tests {
         assert_eq!(got.len(), max_per_doc() + 1, "{got:?}");
         assert_eq!(got.last(), Some(&"a memory of its own"));
         assert_eq!(report.judged, 5, "one batch covers the page");
+    }
+
+    /// A pool of 5,000 and a judge that answers instantly and rejects
+    /// everything. The walk judged the whole pool (tokio's timeout accepts a
+    /// ready answer before it looks at the clock) and rescanned the queue
+    /// every batch. It now stops at RELEVANCE_MAX_POOL judged and fills the
+    /// page unjudged, well inside the deadline.
+    #[tokio::test]
+    async fn a_huge_pool_and_an_instant_judge_stay_inside_the_deadline() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut results: Vec<HybridResult> = (0..5_000)
+            .map(|i| result("chunk", "personal", &format!("passage {i}")))
+            .collect();
+        let judge = stub_judge(JudgeMode::On, "0.01");
+        let started = std::time::Instant::now();
+        let report = judge.apply(&store, "anything", &mut results, 10).await;
+        assert!(
+            started.elapsed() < RELEVANCE_DEADLINE + std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.judged, RELEVANCE_MAX_POOL);
+        assert_eq!(report.dropped, RELEVANCE_MAX_POOL);
+        assert!(!report.abstained, "unjudged candidates remain");
+        let got: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+        let want: Vec<String> = (200..210).map(|i| format!("passage {i}")).collect();
+        assert_eq!(got, want);
+        assert!(results.iter().all(|r| r.relevance.is_none()));
+    }
+
+    /// The deadline is checked before every batch, so an expired one asks
+    /// nothing even of a judge that would answer at once.
+    #[tokio::test]
+    async fn an_expired_deadline_asks_nothing_and_fills_unjudged() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut results: Vec<HybridResult> = (0..30)
+            .map(|i| result("chunk", "personal", &format!("passage {i}")))
+            .collect();
+        let judge = RelevanceJudge {
+            mode: JudgeMode::On,
+            judge: Box::new(engram_llm::judge::stub::StubJudge::parse("0.01").unwrap()),
+            deadline: std::time::Duration::ZERO,
+        };
+        let report = judge.apply(&store, "anything", &mut results, 10).await;
+        assert_eq!(report.judged, 0);
+        assert!(report.error.is_some());
+        assert_eq!(results.len(), 10);
+        assert!(results.iter().all(|r| r.relevance.is_none()));
     }
 
     /// A judge that never answers, like a provider stuck in retries.
