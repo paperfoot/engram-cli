@@ -854,6 +854,73 @@ fn an_imported_allergy_under_another_spelling_lands_open_and_is_found() {
     );
 }
 
+/// Import keeps the file's spelling on disk, so a medication can sit under
+/// `is_on_medication`. The write path loaded a subject's siblings by the
+/// stored predicate, so a later cessation (canonical `takes_medication`)
+/// never saw that row: it recorded a separate closed interval and the
+/// stopped medication stayed current.
+#[test]
+fn a_cessation_closes_a_medication_stored_under_another_spelling() {
+    let source = store();
+    remember_facts(
+        source.path(),
+        "personal",
+        "Elias started metformin in January 2024.",
+        &med("Elias", "metformin", "2024-01-01"),
+    );
+    let mut doc = run_json(source.path(), &["export"])["data"].clone();
+    doc["facts"][0]["predicate"] = json!("is_on_medication");
+    let mut events = doc["events"].as_array().cloned().unwrap();
+    for e in &mut events {
+        if e["kind"] == "fact.observed" {
+            e["payload"]["relation"] = json!("is_on_medication");
+        }
+    }
+    doc["events"] = json!(events);
+    let file = source.path().join("legacy.json");
+    std::fs::write(&file, serde_json::to_vec(&doc).unwrap()).unwrap();
+
+    let target = store();
+    run_json(target.path(), &["import", file.to_str().unwrap()]);
+    assert_eq!(
+        group_values(&state(target.path(), "Elias", &[]), "takes_medication").len(),
+        1,
+        "the imported medication is current before the cessation"
+    );
+    remember_facts(
+        target.path(),
+        "personal",
+        "Elias stopped metformin in June 2025.",
+        r#"[{"subject":"Elias","predicate":"stopped_taking","object":"metformin",
+             "valid_until":"2025-06-01"}]"#,
+    );
+    let v = state(target.path(), "Elias", &[]);
+    assert_eq!(
+        group_values(&v, "takes_medication").len(),
+        0,
+        "a stopped medication is not current: {v}"
+    );
+    let all = state(target.path(), "Elias", &["--include-closed"]);
+    let group = all["data"]["state"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["relation"] == "takes_medication")
+        .cloned()
+        .unwrap_or_else(|| panic!("no takes_medication group: {all}"));
+    let history = group["history"].as_array().unwrap();
+    assert_eq!(
+        history.len(),
+        1,
+        "one interval, closed — no second row: {all}"
+    );
+    assert_eq!(history[0]["id"], doc["facts"][0]["id"], "{all}");
+    assert_eq!(
+        history[0]["valid_until"],
+        json!("2025-06-01T00:00:00+00:00")
+    );
+}
+
 /// The isolation gate (CD-6), asserted rather than trusted.
 #[test]
 fn this_suite_never_reaches_for_the_real_store() {

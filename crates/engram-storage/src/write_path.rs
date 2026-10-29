@@ -367,6 +367,12 @@ impl SqliteStore {
 
     /// Facts on one relation for one subject. `include_closed = false` returns
     /// only intervals that still assert something.
+    ///
+    /// Matches on the CANONICAL relation: every stored spelling that
+    /// canonicalizes to `relation`'s canonical form is a sibling. Import keeps
+    /// the file's spelling on disk, and older rows predate the safety
+    /// aliases, so an exact `predicate = ?` match let a cessation of
+    /// `takes_medication` miss the `is_on_medication` row it ends.
     pub fn facts_for_relation(
         &self,
         kb: Option<&str>,
@@ -382,18 +388,25 @@ impl SqliteStore {
         };
         let sql = format!(
             "SELECT {} FROM facts
-              WHERE subject_norm = ?1 AND predicate = ?2
-                AND (?3 IS NULL OR kb = ?3) AND (?4 IS NULL OR diary = ?4){open}
+              WHERE subject_norm = ?1
+                AND (?2 IS NULL OR kb = ?2) AND (?3 IS NULL OR diary = ?3){open}
               ORDER BY created_at DESC",
             fact_columns("")
         );
+        let canonical = engram_core::relations::canonical_relation(relation);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![subject_norm, relation, kb, diary],
+            params![subject_norm, kb, diary],
             crate::sqlite::parse_fact_row_pub,
         )?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        let mut out = Vec::new();
+        for row in rows {
+            let fact = row?;
+            if engram_core::relations::canonical_relation(&fact.predicate) == canonical {
+                out.push(fact);
+            }
+        }
+        Ok(out)
     }
 
     /// Open intervals for a subject, optionally narrowed to one relation.
