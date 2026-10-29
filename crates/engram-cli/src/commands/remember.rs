@@ -35,6 +35,7 @@ use engram_core::types::{Memory, MemorySource, SourceKind};
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::facts::{extract_facts, ExtractedFact};
 use engram_ingest::memory::chunk_memory;
+use engram_llm::judge::Judge;
 use serde_json::json;
 use std::time::Instant;
 use uuid::Uuid;
@@ -252,6 +253,12 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // the memory is stored and its fact batch fails.
     crate::fact_write::gate_thresholds()?;
     let grounding = GroundingJudge::resolve(offline)?;
+    // `--autonomy full` settles queued pairs with the JEV conflict rule; with
+    // no judge reachable they queue, exactly as under `assisted`.
+    let adjudicator = match autonomy {
+        Autonomy::Full => crate::judge::resolve_judge(offline)?,
+        _ => None,
+    };
 
     // The KB budget guards PAID calls: cloud embedding, LLM extraction /
     // adjudication (which run whenever an OpenRouter key resolves and
@@ -264,7 +271,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let extraction_may_spend = !no_extract_facts
         && crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
             .is_some();
-    if write_embedder.cloud || extraction_may_spend || grounding.is_some() {
+    if write_embedder.cloud || extraction_may_spend || grounding.is_some() || adjudicator.is_some()
+    {
         crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     }
 
@@ -312,7 +320,6 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     .store
                     .memory_times(existing)?
                     .unwrap_or((None, chrono::DateTime::UNIX_EPOCH));
-                let dedup_llm = crate::fact_llm::resolve()?;
                 let plan = FactBatchPlan {
                     memory_id: existing,
                     kb: &kb,
@@ -322,7 +329,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                         created_at: stored_created,
                     },
                     autonomy,
-                    llm: dedup_llm.as_ref(),
+                    adjudicator: adjudicator.as_deref(),
                     embedder: write_embedder.embedder.as_ref(),
                     facts: &caller_facts,
                     marker: None,
@@ -619,7 +626,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 created_at: now,
             },
             autonomy,
-            llm: llm.as_ref(),
+            adjudicator: adjudicator.as_deref(),
             embedder: embedder.as_ref(),
             facts: &caller_facts,
             marker: None,
@@ -643,7 +650,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 created_at: now,
             },
             autonomy,
-            llm: llm.as_ref(),
+            adjudicator: adjudicator.as_deref(),
             embedder: embedder.as_ref(),
             facts: &extracted,
             marker,
@@ -784,7 +791,9 @@ struct FactBatchPlan<'a> {
     diary: &'a str,
     memory_time: MemoryTime,
     autonomy: Autonomy,
-    llm: Option<&'a FactLlm>,
+    /// The judge `--autonomy full` asks about queued pairs (see
+    /// `fact_write::conflict_rule`).
+    adjudicator: Option<&'a dyn Judge>,
     /// The SAME embedder the chunks were written with. The novelty gate has to
     /// agree with the index it is gating: `novelty_gate` skips candidates of a
     /// different width, so a gate on another embedder calls every fact novel.
@@ -826,7 +835,7 @@ async fn persist_facts(
         kb: plan.kb,
         memory_time: plan.memory_time,
         embedder: Some(plan.embedder),
-        llm: plan.llm.map(|l| l.as_chat()),
+        adjudicator: plan.adjudicator,
         autonomy: plan.autonomy,
         source_kind: plan.source_kind,
     };

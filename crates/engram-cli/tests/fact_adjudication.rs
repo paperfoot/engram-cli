@@ -1,24 +1,58 @@
-//! `--autonomy full` — the machine adjudicator fails CLOSED.
+//! `--autonomy full` — the JEV conflict rule fails CLOSED.
 //!
-//! The adjudicator is a `Heuristic` authority. Whatever it answers — or fails
+//! The rule is a `Heuristic` authority. Whatever the judge answers — or fails
 //! to answer — the store may end up with MORE open questions than `assisted`
 //! would leave, never fewer on a safety relation, and never a close or an
-//! absorb on behalf of an observation it threw away.
+//! absorb on behalf of an observation it threw away. Safety pairs are never
+//! sent to the judge at all.
 //!
-//! Every test drives the judge through `ENGRAM_FACT_LLM_STUB` with a
-//! `{"NEW fact:": <reply>}` rule (the adjudication prompt's user text starts
-//! with `NEW fact:`); keys are stripped by the harness, so nothing here can
-//! reach a network.
+//! Every test drives the judge through `ENGRAM_JUDGE_STUB`, whose rules match
+//! substrings of each question's instructions (see `judge::stub`); keys are
+//! stripped by the harness, so nothing here can reach a network.
 
 mod wave3_fact_support;
 use serde_json::{json, Value};
 use wave3_fact_support::*;
 
-/// `remember --facts-json … --autonomy full` with the judge answering `reply`.
-fn judged(store: &std::path::Path, content: &str, facts_json: &str, reply: &str) -> Value {
-    let script = json!({ "NEW fact:": reply, "*": "[]" }).to_string();
+/// The four pair questions, by a phrase each one's wording contains.
+fn signals(restates: f64, same_slot: f64, contradicts: f64, old_ended: f64) -> String {
+    json!({
+        "same claim": restates,
+        "same attribute": same_slot,
+        "contradict each": contradicts,
+        "stopped being": old_ended,
+    })
+    .to_string()
+}
+
+/// A move or a correction, as the judge measured them on the pair set.
+fn supersede() -> String {
+    signals(0.02, 0.97, 0.8, 0.9)
+}
+
+/// A second, compatible value.
+fn coexist() -> String {
+    signals(0.02, 0.9, 0.03, 0.02)
+}
+
+/// The same claim, worded differently.
+fn restates() -> String {
+    signals(0.97, 0.98, 0.05, 0.02)
+}
+
+/// A clash, but the text never says the stored value ended.
+fn undecided() -> String {
+    signals(0.02, 0.95, 0.6, 0.05)
+}
+
+/// A judge that answers nothing (no rule matches, no `*`): a provider that
+/// dropped every answer.
+const NO_ANSWER: &str = r#"{"no question says this": 0.5}"#;
+
+/// `remember --facts-json … --autonomy full` with the judge scripted by `spec`.
+fn judged(store: &std::path::Path, content: &str, facts_json: &str, spec: &str) -> Value {
     run_json(
-        engram(store).env("ENGRAM_FACT_LLM_STUB", script),
+        engram(store).env("ENGRAM_JUDGE_STUB", spec),
         &[
             "remember",
             content,
@@ -67,21 +101,21 @@ fn open_objects(store: &std::path::Path) -> Vec<String> {
     objects
 }
 
-// ----- B1: no verdict is not "coexist" -------------------------------------
+// ----- no verdict is not "coexist" -----------------------------------------
 
 #[test]
-fn a_garbled_verdict_leaves_the_safety_question_queued() {
+fn an_unanswered_judgement_leaves_the_question_queued() {
     let tmp = store();
     remember_facts(
         tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
     );
     let v = judged(
         tmp.path(),
-        "Ana now takes metformin 1000 mg.",
-        &med("metformin 1000 mg"),
-        "I cannot decide",
+        "Ana was born 1990-04-13.",
+        &birthday("1990-04-13"),
+        NO_ANSWER,
     );
     assert_eq!(v["data"]["facts_added"], 1, "{v}");
     assert_eq!(queued(&v).len(), 1, "the question must survive: {v}");
@@ -89,56 +123,31 @@ fn a_garbled_verdict_leaves_the_safety_question_queued() {
         note_kinds(&v).contains(&"adjudication_failed".to_string()),
         "the envelope must say nobody decided: {v}"
     );
+    assert_eq!(v["metadata"]["adjudication"]["failed"], 1, "{v}");
     assert_eq!(open_conflicts(tmp.path())["data"]["total_open"], 1);
-    assert_eq!(
-        open_objects(tmp.path()),
-        ["metformin 1000 mg", "metformin 500 mg"]
-    );
+    assert_eq!(open_objects(tmp.path()), ["1990-04-12", "1990-04-13"]);
 }
 
-/// A provider's `content: null` arrives as an empty string.
+/// Signals that do not settle a pair leave it to the caller, and that is not
+/// a failure: the judge answered, the rule declined.
 #[test]
-fn an_empty_reply_leaves_the_question_queued() {
-    let tmp = store();
-    remember_facts(
-        tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
-    );
-    let v = judged(
-        tmp.path(),
-        "Ana now takes metformin 1000 mg.",
-        &med("metformin 1000 mg"),
-        "",
-    );
-    assert_eq!(queued(&v).len(), 1, "{v}");
-    assert!(note_kinds(&v).contains(&"adjudication_failed".to_string()));
-}
-
-/// Not only safety relations: a non-verdict decides nothing anywhere.
-#[test]
-fn a_non_verdict_decides_nothing_on_a_routine_relation_either() {
+fn an_undecided_pair_stays_queued_without_a_failure() {
     let tmp = store();
     remember_facts(
         tmp.path(),
         "Ana was born 1990-04-12.",
         &birthday("1990-04-12"),
     );
-    for (object, reply) in [
-        ("1990-04-13", r#"{"action":"supersede","ids":[]}"#),
-        ("1990-04-14", r#"{"action":"merge"}"#),
-    ] {
+    for object in ["1990-04-13", "1990-04-14"] {
         let v = judged(
             tmp.path(),
             &format!("Ana was born {object}."),
             &birthday(object),
-            reply,
+            &undecided(),
         );
-        assert!(
-            note_kinds(&v).contains(&"adjudication_failed".to_string()),
-            "{reply}: {v}"
-        );
-        assert!(!queued(&v).is_empty(), "{reply}: {v}");
+        assert!(!queued(&v).is_empty(), "{object}: {v}");
+        assert!(note_kinds(&v).is_empty(), "{object}: {v}");
+        assert_eq!(v["metadata"]["adjudication"]["failed"], 0, "{v}");
     }
     // 13 vs 12, then 14 vs 12 and 14 vs 13: every question still open.
     assert_eq!(open_conflicts(tmp.path())["data"]["total_open"], 3);
@@ -155,32 +164,33 @@ fn full_autonomy_without_a_judge_queues_like_assisted() {
     let tmp = store();
     remember_facts(
         tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
     );
     let v = run_json(
         &mut engram(tmp.path()),
         &[
             "remember",
-            "Ana now takes metformin 1000 mg.",
+            "Ana was born 1990-04-13.",
             "--kb",
             "personal",
             "--autonomy",
             "full",
             "--facts-json",
-            &med("metformin 1000 mg"),
+            &birthday("1990-04-13"),
         ],
     );
     assert_eq!(queued(&v).len(), 1, "{v}");
-    assert_eq!(queued(&v)[0]["suggested_action"], "requires_context");
+    assert_eq!(v["metadata"]["adjudication"]["calls"], 0, "{v}");
+    assert!(note_kinds(&v).is_empty(), "{v}");
 }
 
-// ----- B2: reject_new discards the WHOLE observation -----------------------
+// ----- a restatement discards the WHOLE observation ------------------------
 
-/// The report's repro: a caller's birthday correction plans a close of the
-/// extractor's guess; the judge then rejects the correction. The close used to
-/// survive — `close_authority=caller`, `closed_by` naming a fact that was never
-/// written.
+/// A caller's birthday correction plans a close of the extractor's guess; the
+/// rule then reads the correction as a restatement. The close must not
+/// survive — `close_authority=caller`, `closed_by` naming a fact that was
+/// never written.
 #[test]
 fn a_rejected_observation_closes_nothing_on_its_way_out() {
     let tmp = store();
@@ -206,7 +216,7 @@ fn a_rejected_observation_closes_nothing_on_its_way_out() {
         tmp.path(),
         "Ana was born 1990-04-14.",
         &birthday("1990-04-14"),
-        r#"{"action":"reject_new"}"#,
+        &restates(),
     );
     assert_eq!(v["data"]["facts_added"], 0, "{v}");
     assert_eq!(v["data"]["facts_deduped"], 1, "{v}");
@@ -222,94 +232,47 @@ fn a_rejected_observation_closes_nothing_on_its_way_out() {
     assert_eq!(open_objects(tmp.path()), ["1990-04-12", "1990-04-13"]);
 }
 
-// ----- B3: a safety question is the caller's -------------------------------
+// ----- a safety question is the caller's -----------------------------------
 
-/// The report's repro: a caller-asserted dose change, `reject_new`ed by the
-/// judge, vanished and was reported as a duplicate.
+/// A dose change is a question only the caller may settle, so no judge is
+/// even asked: whatever it would say, the pair queues, the caller's dose is
+/// stored, and nothing about the medication leaves the machine.
 #[test]
-fn the_judge_cannot_discard_a_safety_observation() {
-    let tmp = store();
-    remember_facts(
-        tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
-    );
-    let v = judged(
-        tmp.path(),
-        "Ana now takes metformin 1000 mg.",
-        &med("metformin 1000 mg"),
-        r#"{"action":"reject_new"}"#,
-    );
-    assert_eq!(
-        v["data"]["facts_added"], 1,
-        "the caller's dose is kept: {v}"
-    );
-    assert_eq!(v["data"]["facts_deduped"], 0, "{v}");
-    assert_eq!(queued(&v).len(), 1, "{v}");
-    assert_eq!(queued(&v)[0]["suggested_action"], "requires_context");
-    assert!(note_kinds(&v).contains(&"adjudication_kept_safety".to_string()));
-    assert_eq!(
-        open_objects(tmp.path()),
-        ["metformin 1000 mg", "metformin 500 mg"]
-    );
+fn a_safety_pair_is_never_sent_to_the_judge() {
+    for spec in [restates(), coexist(), supersede()] {
+        let tmp = store();
+        remember_facts(
+            tmp.path(),
+            "Ana takes metformin 500 mg.",
+            &med("metformin 500 mg"),
+        );
+        let v = judged(
+            tmp.path(),
+            "Ana now takes metformin 1000 mg.",
+            &med("metformin 1000 mg"),
+            &spec,
+        );
+        assert_eq!(v["data"]["facts_added"], 1, "the caller's dose is kept: {v}");
+        assert_eq!(v["data"]["facts_deduped"], 0, "{v}");
+        assert_eq!(queued(&v).len(), 1, "{v}");
+        assert_eq!(queued(&v)[0]["suggested_action"], "requires_context");
+        assert!(note_kinds(&v).is_empty(), "{v}");
+        let adjudication = &v["metadata"]["adjudication"];
+        assert_eq!(adjudication["calls"], 0, "{v}");
+        assert_eq!(adjudication["pairs_in"], 0, "{v}");
+        assert_eq!(adjudication["not_asked"], 0, "{v}");
+        assert_eq!(open_conflicts(tmp.path())["data"]["total_open"], 1);
+        assert_eq!(
+            open_objects(tmp.path()),
+            ["metformin 1000 mg", "metformin 500 mg"]
+        );
+    }
 }
 
+/// Outside the safety registry the rule's answers stand — `--autonomy full`
+/// is not `assisted` under another name.
 #[test]
-fn the_judge_cannot_dismiss_a_safety_question() {
-    let tmp = store();
-    remember_facts(
-        tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
-    );
-    let v = judged(
-        tmp.path(),
-        "Ana now takes metformin 1000 mg.",
-        &med("metformin 1000 mg"),
-        r#"{"action":"coexist"}"#,
-    );
-    assert_eq!(queued(&v).len(), 1, "the question survives: {v}");
-    assert!(note_kinds(&v).contains(&"adjudication_kept_safety".to_string()));
-    assert_eq!(open_conflicts(tmp.path())["data"]["total_open"], 1);
-}
-
-/// `may_close` already refused this close; the answer now says so rather than
-/// counting a supersede that closed nothing, with no reason given.
-#[test]
-fn a_refused_safety_supersede_is_explained() {
-    let tmp = store();
-    remember_facts(
-        tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
-    );
-    let old = facts_for(tmp.path(), "Ana")[0]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let v = judged(
-        tmp.path(),
-        "Ana now takes metformin 1000 mg.",
-        &med("metformin 1000 mg"),
-        &format!(r#"{{"action":"supersede","ids":["{old}"]}}"#),
-    );
-    assert_eq!(queued(&v).len(), 1, "{v}");
-    assert_eq!(note_kinds(&v), ["adjudication_kept_safety"], "{v}");
-    assert!(v["data"]["plan_notes"][0]["detail"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("answered supersede"));
-    assert_eq!(v["metadata"]["adjudication"]["pairs_closed"], 0, "{v}");
-    assert_eq!(
-        open_objects(tmp.path()),
-        ["metformin 1000 mg", "metformin 500 mg"]
-    );
-}
-
-/// And outside the safety registry the judge's answers still stand — the fix
-/// is scoped, not a switch that turns `--autonomy full` into `assisted`.
-#[test]
-fn the_judge_still_settles_a_routine_question() {
+fn the_rule_settles_routine_questions() {
     let tmp = store();
     remember_facts(
         tmp.path(),
@@ -320,7 +283,7 @@ fn the_judge_still_settles_a_routine_question() {
         tmp.path(),
         "Ana was born 1990-04-13.",
         &birthday("1990-04-13"),
-        r#"{"action":"coexist"}"#,
+        &coexist(),
     );
     assert_eq!(queued(&v).len(), 0, "{v}");
     assert!(note_kinds(&v).is_empty(), "{v}");
@@ -329,17 +292,17 @@ fn the_judge_still_settles_a_routine_question() {
         tmp.path(),
         "Ana was born 1990-04-14.",
         &birthday("1990-04-14"),
-        r#"{"action":"reject_new"}"#,
+        &restates(),
     );
     assert_eq!(v["data"]["facts_added"], 0, "{v}");
     assert_eq!(v["data"]["facts_deduped"], 1, "{v}");
     assert_eq!(open_objects(tmp.path()), ["1990-04-12", "1990-04-13"]);
 }
 
-// ----- B11: a supersede that names one pair leaves the others asked --------
-
+/// Each pair gets its own ruling: the one the text says ended closes, the
+/// one it says nothing about stays a question.
 #[test]
-fn pairs_the_judge_did_not_name_stay_queued() {
+fn each_pair_is_ruled_on_its_own() {
     let tmp = store();
     remember_facts(
         tmp.path(),
@@ -351,32 +314,26 @@ fn pairs_the_judge_did_not_name_stay_queued() {
         "Ana was born 1990-04-13.",
         &birthday("1990-04-13"),
     );
-    let id_of = |object: &str| {
-        facts_for(tmp.path(), "Ana")
-            .into_iter()
-            .find(|f| f["object"] == object)
-            .and_then(|f| f["id"].as_str().map(str::to_string))
-            .expect("stored")
-    };
-    let first = id_of("1990-04-12");
+    // The longest matching key wins, so the stored 04-13 fact's own object
+    // overrides the per-question phrases for its four questions: a weak clash
+    // (0.15) the rule leaves to the caller. 04-12 gets a clear supersede.
+    let mut spec: Value = serde_json::from_str(&supersede()).unwrap();
+    spec[r#""object":"1990-04-13""#] = json!(0.15);
+    let spec = spec.to_string();
     let v = judged(
         tmp.path(),
-        "Ana was born 1990-04-14.",
+        "Ana was born 1990-04-14, not the 12th.",
         &birthday("1990-04-14"),
-        &format!(r#"{{"action":"supersede","ids":["{first}"]}}"#),
+        &spec,
     );
     assert_eq!(v["data"]["conflicts"].as_array().unwrap().len(), 1, "{v}");
     let asked: Vec<Value> = queued(&v);
-    assert_eq!(
-        asked.len(),
-        1,
-        "the unnamed 04-13 pair is still a question: {v}"
-    );
+    assert_eq!(asked.len(), 1, "the 04-13 pair is still a question: {v}");
     assert_eq!(asked[0]["old"]["object"], "1990-04-13");
     assert_eq!(open_objects(tmp.path()), ["1990-04-13", "1990-04-14"]);
 }
 
-// ----- B5: judged outside the write lock, applied only to what it saw ------
+// ----- judged outside the write lock, applied only to what it saw ----------
 
 /// Two facts in one batch. The judge sees both BEFORE the transaction, when
 /// 04-14 conflicts only with 04-12. By the time 04-14 is written, 04-13 has
@@ -395,7 +352,7 @@ fn a_verdict_about_different_pairs_is_not_applied() {
         "Ana was born on the 13th, or the 14th.",
         r#"[{"subject":"Ana","predicate":"birthday","object":"1990-04-13"},
             {"subject":"Ana","predicate":"birthday","object":"1990-04-14"}]"#,
-        r#"{"action":"coexist"}"#,
+        &coexist(),
     );
     assert!(
         note_kinds(&v).contains(&"adjudication_stale".to_string()),
@@ -438,7 +395,7 @@ fn a_conflict_inside_one_batch_says_no_judge_was_asked() {
         "Ana was born on the 12th, or the 13th.",
         r#"[{"subject":"Ana","predicate":"birthday","object":"1990-04-12"},
             {"subject":"Ana","predicate":"birthday","object":"1990-04-13"}]"#,
-        r#"{"action":"coexist"}"#,
+        &coexist(),
     );
     assert_eq!(queued(&v).len(), 1, "{v}");
     assert_eq!(note_kinds(&v), ["adjudication_not_asked"], "{v}");
@@ -450,11 +407,11 @@ fn a_conflict_inside_one_batch_says_no_judge_was_asked() {
 
 // ----- which judge answered: journaled, never binding ----------------------
 
-/// A routine question the judge settled. Its answer is journaled — `void`,
-/// `machine`, `judge:llm` — and a later write of the same question (same kb,
-/// so the same semantic key, from another diary) is planned exactly as in a
-/// store that never met the judge: asked again, nothing replayed. A machine
-/// `keep_both` here would have answered it silently forever.
+/// A routine question the rule settled. Its answer is journaled — `void`,
+/// `machine`, `judge:<provider>`, with the four probabilities — and a later
+/// write of the same question (same kb, so the same semantic key, from
+/// another diary) is planned exactly as in a store that never met the judge:
+/// asked again, nothing replayed.
 #[test]
 fn a_judges_answer_is_journaled_and_binds_nothing() {
     let later = |store: &std::path::Path| {
@@ -489,7 +446,7 @@ fn a_judges_answer_is_journaled_and_binds_nothing() {
         judged_store.path(),
         "Ana was born 1990-04-13.",
         &birthday("1990-04-13"),
-        r#"{"action":"reject_new"}"#,
+        &restates(),
     );
     assert_eq!(v["data"]["facts_deduped"], 1, "{v}");
     let after_judge = later(judged_store.path());
@@ -514,12 +471,12 @@ fn a_judges_answer_is_journaled_and_binds_nothing() {
     let row = &rows[0];
     assert_eq!(row.verdict, "void");
     assert_eq!(row.authority, "machine");
-    assert_eq!(row.actor, "judge:llm");
+    assert_eq!(row.actor, "judge:stub");
     let note = row.note.as_deref().unwrap_or_default();
-    assert!(
-        note.starts_with("action=reject_new model=")
-            && note.ends_with(" rule=immutable_attribute_disagreement"),
-        "{note}"
+    assert_eq!(
+        note,
+        "action=reject_new model=stub rule=immutable_attribute_disagreement \
+         restates=0.97 same_slot=0.98 contradicts=0.05 old_ended=0.02"
     );
 }
 
@@ -530,14 +487,14 @@ fn a_failed_judgement_is_journaled_as_failed() {
     let tmp = store();
     remember_facts(
         tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
     );
     let v = judged(
         tmp.path(),
-        "Ana now takes metformin 1000 mg.",
-        &med("metformin 1000 mg"),
-        "I cannot decide",
+        "Ana was born 1990-04-13.",
+        &birthday("1990-04-13"),
+        NO_ANSWER,
     );
     let key = queued(&v)[0]["decision_key"]
         .as_str()
@@ -559,20 +516,20 @@ fn a_failed_judgement_is_journaled_as_failed() {
 /// answers the question it failed to settle has overruled nobody. `reflect`
 /// read every `machine` row as a ruling and proposed the lesson "the machine
 /// ruled `void` and the caller ruled `keep_both`" — exactly on the questions
-/// this lane routes to the caller (a failed, stale or safety-refused judge).
+/// this lane routes to the caller (a failed or stale judge).
 #[test]
 fn a_caller_answering_after_the_judge_overrules_nobody() {
     let tmp = store();
     remember_facts(
         tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
     );
     let v = judged(
         tmp.path(),
-        "Ana now takes metformin 1000 mg.",
-        &med("metformin 1000 mg"),
-        "I cannot decide",
+        "Ana was born 1990-04-13.",
+        &birthday("1990-04-13"),
+        NO_ANSWER,
     );
     let id = queued(&v)[0]["conflict_id"]
         .as_str()
@@ -605,15 +562,11 @@ fn the_metadata_counts_what_the_gate_and_the_judge_did() {
     );
     assert_eq!(first["metadata"]["adjudication"]["calls"], 0);
 
-    let old = facts_for(tmp.path(), "Ana")[0]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
     let v = judged(
         tmp.path(),
-        "Ana was born 1990-04-13.",
+        "Ana was born 1990-04-13, not the 12th.",
         &birthday("1990-04-13"),
-        &format!(r#"{{"action":"supersede","ids":["{old}"]}}"#),
+        &supersede(),
     );
     assert_eq!(v["metadata"]["gate"]["skipped_has_siblings"], 1, "{v}");
     assert_eq!(
@@ -626,22 +579,20 @@ fn the_metadata_counts_what_the_gate_and_the_judge_did() {
 
     remember_facts(
         tmp.path(),
-        "Ana takes metformin 500 mg.",
-        &med("metformin 500 mg"),
+        "Ana was born 1990-04-14.",
+        &birthday("1990-04-14"),
     );
     let v = judged(
         tmp.path(),
-        "Ana now takes metformin 1000 mg.",
-        &med("metformin 1000 mg"),
-        "I cannot decide",
+        "Ana was born 1990-04-15.",
+        &birthday("1990-04-15"),
+        NO_ANSWER,
     );
+    // 04-15 against the open 04-13 and 04-14: both stay asked.
     let adjudication = &v["metadata"]["adjudication"];
     assert_eq!(adjudication["failed"], 1, "{v}");
-    assert_eq!(adjudication["pairs_kept"], 1, "{v}");
-    assert_eq!(
-        v["metadata"]["queued_by_rule"],
-        json!({"safety_member_change": 1})
-    );
+    assert_eq!(adjudication["pairs_kept"], 2, "{v}");
+    assert_eq!(adjudication["pairs_closed"], 0, "{v}");
 }
 
 // ----- B4: a gate duplicate is a restatement about the SAME subject --------
@@ -849,16 +800,8 @@ const MEDS: [&str; 5] = [
 ];
 
 /// A judge that would retire every fact it is shown, if it were ever asked.
-fn supersede_everything(store: &std::path::Path) -> String {
-    let mut ids: Vec<Value> = facts_for(store, "Ana")
-        .iter()
-        .map(|f| f["id"].clone())
-        .collect();
-    if ids.is_empty() {
-        // `supersede` with no ids is not a verdict; name something.
-        ids.push(json!("00000000-0000-0000-0000-000000000000"));
-    }
-    json!({ "action": "supersede", "ids": ids }).to_string()
+fn supersede_everything(_store: &std::path::Path) -> String {
+    supersede()
 }
 
 fn assert_five_open_and_untouched(store: &std::path::Path) {
