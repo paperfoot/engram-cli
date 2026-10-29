@@ -438,6 +438,11 @@ fn shadow_journals_the_real_ruling_and_applies_nothing() {
     );
     let asked = queued(&v);
     assert_eq!(asked.len(), 1, "shadow applied the verdict: {v}");
+    let notes = note_kinds(&v);
+    assert!(
+        !notes.contains(&"adjudication_stale".to_string()),
+        "a fresh shadow verdict is not stale: {v}"
+    );
     assert_eq!(
         open_objects(tmp.path()),
         ["1990-04-12", "1990-04-13"],

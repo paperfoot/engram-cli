@@ -1653,7 +1653,7 @@ async fn write_judged_fact(
             return Ok(());
         }
     };
-    let applied = match judged {
+    let settled = match judged {
         Some(j) => settle_judgement(ctx, w, j, Some((&mut plan, &p)), outcome)?,
         None => false,
     };
@@ -1663,7 +1663,7 @@ async fn write_judged_fact(
             .get(&q.old_fact_id)
             .is_some_and(|old| !pair_is_safety(&p.observation, old))
     });
-    if !applied
+    if !settled
         && w.autonomy == Autonomy::Full
         && matches!(w.adjudicator, Adjudicator::Withheld)
         && routine_queued
@@ -1672,7 +1672,7 @@ async fn write_judged_fact(
         plan.notes.push(PlanNote::AdjudicationFailed {
             reason: "judge_not_consented",
         });
-    } else if !applied
+    } else if !settled
         && w.autonomy == Autonomy::Full
         && w.adjudicator.judge().is_some()
         && routine_queued
@@ -1704,7 +1704,9 @@ async fn write_judged_fact(
 /// One gathered verdict, handled exactly once: counted, journaled, and
 /// applied if it still answers this observation's queued pairs. `planned` is
 /// `None` when the observation no longer plans at all (the gate now finds it
-/// stored). Returns whether the verdict was applied.
+/// stored). Returns whether the verdict was settled: applied, or — under
+/// shadow — deliberately not applied. `false` means it no longer answers
+/// these pairs (stale).
 fn settle_judgement(
     ctx: &AppContext,
     w: &FactWriteCtx<'_>,
@@ -1741,7 +1743,7 @@ fn settle_judgement(
         plan.notes.push(PlanNote::AdjudicationFailed {
             reason: "judge_shadow",
         });
-        return Ok(false);
+        return Ok(true);
     }
     let closes = plan.closes.len();
     apply_judgement(plan, &p.observation, &p.by_id(), j);
