@@ -1,22 +1,23 @@
-//! `engram people list|show` — the networking view over the entity graph.
+//! `engram people list|show` — who do I know, and how are they connected?
 //!
-//! `entities list` answers "what is in this KB". These commands answer the
-//! question a networker actually asks: *who* do I know, and *how* are they
-//! connected? Every relation is printed with its predicate AND the memory it
-//! came from, so an answer like "Noemi — introduced_by → Avi Roy" can always
-//! be checked against the sentence that produced it.
+//! A thin view over live facts (`engram_storage::people`): a person is a name
+//! the facts treat as one, and every relation printed is a fact with its
+//! source memory, so "Noemi — introduced_by → Avi Roy" can always be checked
+//! against the sentence that produced it and corrected with the fact commands.
 
 use crate::context::AppContext;
 use crate::error::CliError;
 use crate::output::{print_success, Listing, Metadata, Scope};
 use crate::read_surface::{self, CursorKey, Provenance};
 use engram_core::handle::HandleKind;
-use engram_storage::{EntityRecord, RelationRecord};
+use engram_core::types::Fact;
+use engram_storage::people::{ALIAS_PREDICATES, PERSON_LINKS};
+use engram_storage::PersonRow;
 use serde_json::{json, Value};
 
 /// Relations per person in the list view.
 const LIST_RELATIONS: usize = 5;
-/// Upper bound on relations pulled for one person in the show view.
+/// Upper bound on facts pulled for one person in the show view.
 const SHOW_RELATIONS: usize = 200;
 
 pub fn list(
@@ -38,44 +39,23 @@ pub fn list(
         Some(raw) => read_surface::decode_cursor(raw, &key)?,
         None => 0,
     };
-    // Over-fetch and skip: `list_entities_by_kind` has no OFFSET yet.
-    let people: Vec<_> = ctx
+    let (people, total) = ctx
         .store
-        .list_entities_by_kind(
-            kb_filter,
-            engram_graph::people::KIND_PERSON,
-            limit.saturating_add(offset),
-            min_mentions,
-        )?
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect();
-    let total = ctx.store.count_entities_by_kind(
-        kb_filter,
-        engram_graph::people::KIND_PERSON,
-        min_mentions,
-    )?;
+        .list_people(kb_filter, limit, offset, min_mentions)?;
 
     let mut rows = Vec::with_capacity(people.len());
     for person in &people {
-        let relations = ctx
+        let facts = ctx
             .store
-            .relations_for_entity(&person.kb, person.id, SHOW_RELATIONS)?;
-        let ranked = rank_relations(&person.canonical_name, relations);
+            .person_facts(&person.kb, &person.name_norm, SHOW_RELATIONS)?;
+        let edges = edges(person, &facts);
         rows.push(json!({
-            "name": person.canonical_name,
-            "entity_id": person.id.to_string(),
-            "handle": read_surface::handle(HandleKind::Entity, person.id),
+            "name": person.name,
             "kb": person.kb,
-            "aliases": person.aliases,
-            "mentions": person.mention_count,
-            "relation_count": ranked.len(),
-            "top_relations": ranked
-                .iter()
-                .take(LIST_RELATIONS)
-                .map(edge_json)
-                .collect::<Vec<_>>(),
+            "aliases": aliases(person, &facts),
+            "mentions": person.facts,
+            "relation_count": edges.len(),
+            "top_relations": edges.iter().take(LIST_RELATIONS).map(edge_json).collect::<Vec<_>>(),
         }));
     }
 
@@ -96,8 +76,8 @@ pub fn list(
     };
     Listing::page(
         people.len(),
-        total,
-        read_surface::next_cursor(&key, offset, people.len(), total),
+        total as i64,
+        read_surface::next_cursor(&key, offset, people.len(), total as i64),
     )
     .attach(&mut payload);
     print_success(ctx.format, Value::Object(payload), meta, |data| {
@@ -105,7 +85,7 @@ pub fn list(
             return;
         };
         if arr.is_empty() {
-            println!("(no people yet — run `engram compile --kb <kb> --all`)");
+            println!("(no people yet — they appear as facts about them are remembered)");
             return;
         }
         for person in arr {
@@ -145,19 +125,12 @@ pub fn list(
 
 /// `engram people show <name> [--kb '*']`
 ///
-/// One person usually exists once PER KB — the compiler builds entity rows per
-/// namespace — so an unscoped lookup has to merge them. It used to call
-/// `find_entity(None, …)`, whose SQL is `LIMIT 1` with no ORDER BY: SQLite
-/// handed back an arbitrary KB's row and every other KB's aliases, mentions,
-/// relations and memories were silently dropped, which is the opposite of what
-/// `--kb '*'` asks for. `find_entities` returns one row per KB, so this now
-/// unions the aliases, sums the mention counts, and keeps relations and
-/// snippets grouped by their own KB (provenance survives the merge).
+/// One name can be a person in several KBs. An unscoped lookup merges them:
+/// aliases are unioned, fact counts summed, and relations and snippets stay
+/// grouped by their own KB so provenance survives the merge.
 pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Result<(), CliError> {
     let kb_filter = if kb == "*" { None } else { Some(kb.as_str()) };
-    // One row per KB. The cap is generous: a name is expected in a handful of
-    // KBs, never hundreds.
-    let matches = ctx.store.find_entities(kb_filter, &name, 64)?;
+    let matches = ctx.store.resolve_person(kb_filter, &name)?;
     let Some(primary) = matches.first().cloned() else {
         let scope = if kb == "*" {
             "any kb".to_string()
@@ -165,54 +138,36 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
             format!("kb {kb:?}")
         };
         return Err(CliError::BadInput(format!(
-            "no entity named {name:?} in {scope} — run `engram people list` to browse"
+            "no person named {name:?} in {scope} — run `engram people list` to browse"
         )));
     };
 
-    // Per-KB views, in the order find_entities ranked them (best-mentioned
-    // first), so the merged output leads with the KB that knows this person best.
-    let mut per_kb: Vec<(EntityRecord, Vec<Edge>)> = Vec::with_capacity(matches.len());
+    let mut per_kb: Vec<(PersonRow, Vec<Fact>)> = Vec::with_capacity(matches.len());
     for person in matches {
-        let relations = ctx
+        let facts = ctx
             .store
-            .relations_for_entity(&person.kb, person.id, SHOW_RELATIONS)?;
-        let ranked = rank_relations(&person.canonical_name, relations);
-        per_kb.push((person, ranked));
+            .person_facts(&person.kb, &person.name_norm, SHOW_RELATIONS)?;
+        per_kb.push((person, facts));
     }
 
-    // Union of aliases (and of the other KBs' canonical spellings, which are
-    // aliases from the merged person's point of view), case-insensitively
-    // deduped against the primary name.
-    let mut aliases: Vec<String> = Vec::new();
-    let mut seen_alias: Vec<String> = vec![primary.canonical_name.to_ascii_lowercase()];
-    let push_alias = |candidate: &str, out: &mut Vec<String>, seen: &mut Vec<String>| {
-        let key = candidate.to_ascii_lowercase();
-        if candidate.trim().is_empty() || seen.contains(&key) {
-            return;
-        }
-        seen.push(key);
-        out.push(candidate.to_string());
-    };
-    for (person, _) in &per_kb {
-        push_alias(&person.canonical_name, &mut aliases, &mut seen_alias);
-        for alias in &person.aliases {
-            push_alias(alias, &mut aliases, &mut seen_alias);
+    let mut all_aliases: Vec<String> = Vec::new();
+    for (person, facts) in &per_kb {
+        for alias in aliases(person, facts) {
+            if !all_aliases.iter().any(|a| a.eq_ignore_ascii_case(&alias)) {
+                all_aliases.push(alias);
+            }
         }
     }
-
-    let mentions: u32 = per_kb.iter().map(|(p, _)| p.mention_count).sum();
-    let relation_total: usize = per_kb.iter().map(|(_, r)| r.len()).sum();
+    let mentions: u32 = per_kb.iter().map(|(p, _)| p.facts).sum();
     let kbs: Vec<String> = per_kb.iter().map(|(p, _)| p.kb.clone()).collect();
 
-    // Flat relation list (each edge labelled with its KB) plus the per-KB
-    // grouping, so a caller can either scan everything or stay inside one
-    // namespace.
-    let mut flat_relations: Vec<Value> = Vec::with_capacity(relation_total);
+    let mut flat_relations: Vec<Value> = Vec::new();
     let mut relations_by_kb: Vec<Value> = Vec::with_capacity(per_kb.len());
     let mut memories: Vec<Value> = Vec::new();
-    for (person, ranked) in &per_kb {
-        let mut group: Vec<Value> = Vec::with_capacity(ranked.len());
-        for edge in ranked {
+    for (person, facts) in &per_kb {
+        let edges = edges(person, facts);
+        let mut group: Vec<Value> = Vec::with_capacity(edges.len());
+        for edge in &edges {
             let mut v = edge_json(edge);
             v["kb"] = json!(person.kb);
             group.push(v.clone());
@@ -220,13 +175,10 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
         }
         relations_by_kb.push(json!({
             "kb": person.kb,
-            "entity_id": person.id.to_string(),
-            "mentions": person.mention_count,
+            "mentions": person.facts,
             "relations": group,
         }));
-        // Snippets come from every KB, each tagged, instead of only whichever
-        // row SQLite happened to return first.
-        for mut snippet in memory_snippets(ctx, person, ranked, snippets)? {
+        for mut snippet in memory_snippets(ctx, person, facts, snippets)? {
             snippet["kb"] = json!(person.kb);
             memories.push(snippet);
         }
@@ -241,16 +193,13 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
     meta.add("kb", kb_label.clone());
     meta.add("kbs", kbs.clone());
     meta.add("relations", flat_relations.len());
-    meta.add("kind", primary.kind.clone());
     let payload = json!({
         "kb": kb_label,
         "kbs": kbs,
         "person": {
-            "name": primary.canonical_name,
-            "kind": primary.kind,
-            "aliases": aliases,
+            "name": primary.name,
+            "aliases": all_aliases,
             "mentions": mentions,
-            "entity_id": primary.id.to_string(),
         },
         "relations": flat_relations,
         "relations_by_kb": relations_by_kb,
@@ -260,9 +209,8 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
     print_success(ctx.format, payload, meta, |data| {
         let person = &data["person"];
         println!(
-            "{}  ({}, {} mentions)",
+            "{}  ({} facts)",
             person["name"].as_str().unwrap_or(""),
-            person["kind"].as_str().unwrap_or(""),
             person["mentions"].as_u64().unwrap_or(0)
         );
         if let Some(aliases) = person["aliases"].as_array() {
@@ -289,38 +237,20 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
             }
         }
         println!();
-        let groups = data["relations_by_kb"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let total: usize = groups
-            .iter()
-            .map(|g| g["relations"].as_array().map(|a| a.len()).unwrap_or(0))
-            .sum();
-        if total == 0 {
-            println!("Relations: (none yet)");
-        } else {
-            for group in &groups {
-                let relations = group["relations"].as_array().cloned().unwrap_or_default();
-                if relations.is_empty() {
-                    continue;
-                }
-                println!("Relations (kb={}):", group["kb"].as_str().unwrap_or(""));
-                for edge in &relations {
-                    let source = edge["sources"]
-                        .as_array()
-                        .and_then(|s| s.first())
-                        .and_then(|s| s.get("memory_id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unsourced");
-                    println!(
-                        "  {} — {} -> {}, source: {}",
-                        edge["subject"].as_str().unwrap_or(""),
-                        edge["predicate"].as_str().unwrap_or(""),
-                        edge["object"].as_str().unwrap_or(""),
-                        source
-                    );
-                }
+        for group in data["relations_by_kb"].as_array().into_iter().flatten() {
+            let relations = group["relations"].as_array().cloned().unwrap_or_default();
+            if relations.is_empty() {
+                continue;
+            }
+            println!("Relations (kb={}):", group["kb"].as_str().unwrap_or(""));
+            for edge in &relations {
+                println!(
+                    "  {} — {} -> {}  [{}]",
+                    edge["subject"].as_str().unwrap_or(""),
+                    edge["predicate"].as_str().unwrap_or(""),
+                    edge["object"].as_str().unwrap_or(""),
+                    edge["handle"].as_str().unwrap_or("")
+                );
             }
         }
         let memories = data["memories"].as_array().cloned().unwrap_or_default();
@@ -339,85 +269,68 @@ pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Resu
     Ok(())
 }
 
-/// One relation as seen FROM the person being displayed.
-struct Edge {
-    record: RelationRecord,
-    /// The other endpoint's display name.
-    other: String,
+/// One fact as seen FROM the person being displayed.
+struct Edge<'a> {
+    fact: &'a Fact,
+    /// The other end: a person for a link, a value for an attribute.
+    other: &'a str,
     /// `outgoing` when the person is the subject, `incoming` otherwise.
     direction: &'static str,
 }
 
-/// Order relations so the networking-relevant ones come first: typed edges
-/// (introduced_by, friend_of, …) before the weak `co_occurs_with` fallback,
-/// then by weight.
-fn rank_relations(person: &str, relations: Vec<RelationRecord>) -> Vec<Edge> {
-    let mut edges: Vec<Edge> = relations
-        .into_iter()
-        .map(|record| {
-            let outgoing = record.from_entity.eq_ignore_ascii_case(person);
-            let other = if outgoing {
-                record.to_entity.clone()
-            } else {
-                record.from_entity.clone()
-            };
+/// Links to other people first, then what the facts say about the person;
+/// newest first within each (the order `person_facts` returns). Alias facts
+/// are reported as aliases, not relations.
+fn edges<'a>(person: &PersonRow, facts: &'a [Fact]) -> Vec<Edge<'a>> {
+    facts
+        .iter()
+        .filter(|f| !ALIAS_PREDICATES.contains(&f.predicate.as_str()))
+        .map(|fact| {
+            let outgoing = fact.subject_norm == person.name_norm;
             Edge {
-                record,
-                other,
+                fact,
+                other: if outgoing { &fact.object } else { &fact.subject },
                 direction: if outgoing { "outgoing" } else { "incoming" },
             }
         })
-        .collect();
-    edges.sort_by(|a, b| {
-        typed_rank(&a.record.predicate)
-            .cmp(&typed_rank(&b.record.predicate))
-            .then_with(|| {
-                b.record
-                    .weight
-                    .partial_cmp(&a.record.weight)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.other.cmp(&b.other))
-    });
-    edges
+        .collect()
 }
 
-/// 0 = typed relation, 1 = generic co-occurrence.
-fn typed_rank(predicate: &str) -> u8 {
-    match predicate {
-        "co_occurs_with" | "related_to" => 1,
-        _ => 0,
+fn aliases(person: &PersonRow, facts: &[Fact]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in facts {
+        if f.subject_norm == person.name_norm
+            && ALIAS_PREDICATES.contains(&f.predicate.as_str())
+            && !f.object.eq_ignore_ascii_case(&person.name)
+            && !out.iter().any(|a| a.eq_ignore_ascii_case(&f.object))
+        {
+            out.push(f.object.clone());
+        }
     }
+    out
 }
 
 fn edge_json(edge: &Edge) -> Value {
-    let sources = edge
-        .record
-        .provenance
-        .get("sources")
-        .cloned()
-        .unwrap_or_else(|| match &edge.record.provenance {
-            Value::Null => json!([]),
-            other => json!([other]),
-        });
     json!({
-        "subject": edge.record.from_entity,
-        "predicate": edge.record.predicate,
-        "object": edge.record.to_entity,
+        "subject": edge.fact.subject,
+        "predicate": edge.fact.predicate,
+        "object": edge.fact.object,
         "other": edge.other,
         "direction": edge.direction,
-        "weight": edge.record.weight,
-        "sources": sources,
+        "link": PERSON_LINKS.contains(&edge.fact.predicate.as_str()),
+        "confidence": edge.fact.confidence,
+        "fact_id": edge.fact.id.to_string(),
+        "handle": read_surface::handle(HandleKind::Fact, edge.fact.id),
+        "sources": [{ "memory_id": edge.fact.source_memory_id.to_string() }],
     })
 }
 
-/// Memory snippets for a person: the memories that produced their relations
-/// first (they are the ones a networker wants to re-read), then any other
-/// memory that names them or one of their aliases.
+/// Memory snippets for a person: the memories their facts came from first
+/// (the ones worth re-reading), then any other memory that names them.
 fn memory_snippets(
     ctx: &AppContext,
-    person: &EntityRecord,
-    edges: &[Edge],
+    person: &PersonRow,
+    facts: &[Fact],
     limit: usize,
 ) -> Result<Vec<Value>, CliError> {
     if limit == 0 {
@@ -425,79 +338,59 @@ fn memory_snippets(
     }
     let mut out: Vec<Value> = Vec::new();
     let mut seen: Vec<uuid::Uuid> = Vec::new();
-
-    let mut push_chunk = |chunk: engram_storage::ChunkRecord, out: &mut Vec<Value>| {
-        if seen.contains(&chunk.chunk_id) {
-            return;
-        }
-        seen.push(chunk.chunk_id);
-        out.push(json!({
-            "memory_id": chunk.memory_id.to_string(),
-            "chunk_id": chunk.chunk_id.to_string(),
-            // The same handle and chain every other surface publishes, so a
-            // caller can hand this row to `edit` without a second lookup.
-            "handle": read_surface::handle(HandleKind::Memory, chunk.memory_id),
-            "provenance": Provenance {
-                chunk_id: Some(chunk.chunk_id),
-                memory_id: Some(chunk.memory_id),
-                document_id: chunk.document_id,
-                kb: Some(chunk.kb.clone()),
-                diary: Some(chunk.diary.clone()),
-                ..Default::default()
-            }.to_json(),
-            "source": chunk.source,
-            "snippet": snippet(&chunk.content),
-        }));
-    };
-
-    for edge in edges {
+    for fact in facts {
         if out.len() >= limit {
             break;
         }
-        for source in edge
-            .record
-            .provenance
-            .get("sources")
-            .and_then(|s| s.as_array())
+        if seen.contains(&fact.source_memory_id) {
+            continue;
+        }
+        if let Some(chunk) = ctx
+            .store
+            .chunks_for_memory(fact.source_memory_id)?
             .into_iter()
-            .flatten()
+            .next()
         {
-            let Some(chunk_id) = source
-                .get("chunk_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            else {
-                continue;
-            };
-            if let Some(chunk) = ctx.store.get_chunk_record(chunk_id)? {
-                push_chunk(chunk, &mut out);
-            }
-            if out.len() >= limit {
-                break;
-            }
+            seen.push(chunk.memory_id);
+            out.push(chunk_json(chunk));
         }
     }
-
     if out.len() < limit {
-        let mut names = vec![person.canonical_name.clone()];
-        names.extend(person.aliases.iter().cloned());
-        for needle in names {
+        for chunk in ctx
+            .store
+            .chunks_containing(&person.kb, &person.name, limit * 2)?
+        {
             if out.len() >= limit {
                 break;
             }
-            for chunk in ctx
-                .store
-                .chunks_containing(&person.kb, &needle, limit * 2)?
-            {
-                push_chunk(chunk, &mut out);
-                if out.len() >= limit {
-                    break;
-                }
+            if !seen.contains(&chunk.memory_id) {
+                seen.push(chunk.memory_id);
+                out.push(chunk_json(chunk));
             }
         }
     }
     out.truncate(limit);
     Ok(out)
+}
+
+fn chunk_json(chunk: engram_storage::ChunkRecord) -> Value {
+    json!({
+        "memory_id": chunk.memory_id.to_string(),
+        "chunk_id": chunk.chunk_id.to_string(),
+        // The same handle and chain every other surface publishes, so a
+        // caller can hand this row to `edit` without a second lookup.
+        "handle": read_surface::handle(HandleKind::Memory, chunk.memory_id),
+        "provenance": Provenance {
+            chunk_id: Some(chunk.chunk_id),
+            memory_id: Some(chunk.memory_id),
+            document_id: chunk.document_id,
+            kb: Some(chunk.kb.clone()),
+            diary: Some(chunk.diary.clone()),
+            ..Default::default()
+        }.to_json(),
+        "source": chunk.source,
+        "snippet": snippet(&chunk.content),
+    })
 }
 
 fn snippet(content: &str) -> String {
@@ -513,51 +406,64 @@ fn snippet(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use engram_core::types::{FactType, SourceKind};
     use uuid::Uuid;
 
-    fn relation(from: &str, to: &str, predicate: &str, weight: f32) -> RelationRecord {
-        RelationRecord {
+    fn fact(s: &str, p: &str, o: &str) -> Fact {
+        Fact {
             id: Uuid::new_v4(),
+            source_memory_id: Uuid::new_v4(),
+            subject: s.into(),
+            subject_norm: s.to_lowercase(),
+            predicate: p.into(),
+            object: o.into(),
+            object_norm: o.to_lowercase(),
+            confidence: 1.0,
+            created_at: Utc::now(),
+            superseded_by: None,
+            superseded_at: None,
+            diary: "default".into(),
+            fact_type: FactType::default(),
+            valid_from: None,
+            valid_until: None,
+            resolution: None,
+            source_kind: SourceKind::UserStated,
+            confirmations: 0,
+            closed_by: None,
+            close_reason: None,
+            close_authority: None,
             kb: "default".into(),
-            from_entity: from.into(),
-            to_entity: to.into(),
-            predicate: predicate.into(),
-            weight,
-            provenance: json!({ "sources": [{ "memory_id": "m1" }] }),
-            from_entity_id: Uuid::new_v4(),
-            to_entity_id: Uuid::new_v4(),
+        }
+    }
+
+    fn person(name: &str) -> PersonRow {
+        PersonRow {
+            name: name.into(),
+            name_norm: name.to_lowercase(),
+            kb: "default".into(),
+            facts: 0,
         }
     }
 
     #[test]
-    fn typed_relations_outrank_co_occurrence() {
-        let ranked = rank_relations(
-            "Noemi",
-            vec![
-                relation("Noemi", "Rapamycin", "co_occurs_with", 9.0),
-                relation("Noemi", "Avi Roy", "introduced_by", 1.0),
-            ],
-        );
-        assert_eq!(ranked[0].record.predicate, "introduced_by");
-        assert_eq!(ranked[1].record.predicate, "co_occurs_with");
-    }
-
-    #[test]
     fn direction_is_relative_to_the_person_shown() {
-        let ranked = rank_relations(
-            "Avi Roy",
-            vec![relation("Noemi", "Avi Roy", "friend_of", 1.0)],
-        );
-        assert_eq!(ranked[0].direction, "incoming");
-        assert_eq!(ranked[0].other, "Noemi");
+        let facts = vec![fact("Noemi", "friend_of", "Avi Roy")];
+        let edges = edges(&person("Avi Roy"), &facts);
+        assert_eq!(edges[0].direction, "incoming");
+        assert_eq!(edges[0].other, "Noemi");
     }
 
     #[test]
-    fn legacy_flat_provenance_still_lists_a_source() {
-        let mut record = relation("Noemi", "Avi Roy", "co_occurs_with", 1.0);
-        record.provenance = json!({ "chunk_id": "c1" });
-        let ranked = rank_relations("Noemi", vec![record]);
-        let value = edge_json(&ranked[0]);
-        assert_eq!(value["sources"].as_array().map(|a| a.len()), Some(1));
+    fn nicknames_are_aliases_not_relations() {
+        let facts = vec![
+            fact("Noemi", "has_nickname", "Nomi"),
+            fact("Noemi", "works_at", "Example Labs"),
+        ];
+        let p = person("Noemi");
+        assert_eq!(aliases(&p, &facts), vec!["Nomi".to_string()]);
+        let edges = edges(&p, &facts);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edge_json(&edges[0])["sources"][0]["memory_id"], facts[1].source_memory_id.to_string());
     }
 }

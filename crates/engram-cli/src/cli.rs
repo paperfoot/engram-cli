@@ -146,7 +146,7 @@ pub enum Command {
         #[arg(long, default_value = "topic")]
         layer: String,
 
-        /// Retrieval mode: evidence|raw|wiki|explore|agent.
+        /// Retrieval mode: evidence|raw (wiki|explore|agent are accepted and run evidence).
         #[arg(long, default_value = "evidence")]
         mode: String,
 
@@ -177,10 +177,7 @@ pub enum Command {
 
         /// Earliest event_time to include: RFC3339 (2026-06-01T09:30:00Z) or
         /// YYYY-MM-DD, which means the START of that UTC day. Same spellings
-        /// `remember --event-time` accepts. NOTE: a temporal window restricts
-        /// results to raw memory chunks — derived sources (claims, wiki pages,
-        /// entities, relations) carry no event time of their own and are
-        /// withheld, which `metadata.temporal_scope` reports.
+        /// `remember --event-time` accepts.
         #[arg(long)]
         since: Option<String>,
 
@@ -270,7 +267,7 @@ Examples:
     #[command(subcommand)]
     Kb(KbCommand),
 
-    /// Inspect compile/daemon jobs.
+    /// Inspect background jobs.
     #[command(subcommand)]
     Jobs(JobsCommand),
 
@@ -343,7 +340,7 @@ Examples:
 
     /// Diagnose configuration, keys, schema, embeddings, and daemon port.
     Doctor {
-        /// Also require OpenRouter for compiler checks.
+        /// Also require OpenRouter (fact extraction).
         #[arg(long)]
         compiler: bool,
         /// Include store lifecycle checks for stale derived memory artifacts.
@@ -756,7 +753,7 @@ pub enum MemoryCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum JobsCommand {
-    /// List compiler jobs.
+    /// List background jobs.
     #[command(visible_aliases = ["ls"])]
     List {
         /// Knowledge base/domain namespace.
@@ -768,7 +765,7 @@ pub enum JobsCommand {
         /// Max jobs to return.
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Only jobs of this kind (compile|backfill).
+        /// Only jobs of this kind (backfill).
         #[arg(long)]
         kind: Option<String>,
         /// Only jobs in this status (queued|running|completed|paused|failed|cancelled|abandoned).
@@ -779,7 +776,7 @@ pub enum JobsCommand {
     Show { id: String },
     /// Submit a background job.
     Submit {
-        /// compile|backfill.
+        /// backfill.
         #[arg(long)]
         kind: String,
         /// Knowledge base/domain namespace.
@@ -900,7 +897,7 @@ pub enum BudgetCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum PeopleCommand {
-    /// List people with their aliases, mention counts, and top relations.
+    /// List people — names your facts treat as people — with fact counts and top relations.
     #[command(visible_aliases = ["ls"])]
     List {
         /// Knowledge base/domain namespace. Defaults to all KBs ("*").
@@ -909,7 +906,7 @@ pub enum PeopleCommand {
         /// Max people to return.
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Minimum mention count filter.
+        /// Only people named by at least this many live facts.
         #[arg(long, default_value_t = 1)]
         min_mentions: u32,
         /// Opaque continuation token from a previous page's `cursor`. Do not
@@ -917,11 +914,11 @@ pub enum PeopleCommand {
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// Show one person: aliases, relations with provenance, and the memories
-    /// that mention them.
+    /// Show one person: their facts and links to other people, each with its
+    /// source memory, and the memories that mention them.
     #[command(visible_aliases = ["get"])]
     Show {
-        /// Person name or any known alias (case-insensitive).
+        /// Person name (case-insensitive).
         name: String,
         /// Knowledge base/domain namespace. Defaults to all KBs ("*").
         #[arg(long, default_value = "*")]

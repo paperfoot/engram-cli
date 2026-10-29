@@ -11,7 +11,9 @@ pub mod jobs;
 pub mod journal;
 pub mod lessons;
 pub mod migrate_v10;
+pub mod migrate_v14;
 pub mod paths;
+pub mod people;
 pub mod rebuild;
 pub mod sqlite;
 #[cfg(test)]
@@ -36,4 +38,5 @@ pub use sqlite::{
     FactExportRow, KbExportRow, KnowledgeBase, MemoryExportRow, RelationRecord, SourceCitation,
     SqliteStore, StoredChunkEmbedding, WikiPageRecord,
 };
+pub use people::PersonRow;
 pub use write_path::{DerivationRow, RetractOutcome};

@@ -874,7 +874,7 @@ const MEMORY_CONSTRAINS_DERIVED: &str = "(
     )
 )";
 
-pub const CURRENT_VERSION: i32 = 13;
+pub const CURRENT_VERSION: i32 = 14;
 
 /// A fact still asserts something only while BOTH are true: no successor took
 /// its slot, and its own interval has not been closed. `close_reason='stopped'`
@@ -883,7 +883,7 @@ pub const CURRENT_VERSION: i32 = 13;
 /// the exact failure move 2 exists to prevent, introduced by move 2. Mirrors
 /// `engram_core::interval::is_open_fact`; the two are one rule in two
 /// languages and a test pins them equal.
-const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND superseded_by IS NULL)";
+pub(crate) const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND superseded_by IS NULL)";
 
 /// The fact projection, in `parse_fact_row` order. Written once so a `SELECT`
 /// and its parser cannot drift: a wrong column offset mis-parses silently,
@@ -948,11 +948,24 @@ impl SqliteStore {
         // one must not pay for a copy on every CLI invocation.
         let mut backup_path = None;
         if let Some(v) = store.try_schema_version()? {
-            if v < 10 && store.path != Path::new(":memory:") {
+            // v14 writes rows too (typed person links copied into facts),
+            // so a store that holds any takes the same backup.
+            let rewrites = if v < 10 {
+                Some(10)
+            } else if v < 14 && store.has_typed_relations()? {
+                Some(14)
+            } else {
+                None
+            };
+            if let (Some(version), false) = (rewrites, store.path == Path::new(":memory:")) {
                 // Captured, not discarded: the migration log records where
                 // the rollback file went (final-review finding 5) — a backup
                 // an operator cannot find is a backup that does not exist.
-                backup_path = Some(crate::backup::vacuum_into_backup(&store.conn, &store.path)?);
+                backup_path = Some(crate::backup::vacuum_into_backup(
+                    &store.conn,
+                    &store.path,
+                    version,
+                )?);
             }
         }
         store.migrate(backup_path)?;
@@ -1146,6 +1159,11 @@ impl SqliteStore {
             // itself, no backfill pass and no row rewrite (D25) [G9].
             if current < 13 {
                 s.migrate_v13()?;
+            }
+            // v14 copies the compiled graph's typed person links into facts
+            // (see `migrate_v14`); INSERT only, backed up when it will write.
+            if current < 14 {
+                s.migrate_v14(backup_path.clone())?;
             }
             if current != CURRENT_VERSION {
                 s.conn.execute(
@@ -4556,7 +4574,10 @@ impl SqliteStore {
         self.with_tx(|s| s.insert_fact_row(f))
     }
 
-    fn insert_fact_row(&self, f: &engram_core::types::Fact) -> Result<(), StorageError> {
+    pub(crate) fn insert_fact_row(
+        &self,
+        f: &engram_core::types::Fact,
+    ) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT INTO facts(id, source_memory_id, subject, subject_norm,
                 predicate, object, object_norm, confidence, created_at,

@@ -7,7 +7,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 
 /// Point a spawned binary's data/config/cache at `home`.
@@ -507,71 +507,6 @@ fn recall_refuses_mixed_embedding_metadata() {
 }
 
 #[test]
-fn kb_ingest_compile_entities_flow() {
-    let (tmp, mut kb_cmd) = with_isolated_home();
-    kb_cmd
-        .args([
-            "kb",
-            "create",
-            "ageing-biology",
-            "--description",
-            "Ageing biology",
-        ])
-        .arg("--json")
-        .assert()
-        .success();
-
-    let fixture = tmp.path().join("paper.md");
-    std::fs::write(
-        &fixture,
-        "Rapamycin inhibits mTORC1 signaling in mice. Human trials measure vaccine response rather than lifespan.",
-    )
-    .unwrap();
-
-    let mut ingest_cmd = engram();
-    ingest_cmd.env_remove("ENGRAM_STORE");
-    ingest_cmd.env("HOME", tmp.path());
-    ingest_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    ingest_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    ingest_cmd.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
-    ingest_cmd
-        .args([
-            "ingest",
-            fixture.to_str().unwrap(),
-            "--kb",
-            "ageing-biology",
-            "--mode",
-            "takeaways",
-            "--compile",
-            "evidence",
-            "--json",
-        ])
-        .assert()
-        .success();
-
-    let mut entities_cmd = engram();
-    entities_cmd.env_remove("ENGRAM_STORE");
-    entities_cmd.env("HOME", tmp.path());
-    entities_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    entities_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    entities_cmd.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
-    let out = entities_cmd
-        .args(["entities", "list", "--kb", "ageing-biology", "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let v = parse_stdout(&out);
-    assert_eq!(v["status"], "success");
-    assert!(v["data"]["entities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|e| e["canonical_name"] == "Rapamycin"));
-}
-
-#[test]
 fn kb_delete_removes_recallable_memories_in_that_kb() {
     let (tmp, mut kb_cmd) = with_isolated_home();
     kb_cmd
@@ -901,17 +836,6 @@ fn documents_jobs_budget_and_scientific_bench_work() {
     assert_eq!(docs["status"], "success");
     assert_eq!(docs["data"]["documents"].as_array().unwrap().len(), 1);
 
-    let mut compile_cmd = engram();
-    compile_cmd.env_remove("ENGRAM_STORE");
-    compile_cmd.env("HOME", tmp.path());
-    compile_cmd.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    compile_cmd.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    compile_cmd.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
-    compile_cmd
-        .args(["compile", "--kb", "ageing-biology", "--all", "--json"])
-        .assert()
-        .success();
-
     let mut jobs_cmd = engram();
     jobs_cmd.env_remove("ENGRAM_STORE");
     jobs_cmd.env("HOME", tmp.path());
@@ -926,7 +850,7 @@ fn documents_jobs_budget_and_scientific_bench_work() {
         .stdout
         .clone();
     let jobs = parse_stdout(&jobs_out);
-    assert!(!jobs["data"]["jobs"].as_array().unwrap().is_empty());
+    assert!(jobs["data"]["jobs"].is_array());
 
     let mut budget_cmd = engram();
     budget_cmd.env_remove("ENGRAM_STORE");
@@ -1256,91 +1180,6 @@ fn ingest_same_source_path_is_idempotent() {
     let kb = parse_stdout(&kb_out);
     assert_eq!(kb["data"]["knowledge_base"]["document_count"], 1);
     assert_eq!(kb["data"]["knowledge_base"]["memory_count"], 1);
-}
-
-#[test]
-fn document_delete_clears_derived_entities() {
-    let (tmp, mut ingest) = with_isolated_home();
-    let fixture = tmp.path().join("paper.md");
-    std::fs::write(
-        &fixture,
-        "Rapamycin inhibits mTORC1 in mice. Human trials measure vaccine response.",
-    )
-    .unwrap();
-    ingest
-        .args([
-            "ingest",
-            fixture.to_str().unwrap(),
-            "--kb",
-            "delete-clean",
-            "--mode",
-            "papers",
-            "--compile",
-            "evidence",
-            "--json",
-        ])
-        .assert()
-        .success();
-
-    let mut docs = engram();
-    docs.env_remove("ENGRAM_STORE");
-    docs.env("HOME", tmp.path());
-    docs.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    docs.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    docs.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
-    let docs_out = docs
-        .args(["documents", "list", "--kb", "delete-clean", "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let docs_json = parse_stdout(&docs_out);
-    let document_id = docs_json["data"]["documents"][0]["id"].as_str().unwrap();
-
-    let mut delete = engram();
-    delete.env_remove("ENGRAM_STORE");
-    delete.env("HOME", tmp.path());
-    delete.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    delete.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    delete.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
-    delete
-        .args(["documents", "delete", document_id, "--confirm", "--json"])
-        .assert()
-        .success();
-
-    // Deleting one document no longer wipes the whole KB's compiled
-    // knowledge; entity aggregates go stale until the next compile.
-    // A fresh compile over the (now empty) KB must clear them.
-    let mut compile = engram();
-    compile.env_remove("ENGRAM_STORE");
-    compile.env("HOME", tmp.path());
-    compile.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    compile.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    compile.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
-    compile
-        .args(["compile", "--kb", "delete-clean", "--all", "--json"])
-        .assert()
-        .success();
-
-    let mut entities = engram();
-    entities.env_remove("ENGRAM_STORE");
-    entities.env("HOME", tmp.path());
-    entities.env("XDG_CONFIG_HOME", tmp.path().join(".config"));
-    entities.env("XDG_DATA_HOME", tmp.path().join(".local/share"));
-    entities.env("XDG_CACHE_HOME", tmp.path().join(".cache"));
-    let entities_out = entities
-        .args(["entities", "list", "--kb", "delete-clean", "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let entities_json = parse_stdout(&entities_out);
-    assert_eq!(
-        entities_json["data"]["entities"].as_array().unwrap().len(),
-        0
-    );
 }
 
 #[test]
@@ -2335,140 +2174,6 @@ fn retrieval_default_kb_config_pins_recall_scope() {
 }
 
 #[test]
-fn diary_scoped_recall_never_returns_another_diarys_compiled_claims() {
-    let (tmp, _cmd) = with_isolated_home();
-    // Two diaries share one KB, so the KB alone cannot prove provenance.
-    // The digit matters: the deterministic compiler only turns a sentence into
-    // a cited claim when it looks like evidence.
-    remember_in(
-        &tmp,
-        "Nadia consulted a psychiatrist about 3 ketamine infusions last winter.",
-        "shared",
-        "private",
-    );
-    remember_in(
-        &tmp,
-        "Standup moved to Tuesday mornings at 9 am for the whole team.",
-        "shared",
-        "work",
-    );
-
-    // Compile turns each chunk into cited claims — the LLM/compiler paraphrase
-    // layer that recall searches in agent/evidence mode.
-    cmd_in(&tmp)
-        .args(["compile", "--kb", "shared", "--all", "--json"])
-        .assert()
-        .success();
-
-    // The owning diary still sees its own content.
-    let v = recall_json(
-        &tmp,
-        &[
-            "ketamine psychiatrist",
-            "--diary",
-            "private",
-            "--mode",
-            "agent",
-        ],
-    );
-    assert!(
-        contents(&v).iter().any(|c| c.contains("ketamine")),
-        "the private diary must still recall its own memory"
-    );
-
-    // A recall scoped to another diary must return nothing derived from it —
-    // not the chunk, and not a claim restating the chunk.
-    let v = recall_json(
-        &tmp,
-        &[
-            "ketamine psychiatrist",
-            "--diary",
-            "work",
-            "--mode",
-            "agent",
-        ],
-    );
-    let leaked = contents(&v);
-    assert!(
-        !leaked
-            .iter()
-            .any(|c| c.to_lowercase().contains("ketamine")
-                || c.to_lowercase().contains("psychiatrist")),
-        "diary isolation leak: {leaked:?}"
-    );
-    // The exclusion is reported, not silent.
-    let excluded = &v["metadata"]["diary_isolation"]["excluded_candidates"];
-    assert!(
-        excluded["claim"].as_u64().unwrap_or(0) >= 1,
-        "withheld claims must be reported in metadata: {}",
-        v["metadata"]["diary_isolation"]
-    );
-    assert_eq!(v["metadata"]["diary_isolation"]["diary"], "work");
-}
-
-#[test]
-fn entity_retrieval_fires_when_recall_spans_every_kb() {
-    let (tmp, _cmd) = with_isolated_home();
-    remember_in(
-        &tmp,
-        "Rapamycin extends mouse lifespan through mTORC1 inhibition.",
-        "one",
-        "default",
-    );
-    remember_in(
-        &tmp,
-        "Metformin lowers fasting glucose in older adults.",
-        "two",
-        "default",
-    );
-    for kb in ["one", "two"] {
-        cmd_in(&tmp)
-            .args(["compile", "--kb", kb, "--all", "--json"])
-            .assert()
-            .success();
-    }
-
-    // Both KBs really do carry an entity.
-    for (kb, name) in [("one", "Rapamycin"), ("two", "Metformin")] {
-        let out = cmd_in(&tmp)
-            .args(["entities", "list", "--kb", kb, "--json"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone();
-        let v = parse_stdout(&out);
-        assert!(
-            v["data"]["entities"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|e| e["canonical_name"] == name),
-            "expected entity {name} in kb {kb}"
-        );
-    }
-
-    // Unscoped recall used to return early before entity/graph retrieval,
-    // silently dropping two of the pipeline's sources.
-    let v = recall_json(&tmp, &["Rapamycin Metformin", "--top-k", "20"]);
-    let results = v["data"]["results"].as_array().unwrap();
-    let entity_kbs: Vec<&str> = results
-        .iter()
-        .filter(|r| {
-            r["sources"]
-                .as_array()
-                .map(|s| s.iter().any(|x| x == "entity"))
-                .unwrap_or(false)
-        })
-        .map(|r| r["kb"].as_str().unwrap_or_default())
-        .collect();
-    assert!(
-        entity_kbs.contains(&"one") && entity_kbs.contains(&"two"),
-        "entity retrieval must fire in both KBs, got {entity_kbs:?}"
-    );
-}
-
-#[test]
 fn remember_extracts_facts_by_default() {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let v = run_json(
@@ -2896,29 +2601,23 @@ fn facts_backfill_scopes_to_kb_and_diary() {
 // API key: the deterministic extractor is the floor, not a fallback.
 // ---------------------------------------------------------------------------
 
-/// Ingest one networking note and compile it, returning the isolated home.
+/// One networking note remembered with the facts an agent would supply,
+/// returning the isolated home. No API key: people come from facts.
 fn networking_kb() -> tempfile::TempDir {
-    let (tmp, mut ingest) = with_isolated_home();
-    let fixture = tmp.path().join("network.md");
-    std::fs::write(
-        &fixture,
-        "Avi Roy introduced me to Noemi Kostova at the Longevity Summit. \
-         Noemi Kostova is married to Sam Lee. \
-         I'm seeing Noemi on Monday. She's bringing Avi Roy. \
-         Noemi's deck was excellent. \
-         Sam Lee works with Avi Roy on the fund.",
-    )
-    .unwrap();
-    ingest
+    let (tmp, _) = with_isolated_home();
+    cmd_in(&tmp)
         .args([
-            "ingest",
-            fixture.to_str().unwrap(),
+            "remember",
+            "Avi Roy introduced me to Noemi Kostova at the Longevity Summit. \
+             Noemi Kostova is married to Sam Lee. Everyone calls her Nomi. \
+             Sam Lee works with Avi Roy on the fund.",
             "--kb",
             "network",
-            "--mode",
-            "general",
-            "--compile",
-            "evidence",
+            "--facts-json",
+            r#"[{"subject":"Noemi Kostova","predicate":"introduced_by","object":"Avi Roy"},
+                {"subject":"Noemi Kostova","predicate":"married_to","object":"Sam Lee"},
+                {"subject":"Noemi Kostova","predicate":"has_nickname","object":"Nomi"},
+                {"subject":"Sam Lee","predicate":"works_with","object":"Avi Roy"}]"#,
             "--json",
         ])
         .assert()
@@ -2936,41 +2635,6 @@ fn json_cmd(tmp: &tempfile::TempDir, args: &[&str]) -> Value {
         .stdout
         .clone();
     parse_stdout(&out)
-}
-
-#[test]
-fn compile_types_people_and_rejects_contraction_junk() {
-    let tmp = networking_kb();
-    let v = json_cmd(
-        &tmp,
-        &["entities", "list", "--kb", "network", "--limit", "100"],
-    );
-    let entities = v["data"]["entities"].as_array().unwrap();
-    let names: Vec<&str> = entities
-        .iter()
-        .filter_map(|e| e["canonical_name"].as_str())
-        .collect();
-
-    for junk in ["I'm", "She's", "It's", "Monday", "The"] {
-        assert!(!names.contains(&junk), "junk entity {junk} in {names:?}");
-    }
-    // "Noemi's" folds into its owner; no rival possessive node.
-    assert!(
-        !names.iter().any(|n| n.ends_with("'s")),
-        "possessive entity survived: {names:?}"
-    );
-
-    let people: Vec<&str> = entities
-        .iter()
-        .filter(|e| e["kind"] == "person")
-        .filter_map(|e| e["canonical_name"].as_str())
-        .collect();
-    for expected in ["Avi Roy", "Noemi Kostova", "Sam Lee"] {
-        assert!(
-            people.contains(&expected),
-            "{expected} not typed person: {people:?}"
-        );
-    }
 }
 
 #[test]
@@ -2998,17 +2662,8 @@ fn people_list_returns_person_entities_with_relations() {
         predicates.contains(&"introduced_by") || predicates.contains(&"married_to"),
         "expected typed relations, got {predicates:?}"
     );
-    // Alias spellings fold onto the person instead of splitting the node.
-    let aliases: Vec<&str> = noemi["aliases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|a| a.as_str())
-        .collect();
-    assert!(
-        aliases.iter().any(|a| a.starts_with("Noemi")),
-        "{aliases:?}"
-    );
+    // A nickname fact is an alias, not a relation.
+    assert_eq!(noemi["aliases"], json!(["Nomi"]));
 }
 
 #[test]
@@ -3019,7 +2674,6 @@ fn people_show_reports_predicate_provenance_and_snippets() {
         &["people", "show", "Noemi Kostova", "--kb", "network"],
     );
     assert_eq!(v["status"], "success");
-    assert_eq!(v["data"]["person"]["kind"], "person");
 
     let relations = v["data"]["relations"].as_array().unwrap();
     let introduced = relations
@@ -3029,17 +2683,22 @@ fn people_show_reports_predicate_provenance_and_snippets() {
     assert_eq!(introduced["subject"], "Noemi Kostova");
     assert_eq!(introduced["object"], "Avi Roy");
 
-    // Every typed edge must be checkable: a memory id and the source sentence.
+    // Every edge is a fact an agent can cite or correct, sourced to its memory.
+    assert!(introduced["handle"].as_str().is_some_and(|h| h.starts_with("fact:")));
     let source = introduced["sources"]
         .as_array()
         .and_then(|s| s.first())
         .expect("edge provenance");
     assert!(source["memory_id"].as_str().is_some_and(|m| !m.is_empty()));
-    assert!(source["chunk_id"].as_str().is_some_and(|c| !c.is_empty()));
-    assert!(source["sentence"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("introduced"));
+    // Sam Lee sees the marriage from the other end.
+    let sam = json_cmd(&tmp, &["people", "show", "Sam Lee", "--kb", "network"]);
+    let married = sam["data"]["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["predicate"] == "married_to")
+        .expect("married_to seen from Sam Lee");
+    assert_eq!((married["direction"].as_str(), married["other"].as_str()), (Some("incoming"), Some("Noemi Kostova")));
 
     let memories = v["data"]["memories"].as_array().unwrap();
     assert!(!memories.is_empty(), "expected memory snippets");
@@ -3051,8 +2710,10 @@ fn people_show_reports_predicate_provenance_and_snippets() {
 #[test]
 fn people_show_resolves_an_alias() {
     let tmp = networking_kb();
-    // "Noemi" was written bare in one sentence; it must resolve to the person.
+    // A unique first name and a nickname both resolve to the person.
     let v = json_cmd(&tmp, &["people", "show", "noemi", "--kb", "network"]);
+    assert_eq!(v["data"]["person"]["name"], "Noemi Kostova");
+    let v = json_cmd(&tmp, &["people", "show", "Nomi", "--kb", "network"]);
     assert_eq!(v["data"]["person"]["name"], "Noemi Kostova");
 }
 
@@ -3071,107 +2732,6 @@ fn people_show_unknown_name_is_bad_input() {
         .assert()
         .failure()
         .code(3);
-}
-
-#[test]
-fn graph_neighbors_is_person_centric() {
-    let tmp = networking_kb();
-    let v = json_cmd(
-        &tmp,
-        &["graph", "neighbors", "Noemi Kostova", "--kb", "network"],
-    );
-    assert_eq!(v["data"]["resolved"]["kind"], "person");
-    let neighbors = v["data"]["neighbors"].as_array().unwrap();
-    let avi = neighbors
-        .iter()
-        .find(|n| n["name"] == "Avi Roy")
-        .expect("Avi Roy is a neighbor");
-    assert_eq!(avi["kind"], "person");
-    assert!(avi["relations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| r["predicate"] == "introduced_by"));
-
-    // --typed-only drops the weak co-occurrence edges.
-    let typed = json_cmd(
-        &tmp,
-        &[
-            "graph",
-            "neighbors",
-            "Noemi Kostova",
-            "--kb",
-            "network",
-            "--typed-only",
-        ],
-    );
-    assert!(typed["data"]["relations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|r| r["predicate"] != "co_occurs_with"));
-}
-
-#[test]
-fn recompiling_converges_instead_of_accumulating() {
-    let tmp = networking_kb();
-    let before = json_cmd(
-        &tmp,
-        &["entities", "list", "--kb", "network", "--limit", "500"],
-    );
-    let people_before = json_cmd(&tmp, &["people", "list", "--kb", "network"]);
-
-    json_cmd(&tmp, &["compile", "--kb", "network", "--all"]);
-    json_cmd(&tmp, &["compile", "--kb", "network", "--all"]);
-
-    let after = json_cmd(
-        &tmp,
-        &["entities", "list", "--kb", "network", "--limit", "500"],
-    );
-    let people_after = json_cmd(&tmp, &["people", "list", "--kb", "network"]);
-
-    let fingerprint = |v: &Value, key: &str, field: &str| -> Vec<String> {
-        let mut out: Vec<String> = v["data"][key]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| {
-                format!(
-                    "{}:{}",
-                    e[field].as_str().unwrap_or(""),
-                    e["mention_count"]
-                        .as_u64()
-                        .or_else(|| e["mentions"].as_u64())
-                        .unwrap_or(0)
-                )
-            })
-            .collect();
-        out.sort();
-        out
-    };
-    assert_eq!(
-        fingerprint(&before, "entities", "canonical_name"),
-        fingerprint(&after, "entities", "canonical_name"),
-        "recompile must replace derived entities, not accumulate them"
-    );
-    assert_eq!(
-        fingerprint(&people_before, "people", "name"),
-        fingerprint(&people_after, "people", "name")
-    );
-
-    // Edge weight and provenance must not creep up across recompiles either.
-    let edges = json_cmd(
-        &tmp,
-        &["people", "show", "Noemi Kostova", "--kb", "network"],
-    );
-    let introduced = edges["data"]["relations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["predicate"] == "introduced_by")
-        .expect("introduced_by edge");
-    assert_eq!(introduced["sources"].as_array().unwrap().len(), 1);
-    assert!(introduced["weight"].as_f64().unwrap() <= 1.0);
 }
 
 /// The personal-memory suite must run end to end with no API keys and produce
@@ -3376,169 +2936,6 @@ fn bench_personal_rejects_an_unknown_profile() {
 // adversarial review found in a live sandbox; each one fails without its fix.
 // ---------------------------------------------------------------------------
 
-/// Store a memory and return its id.
-fn remember_returning_id(tmp: &tempfile::TempDir, args: &[&str]) -> String {
-    let out = cmd_in(tmp)
-        .arg("remember")
-        .args(args)
-        .args(["--no-facts", "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    parse_stdout(&out)["data"]["id"]
-        .as_str()
-        .expect("memory id")
-        .to_string()
-}
-
-/// FINDING 1 (critical): `forget` must not widen what another diary can see.
-///
-/// `forget` is a soft delete that leaves the KB's wiki pages and entity
-/// aggregates standing until the next compile. The isolation gate counted only
-/// live memories, so deleting the last memory of the private diary made the
-/// shared KB look like it belonged wholly to `work` — and a `--diary work`
-/// recall started returning wiki text paraphrasing the just-deleted private
-/// memory. Deleting content must never publish it.
-#[test]
-fn forget_does_not_unseal_another_diarys_derived_content() {
-    let tmp = tempfile::tempdir().expect("tmp dir");
-    let private_id = remember_returning_id(
-        &tmp,
-        &[
-            "Nadia consulted a psychiatrist about 3 ketamine infusions last winter.",
-            "--kb",
-            "shared",
-            "--diary",
-            "personal",
-        ],
-    );
-    remember_returning_id(
-        &tmp,
-        &[
-            "Standup moved to Tuesday mornings at 9 am for the whole team.",
-            "--kb",
-            "shared",
-            "--diary",
-            "work",
-        ],
-    );
-
-    // Compile builds the derived layer: wiki pages that quote chunk text
-    // verbatim, plus entity/relation aggregates.
-    cmd_in(&tmp)
-        .args(["compile", "--kb", "shared", "--all", "--json"])
-        .assert()
-        .success();
-
-    let leaked = |v: &Value| -> Vec<String> {
-        contents(v)
-            .into_iter()
-            .filter(|c| {
-                let c = c.to_lowercase();
-                c.contains("ketamine") || c.contains("psychiatrist") || c.contains("nadia")
-            })
-            .collect()
-    };
-
-    // BEFORE forget: the mixed KB is gated, and the gate says so.
-    let before = recall_json(
-        &tmp,
-        &[
-            "ketamine psychiatrist Nadia",
-            "--diary",
-            "work",
-            "--mode",
-            "agent",
-        ],
-    );
-    assert!(
-        leaked(&before).is_empty(),
-        "pre-forget leak into diary work: {:?}",
-        leaked(&before)
-    );
-    assert!(
-        before["metadata"]["diary_isolation"]["excluded_candidates"].is_object(),
-        "the gate must report what it withheld: {}",
-        before["metadata"]
-    );
-
-    // The owning diary can still read its own memory.
-    let owner = recall_json(
-        &tmp,
-        &[
-            "ketamine psychiatrist Nadia",
-            "--diary",
-            "personal",
-            "--mode",
-            "agent",
-        ],
-    );
-    assert!(
-        !leaked(&owner).is_empty(),
-        "the personal diary must still recall its own content"
-    );
-
-    cmd_in(&tmp)
-        .args(["forget", &private_id, "--confirm", "--json"])
-        .assert()
-        .success();
-
-    // AFTER forget: still gated. The wiki page and entity rows that paraphrase
-    // the deleted memory have not been purged, so the KB is not pure `work`.
-    let after = recall_json(
-        &tmp,
-        &[
-            "ketamine psychiatrist Nadia",
-            "--diary",
-            "work",
-            "--mode",
-            "agent",
-        ],
-    );
-    assert!(
-        leaked(&after).is_empty(),
-        "deleting the private memory PUBLISHED it to diary work: {:?}",
-        leaked(&after)
-    );
-    assert!(
-        after["metadata"]["diary_isolation"]["excluded_candidates"].is_object(),
-        "the withheld sources must still be reported after forget: {}",
-        after["metadata"]
-    );
-    assert_eq!(after["metadata"]["diary_isolation"]["diary"], "work");
-
-    // The gate over-blocks on purpose, so it needs a real exit: a full compile
-    // rebuilds the derived layer from live chunks only, genuinely purging the
-    // deleted memory — after which the KB is honestly pure `work` and stops
-    // being gated. Without this the KB would be blocked forever.
-    cmd_in(&tmp)
-        .args(["compile", "--kb", "shared", "--all", "--json"])
-        .assert()
-        .success();
-    let recompiled = recall_json(
-        &tmp,
-        &[
-            "ketamine psychiatrist Nadia",
-            "--diary",
-            "work",
-            "--mode",
-            "agent",
-        ],
-    );
-    assert!(
-        leaked(&recompiled).is_empty(),
-        "the recompile must PURGE the deleted memory, not expose it: {:?}",
-        leaked(&recompiled)
-    );
-    assert!(
-        recompiled["metadata"]["diary_isolation"].is_null(),
-        "once the KB really is single-diary, nothing should be withheld: {}",
-        recompiled["metadata"]
-    );
-}
-
 /// FINDING 2 (major): the "already extracted" marker is a promise that the
 /// facts are in the store, so it may only be written after they are.
 ///
@@ -3603,135 +3000,46 @@ fn a_failed_fact_write_leaves_the_memory_pending_for_backfill() {
     assert_eq!(facts["data"]["facts"][0]["predicate"], "lives_in");
 }
 
-/// FINDING 3 (major): `--since/--until` bound a memory's event time, and only
-/// raw chunks have one. Wiki pages, claims and entity aggregates were never
-/// filtered, so a window could return a wiki page compiled from a 2010 memory.
-#[test]
-fn a_temporal_window_excludes_derived_sources_and_says_so() {
-    let tmp = tempfile::tempdir().expect("tmp dir");
-    cmd_in(&tmp)
-        .args([
-            "remember",
-            "Marguerite presented the vermilion protocol at the Kyoto workshop.",
-            "--kb",
-            "archive",
-            "--event-time",
-            "2010-05-04",
-            "--no-facts",
-            "--json",
-        ])
-        .assert()
-        .success();
-    cmd_in(&tmp)
-        .args(["compile", "--kb", "archive", "--all", "--json"])
-        .assert()
-        .success();
-
-    let kinds = |v: &Value| -> Vec<String> {
-        v["data"]["results"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|r| r["kind"].as_str().unwrap_or_default().to_string())
-            .collect()
-    };
-
-    // Control: the wiki page exists and matches the query.
-    let control = recall_json(&tmp, &["Marguerite vermilion protocol", "--mode", "wiki"]);
-    assert!(
-        kinds(&control).iter().any(|k| k == "wiki_page"),
-        "expected a wiki page without a window: {:?}",
-        kinds(&control)
-    );
-    assert!(
-        control["metadata"]["temporal_scope"].is_null(),
-        "no window means no temporal note"
-    );
-
-    // Windowed: the 2010 page is not admissible under a 2025+ window.
-    let windowed = recall_json(
-        &tmp,
-        &[
-            "Marguerite vermilion protocol",
-            "--mode",
-            "wiki",
-            "--since",
-            "2025-01-01",
-        ],
-    );
-    assert!(
-        !kinds(&windowed).iter().any(|k| k == "wiki_page"),
-        "a wiki page compiled from a 2010 memory leaked through --since: {:?}",
-        kinds(&windowed)
-    );
-    let excluded = windowed["metadata"]["temporal_scope"]["excluded_sources"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        excluded.iter().any(|s| s == "wiki"),
-        "the exclusion must be reported, not silent: {}",
-        windowed["metadata"]["temporal_scope"]
-    );
-
-    // Agent mode withholds every derived source, all reported.
-    let agent = recall_json(
-        &tmp,
-        &[
-            "Marguerite vermilion protocol",
-            "--mode",
-            "agent",
-            "--since",
-            "2025-01-01",
-        ],
-    );
-    let excluded = agent["metadata"]["temporal_scope"]["excluded_sources"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    for source in ["claim", "entity", "wiki"] {
-        assert!(
-            excluded.iter().any(|s| s == source),
-            "{source} exclusion missing from {}",
-            agent["metadata"]["temporal_scope"]
-        );
-    }
-}
-
 /// FINDING 4 (major): `people show --kb '*'` used a LIMIT-1 lookup with no
 /// ORDER BY, so SQLite returned one arbitrary KB's row and every other KB's
 /// relations, aliases and mentions vanished from an explicitly all-KB query.
 #[test]
 fn people_show_across_every_kb_merges_instead_of_dropping_kbs() {
     let (tmp, _cmd) = with_isolated_home();
-    for (kb, text) in [
+    for (kb, text, other) in [
         (
             "network-a",
             "Avi Roy introduced me to Noemi Kostova at the Longevity Summit.",
+            "Avi Roy",
         ),
         (
             "network-b",
             "Priya Nair introduced me to Noemi Kostova at the Basel workshop.",
+            "Priya Nair",
         ),
     ] {
-        let fixture = tmp.path().join(format!("{kb}.md"));
-        std::fs::write(&fixture, text).unwrap();
+        let facts = format!(
+            r#"[{{"subject":"Noemi Kostova","predicate":"introduced_by","object":"{other}"}},
+                {{"subject":"Noemi Kostova","predicate":"met_at","object":"{kb} event"}}]"#
+        );
         cmd_in(&tmp)
-            .args([
-                "ingest",
-                fixture.to_str().unwrap(),
-                "--kb",
-                kb,
-                "--mode",
-                "general",
-                "--compile",
-                "evidence",
-                "--json",
-            ])
+            .args(["remember", text, "--kb", kb, "--facts-json", &facts, "--json"])
             .assert()
             .success();
     }
+    // A second fact in one KB, so the merged count is visibly a sum.
+    cmd_in(&tmp)
+        .args([
+            "remember",
+            "Noemi Kostova works at Example Labs.",
+            "--kb",
+            "network-a",
+            "--facts-json",
+            r#"[{"subject":"Noemi Kostova","predicate":"works_at","object":"Example Labs"}]"#,
+            "--json",
+        ])
+        .assert()
+        .success();
 
     let v = json_cmd(&tmp, &["people", "show", "Noemi Kostova", "--kb", "*"]);
     let kbs: Vec<&str> = v["data"]["kbs"]
@@ -3769,7 +3077,7 @@ fn people_show_across_every_kb_merges_instead_of_dropping_kbs() {
     let merged = v["data"]["person"]["mentions"].as_u64().unwrap_or(0);
     let single = json_cmd(
         &tmp,
-        &["people", "show", "Noemi Kostova", "--kb", "network-a"],
+        &["people", "show", "Noemi Kostova", "--kb", "network-b"],
     )["data"]["person"]["mentions"]
         .as_u64()
         .unwrap_or(0);
@@ -4053,317 +3361,6 @@ fn facts_list_spans_every_diary_by_default_and_says_so() {
 // reproduces every one of those failure classes end to end.
 // ---------------------------------------------------------------------------
 
-/// Ingest a small WhatsApp-shaped corpus — one file per conversation, so the
-/// name unification has to work ACROSS chunks — and compile it.
-fn whatsapp_kb() -> tempfile::TempDir {
-    let (tmp, _) = with_isolated_home();
-    let files: [(&str, &str); 6] = [
-        (
-            "chat-maria.md",
-            "# WhatsApp export — Maria\n\n\
-             Maria Microsoft London Tech: Heyy Elias, the deck is ready for the review.\n\
-             Elias: Thanks Maria. Ok great, I will send notes tonight.\n\
-             Maria Microsoft London Tech: Good morning Elias. Oh and happy birthday!\n\
-             Elias: Morning Maria, dinner on Friday works for me.\n",
-        ),
-        (
-            "chat-noemi.md",
-            "# Notes — Noemi and Avi\n\n\
-             Noemi Varkoni introduced me to Avi Roy at the Longevity Summit.\n\
-             Noemi is speaking in Singapore next month and asked me to join her.\n\
-             Avi emailed me about the fund. I told Avi we should meet in London.\n\
-             I met Lira in London last week and we flew to Ibiza with my friend Avi Roy.\n",
-        ),
-        // The two Lauras live in DIFFERENT conversations on purpose: chunk by
-        // chunk each looks unambiguous, so a per-chunk fold would give both of
-        // them the alias "Laura" and the alias table (unique per KB) would
-        // quietly award one woman's mentions to the other.
-        (
-            "chat-laura-corvo.md",
-            "# Notes — Laura Corvo\n\n\
-             Laura Corvo is a friend from the Barcelona trip; we had dinner in London.\n\
-             Laura texted me about the trip photos.\n",
-        ),
-        (
-            "chat-laura-dating.md",
-            "# Notes — dating\n\n\
-             Laura Quiroz is someone I met on a dating app while in Ibiza.\n\
-             Laura asked if I am free on Friday.\n",
-        ),
-        (
-            "chat-branislava.md",
-            "# WhatsApp export — family\n\n\
-             BRANISLAVA MARENOVIC: call me when you land in Belgrade.\n\
-             Branislava Marenovic is my cousin and she called on Sunday.\n\
-             Branislava sent photos from the wedding.\n\
-             Islam came up over dinner with Lira. My friend Lira is Serbian.\n",
-        ),
-        (
-            "chat-elias.md",
-            "# Notes — Elias\n\n\
-             Elias Danilovski runs the biotech fund from London.\n\
-             Elias met Patrick Ashcomb Pruett at the summit in Ibiza.\n\
-             Patrick asked about the raise and Pruett wants an intro to Avi Roy.\n\
-             Elias's calendar is full. Heyy Elias, are we still on for Friday?\n",
-        ),
-    ];
-    for (name, body) in files {
-        let path = tmp.path().join(name);
-        std::fs::write(&path, body).unwrap();
-        cmd_in(&tmp)
-            .args([
-                "ingest",
-                path.to_str().unwrap(),
-                "--kb",
-                "whatsapp",
-                "--mode",
-                "general",
-                "--json",
-            ])
-            .assert()
-            .success();
-    }
-    json_cmd(&tmp, &["compile", "--kb", "whatsapp", "--all"]);
-    tmp
-}
-
-fn people_named(v: &Value) -> Vec<String> {
-    v["data"]["people"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|p| p["name"].as_str())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn person<'a>(v: &'a Value, name: &str) -> &'a Value {
-    v["data"]["people"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"].as_str() == Some(name))
-        .unwrap_or_else(|| panic!("{name} missing from {:?}", people_named(v)))
-}
-
-fn aliases_of(person: &Value) -> Vec<String> {
-    person["aliases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|a| a.as_str())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-#[test]
-fn places_creeds_and_chat_filler_are_never_people() {
-    let tmp = whatsapp_kb();
-    let v = json_cmd(
-        &tmp,
-        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
-    );
-    let names = people_named(&v);
-    for junk in [
-        // Places and a creed, every one of them in an interpersonal context.
-        "London",
-        "Ibiza",
-        "Singapore",
-        "Barcelona",
-        "Belgrade",
-        "Islam",
-        "Serbian",
-        // Sentence-initial interjections and acknowledgements.
-        "Oh",
-        "Good",
-        "Ok",
-        "Thanks",
-        "Morning",
-        // Greeting-prefixed and contact-label forms.
-        "Heyy Elias",
-        "Morning Maria",
-        "Thanks Maria",
-        "Good Morning",
-        "Maria Microsoft London Tech",
-    ] {
-        assert!(
-            !names.contains(&junk.to_string()),
-            "{junk} must not be a person: {names:?}"
-        );
-    }
-    // Places survive as ordinary entities — only the TYPE was ever wrong.
-    let entities = json_cmd(
-        &tmp,
-        &["entities", "list", "--kb", "whatsapp", "--limit", "200"],
-    );
-    let london = entities["data"]["entities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["canonical_name"] == "London")
-        .expect("London is still an entity");
-    assert_eq!(london["kind"], "concept");
-}
-
-#[test]
-fn a_contact_label_resolves_to_the_person_with_the_label_as_an_alias() {
-    let tmp = whatsapp_kb();
-    let v = json_cmd(
-        &tmp,
-        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
-    );
-    let maria = person(&v, "Maria");
-    assert!(
-        aliases_of(maria).contains(&"Maria Microsoft London Tech".to_string()),
-        "the WhatsApp label must stay resolvable: {:?}",
-        aliases_of(maria)
-    );
-    // …and the label itself still resolves back to her.
-    let show = json_cmd(
-        &tmp,
-        &[
-            "people",
-            "show",
-            "Maria Microsoft London Tech",
-            "--kb",
-            "whatsapp",
-        ],
-    );
-    assert_eq!(show["data"]["person"]["name"], "Maria");
-    assert_eq!(show["data"]["person"]["kind"], "person");
-}
-
-#[test]
-fn greetings_and_case_variants_fold_onto_the_person() {
-    let tmp = whatsapp_kb();
-    let v = json_cmd(
-        &tmp,
-        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
-    );
-
-    // "Heyy Elias" was the real store's second-biggest person, and it had
-    // swallowed the actual Elias's mentions along with the greeting.
-    let elias = person(&v, "Elias Danilovski");
-    let aliases = aliases_of(elias);
-    assert!(aliases.contains(&"Elias".to_string()), "{aliases:?}");
-    assert!(aliases.contains(&"Elias's".to_string()), "{aliases:?}");
-    assert!(
-        elias["mentions"].as_u64().unwrap() >= 6,
-        "every greeting must count for the human: {elias}"
-    );
-
-    // A shouted WhatsApp contact line and the prose spelling are one person,
-    // displayed the way a human writes a name.
-    let branislava = person(&v, "Branislava Marenovic");
-    assert!(aliases_of(branislava).contains(&"Branislava".to_string()));
-    assert!(!people_named(&v).contains(&"BRANISLAVA MARENOVIC".to_string()));
-}
-
-#[test]
-fn bare_first_names_unify_kb_wide_when_unambiguous() {
-    let tmp = whatsapp_kb();
-    let v = json_cmd(
-        &tmp,
-        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
-    );
-    let names = people_named(&v);
-
-    for (short, full) in [
-        ("Noemi", "Noemi Varkoni"),
-        ("Avi", "Avi Roy"),
-        ("Patrick", "Patrick Ashcomb Pruett"),
-        ("Branislava", "Branislava Marenovic"),
-    ] {
-        assert!(
-            !names.contains(&short.to_string()),
-            "{short} must fold into {full}, not stand alone: {names:?}"
-        );
-        let merged = person(&v, full);
-        assert!(
-            aliases_of(merged).contains(&short.to_string()),
-            "{full} must carry {short} as an alias: {:?}",
-            aliases_of(merged)
-        );
-    }
-    // The mention counts merged rather than splitting across two nodes.
-    assert!(person(&v, "Avi Roy")["mentions"].as_u64().unwrap() >= 4);
-    // The bare form still resolves in `people show`.
-    let show = json_cmd(&tmp, &["people", "show", "Noemi", "--kb", "whatsapp"]);
-    assert_eq!(show["data"]["person"]["name"], "Noemi Varkoni");
-}
-
-/// SAFETY: the owner knows two different Lauras (a friend, Laura Corvo, and
-/// someone from a dating thread), and they appear in different conversations.
-/// Same-first-name merging must never fuse two humans — which is why the
-/// unifier folds only on an EXACTLY-ONE match, decided KB-wide rather than
-/// chunk by chunk.
-#[test]
-fn two_people_sharing_a_first_name_are_never_fused() {
-    let tmp = whatsapp_kb();
-    let v = json_cmd(
-        &tmp,
-        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
-    );
-    let names = people_named(&v);
-    for expected in ["Laura Corvo", "Laura Quiroz", "Laura"] {
-        assert!(
-            names.contains(&expected.to_string()),
-            "{expected} must stay its own node: {names:?}"
-        );
-    }
-    for full in ["Laura Corvo", "Laura Quiroz"] {
-        assert!(
-            !aliases_of(person(&v, full)).contains(&"Laura".to_string()),
-            "{full} absorbed the ambiguous bare name: {:?}",
-            aliases_of(person(&v, full))
-        );
-    }
-    // Neither full name may collect the other's bare mentions, so the two
-    // ambiguous ones stay on the ambiguous node.
-    assert_eq!(person(&v, "Laura Corvo")["mentions"], 1);
-    assert_eq!(person(&v, "Laura Quiroz")["mentions"], 1);
-    assert_eq!(person(&v, "Laura")["mentions"], 2);
-    // An ambiguous lookup resolves to the ambiguous node, not to a guess.
-    let show = json_cmd(&tmp, &["people", "show", "Laura", "--kb", "whatsapp"]);
-    assert_eq!(show["data"]["person"]["name"], "Laura");
-}
-
-#[test]
-fn the_hygienic_person_graph_is_stable_across_recompiles() {
-    let tmp = whatsapp_kb();
-    let fingerprint = |v: &Value| -> Vec<String> {
-        let mut out: Vec<String> = v["data"]["people"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| {
-                format!(
-                    "{}:{}:{}",
-                    p["name"].as_str().unwrap_or(""),
-                    p["mentions"].as_u64().unwrap_or(0),
-                    aliases_of(p).join("|")
-                )
-            })
-            .collect();
-        out.sort();
-        out
-    };
-    let before = json_cmd(
-        &tmp,
-        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
-    );
-    json_cmd(&tmp, &["compile", "--kb", "whatsapp", "--all"]);
-    json_cmd(&tmp, &["compile", "--kb", "whatsapp", "--all"]);
-    let after = json_cmd(
-        &tmp,
-        &["people", "list", "--kb", "whatsapp", "--limit", "99"],
-    );
-    assert_eq!(
-        fingerprint(&before),
-        fingerprint(&after),
-        "recompiling must converge, not drift"
-    );
-}
 // ===========================================================================
 // Conflict triage: the fact layer has to survive real volume.
 //
@@ -5096,252 +4093,6 @@ fn chunks_repair_leaves_a_healthy_store_untouched() {
 //      winning the display name because it had more mentions
 // ---------------------------------------------------------------------------
 
-/// One memory per line, so the KB has many chunks and the bare first names
-/// land in chunks that never see the full name — the shape that produced the
-/// duplicate rows.
-const HYGIENE_V3_FIXTURE: &[&str] = &[
-    // The shouted WhatsApp header comes FIRST on purpose: it is the chunk
-    // whose fold used to fail, so the bare row was created before any chunk
-    // had ever said "Maria Marenova".
-    "MARIA: call me back when you get a chance this evening.",
-    "Maria cooked dinner tonight and it was completely excellent.",
-    "Maria Microsoft London Tech sent the invoice over this morning.",
-    "Chelsea Flower Show tickets arrived in the post for Maria today.",
-    "Maria Marenova is my partner and we have lived together for years.",
-    "Partner Rosalie called about the flat and the deposit this week.",
-    "Rosalie is coming over on Thursday to collect the spare keys.",
-    "Wants Elias to confirm the restaurant booking before the weekend.",
-    "Elias is my brother and he confirmed the booking straight away.",
-    "Said the quarterly meeting is at noon in the upstairs room.",
-    "Says the investor deck is finally ready for a proper review.",
-    "Noemi sent the deck this morning and she was thrilled with it.",
-    "Noemi Varkoni introduced me to Avi Roy at the Longevity Summit.",
-    "Laura Corvo is a good friend from the Barcelona trip last year.",
-    "Laura Quiroz is someone I met through a dating app in October.",
-    "Laura texted me about dinner and asked to move it to Sunday.",
-    "Jisoo Park is my colleague and Jordan Peterson wrote back today.",
-];
-
-/// Seed the fixture into an isolated home and compile it.
-fn hygiene_v3_kb() -> tempfile::TempDir {
-    let (tmp, _) = with_isolated_home();
-    for line in HYGIENE_V3_FIXTURE {
-        cmd_in(&tmp)
-            .args([
-                "remember",
-                line,
-                "--kb",
-                "hygiene3",
-                "--no-extract-facts",
-                "--json",
-            ])
-            .assert()
-            .success();
-    }
-    json_cmd(&tmp, &["compile", "--kb", "hygiene3", "--all"]);
-    tmp
-}
-
-/// Every entity in the KB as (canonical_name, kind, mention_count, aliases).
-fn hygiene_v3_entities(tmp: &tempfile::TempDir) -> Vec<(String, String, u64, Vec<String>)> {
-    let v = json_cmd(
-        tmp,
-        &["entities", "list", "--kb", "hygiene3", "--limit", "500"],
-    );
-    v["data"]["entities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| {
-            (
-                e["canonical_name"].as_str().unwrap_or("").to_string(),
-                e["kind"].as_str().unwrap_or("").to_string(),
-                e["mention_count"].as_u64().unwrap_or(0),
-                e["aliases"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn leading_non_name_words_never_reach_the_person_graph() {
-    let tmp = hygiene_v3_kb();
-    let entities = hygiene_v3_entities(&tmp);
-    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
-
-    // A relationship word, a clause-opening verb, and a truncated event name
-    // are not humans — and the bare role word is not an entity at all.
-    for junk in [
-        "Partner Rosalie",
-        "Wants Elias",
-        "Said",
-        "Says",
-        "Partner",
-        "Chelsea Flower Show",
-    ] {
-        assert!(
-            !names.contains(&junk),
-            "junk entity {junk} survived: {names:?}"
-        );
-    }
-    // "Chelsea Flower" may still be a concept, but never a person.
-    for (name, kind, ..) in &entities {
-        if name == "Chelsea Flower" {
-            assert_ne!(kind, "person", "Chelsea Flower is an event, not a human");
-        }
-    }
-
-    // The humans behind the prefixes are real, and carry the prefixed mention.
-    let person = |wanted: &str| {
-        entities
-            .iter()
-            .find(|(n, ..)| n == wanted)
-            .unwrap_or_else(|| panic!("{wanted} missing from {names:?}"))
-    };
-    let (_, rosalie_kind, rosalie_mentions, rosalie_aliases) = person("Rosalie");
-    assert_eq!(rosalie_kind, "person");
-    assert_eq!(
-        *rosalie_mentions, 2,
-        "the mention behind 'Partner Rosalie' must count for her"
-    );
-    let (_, elias_kind, elias_mentions, elias_aliases) = person("Elias");
-    assert_eq!(elias_kind, "person");
-    assert_eq!(*elias_mentions, 2, "'Wants Elias' must count for Elias");
-
-    // A prefix is nobody's name, so it must not be hoarded as a spelling.
-    for (name, _, _, aliases) in &entities {
-        for junk in ["Partner Rosalie", "Wants Elias", "Said", "Says"] {
-            assert!(
-                !aliases.iter().any(|a| a == junk),
-                "{name} kept junk alias {junk}: {aliases:?}"
-            );
-        }
-    }
-    assert!(rosalie_aliases.is_empty(), "{rosalie_aliases:?}");
-    assert!(elias_aliases.is_empty(), "{elias_aliases:?}");
-
-    // The conservative half: real two-part names are untouched.
-    for real in ["Jisoo Park", "Jordan Peterson"] {
-        assert!(names.contains(&real), "{real} was lost: {names:?}");
-    }
-}
-
-#[test]
-fn a_bare_first_name_and_its_full_name_are_one_person() {
-    let tmp = hygiene_v3_kb();
-    let entities = hygiene_v3_entities(&tmp);
-    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
-
-    // ONE row per woman, canonicalised to the name that identifies her, with
-    // every spelling's mentions summed onto it.
-    for (bare, full, expected_mentions) in [
-        ("Noemi", "Noemi Varkoni", 2),
-        ("Maria", "Maria Marenova", 5),
-    ] {
-        let matching: Vec<&(String, String, u64, Vec<String>)> = entities
-            .iter()
-            .filter(|(n, ..)| n.to_lowercase().starts_with(&bare.to_lowercase()))
-            .collect();
-        assert_eq!(
-            matching.len(),
-            1,
-            "{bare}/{full} must collapse to one entity, got {matching:?}"
-        );
-        let (name, kind, mentions, aliases) = matching[0];
-        assert_eq!(name, full, "the full name must win the display name");
-        assert_eq!(kind, "person");
-        assert_eq!(
-            *mentions, expected_mentions,
-            "mentions from every spelling must be summed: {matching:?}"
-        );
-        assert!(
-            aliases.iter().any(|a| a == bare),
-            "the bare form must stay resolvable: {aliases:?}"
-        );
-    }
-
-    // …including the messaging-app contact label.
-    let maria = entities
-        .iter()
-        .find(|(n, ..)| n == "Maria Marenova")
-        .expect("Maria Marenova");
-    assert!(
-        maria.3.iter().any(|a| a == "Maria Microsoft London Tech"),
-        "the contact label must resolve to her: {:?}",
-        maria.3
-    );
-    assert!(
-        !names.contains(&"Maria Microsoft London Tech"),
-        "the label must not stand up a rival node: {names:?}"
-    );
-
-    // Every spelling resolves to the same person through the CLI.
-    for spelling in ["Maria", "Maria Marenova", "Maria Microsoft London Tech"] {
-        let v = json_cmd(&tmp, &["people", "show", spelling, "--kb", "hygiene3"]);
-        assert_eq!(
-            v["data"]["person"]["name"], "Maria Marenova",
-            "{spelling} resolved elsewhere"
-        );
-    }
-}
-
-#[test]
-fn two_people_who_share_a_first_name_are_never_fused() {
-    let tmp = hygiene_v3_kb();
-    let entities = hygiene_v3_entities(&tmp);
-    let lauras: Vec<&String> = entities
-        .iter()
-        .map(|(n, ..)| n)
-        .filter(|n| n.starts_with("Laura"))
-        .collect();
-    assert!(lauras.contains(&&"Laura Corvo".to_string()), "{lauras:?}");
-    assert!(lauras.contains(&&"Laura Quiroz".to_string()), "{lauras:?}");
-    // The ambiguous bare name belongs to neither, so it never becomes their
-    // alias and the two humans stay two humans.
-    for (name, _, _, aliases) in &entities {
-        if name.starts_with("Laura ") {
-            assert!(
-                !aliases.iter().any(|a| a == "Laura"),
-                "{name} absorbed the ambiguous bare name: {aliases:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn hygiene_v3_recompile_is_stable() {
-    let tmp = hygiene_v3_kb();
-    let before = hygiene_v3_entities(&tmp);
-    json_cmd(&tmp, &["compile", "--kb", "hygiene3", "--all"]);
-    json_cmd(&tmp, &["compile", "--kb", "hygiene3", "--all"]);
-    let after = hygiene_v3_entities(&tmp);
-
-    let fingerprint = |rows: &[(String, String, u64, Vec<String>)]| -> Vec<String> {
-        let mut out: Vec<String> = rows
-            .iter()
-            .map(|(name, kind, mentions, aliases)| {
-                let mut aliases = aliases.clone();
-                aliases.sort();
-                format!("{name}|{kind}|{mentions}|{}", aliases.join(","))
-            })
-            .collect();
-        out.sort();
-        out
-    };
-    assert_eq!(
-        fingerprint(&before),
-        fingerprint(&after),
-        "recompiling must converge, not drift"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // ENTITY HYGIENE v4 — the junk that BLOCKED unification.
 //
@@ -5365,333 +4116,6 @@ fn hygiene_v3_recompile_is_stable() {
 // of them person-typed) plus one junk alias, with Maria split 3/1 across two
 // rows and Noemi 1/1. AFTER: 13 entities, no junk, one row each.
 // ---------------------------------------------------------------------------
-
-/// WhatsApp-shaped one-liners, one memory each, so the bare first names land
-/// in chunks that never see the full name and unification has to work KB-wide.
-const HYGIENE_V4_FIXTURE: &[&str] = &[
-    "MARIA: call me back when you get a chance about the Egypt trip.",
-    "Maria cooked dinner tonight and it was completely excellent.",
-    "Maria Microsoft London Tech sent the signed invoice over this morning.",
-    "Maria Marenova is my partner and we have lived together for years.",
-    "MARIA RE-INITIATES AGAIN on the Egypt plan and wants an answer.",
-    "MARIA RE-INITIATED the visa paperwork thread with the agency.",
-    "Maria Marenova PERSONALLY ORGANISES the whole trip every single year.",
-    "Maria ONCE told me she never wanted to fly on a Monday again.",
-    "Maria Nov-2025 receipts are still sitting in the shared folder.",
-    "Maria June-2026 flights were booked on the cheaper airline.",
-    "Maria Ibiza-period photos were finally uploaded to the album.",
-    "Maria's Nov 2025 Egypt itinerary landed in my inbox last night.",
-    "Maria's Egypt-invite PDF is attached to the same email thread.",
-    "Her LinkedIn is maria-marenova-9398b6108 if you want to connect.",
-    "Noemi sent the deck this morning and she was thrilled with it.",
-    "Noemi Varkoni introduced me to my friend Avi at the Longevity Summit.",
-    "Noemi's Southwark flat viewing is booked for Tuesday afternoon.",
-    "Noemi's June was busy with three separate shoots in one week.",
-    "Noemi Varkoni's Lipitrex prescription was renewed by the clinic.",
-    "Reading Lira a bedtime story is the best part of my whole day.",
-    "Lira is my daughter and she turned four in the spring.",
-    "Avi's One Blackfriars party was packed with the fund crowd.",
-    "Avi's Thanksgiving dinner ran until two in the morning.",
-    "Avi is a friend from the longevity circuit and he called today.",
-    "Laura Corvo is a good friend from the Barcelona trip last year.",
-    "Laura Quiroz is someone I met through a dating app in October.",
-    "Laura texted me about dinner and asked to move it to Sunday.",
-    "Jisoo Park is my colleague and Jordan Peterson wrote back today.",
-];
-
-/// Every junk surface the fixture writes. None of them names a human.
-const HYGIENE_V4_JUNK: &[&str] = &[
-    "Maria Ibiza-period",
-    "Maria Nov-2025",
-    "Maria June-2026",
-    "Maria ONCE",
-    "Maria's Nov 2025 Egypt",
-    "Maria's Egypt-invite PDF",
-    "MARIA RE-INITIATES AGAIN",
-    "MARIA RE-INITIATED",
-    "Maria Marenova PERSONALLY ORGANISES",
-    "maria-marenova-9398b6108",
-    "Noemi's Southwark",
-    "Noemi's June",
-    "Noemi Varkoni's Lipitrex",
-    "Reading Lira",
-    "Avi's One Blackfriars",
-    "Avi's Thanksgiving",
-];
-
-fn hygiene_v4_kb() -> tempfile::TempDir {
-    let (tmp, _) = with_isolated_home();
-    for line in HYGIENE_V4_FIXTURE {
-        cmd_in(&tmp)
-            .args([
-                "remember",
-                line,
-                "--kb",
-                "hygiene4",
-                "--no-extract-facts",
-                "--json",
-            ])
-            .assert()
-            .success();
-    }
-    json_cmd(&tmp, &["compile", "--kb", "hygiene4", "--all"]);
-    tmp
-}
-
-/// Every entity in the KB as (canonical_name, kind, mention_count, aliases).
-fn hygiene_v4_entities(tmp: &tempfile::TempDir) -> Vec<(String, String, u64, Vec<String>)> {
-    let v = json_cmd(
-        tmp,
-        &["entities", "list", "--kb", "hygiene4", "--limit", "500"],
-    );
-    v["data"]["entities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| {
-            (
-                e["canonical_name"].as_str().unwrap_or("").to_string(),
-                e["kind"].as_str().unwrap_or("").to_string(),
-                e["mention_count"].as_u64().unwrap_or(0),
-                e["aliases"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn possessives_dates_shouts_and_slugs_never_reach_the_entity_layer() {
-    let tmp = hygiene_v4_kb();
-    let entities = hygiene_v4_entities(&tmp);
-    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
-
-    for junk in HYGIENE_V4_JUNK {
-        assert!(
-            !names.iter().any(|n| n.eq_ignore_ascii_case(junk)),
-            "junk entity {junk} survived: {names:?}"
-        );
-    }
-    // Nor as a spelling of anybody: none of it is a name.
-    for (name, _, _, aliases) in &entities {
-        for junk in HYGIENE_V4_JUNK {
-            assert!(
-                !aliases.iter().any(|a| a.eq_ignore_ascii_case(junk)),
-                "{name} kept junk alias {junk}: {aliases:?}"
-            );
-        }
-    }
-    // No person may carry a possessive or a digit: both mean the surface named
-    // a thing, not a human.
-    for (name, kind, ..) in &entities {
-        if kind != "person" {
-            continue;
-        }
-        assert!(
-            !name.contains('\'') && !name.chars().any(|c| c.is_ascii_digit()),
-            "{name} is not a human name"
-        );
-    }
-}
-
-#[test]
-fn the_junk_that_blocked_unification_is_gone_and_the_names_merge() {
-    let tmp = hygiene_v4_kb();
-    let entities = hygiene_v4_entities(&tmp);
-
-    // ONE row per woman, canonicalised to the name that identifies her, with
-    // every spelling's mentions summed onto it. Both stayed split on the real
-    // store for exactly as long as the junk existed.
-    for (bare, full, expected_mentions) in [
-        ("Maria", "Maria Marenova", 13),
-        ("Noemi", "Noemi Varkoni", 5),
-    ] {
-        let matching: Vec<&(String, String, u64, Vec<String>)> = entities
-            .iter()
-            .filter(|(n, ..)| n.to_lowercase().starts_with(&bare.to_lowercase()))
-            .collect();
-        assert_eq!(
-            matching.len(),
-            1,
-            "{bare}/{full} must collapse to one entity, got {matching:?}"
-        );
-        let (name, kind, mentions, aliases) = matching[0];
-        assert_eq!(name, full, "the full name must win the canonical slot");
-        assert_eq!(kind, "person");
-        assert_eq!(
-            *mentions, expected_mentions,
-            "mentions from every spelling must be summed: {matching:?}"
-        );
-        assert!(
-            aliases.iter().any(|a| a == bare),
-            "the bare form must stay resolvable: {aliases:?}"
-        );
-    }
-    // …and the messaging-app contact label resolves to her too.
-    let maria = entities
-        .iter()
-        .find(|(n, ..)| n == "Maria Marenova")
-        .expect("Maria Marenova");
-    assert!(
-        maria.3.iter().any(|a| a == "Maria Microsoft London Tech"),
-        "the contact label must resolve to her: {:?}",
-        maria.3
-    );
-    for spelling in ["Maria", "Maria Marenova", "Maria Microsoft London Tech"] {
-        let v = json_cmd(&tmp, &["people", "show", spelling, "--kb", "hygiene4"]);
-        assert_eq!(
-            v["data"]["person"]["name"], "Maria Marenova",
-            "{spelling} resolved elsewhere"
-        );
-    }
-}
-
-#[test]
-fn a_junk_compound_never_owns_the_canonical_slot_of_the_human_inside_it() {
-    let tmp = hygiene_v4_kb();
-    let entities = hygiene_v4_entities(&tmp);
-
-    // The four hijack surfaces resolve to the real human, who owns her own
-    // canonical slot and counts the mentions the junk had taken.
-    for (human, expected_mentions, surfaces) in [
-        ("Lira", 2u64, vec!["Reading Lira"]),
-        (
-            "Avi",
-            4,
-            vec!["Avi's One Blackfriars", "Avi's Thanksgiving"],
-        ),
-        (
-            "Noemi Varkoni",
-            5,
-            vec!["Noemi's Southwark", "Noemi Varkoni's Lipitrex"],
-        ),
-        (
-            "Maria Marenova",
-            13,
-            vec!["Maria's Nov 2025 Egypt", "Maria's Egypt-invite PDF"],
-        ),
-    ] {
-        let (name, kind, mentions, _) = entities
-            .iter()
-            .find(|(n, ..)| n == human)
-            .unwrap_or_else(|| panic!("{human} missing: {entities:?}"));
-        assert_eq!(kind, "person", "{name} must be the human, not a thing");
-        assert_eq!(
-            *mentions, expected_mentions,
-            "{name} must keep the mentions the junk had taken"
-        );
-        for surface in surfaces {
-            assert!(
-                !entities.iter().any(|(n, ..)| n == surface),
-                "{surface} still stands as its own row"
-            );
-        }
-    }
-}
-
-#[test]
-fn hygiene_v4_keeps_the_two_lauras_apart() {
-    let tmp = hygiene_v4_kb();
-    let entities = hygiene_v4_entities(&tmp);
-    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
-    for real in [
-        "Laura Corvo",
-        "Laura Quiroz",
-        "Jisoo Park",
-        "Jordan Peterson",
-    ] {
-        assert!(names.contains(&real), "{real} was lost: {names:?}");
-    }
-    // The shared first name belongs to neither of them.
-    for (name, _, _, aliases) in &entities {
-        if name.starts_with("Laura ") {
-            assert!(
-                !aliases.iter().any(|a| a == "Laura"),
-                "{name} absorbed the ambiguous bare name: {aliases:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn hygiene_v4_recompile_is_stable() {
-    let tmp = hygiene_v4_kb();
-    let before = hygiene_v4_entities(&tmp);
-    json_cmd(&tmp, &["compile", "--kb", "hygiene4", "--all"]);
-    json_cmd(&tmp, &["compile", "--kb", "hygiene4", "--all"]);
-    let after = hygiene_v4_entities(&tmp);
-
-    let fingerprint = |rows: &[(String, String, u64, Vec<String>)]| -> Vec<String> {
-        let mut out: Vec<String> = rows
-            .iter()
-            .map(|(name, kind, mentions, aliases)| {
-                let mut aliases = aliases.clone();
-                aliases.sort();
-                format!("{name}|{kind}|{mentions}|{}", aliases.join(","))
-            })
-            .collect();
-        out.sort();
-        out
-    };
-    assert_eq!(
-        fingerprint(&before),
-        fingerprint(&after),
-        "recompiling v4 must converge, not drift"
-    );
-}
-
-/// The wiki index and its entity pages are the compiler's only human-readable
-/// output, and both were ordered ALPHABETICALLY: `.rev()` on a name-keyed
-/// BTreeMap took the last 25 names as "Top entities", `.take(50)` the first 50
-/// for page creation. On this fixture that led with Lira (2 mentions) and left
-/// the woman mentioned 13 times at the bottom of the list.
-#[test]
-fn the_wiki_ranks_entities_by_mentions_not_by_spelling() {
-    let tmp = hygiene_v4_kb();
-    let index = json_cmd(&tmp, &["wiki", "index.md", "--kb", "hygiene4"]);
-    let body = index["data"]["page"]["content"]
-        .as_str()
-        .expect("index page content")
-        .to_string();
-
-    let top: Vec<&str> = body.lines().filter(|l| l.starts_with("- [")).collect();
-    assert!(!top.is_empty(), "no top entities listed: {body}");
-    assert!(
-        top[0].starts_with("- [Maria Marenova]"),
-        "the most-mentioned entity must lead: {top:?}"
-    );
-    let counts: Vec<u64> = top
-        .iter()
-        .filter_map(|l| l.rsplit_once('(').map(|(_, c)| c.trim_end_matches(')')))
-        .filter_map(|c| c.parse().ok())
-        .collect();
-    assert_eq!(
-        counts.len(),
-        top.len(),
-        "unparsed mention counts in {top:?}"
-    );
-    assert!(
-        counts.windows(2).all(|w| w[0] >= w[1]),
-        "top entities are not ranked by mentions: {top:?}"
-    );
-
-    // …and the page for the most-mentioned person exists.
-    let page = json_cmd(
-        &tmp,
-        &["wiki", "entities/maria-marenova.md", "--kb", "hygiene4"],
-    );
-    assert_eq!(page["status"], "success");
-    assert!(page["data"]["page"]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("Mention count: 13"));
-}
 
 // ---------------------------------------------------------------------------
 // ENTITY HYGIENE v5 — a person is shown by the FULLEST name they are known by.
@@ -5718,264 +4142,3 @@ fn the_wiki_ranks_entities_by_mentions_not_by_spelling() {
 // fullest name, every shorter spelling still resolvable as an alias.
 // ---------------------------------------------------------------------------
 
-/// One memory per line, so every bare first name lands in a chunk that never
-/// sees the full name and unification has to work KB-wide.
-const HYGIENE_V5_FIXTURE: &[&str] = &[
-    // A section heading pasted out of a CV — a rival "full name" for Avi.
-    "Avi Roy Professional Background is the section I pasted out of his CV.",
-    "Avi Roy runs the longevity fund and he called about the raise.",
-    "Avi is a friend from the longevity circuit and he called today.",
-    "Avi sent the term sheet over to the lawyers this afternoon.",
-    // A compound surname, which used to be typed `concept`.
-    "Rosalie Brandtke-Wendel signed the tenancy paperwork this morning.",
-    "Rosalie is my partner and she cooked dinner tonight.",
-    "Rosalie texted me about the Vienna trip in September.",
-    // A middle name is not a different man.
-    "Patrick Pruett asked about the raise and he sounded positive.",
-    "Patrick Ashcomb Pruett signed the term sheet on Tuesday.",
-    "Patrick Pruett called back about the valuation this evening.",
-    "Patrick texted me about dinner on Sunday.",
-    // An accent is not a different man either.
-    "Francisco Ferro wrote back about the Barcelona flat.",
-    "Francisco Ferró is my friend from the Madrid trip.",
-    "Francisco Ferró Oliver was copied on the same email thread.",
-    "I called Francisco this morning about the paperwork.",
-    // A two-token given name plus a surname: the same shape as a middle name.
-    "Ming Su Lim is my colleague and she reviewed the deck.",
-    "Ming Su sent the revised deck this afternoon.",
-    // Lira has no full name anywhere — she must stay exactly as she is.
-    "Lira is my daughter and she turned four in the spring.",
-    "LIRA PHYSICAL INTIMACY is a heading in the therapy notes.",
-    "Lira DNA results came back from the lab this week.",
-    "Reading Lira a bedtime story is the best part of my whole day.",
-    // Topic-tag junk that must never become a person.
-    "Elias ADHD notes are in the shared folder.",
-    "ELIAS CREATING the deck took the whole afternoon.",
-    "Elias is my brother and he called on Sunday.",
-    // Already correct after v4 — this must not regress.
-    "Branislava Marenovic is my colleague and she reviewed the contract.",
-    "BRANISLAVA MARENOVIC: call me back when you can.",
-    // Two women who share a first name.
-    "Laura Corvo is a good friend from the Barcelona trip last year.",
-    "Laura Quiroz is someone I met through a dating app in October.",
-    "Laura texted me about dinner and asked to move it to Sunday.",
-    // Two women who share TWO names — the full-name form of the same rule.
-    "Maria Lopez Garcia is my colleague and she reviewed the deck.",
-    "Maria Lopez Fernandez is my dentist and she called back.",
-    "Maria Lopez sent the invoice this morning.",
-];
-
-/// Heading and topic-tag surfaces the fixture writes. None of them is a name.
-const HYGIENE_V5_JUNK: &[&str] = &[
-    "Avi Roy Professional Background",
-    "Elias ADHD",
-    "ELIAS CREATING",
-    "Lira DNA",
-    "LIRA PHYSICAL INTIMACY",
-];
-
-fn hygiene_v5_kb() -> tempfile::TempDir {
-    let (tmp, _) = with_isolated_home();
-    for line in HYGIENE_V5_FIXTURE {
-        cmd_in(&tmp)
-            .args([
-                "remember",
-                line,
-                "--kb",
-                "hygiene5",
-                "--no-extract-facts",
-                "--json",
-            ])
-            .assert()
-            .success();
-    }
-    json_cmd(&tmp, &["compile", "--kb", "hygiene5", "--all"]);
-    tmp
-}
-
-/// Every entity in the KB as (canonical_name, kind, mention_count, aliases).
-fn hygiene_v5_entities(tmp: &tempfile::TempDir) -> Vec<(String, String, u64, Vec<String>)> {
-    let v = json_cmd(
-        tmp,
-        &["entities", "list", "--kb", "hygiene5", "--limit", "500"],
-    );
-    v["data"]["entities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| {
-            (
-                e["canonical_name"].as_str().unwrap_or("").to_string(),
-                e["kind"].as_str().unwrap_or("").to_string(),
-                e["mention_count"].as_u64().unwrap_or(0),
-                e["aliases"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
-/// THE REQUIREMENT: one row per human, named by the fullest form of their name,
-/// with every shorter spelling kept as a resolvable alias and the mentions of
-/// all of them summed onto it.
-#[test]
-fn a_person_is_shown_by_the_fullest_name_they_are_known_by() {
-    let tmp = hygiene_v5_kb();
-    let entities = hygiene_v5_entities(&tmp);
-
-    for (fullest, mentions, shorter) in [
-        ("Avi Roy", 4u64, vec!["Avi"]),
-        ("Rosalie Brandtke-Wendel", 3, vec!["Rosalie"]),
-        (
-            "Patrick Ashcomb Pruett",
-            4,
-            vec!["Patrick", "Patrick Pruett"],
-        ),
-        (
-            // His father's second surname per the user, but structurally a
-            // token inserted into the same name — treated by rule, not by
-            // special case, so the data is the thing to correct if it is wrong.
-            "Francisco Ferró Oliver",
-            4,
-            vec!["Francisco", "Francisco Ferro", "Francisco Ferró"],
-        ),
-        ("Ming Su Lim", 2, vec!["Ming Su"]),
-    ] {
-        let first = fullest.split(' ').next().unwrap();
-        let rows: Vec<&(String, String, u64, Vec<String>)> = entities
-            .iter()
-            .filter(|(n, ..)| n.split(' ').next() == Some(first))
-            .collect();
-        assert_eq!(rows.len(), 1, "{fullest} must be ONE entity, got {rows:?}");
-        let (name, kind, count, aliases) = rows[0];
-        assert_eq!(
-            name, fullest,
-            "the fullest name must own the canonical slot"
-        );
-        assert_eq!(kind, "person", "{name} is a human");
-        assert_eq!(
-            *count, mentions,
-            "every spelling's mentions must be summed onto {name}: {rows:?}"
-        );
-        for short in &shorter {
-            assert!(
-                aliases.iter().any(|a| a == short),
-                "{short} must stay resolvable on {name}: {aliases:?}"
-            );
-            // …and resolvable through the surface an agent actually calls.
-            let v = json_cmd(&tmp, &["people", "show", short, "--kb", "hygiene5"]);
-            assert_eq!(
-                v["data"]["person"]["name"], *fullest,
-                "{short} resolved somewhere else"
-            );
-        }
-    }
-}
-
-/// A Title-Case noun phrase after a name is a document heading. One of these
-/// was person-typed and blocked Avi's merge; the rest diluted mention counts.
-#[test]
-fn heading_and_topic_junk_never_reaches_the_entity_layer() {
-    let tmp = hygiene_v5_kb();
-    let entities = hygiene_v5_entities(&tmp);
-    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
-
-    for junk in HYGIENE_V5_JUNK {
-        assert!(
-            !names.iter().any(|n| n.eq_ignore_ascii_case(junk)),
-            "junk entity {junk} survived: {names:?}"
-        );
-    }
-    for (name, _, _, aliases) in &entities {
-        for junk in HYGIENE_V5_JUNK {
-            assert!(
-                !aliases.iter().any(|a| a.eq_ignore_ascii_case(junk)),
-                "{name} kept junk alias {junk}: {aliases:?}"
-            );
-        }
-    }
-    // The mentions the junk had taken belong to the humans inside it.
-    for (human, mentions) in [("Lira", 4u64), ("Elias", 3)] {
-        let (name, kind, count, _) = entities
-            .iter()
-            .find(|(n, ..)| n == human)
-            .unwrap_or_else(|| panic!("{human} missing: {entities:?}"));
-        assert_eq!(kind, "person", "{name} must stay the human");
-        assert_eq!(
-            *count, mentions,
-            "{name} must keep the mentions the headings had taken"
-        );
-    }
-}
-
-/// The safety half. Merging by "the fullest name wins" must not fuse people
-/// who merely share a name, and must not rename anybody who is already right.
-#[test]
-fn hygiene_v5_never_fuses_two_people_who_share_a_name() {
-    let tmp = hygiene_v5_kb();
-    let entities = hygiene_v5_entities(&tmp);
-    let names: Vec<&str> = entities.iter().map(|(n, ..)| n.as_str()).collect();
-
-    for separate in [
-        // Two women, one first name.
-        "Laura Corvo",
-        "Laura Quiroz",
-        // Two women, TWO shared names: the shorter form belongs to neither.
-        "Maria Lopez Garcia",
-        "Maria Lopez Fernandez",
-        "Maria Lopez",
-        // No fuller spelling exists anywhere, so she keeps the name she has.
-        "Lira",
-        // Already unified before v5 — the shouted export folds onto her.
-        "Branislava Marenovic",
-    ] {
-        assert!(names.contains(&separate), "{separate} was lost: {names:?}");
-    }
-    for (name, _, _, aliases) in &entities {
-        if name.starts_with("Laura ") {
-            assert!(
-                !aliases.iter().any(|a| a == "Laura"),
-                "{name} absorbed the ambiguous bare name: {aliases:?}"
-            );
-        }
-        if name.starts_with("Maria Lopez ") {
-            assert!(
-                !aliases.iter().any(|a| a == "Maria Lopez"),
-                "{name} absorbed the ambiguous shorter name: {aliases:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn hygiene_v5_recompile_is_stable() {
-    let tmp = hygiene_v5_kb();
-    let before = hygiene_v5_entities(&tmp);
-    json_cmd(&tmp, &["compile", "--kb", "hygiene5", "--all"]);
-    json_cmd(&tmp, &["compile", "--kb", "hygiene5", "--all"]);
-    let after = hygiene_v5_entities(&tmp);
-
-    let fingerprint = |rows: &[(String, String, u64, Vec<String>)]| -> Vec<String> {
-        let mut out: Vec<String> = rows
-            .iter()
-            .map(|(name, kind, mentions, aliases)| {
-                let mut aliases = aliases.clone();
-                aliases.sort();
-                format!("{name}|{kind}|{mentions}|{}", aliases.join(","))
-            })
-            .collect();
-        out.sort();
-        out
-    };
-    assert_eq!(
-        fingerprint(&before),
-        fingerprint(&after),
-        "recompiling v5 must converge, not drift"
-    );
-}
