@@ -25,7 +25,7 @@ use crate::error::CliError;
 use crate::fact_llm::FactLlm;
 use crate::fact_write::{
     write_fact_batch, Autonomy, FactBatch, FactBatchError, FactExtractionMarker, FactWriteCtx,
-    FactWriteOutcome, MemoryTime,
+    FactWriteOutcome, GroundingJudge, MemoryTime,
 };
 use crate::output::{print_success, Metadata};
 use crate::retrieval::{resolve_write_embedder, WriteEmbedder};
@@ -80,6 +80,9 @@ enum ExtractionStatus {
     CallerSupplied,
     /// No OpenRouter key resolved — the loud skip.
     SkippedNoKey,
+    /// Identical content was already stored: the extractor saw it then (or
+    /// `facts backfill` still will), so the duplicate costs no LLM call.
+    SkippedDuplicate,
     /// The LLM call was attempted and failed. The memory is still stored.
     Failed(String),
     /// The facts could not be persisted, so NOTHING was — a batch is one unit
@@ -100,6 +103,7 @@ impl ExtractionStatus {
             ExtractionStatus::Disabled => "disabled",
             ExtractionStatus::CallerSupplied => "skipped_facts_json",
             ExtractionStatus::SkippedNoKey => "skipped_no_openrouter_key",
+            ExtractionStatus::SkippedDuplicate => "skipped_duplicate",
             ExtractionStatus::Failed(_) => "failed",
             // Renamed from `failed_partial_persist`: a partial persist is
             // exactly what can no longer happen.
@@ -244,17 +248,23 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // the argument checks above, so a bad argument is still exit 3 rather than
     // being masked by the environment.
     let write_embedder = resolve_write_embedder("remember", offline)?;
+    // Same reason: a gate threshold nobody can use is exit 2 now, not after
+    // the memory is stored and its fact batch fails.
+    crate::fact_write::gate_thresholds()?;
+    let grounding = GroundingJudge::resolve(offline)?;
 
-    // The KB budget guards PAID calls: cloud embedding, and LLM extraction /
+    // The KB budget guards PAID calls: cloud embedding, LLM extraction /
     // adjudication (which run whenever an OpenRouter key resolves and
-    // --no-extract-facts was not passed). A fully offline write spends
+    // --no-extract-facts was not passed), and the grounding judge (resolved
+    // only when grounding is shadow/on and a judge is reachable, and it
+    // grounds --facts-json batches too). A fully offline write spends
     // nothing, so a zero spend cap must not block it — a free operation
     // failing with a budget error is a new failure mode with no money
     // behind it.
     let extraction_may_spend = !no_extract_facts
         && crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
             .is_some();
-    if write_embedder.cloud || extraction_may_spend {
+    if write_embedder.cloud || extraction_may_spend || grounding.is_some() {
         crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     }
 
@@ -316,6 +326,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                     embedder: write_embedder.embedder.as_ref(),
                     facts: &caller_facts,
                     marker: None,
+                    source_text: &content,
+                    grounding: grounding.as_ref(),
                     // The caller asserted these, on the retry path exactly as
                     // on the first run: dedup must not downgrade provenance.
                     source_kind: SourceKind::UserStated,
@@ -331,8 +343,21 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 validity_updated = ctx.store.set_memory_valid_until(existing, vu)?;
             }
             let facts_source_kind = facts_source_kind(caller_batch_committed, false);
+            // `chunks` and `fact_extraction` are always-present in the
+            // published schema; this envelope used to omit both. The flags
+            // keep their main-path meaning; otherwise extraction was skipped
+            // because the content is not new.
+            let status = if no_extract_facts {
+                ExtractionStatus::Disabled
+            } else if facts_json.is_some() && !force_extract_facts {
+                ExtractionStatus::CallerSupplied
+            } else {
+                ExtractionStatus::SkippedDuplicate
+            };
             let mut meta = Metadata::default();
             meta.add("deduplicated", true);
+            meta.add("chunks_stored", 0);
+            meta.add("fact_extraction", status.as_str());
             meta.add("existing_id", existing.to_string());
             if validity_updated {
                 meta.add("valid_until_updated", true);
@@ -343,32 +368,35 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             meta.add("handle", crate::commands::memory::render_handle(existing));
             meta.add("facts_added", outcome.added);
             meta.add("facts_source_kind", facts_source_kind);
-            print_success(
-                ctx.format,
-                json!({
+            for (name, counts) in outcome.counters() {
+                meta.add(name, counts);
+            }
+            let mut data = json!({
                     "id": existing.to_string(),
                     "handle": crate::commands::memory::render_handle(existing),
                     "stored": false,
                     "deduplicated": true,
                     "valid_until_updated": validity_updated,
+                    "chunks": 0,
                     "kb": kb,
+                    "fact_extraction": status.as_str(),
                     "facts_added": outcome.added,
                     "facts_source_kind": facts_source_kind,
                     "facts_deduped": outcome.deduped,
                     "conflicts": outcome.conflicts,
                     "adjudication_needed": outcome.queued,
                     "date_parse_warnings": outcome.date_warnings,
+                    "plan_notes": outcome.plan_notes,
                     "reason": "identical content already stored in this kb/diary; nothing re-embedded",
-                }),
-                meta,
-                |data| {
-                    println!(
-                        "Duplicate of {existing} — nothing re-stored ({} facts attached, use \
+            });
+            with_grounding(&mut data, outcome.grounding);
+            print_success(ctx.format, data, meta, |data| {
+                println!(
+                    "Duplicate of {existing} — nothing re-stored ({} facts attached, use \
                          --allow-duplicate to force a second memory)",
-                        data["facts_added"]
-                    )
-                },
-            );
+                    data["facts_added"]
+                )
+            });
             return Ok(());
         }
     }
@@ -595,6 +623,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             embedder: embedder.as_ref(),
             facts: &caller_facts,
             marker: None,
+            source_text: &content,
+            grounding: grounding.as_ref(),
             source_kind: SourceKind::UserStated,
         };
         if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
@@ -603,6 +633,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         caller_batch_committed = true;
     }
     if !extracted.is_empty() || marker.is_some() {
+        let dropped_before = outcome.grounding_counts.dropped();
         let plan = FactBatchPlan {
             memory_id: memory.id,
             kb: &kb,
@@ -616,6 +647,8 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             embedder: embedder.as_ref(),
             facts: &extracted,
             marker,
+            source_text: &content,
+            grounding: grounding.as_ref(),
             source_kind: SourceKind::AgentExtracted,
         };
         if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
@@ -631,16 +664,26 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 detail: failure.error.to_string(),
             };
         } else {
-            extraction_batch_committed = !extracted.is_empty();
+            // Only if a triple got past grounding: a batch whose every fact
+            // was dropped left this memory with no extracted facts.
+            let dropped = outcome.grounding_counts.dropped() - dropped_before;
+            extraction_batch_committed = extracted.len() > dropped;
         }
     }
     let facts_source_kind = facts_source_kind(caller_batch_committed, extraction_batch_committed);
 
+    let counters = outcome.counters();
     let facts_added = outcome.added;
     let conflicts = outcome.conflicts;
     let adjudication_needed = outcome.queued;
     let facts_deduped = outcome.deduped;
     let date_warnings = outcome.date_warnings;
+    // The planner's non-fatal reports: an unreadable `valid_until`, an ending
+    // with nothing open, a prior ruling applied instead of asked again. They
+    // were collected and dropped here, so a replayed caller decision changed
+    // the store with no trace in the answer.
+    let plan_notes = outcome.plan_notes;
+    let grounding = outcome.grounding;
 
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -671,6 +714,9 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     meta.add("date_parse_warnings", date_warnings.len());
     meta.add("fact_extraction", status.as_str());
     meta.add("facts_source_kind", facts_source_kind);
+    for (name, counts) in counters {
+        meta.add(name, counts);
+    }
     let note = status.note(&kb);
     if let Some(note) = &note {
         meta.add("fact_extraction_note", note.clone());
@@ -689,9 +735,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         );
     }
 
-    print_success(
-        ctx.format,
-        json!({
+    let mut data = json!({
             "id": memory.id,
             "handle": crate::commands::memory::render_handle(memory.id),
             "stored": true,
@@ -705,22 +749,30 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             "facts_added": facts_added,
             "facts_deduped": facts_deduped,
             "date_parse_warnings": date_warnings,
+            "plan_notes": plan_notes,
             "conflicts": conflicts,
             "adjudication_needed": adjudication_needed,
-        }),
-        meta,
-        |_| {
-            println!(
-                "Stored memory {} ({} chunks, {} facts, {} conflicts, {} queued for resolution)",
-                memory.id,
-                chunks_stored,
-                facts_added,
-                conflicts.len(),
-                adjudication_needed.len()
-            )
-        },
-    );
+    });
+    with_grounding(&mut data, grounding);
+    print_success(ctx.format, data, meta, |_| {
+        println!(
+            "Stored memory {} ({} chunks, {} facts, {} conflicts, {} queued for resolution)",
+            memory.id,
+            chunks_stored,
+            facts_added,
+            conflicts.len(),
+            adjudication_needed.len()
+        )
+    });
     Ok(())
+}
+
+/// `data.facts_grounding`, only when grounding judged a fact or dropped one:
+/// off, and with nothing dropped, the envelope is unchanged.
+pub(crate) fn with_grounding(data: &mut serde_json::Value, grounding: Vec<serde_json::Value>) {
+    if !grounding.is_empty() {
+        data["facts_grounding"] = json!(grounding);
+    }
 }
 
 /// Everything one memory's fact batch needs. Bundled so the duplicate-content
@@ -739,6 +791,9 @@ struct FactBatchPlan<'a> {
     embedder: &'a dyn Embedder,
     facts: &'a [ExtractedFact],
     marker: Option<FactExtractionMarker<'a>>,
+    /// The memory text, which the facts are grounded against.
+    source_text: &'a str,
+    grounding: Option<&'a GroundingJudge>,
     /// Who claims these triples. `UserStated` for `--facts-json`,
     /// `AgentExtracted` for what the extractor produced — the whole point of
     /// splitting one run into two batches.
@@ -778,6 +833,8 @@ async fn persist_facts(
     let batch = FactBatch {
         facts: plan.facts,
         marker: plan.marker,
+        source_text: plan.source_text,
+        grounding: plan.grounding,
     };
     write_fact_batch(ctx, &write_ctx, &batch, outcome).await
 }

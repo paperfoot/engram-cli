@@ -1,5 +1,55 @@
 # Changelog
 
+### Unreleased (next release)
+
+What an agent pays to learn and use engram. A session of one discovery,
+three recalls and two remembers read about 53k tokens, most of it a skill
+that told the agent to load a 36k-token manifest.
+
+- The installed skill is a signpost: the memory loop, the trust rule, empty
+  results, handles, adjudication, corrections, and where to look next
+  (5,673 → about 720 tokens). Nothing it dropped is lost: every rule moved
+  into the command it governs, reachable with `agent-info --command`.
+- `engram agent-info --command <path>` describes one command, or a group
+  such as `facts`: the global invariants, its contract entry, its prose and
+  the decision rules that govern it (recall: about 2.7k tokens). `--index`
+  lists every command in one line each. Both open no store, and every key
+  they share with the full manifest is byte-identical to it.
+- Every command answers `agent-info --schema`, or says `schema_available:
+  false` with a usage line (wiki, graph, entities, chunks repair, bench,
+  research). `ingest`, `repair`, `update` and `people show` were advertised
+  and failed their pull.
+- `agent-info` and `--schema` print compact JSON on a pipe (pretty on a
+  terminal): 15% of every manifest read was indentation.
+- `skill install` replaces an untouched copy of any earlier release instead
+  of refusing it as a hand edit, so the reinstall `update` prescribes works.
+  Copies now carry a `body_hash`; an edited copy is still refused without
+  `--force`, and the refusal says so instead of pointing at `config check`.
+- Bad-input errors suggest `agent-info --command '<command>'`; an unknown
+  `--schema` or `--command` path no longer suggests the call that failed.
+- `engram bench` no longer opens, migrates or backs up the store; only the
+  suites that read a KB do.
+- `recall` puts `kb` and `kb_scope` in `data`, as its schema always said, and
+  omits `diary_isolation`, `temporal_scope` and `expiry` from
+  `data.metadata` when they are null. Its scores and confidences, and
+  those in `state` and in absences, print at four decimal places (`0.92`,
+  not `0.9200000166893005`); `facts show` and `facts list` do not yet.
+- The contract lists exactly the flags each command parses, and a test holds
+  it there. `ingest --offline` was missing, and the manifest still said
+  keyless `ingest` and `chunks repair` embed with the stub silently; both
+  now refuse like `remember`. `facts backfill` is the one write that still
+  does, and its contract says so.
+- The contract describes the judge block and TypeSafe key in `config show`,
+  `config check` and `doctor`, and everything the fact write path reports
+  (`plan_notes`, the gate / queue / adjudication counters, `handle`,
+  `skipped_duplicate`); a dedup `remember` answered with a `fact_extraction`
+  value its own enum did not contain.
+- A bad `ENGRAM_FACT_*_THRESHOLD` suggests fixing or unsetting that variable,
+  not `engram config check`, which probes keys and cannot see it.
+- `facts show` spans every KB and diary by default, like `facts list` and
+  `state`. It read only `default`, so a fact filed under `personal` came back
+  as zero facts with `origin: flag` although no flag was passed.
+
 ## 0.4.1 — 2026-08-11
 
 The first field-driven refinement round on top of 0.4.0, gated by six

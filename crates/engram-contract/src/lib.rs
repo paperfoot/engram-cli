@@ -31,11 +31,13 @@ pub fn contract() -> &'static Contract {
         schema_version: registry::SCHEMA_VERSION,
         envelope: registry::ENVELOPE,
         commands: registry::COMMANDS,
+        schema_unavailable: registry::SCHEMA_UNAVAILABLE,
         global_flags: registry::GLOBAL_FLAGS,
         exit_codes: registry::EXIT_CODES,
         error_codes: registry::ERROR_CODES,
         vocabularies: registry::VOCABULARIES,
         env_vars: registry::ENV_VARS,
+        invariants: registry::INVARIANTS,
     })
 }
 
@@ -46,6 +48,15 @@ pub fn command(path: &str) -> Option<&'static CommandSpec> {
     cs.iter()
         .find(|c| c.path == path)
         .or_else(|| cs.iter().find(|c| c.aliases.contains(&path)))
+}
+
+/// `Some` when the path names a command the contract knows of but does not
+/// describe. Disjoint from [`command`]: a path is one or the other.
+pub fn unavailable(path: &str) -> Option<&'static UnavailableSpec> {
+    contract()
+        .schema_unavailable
+        .iter()
+        .find(|u| u.path == path)
 }
 
 /// Every enumerated vocabulary the contract pins, by name.
@@ -269,6 +280,70 @@ mod tests {
         assert_eq!(v["contract_version"], serde_json::json!("contract@1"));
         assert!(v["vocabularies"]["resolve_action"].is_array());
         assert!(v["error_codes"].is_array());
+    }
+
+    #[test]
+    fn scope_resolves_a_leaf_an_alias_and_a_group() {
+        use agent_info::scope;
+        assert_eq!(scope("recall"), vec!["recall"]);
+        assert_eq!(scope("search"), vec!["recall"]);
+        assert_eq!(scope("  facts   show "), vec!["facts show"]);
+        assert_eq!(scope("wiki"), vec!["wiki"]);
+        let facts = scope("facts");
+        assert_eq!(facts.len(), 6, "{facts:?}");
+        assert!(facts.iter().all(|p| p.starts_with("facts ")));
+        // A group spelled by its alias, and a group whose members are
+        // aliases of commands filed elsewhere.
+        assert!(!scope("person").is_empty());
+        assert!(scope("person").iter().all(|p| p.starts_with("people ")));
+        let memory = scope("memory");
+        assert!(
+            memory.contains(&"edit") && memory.contains(&"forget"),
+            "{memory:?}"
+        );
+        assert_eq!(scope("entities"), vec!["entities list", "entities show"]);
+    }
+
+    #[test]
+    fn scope_is_empty_for_a_name_it_does_not_know() {
+        assert!(agent_info::scope("recal").is_empty());
+        assert!(agent_info::scope("").is_empty());
+        // A prefix that is not a whole group word matches nothing.
+        assert!(agent_info::scope("fact").is_empty());
+    }
+
+    #[test]
+    fn the_index_lists_every_command_and_marks_only_what_differs() {
+        let index = agent_info::render_index();
+        let index = index.as_object().unwrap();
+        let c = contract();
+        assert_eq!(index.len(), c.commands.len() + c.schema_unavailable.len());
+        for spec in c.commands {
+            let e = &index[spec.path];
+            assert_eq!(e["summary"], spec.summary);
+            assert_eq!(
+                e.get("destructive").is_some(),
+                spec.destructive,
+                "{}",
+                spec.path
+            );
+            assert!(e.get("schema_available").is_none(), "{}", spec.path);
+        }
+        for u in c.schema_unavailable {
+            assert_eq!(index[u.path]["schema_available"], false);
+        }
+    }
+
+    #[test]
+    fn the_additive_block_carries_the_invariants_and_every_error_exit() {
+        let v = agent_info::render(&RuntimeContext::fixture());
+        assert_eq!(
+            v["invariants"].as_array().unwrap().len(),
+            registry::INVARIANTS.len()
+        );
+        for e in contract().error_codes {
+            assert_eq!(v["error_code_exits"][e.code], e.exit, "{}", e.code);
+        }
     }
 
     #[test]

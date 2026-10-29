@@ -126,6 +126,7 @@ struct CloseColumns {
     closed_by: Option<String>,
     superseded_by: Option<String>,
     superseded_at: Option<String>,
+    resolution: Option<String>,
 }
 
 impl CloseColumns {
@@ -154,7 +155,12 @@ impl CloseColumns {
             || self.closed_by != closed_by
             || (e.payload_bool("sets_superseded_by")
                 && (self.superseded_by != closed_by
-                    || self.superseded_at.as_deref() != Some(superseded_at.as_str()))))
+                    || self.superseded_at.as_deref() != Some(superseded_at.as_str())))
+            // [V5] The close COALESCEs `resolution`, so a tag the row already
+            // carries moves nothing; any other tag would rewrite the audit
+            // trail of a safety fact.
+            || e.payload_opt_str("resolution")
+                .is_some_and(|r| self.resolution.as_deref() != Some(r.as_str())))
     }
 }
 
@@ -276,7 +282,8 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<Applied, StorageError>
                     .conn
                     .query_row(
                         "SELECT predicate, valid_from, valid_until, close_reason,
-                                close_authority, closed_by, superseded_by, superseded_at
+                                close_authority, closed_by, superseded_by, superseded_at,
+                                resolution
                            FROM facts WHERE id = ?1",
                         params![id.to_string()],
                         |r| {
@@ -290,6 +297,7 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<Applied, StorageError>
                                     closed_by: r.get(5)?,
                                     superseded_by: r.get(6)?,
                                     superseded_at: r.get(7)?,
+                                    resolution: r.get(8)?,
                                 },
                             ))
                         },
@@ -322,13 +330,18 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<Applied, StorageError>
                     }
                 }
             }
+            // `resolution` is COALESCEd exactly as the live close writes it:
+            // a close event that names no rule leaves the observed row's tag
+            // alone. Authority comes from `authority` only (see
+            // `payload::with_resolution`).
             store.conn.execute(
                 "UPDATE facts
                     SET valid_until = ?1, close_reason = ?2, close_authority = ?3,
                         closed_by = ?4,
                         superseded_by = CASE WHEN ?5 THEN ?4 ELSE superseded_by END,
-                        superseded_at = CASE WHEN ?5 THEN ?6 ELSE superseded_at END
-                  WHERE id = ?7",
+                        superseded_at = CASE WHEN ?5 THEN ?6 ELSE superseded_at END,
+                        resolution = COALESCE(?7, resolution)
+                  WHERE id = ?8",
                 params![
                     e.payload_str("valid_until")?,
                     e.payload_str("reason")?,
@@ -339,6 +352,7 @@ pub fn apply(store: &SqliteStore, e: &EventRow) -> Result<Applied, StorageError>
                     // which is what a live close writes anyway.
                     e.payload_opt_str("superseded_at")
                         .unwrap_or(e.payload_str("valid_until")?),
+                    e.payload_opt_str("resolution"),
                     id.to_string(),
                 ],
             )?;

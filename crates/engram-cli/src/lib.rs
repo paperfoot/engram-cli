@@ -14,6 +14,7 @@ pub mod engine;
 pub mod error;
 pub mod fact_llm;
 pub mod fact_write;
+pub mod judge;
 pub mod output;
 pub mod read_surface;
 pub mod respond;
@@ -33,17 +34,76 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     apply_store_override(cli.store.as_deref())?;
     output::mark_command_start();
     let format = output::OutputFormat::detect(cli.json);
-    // The discovery surface answers BEFORE any store is opened: constructing
+    // Store-free commands answer BEFORE any store is opened: constructing
     // AppContext runs migrations, and "run agent-info to check the setup"
-    // must never be the call that migrates (or creates) a database.
-    if let Command::AgentInfo { schema } = &cli.command {
-        return agent_info::run(schema.as_deref());
-    }
+    // must never be the call that migrates (or creates) a database. A
+    // benchmark measures fixtures and datasets, not the user's memory, so it
+    // must not be that call either; the one suite that reads a KB opens the
+    // store itself.
+    let command = match cli.command {
+        Command::AgentInfo {
+            schema,
+            command,
+            index,
+        } => {
+            let view = match (schema, command) {
+                (Some(path), _) => agent_info::View::Schema(path),
+                (None, Some(path)) => agent_info::View::Command(path),
+                (None, None) if index => agent_info::View::Index,
+                (None, None) => agent_info::View::Full,
+            };
+            return agent_info::run(view, format);
+        }
+        Command::Bench {
+            suite,
+            profile,
+            mab_split,
+            download,
+            limit,
+            answerer,
+            judge,
+            ragas,
+            top_k,
+            save,
+            mode,
+            kb,
+            corpus,
+            dataset,
+            rerank,
+            year,
+        } => {
+            return commands::bench::run(
+                format,
+                commands::bench::BenchArgs {
+                    suite,
+                    profile,
+                    mab_split,
+                    download,
+                    limit,
+                    answerer,
+                    judge,
+                    ragas,
+                    top_k,
+                    save,
+                    mode,
+                    kb,
+                    corpus,
+                    dataset,
+                    rerank,
+                    year,
+                },
+            )
+            .await
+        }
+        command => command,
+    };
     let ctx = context::AppContext::new(format, cli.quiet)?;
-    ctx.core.set_actor(actor_for(&cli.command));
+    ctx.core.set_actor(actor_for(&command));
 
-    match cli.command {
-        Command::AgentInfo { schema } => agent_info::run(schema.as_deref()),
+    match command {
+        Command::AgentInfo { .. } | Command::Bench { .. } => {
+            unreachable!("store-free commands return before the store opens")
+        }
         Command::Remember {
             content,
             importance,
@@ -128,9 +188,11 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             exclude,
             max_files,
             all,
+            offline,
         } => {
             commands::ingest::run(
                 &ctx, path, mode, diary, kb, compile, dry_run, include, exclude, max_files, all,
+                offline,
             )
             .await
         }
@@ -504,47 +566,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         },
         Command::Export { format, kb } => commands::export::run(&ctx, format, kb),
         Command::Import { file } => commands::import::run(&ctx, file),
-        Command::Bench {
-            suite,
-            profile,
-            mab_split,
-            download,
-            limit,
-            answerer,
-            judge,
-            ragas,
-            top_k,
-            save,
-            mode,
-            kb,
-            corpus,
-            dataset,
-            rerank,
-            year,
-        } => {
-            commands::bench::run(
-                &ctx,
-                commands::bench::BenchArgs {
-                    suite,
-                    profile,
-                    mab_split,
-                    download,
-                    limit,
-                    answerer,
-                    judge,
-                    ragas,
-                    top_k,
-                    save,
-                    mode,
-                    kb,
-                    corpus,
-                    dataset,
-                    rerank,
-                    year,
-                },
-            )
-            .await
-        }
         Command::Config(sub) => match sub {
             ConfigCommand::Show => commands::config::show(&ctx),
             ConfigCommand::Set { key, value } => commands::config::set(&ctx, key, value),
@@ -557,7 +578,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 kb,
                 all_kbs,
                 dry_run,
-            } => commands::chunks::repair(&ctx, kb, all_kbs, dry_run).await,
+                offline,
+            } => commands::chunks::repair(&ctx, kb, all_kbs, dry_run, offline).await,
         },
     }
 }

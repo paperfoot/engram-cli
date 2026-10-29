@@ -23,7 +23,8 @@ fn store_is_untouched(sb: &Sandbox) -> bool {
         .is_none()
 }
 
-/// All thirty of them, one process each. The generator and the binary must
+/// Every registered command, one process each (`contract_coverage.rs` holds
+/// the same line for every clap leaf, including the declared gaps). The generator and the binary must
 /// agree byte for byte, or `--schema` is a second, quietly diverging source.
 #[test]
 fn every_registered_command_answers_its_own_schema_path() {
@@ -118,10 +119,10 @@ fn the_suggestion_the_parser_hands_out_actually_runs() {
     let out = sb.cmd().args(["recall", "--nonsense"]).output().unwrap();
     let err = Sandbox::err_json(&out);
     let suggestion = err["error"]["suggestion"].as_str().unwrap().to_string();
-    assert!(suggestion.contains("agent-info --schema"), "{suggestion}");
+    assert!(suggestion.contains("agent-info --command"), "{suggestion}");
     let followed = sb
         .cmd()
-        .args(["agent-info", "--schema", "recall"])
+        .args(["agent-info", "--command", "recall"])
         .output()
         .expect("the advertised invocation");
     assert!(
@@ -129,4 +130,86 @@ fn the_suggestion_the_parser_hands_out_actually_runs() {
         "the suggestion sends agents to a command that fails: {}",
         String::from_utf8_lossy(&followed.stderr)
     );
+}
+
+/// The loop this file's header describes, closed at its last door: a wrong
+/// name passed to `--schema` used to get the generic `bad_input` advice —
+/// "run `engram agent-info --schema '<command>'`" — the call that had just
+/// failed. The suggestion must name a different call, and that call must run.
+#[test]
+fn an_unknown_schema_path_does_not_suggest_itself() {
+    let sb = Sandbox::new();
+    let out = sb
+        .cmd()
+        .args(["agent-info", "--schema", "ingest-all"])
+        .output()
+        .expect("schema");
+    assert_eq!(out.status.code(), Some(3));
+    let err = Sandbox::err_json(&out);
+    assert_eq!(err["error"]["code"], "bad_input");
+    let suggestion = err["error"]["suggestion"].as_str().unwrap();
+    assert!(!suggestion.contains("--schema"), "{suggestion}");
+    assert!(suggestion.contains("engram --help"), "{suggestion}");
+    let followed = sb.cmd().arg("--help").output().unwrap();
+    assert!(followed.status.success());
+    assert!(store_is_untouched(&sb));
+}
+
+/// Recovery is executable and cheap: every discovery command an error hands
+/// out runs, and none of them is the full manifest. A suggestion that sends an
+/// agent to a 39k-token read after a typo costs more than the typo.
+#[test]
+fn every_parser_suggestion_runs_and_stays_small() {
+    let sb = Sandbox::new();
+    // The followed calls run in their own sandbox: `repair` opens the store
+    // before it refuses, but the discovery calls it points at must not.
+    let probe = Sandbox::new();
+    // (argv that fails, the command an agent would substitute for <command>)
+    let cases: &[(&[&str], &str)] = &[
+        (&["recal", "x"], "recall"),
+        (&["recall", "x", "--nonsense"], "recall"),
+        (&["recall", "x", "--layer", "bogus"], "recall"),
+        (&["recall"], "recall"),
+        (&["repair"], "repair"),
+        (&["agent-info", "--schema", "bogus"], "recall"),
+        (&["agent-info", "--command", "bogus"], "recall"),
+    ];
+    for (argv, command) in cases {
+        let out = sb.cmd().args(*argv).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{argv:?}");
+        let suggestion = Sandbox::err_json(&out)["error"]["suggestion"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let runnable: Vec<Vec<String>> = suggestion
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|c| {
+                c.starts_with("engram ") && (c.contains("--help") || c.contains("agent-info"))
+            })
+            .map(|c| {
+                c.replace("'<command>'", command)
+                    .replace("<command>", command)
+                    .split_whitespace()
+                    .skip(1)
+                    .map(String::from)
+                    .collect()
+            })
+            .collect();
+        assert!(
+            !runnable.is_empty(),
+            "{argv:?} suggests nothing runnable: {suggestion}"
+        );
+        for followed in runnable {
+            let out = probe.cmd().args(&followed).output().unwrap();
+            assert!(out.status.success(), "{argv:?} -> {followed:?} fails");
+            assert!(
+                out.stdout.len() < 12 * 1024,
+                "{argv:?} -> {followed:?} answers {} bytes",
+                out.stdout.len()
+            );
+        }
+    }
+    assert!(store_is_untouched(&probe));
 }

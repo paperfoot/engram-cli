@@ -11,6 +11,8 @@ use engram_storage::paths;
 use serde_json::json;
 use std::io::Write;
 
+pub(crate) mod providers;
+
 fn mask_key(key: &str) -> String {
     // Threshold 16, matching GeminiEmbedder::mask: at 12, head-6 + tail-4
     // left only 2 characters hidden.
@@ -36,8 +38,31 @@ fn read_toml() -> Result<toml::Value, CliError> {
         return Ok(toml::Value::Table(toml::value::Table::new()));
     }
     let text = std::fs::read_to_string(&p)?;
-    toml::from_str(&text)
-        .map_err(|e| CliError::Config(format!("invalid TOML at {}: {e}", p.display())))
+    toml::from_str(&text).map_err(|e| toml_error(&p, &text, &e))
+}
+
+/// A config.toml parse error as a line and column, never the source line:
+/// `toml`'s Display quotes the offending line, which can hold an API key,
+/// and this error reaches `doctor`, `config show|check|set` and every
+/// command that reads a strict setting.
+fn toml_error(path: &std::path::Path, text: &str, e: &toml::de::Error) -> CliError {
+    let at = e
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| {
+            let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+            format!(
+                " at line {}, column {}",
+                before.matches('\n').count() + 1,
+                before[line_start..].chars().count() + 1
+            )
+        })
+        .unwrap_or_default();
+    CliError::Config(format!(
+        "invalid TOML in {}{at}: {}",
+        path.display(),
+        e.message().trim().replace('\n', "; ")
+    ))
 }
 
 fn write_toml(value: &toml::Value) -> Result<(), CliError> {
@@ -61,6 +86,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
     let gemini_source = describe_key_source("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere_source = describe_key_source("COHERE_API_KEY", &file_cfg, "keys.cohere");
     let openrouter_source = describe_key_source("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
+    let typesafe_source = describe_key_source("TYPESAFE_API_KEY", &file_cfg, "keys.typesafe");
     let chunking = crate::commands::chunks::resolve_policy();
 
     print_success(
@@ -78,7 +104,11 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
                     .collect::<Vec<_>>(),
                 "cohere": cohere_source,
                 "openrouter": openrouter_source,
+                "typesafe": typesafe_source,
             },
+            // Per-site judge modes (off | shadow | on; default off) and the
+            // route a networked command would take.
+            "judge": crate::judge::status(),
             "retrieval": {
                 "profile": "cloud_quality",
                 // Derived, not hardcoded: this line said 50 long after the
@@ -148,7 +178,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
 }
 
 fn describe_key_source(env: &str, file: &toml::Value, path: &str) -> serde_json::Value {
-    if let Ok(v) = std::env::var(env) {
+    if let Some(v) = env_secret(env) {
         return json!({ "source": "env", "env": env, "value": mask_key(&v) });
     }
     // Walk path dot-separated
@@ -161,7 +191,7 @@ fn describe_key_source(env: &str, file: &toml::Value, path: &str) -> serde_json:
             }
         }
     }
-    if let Some(s) = cur.as_str() {
+    if let Some(s) = cur.as_str().filter(|s| !s.is_empty()) {
         json!({ "source": "config_file", "value": mask_key(s) })
     } else {
         json!({ "source": "unset" })
@@ -203,62 +233,31 @@ pub fn set(ctx: &AppContext, key: String, value: String) -> Result<(), CliError>
 }
 
 pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
-    let file_cfg = read_toml().unwrap_or(toml::Value::Table(toml::value::Table::new()));
-    let gemini = has_key("GEMINI_API_KEY", &file_cfg, "keys.gemini");
-    let cohere = has_key("COHERE_API_KEY", &file_cfg, "keys.cohere");
-    let openrouter = has_key("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
-
-    // LIVE per-key probe. "Configured" is not "working": a key can be
-    // syntactically present while its AI Studio project sits at zero prepaid
-    // credits, and the free models-list endpoint answers 200 for such a key —
-    // only a real embed call tells the truth. One 5-character embed per key,
-    // a fraction of a thousandth of a cent, so `config check` can say which
-    // key in the chain will actually serve.
-    let mut gemini_keys: Vec<(String, String)> = Vec::new();
-    if let Some(primary) = resolve_secret("GEMINI_API_KEY", "keys.gemini") {
-        gemini_keys.push(("primary".to_string(), primary));
-    }
-    for (i, k) in gemini_fallback_keys().into_iter().enumerate() {
-        gemini_keys.push((format!("fallback_{}", i + 1), k));
-    }
-    // Concurrent probes on ONE shared client: serial fresh-client probes made
-    // an offline machine wait up to 20s PER KEY in the chain.
-    let probe_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .ok();
-    let mut probes = serde_json::Map::new();
-    let mut any_key_serves = gemini_keys.is_empty();
-    let mut join = tokio::task::JoinSet::new();
-    for (i, (_, key)) in gemini_keys.iter().enumerate() {
-        let client = probe_client.clone();
-        let key = key.clone();
-        join.spawn(async move { (i, probe_gemini_key(client.as_ref(), &key).await) });
-    }
-    let mut probe_results: Vec<&'static str> = vec!["probe_error"; gemini_keys.len()];
-    while let Some(res) = join.join_next().await {
-        if let Ok((i, status)) = res {
-            probe_results[i] = status;
-        }
-    }
-    for ((label, key), status) in gemini_keys.iter().zip(probe_results) {
-        if status == "ok" {
-            any_key_serves = true;
-        }
-        probes.insert(format!("{label} ({})", mask_key(key)), json!(status));
-    }
+    // LIVE probes, one per configured key, unset providers never dialled.
+    // "Configured" is not "working": a key can be present while its project
+    // is denied, out of quota or out of credit, and only a real call says so.
+    let statuses = providers::probed().await;
+    let configured = |name: &str| {
+        statuses
+            .iter()
+            .any(|s| s.name == name && s.source != "unset")
+    };
+    let gemini = configured("gemini");
+    let cohere = configured("cohere");
 
     print_success(
         ctx.format,
         json!({
-            "gemini": if gemini { "configured" } else { "missing" },
-            "gemini_keys_probed": probes,
-            "cohere": if cohere { "configured (optional)" } else { "missing (optional)" },
-            "openrouter": if openrouter { "configured (compiler)" } else { "missing (compiler optional)" },
             // Configured is not working: "ok" is true only when a key in
-            // the chain actually SERVED the live probe. An agent branching on
-            // this contract must not proceed on a depleted chain.
-            "ok": gemini && any_key_serves,
+            // the Gemini chain actually SERVED the live probe. An agent
+            // branching on this contract must not proceed on a dead chain.
+            "ok": gemini && providers::gemini_serves(&statuses),
+            "providers": statuses.iter().map(providers::ProviderStatus::to_json).collect::<Vec<_>>(),
+            "next_steps": providers::next_steps(&statuses),
+            // Presence only, no live probe. `route` is what a judged command
+            // would use; `warnings` names a site set to shadow or on with
+            // no route or on the test stub.
+            "judge": crate::judge::status(),
             "summary": if gemini {
                 if cohere { "hybrid_gemini + cohere" } else { "hybrid_gemini (no rerank)" }
             } else {
@@ -269,45 +268,6 @@ pub async fn check(ctx: &AppContext) -> Result<(), CliError> {
         |data| println!("{}", serde_json::to_string_pretty(data).unwrap()),
     );
     Ok(())
-}
-
-/// One cheap embedContent against a single key. Statuses are deliberately a
-/// closed vocabulary an agent can branch on.
-async fn probe_gemini_key(client: Option<&reqwest::Client>, key: &str) -> &'static str {
-    let Some(client) = client else {
-        return "probe_error";
-    };
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={key}",
-        engram_embed::gemini::DEFAULT_MODEL
-    );
-    let body = json!({
-        "content": {"parts": [{"text": "probe"}]},
-        "outputDimensionality": 8,
-    });
-    match client.post(&url).json(&body).send().await {
-        Err(_) => "unreachable",
-        Ok(resp) => match resp.status().as_u16() {
-            200 => "ok",
-            429 => "quota_or_credits_depleted",
-            400 | 401 | 403 => "invalid_or_revoked",
-            _ => "probe_error",
-        },
-    }
-}
-
-fn has_key(env: &str, file: &toml::Value, path: &str) -> bool {
-    if std::env::var(env).is_ok() {
-        return true;
-    }
-    let mut cur = file;
-    for part in path.split('.') {
-        match cur.get(part) {
-            Some(next) => cur = next,
-            None => return false,
-        }
-    }
-    cur.as_str().map(|s| !s.is_empty()).unwrap_or(false)
 }
 
 /// Split a fallback-key list: comma- or whitespace-separated, trimmed,
@@ -338,15 +298,21 @@ pub fn gemini_fallback_keys() -> Vec<String> {
         .collect()
 }
 
+/// A key from the environment; an empty variable is absent. The one env
+/// reader for keys: `config show` and `config check` once treated
+/// `OPENROUTER_API_KEY=` as configured while every command using the key
+/// treated it as missing.
+fn env_secret(env: &str) -> Option<String> {
+    std::env::var(env).ok().filter(|v| !v.is_empty())
+}
+
 /// Resolve a secret in the canonical order: env var → config file → None.
 /// This is the single source of truth for key lookup so users can either
 /// set `GEMINI_API_KEY` in the environment or run `engram config set keys.gemini <value>` and
 /// both work identically. Framework rule: env overrides file.
 pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(env) {
-        if !v.is_empty() {
-            return Some(v);
-        }
+    if let Some(v) = env_secret(env) {
+        return Some(v);
     }
     let root = read_toml().ok()?;
     let mut cur = &root;
@@ -356,6 +322,22 @@ pub fn resolve_secret(env: &str, toml_path: &str) -> Option<String> {
     cur.as_str()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// The value at a dotted `toml_path` in config.toml, `None` when unset.
+/// Unlike [`resolve_config_string`], an unreadable or invalid file is an
+/// error rather than "unset", for settings that must never fall back to a
+/// default silently.
+pub fn config_value(toml_path: &str) -> Result<Option<toml::Value>, CliError> {
+    let root = read_toml()?;
+    let mut cur = &root;
+    for part in toml_path.split('.') {
+        match cur.get(part) {
+            Some(next) => cur = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cur.clone()))
 }
 
 pub fn resolve_config_string(toml_path: &str) -> Option<String> {
@@ -410,7 +392,40 @@ pub fn stub_forced() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_list;
+    use super::*;
+
+    #[test]
+    fn a_toml_error_never_quotes_config_toml() {
+        let secret = "AIzaFAKESECRET0123456789abcdef";
+        for text in [
+            format!("[keys]\ngemini \"{secret}\"\n"),
+            format!("[keys]\nopenrouter = \"{secret}\n"),
+            format!("[keys]\ngemini = {secret}\n"),
+            format!("[keys]\n{secret}\n"),
+            format!("[keys]\ngemini = \"{secret}\"\ngemini = \"{secret}\"\n"),
+        ] {
+            let e = toml::from_str::<toml::Value>(&text).unwrap_err();
+            let msg = toml_error(std::path::Path::new("/c/config.toml"), &text, &e).to_string();
+            assert!(!msg.contains("AIza"), "{msg}");
+            assert!(msg.contains("/c/config.toml at line "), "{msg}");
+        }
+    }
+
+    #[test]
+    fn an_empty_key_is_absent_in_env_and_in_the_file() {
+        let file: toml::Value = toml::from_str("[keys]\ntypesafe = \"\"\n").unwrap();
+        // Read by these tests only.
+        let unset = "ENGRAM_TEST_UNSET_KEY_3F9C1B";
+        let empty = "ENGRAM_TEST_EMPTY_KEY_3F9C1B";
+        std::env::set_var(empty, "");
+        for env in [unset, empty] {
+            assert_eq!(
+                describe_key_source(env, &file, "keys.typesafe"),
+                json!({ "source": "unset" }),
+                "{env}"
+            );
+        }
+    }
 
     #[test]
     fn key_lists_split_on_commas_and_whitespace_and_dedup() {

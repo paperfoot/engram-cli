@@ -141,15 +141,18 @@ impl SqliteStore {
                 &EventDraft::new(
                     EventKind::FactIntervalClosed,
                     cli_actor(&diary),
-                    payload::fact_interval_closed(
-                        fact_id,
-                        clamped,
-                        closed_by,
-                        reason,
-                        authority,
-                        sets_superseded_by,
-                        sets_superseded_by.then(|| clamped.to_rfc3339()).as_deref(),
-                        false,
+                    payload::with_resolution(
+                        payload::fact_interval_closed(
+                            fact_id,
+                            clamped,
+                            closed_by,
+                            reason,
+                            authority,
+                            sets_superseded_by,
+                            sets_superseded_by.then(|| clamped.to_rfc3339()).as_deref(),
+                            false,
+                        ),
+                        resolution,
                     ),
                 )
                 .scope(Some(&kb), Some(&diary))
@@ -476,6 +479,16 @@ mod tests {
     }
 
     fn fact(store: &SqliteStore, memory_id: Uuid, predicate: &str, object: &str) -> Uuid {
+        fact_resolved(store, memory_id, predicate, object, None)
+    }
+
+    fn fact_resolved(
+        store: &SqliteStore,
+        memory_id: Uuid,
+        predicate: &str,
+        object: &str,
+        resolution: Option<&str>,
+    ) -> Uuid {
         let f = Fact {
             id: Uuid::new_v4(),
             source_memory_id: memory_id,
@@ -492,7 +505,7 @@ mod tests {
             fact_type: FactType::Assertion,
             valid_from: Some(Utc::now()),
             valid_until: None,
-            resolution: None,
+            resolution: resolution.map(str::to_string),
             source_kind: SourceKind::UserStated,
             confirmations: 0,
             closed_by: None,
@@ -573,6 +586,56 @@ mod tests {
         assert!(
             closed.payload_bool("sets_superseded_by"),
             "the compat write must be rebuildable from the event alone"
+        );
+    }
+
+    /// [V5] The rule or judge that closed an interval is journalled with the
+    /// close, so `admin rebuild` restores `facts.resolution` instead of
+    /// erasing it. A close that names no rule — every event written before
+    /// the field existed — leaves the tag the observation carried.
+    #[test]
+    fn the_close_resolution_survives_a_rebuild() {
+        let (_tmp, _g, store) = temp_store();
+        let m = memory(&store, "Ana moved to Porto and stopped metformin.");
+        let old = fact(&store, m, "lives_in", "Lisbon");
+        let new = fact(&store, m, "lives_in", "Porto");
+        let stopped = fact_resolved(&store, m, "takes_medication", "metformin", Some("observed"));
+        assert!(store
+            .close_fact_interval(
+                old,
+                Utc::now(),
+                "superseded",
+                "successor_interval",
+                Some(new),
+                Some("slot_lww")
+            )
+            .unwrap());
+        assert!(store
+            .close_fact_interval(stopped, Utc::now(), "stopped", "explicit_end", None, None)
+            .unwrap());
+        let close = store.events_for_subject(old).unwrap().pop().unwrap();
+        assert_eq!(
+            close.payload_opt_str("resolution").as_deref(),
+            Some("slot_lww")
+        );
+        let untagged = store.events_for_subject(stopped).unwrap().pop().unwrap();
+        assert!(untagged.payload.get("resolution").is_none());
+
+        store.rebuild_projections(None, false).unwrap();
+        let old_row = store.get_fact(old).unwrap().unwrap();
+        assert_eq!(old_row.resolution.as_deref(), Some("slot_lww"));
+        assert_eq!(
+            old_row.close_authority.as_deref(),
+            Some("successor_interval")
+        );
+        assert_eq!(
+            store
+                .get_fact(stopped)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .as_deref(),
+            Some("observed")
         );
     }
 

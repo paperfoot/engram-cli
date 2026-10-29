@@ -23,6 +23,13 @@ fn point_at_home(cmd: &mut Command, home: &std::path::Path) {
     cmd.env_remove("GEMINI_API_KEY");
     cmd.env_remove("COHERE_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
+    cmd.env_remove("TYPESAFE_API_KEY");
+    cmd.env_remove("GEMINI_API_KEY_FALLBACKS");
+    cmd.env_remove("ENGRAM_JUDGE_STUB");
+    cmd.env_remove("ENGRAM_JUDGE_GROUNDING");
+    cmd.env_remove("ENGRAM_JUDGE_ADJUDICATE");
+    cmd.env_remove("ENGRAM_JUDGE_DEDUPE");
+    cmd.env_remove("ENGRAM_JUDGE_LOG");
     cmd.env_remove("ENGRAM_FACT_LLM_STUB");
     cmd.env_remove("ENGRAM_FACT_WRITE_FAIL");
     cmd.env("HOME", home);

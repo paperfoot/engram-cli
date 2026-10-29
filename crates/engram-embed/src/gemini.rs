@@ -24,6 +24,11 @@ pub const MAX_INPUT_CHARS: usize = 7800;
 const MAX_CHARS_PER_BATCH: usize = 60_000;
 const MAX_TEXTS_PER_BATCH: usize = 100;
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+/// The key travels in this header, never in the URL: reqwest's error Display
+/// appends the request URL, so a `?key=` query string put the key into every
+/// transport, timeout and decode error — stderr, tracing logs and the JSON
+/// error envelope an agent reads. Errors are mapped `without_url()` as well.
+const KEY_HEADER: &str = "x-goog-api-key";
 
 pub struct GeminiEmbedder {
     client: reqwest::Client,
@@ -39,6 +44,9 @@ pub struct GeminiEmbedder {
     rotation_reason: std::sync::Mutex<Option<String>>,
     model: String,
     dimensions: usize,
+    /// Always [`ENDPOINT`] outside tests; a field only so a test can point the
+    /// client at a closed local port.
+    endpoint: String,
 }
 
 impl GeminiEmbedder {
@@ -56,6 +64,7 @@ impl GeminiEmbedder {
             rotation_reason: std::sync::Mutex::new(None),
             model: DEFAULT_MODEL.to_string(),
             dimensions: DEFAULT_DIMS,
+            endpoint: ENDPOINT.to_string(),
         }
     }
 
@@ -376,7 +385,7 @@ impl Embedder for GeminiEmbedder {
         };
 
         // Full-lifecycle retry: send + 429 + 5xx + body read + JSON parse.
-        // The URL is rebuilt every attempt because a quota refusal rotates
+        // The key is re-read every attempt because a quota refusal rotates
         // `active` to the next fallback key.
         // Long benchmark runs (1500+ queries) hit transient drops; without
         // retry the whole bench dies on the first one.
@@ -384,15 +393,19 @@ impl Embedder for GeminiEmbedder {
         let mut attempt: u32 = 0;
         loop {
             let key_idx = self.active_index();
-            let url = format!(
-                "{}/{}:embedContent?key={}",
-                ENDPOINT, self.model, self.keys[key_idx]
-            );
+            let url = format!("{}/{}:embedContent", self.endpoint, self.model);
             // 1. send
-            let send_result = self.client.post(&url).json(&req).send().await;
+            let send_result = self
+                .client
+                .post(&url)
+                .header(KEY_HEADER, &self.keys[key_idx])
+                .json(&req)
+                .send()
+                .await;
             let resp = match send_result {
                 Ok(r) => r,
                 Err(e) => {
+                    let e = e.without_url();
                     if (attempt as usize) < delays_secs.len() {
                         let wait = delays_secs[attempt as usize];
                         attempt += 1;
@@ -496,6 +509,7 @@ impl Embedder for GeminiEmbedder {
                 match resp.text().await {
                     Ok(t) => t,
                     Err(e) => {
+                        let e = e.without_url();
                         if (attempt as usize) < delays_secs.len() {
                             let wait = delays_secs[attempt as usize];
                             attempt += 1;
@@ -592,16 +606,20 @@ impl Embedder for GeminiEmbedder {
             let mut attempt: u32 = 0;
             let delays_secs: [u64; 6] = [4, 8, 16, 32, 60, 60];
             let parsed: BatchEmbedResponse = loop {
-                // Rebuilt per attempt: a quota refusal rotates to a fallback key.
+                // Re-read per attempt: a quota refusal rotates to a fallback key.
                 let key_idx = self.active_index();
-                let url = format!(
-                    "{}/{}:batchEmbedContents?key={}",
-                    ENDPOINT, self.model, self.keys[key_idx]
-                );
-                let send_result = self.client.post(&url).json(&body).send().await;
+                let url = format!("{}/{}:batchEmbedContents", self.endpoint, self.model);
+                let send_result = self
+                    .client
+                    .post(&url)
+                    .header(KEY_HEADER, &self.keys[key_idx])
+                    .json(&body)
+                    .send()
+                    .await;
                 let resp = match send_result {
                     Ok(r) => r,
                     Err(e) => {
+                        let e = e.without_url();
                         if (attempt as usize) < delays_secs.len() {
                             let wait = delays_secs[attempt as usize];
                             attempt += 1;
@@ -695,7 +713,7 @@ impl Embedder for GeminiEmbedder {
                         return Err(BatchEmbedFailure {
                             error: EmbedError::Http {
                                 provider: "gemini",
-                                source: e,
+                                source: e.without_url(),
                             },
                             charged_texts,
                             charged_requests,
@@ -874,6 +892,41 @@ mod tests {
                 assert_eq!(pair[0].end, pair[1].start);
             }
             assert_eq!(ranges.last().unwrap().end, texts.len());
+        }
+    }
+
+    /// [C0] A key in the URL rode out in every transport error: reqwest's
+    /// Display appends the URL, and that string reached stderr, the tracing
+    /// log and the JSON error envelope an agent reads. A closed local port
+    /// fails every attempt, so both entry points end in their transport-error
+    /// arm; the paused clock skips the backoff ladder.
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_error_never_carries_the_key() {
+        const SENTINEL: &str = "SENTINEL-KEY-c0ffee-never-print-me";
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut e = GeminiEmbedder::new(SENTINEL);
+        e.endpoint = format!("http://127.0.0.1:{port}/v1beta/models");
+
+        let one = e
+            .embed_one("hello", TaskMode::RetrievalQuery)
+            .await
+            .unwrap_err();
+        let batch = e
+            .embed_batch_accounted(&["hello"], TaskMode::RetrievalDocument)
+            .await
+            .unwrap_err()
+            .error;
+        for err in [one, batch] {
+            assert!(matches!(err, EmbedError::Http { .. }), "{err:?}");
+            let rendered = format!("{err} | {err:?}");
+            assert!(
+                !rendered.contains(SENTINEL),
+                "the error text carries the key: {rendered}"
+            );
         }
     }
 }

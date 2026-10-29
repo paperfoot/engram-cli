@@ -27,6 +27,19 @@ pub enum CliError {
     #[error("bad input: {0}")]
     BadInput(String),
 
+    /// Bad input whose recovery depends on where it happened. The generic
+    /// `bad_input` advice points at `agent-info --command`, which is a loop
+    /// when the call that failed WAS a discovery call. Same code, same exit;
+    /// only the suggestion is specific.
+    #[error("bad input: {message}")]
+    BadInputHint { message: String, suggestion: String },
+
+    /// A config error whose fix is known where it happens. Same code, same
+    /// exit as `Config`; the generic `config check` advice would send the
+    /// caller to probe API keys for a problem that has nothing to do with them.
+    #[error("config error: {message}")]
+    ConfigHint { message: String, suggestion: String },
+
     #[error("rate limited: {0}")]
     RateLimited(String),
 
@@ -136,8 +149,8 @@ impl CliError {
         use CliError::*;
         match self {
             Transient(_) | Io(_) | Serde(_) | Zip(_) => ErrorCode::Transient,
-            Config(_) => ErrorCode::Config,
-            BadInput(_) | Ingest(_) | Bench(_) => ErrorCode::BadInput,
+            Config(_) | ConfigHint { .. } => ErrorCode::Config,
+            BadInput(_) | BadInputHint { .. } | Ingest(_) | Bench(_) => ErrorCode::BadInput,
             RateLimited(_) => ErrorCode::RateLimited,
             Storage(e) => storage_error_code(e),
             // Preserves today's exit 2: the highest-traffic setup failure
@@ -173,8 +186,8 @@ impl CliError {
         use CliError::*;
         match self {
             Transient(_) => "transient_error",
-            Config(_) => "config_error",
-            BadInput(_) => "bad_input",
+            Config(_) | ConfigHint { .. } => "config_error",
+            BadInput(_) | BadInputHint { .. } => "bad_input",
             RateLimited(_) => "rate_limited",
             Embed(_) => "embed_error",
             Rerank(_) => "rerank_error",
@@ -199,8 +212,29 @@ impl CliError {
         use CliError::*;
         Some(match self {
             BadInput(_) | Ingest(_) | Bench(_) => {
-                "run `engram agent-info --schema '<command>'` for this command's exact argument shape"
+                "run `engram agent-info --command '<command>'` for this command's exact argument shape and rules"
                     .to_string()
+            }
+            BadInputHint { suggestion, .. } | ConfigHint { suggestion, .. } => suggestion.clone(),
+            // Both gate-threshold messages (fact_write.rs
+            // `parse_gate_thresholds`) begin with the variable's name; a key
+            // probe cannot fix a typo in one of them. Match the two names, not
+            // the `ENGRAM_FACT_` prefix: the LLM stub's error shares it.
+            Config(m)
+                if m.starts_with(crate::fact_write::DUP_THRESHOLD_ENV)
+                    || m.starts_with(crate::fact_write::NOVEL_THRESHOLD_ENV) =>
+            {
+                format!(
+                "fix or unset the ENGRAM_FACT_*_THRESHOLD variable the message names, then rerun \
+                 the engram command; unset, the novelty gate uses dup {} and novel {}",
+                engram_graph::gate::DEFAULT_DUP_THRESHOLD,
+                engram_graph::gate::DEFAULT_NOVEL_THRESHOLD
+                )
+            }
+            // A bad judge mode or ENGRAM_JUDGE_STUB (judge.rs): a key probe
+            // cannot fix a typo in a setting either.
+            Config(m) if crate::judge::config_error_suggestion(m).is_some() => {
+                crate::judge::config_error_suggestion(m).unwrap_or_default()
             }
             Config(_) => {
                 "run `engram config check` — it live-probes every configured key and names the one that failed"
@@ -244,7 +278,7 @@ impl CliError {
             // and it will never run the one command that would have shown it
             // a broken store.
             MalformedJson { field, .. } => format!(
-                "check the JSON you passed in `{field}`; `engram agent-info --schema '<command>'` gives the exact shape"
+                "check the JSON you passed in `{field}`; `engram agent-info --command '<command>'` gives the exact shape"
             ),
             Storage(e) if storage_error_code(e) == ErrorCode::MalformedJson => {
                 "a stored row failed to deserialize — this is store corruption or a half-applied migration, not your arguments. Run `engram doctor --json`; do not retry"
@@ -382,6 +416,10 @@ mod tests {
             CliError::Transient("x".into()),
             CliError::Config("x".into()),
             CliError::BadInput("x".into()),
+            CliError::BadInputHint {
+                message: "x".into(),
+                suggestion: "`engram --help` lists every command".into(),
+            },
             CliError::RateLimited("x".into()),
             CliError::Storage(StorageError::NotFound("x".into())),
             CliError::NotFound {
@@ -419,6 +457,37 @@ mod tests {
                 "the old non-advice came back"
             );
         }
+    }
+
+    #[test]
+    fn a_bad_gate_threshold_is_not_sent_to_probe_keys() {
+        let e = CliError::Config(
+            "ENGRAM_FACT_DUP_THRESHOLD='x' is not a cosine similarity in [-1, 1]; fix or unset it"
+                .into(),
+        );
+        let s = e.suggestion().unwrap();
+        assert!(s.contains("ENGRAM_FACT_") && s.contains("0.95"), "{s}");
+        assert!(!s.contains("config check"), "{s}");
+        let other = CliError::Config("x".into()).suggestion().unwrap();
+        assert!(other.contains("config check"), "{other}");
+        let stub = CliError::Config("ENGRAM_FACT_LLM_STUB is not a valid script: x".into())
+            .suggestion()
+            .unwrap();
+        assert!(!stub.contains("THRESHOLD"), "{stub}");
+    }
+
+    #[test]
+    fn a_bad_judge_mode_is_not_sent_to_probe_keys() {
+        let e = CliError::Config(
+            "ENGRAM_JUDGE_GROUNDING=\"true\" is not a judge mode; expected off, shadow or on"
+                .into(),
+        );
+        let s = e.suggestion().unwrap();
+        assert!(s.contains("off|shadow|on"), "{s}");
+        assert!(s.contains("`engram config set judge.grounding off`"), "{s}");
+        assert!(!s.contains("config check"), "{s}");
+        let e = CliError::Config("ENGRAM_JUDGE_STUB is not a valid spec: x".into());
+        assert!(!e.suggestion().unwrap().contains("config check"));
     }
 
     #[test]

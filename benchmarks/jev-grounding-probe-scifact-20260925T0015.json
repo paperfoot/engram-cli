@@ -1,0 +1,207 @@
+{
+  "suite": "jev-grounding-probe-scifact",
+  "pairs": 1189,
+  "labels": {
+    "NEI": 416,
+    "CONTRADICT": 265,
+    "SUPPORT": 508
+  },
+  "heuristic": {
+    "precision_supported": 0.5872,
+    "recall_supported": 0.7559,
+    "contradict_admitted": 0.6906,
+    "nei_admitted": 0.2091
+  },
+  "jev": {
+    "plain": {
+      "auc": 0.9652,
+      "missing": 0,
+      "requests": 629,
+      "input_tokens": 523413,
+      "usd": 0.022,
+      "latency_p50_s": 1.52,
+      "latency_p95_s": 3.45,
+      "thresholds": {
+        "0.3": {
+          "jev": {
+            "precision_supported": 0.9139,
+            "recall_supported": 0.878,
+            "contradict_admitted": 0.0377,
+            "nei_admitted": 0.0769
+          },
+          "num+jev": {
+            "precision_supported": 0.9153,
+            "recall_supported": 0.872,
+            "contradict_admitted": 0.0377,
+            "nei_admitted": 0.0745
+          }
+        },
+        "0.5": {
+          "jev": {
+            "precision_supported": 0.9438,
+            "recall_supported": 0.8268,
+            "contradict_admitted": 0.0226,
+            "nei_admitted": 0.0457
+          },
+          "num+jev": {
+            "precision_supported": 0.9457,
+            "recall_supported": 0.8228,
+            "contradict_admitted": 0.0226,
+            "nei_admitted": 0.0433
+          }
+        },
+        "0.7": {
+          "jev": {
+            "precision_supported": 0.9549,
+            "recall_supported": 0.75,
+            "contradict_admitted": 0.0113,
+            "nei_admitted": 0.0361
+          },
+          "num+jev": {
+            "precision_supported": 0.9571,
+            "recall_supported": 0.7461,
+            "contradict_admitted": 0.0113,
+            "nei_admitted": 0.0337
+          }
+        },
+        "0.8": {
+          "jev": {
+            "precision_supported": 0.966,
+            "recall_supported": 0.6713,
+            "contradict_admitted": 0.0075,
+            "nei_admitted": 0.024
+          },
+          "num+jev": {
+            "precision_supported": 0.9658,
+            "recall_supported": 0.6673,
+            "contradict_admitted": 0.0075,
+            "nei_admitted": 0.024
+          }
+        },
+        "0.9": {
+          "jev": {
+            "precision_supported": 0.9754,
+            "recall_supported": 0.5453,
+            "contradict_admitted": 0.0075,
+            "nei_admitted": 0.012
+          },
+          "num+jev": {
+            "precision_supported": 0.9753,
+            "recall_supported": 0.5433,
+            "contradict_admitted": 0.0075,
+            "nei_admitted": 0.012
+          }
+        },
+        "0.95": {
+          "jev": {
+            "precision_supported": 0.9948,
+            "recall_supported": 0.376,
+            "contradict_admitted": 0.0,
+            "nei_admitted": 0.0024
+          },
+          "num+jev": {
+            "precision_supported": 0.9948,
+            "recall_supported": 0.376,
+            "contradict_admitted": 0.0,
+            "nei_admitted": 0.0024
+          }
+        }
+      }
+    },
+    "strict": {
+      "auc": 0.9621,
+      "missing": 0,
+      "requests": 629,
+      "input_tokens": 675605,
+      "usd": 0.0284,
+      "latency_p50_s": 1.52,
+      "latency_p95_s": 4.32,
+      "thresholds": {
+        "0.3": {
+          "jev": {
+            "precision_supported": 0.9318,
+            "recall_supported": 0.8602,
+            "contradict_admitted": 0.0264,
+            "nei_admitted": 0.0601
+          },
+          "num+jev": {
+            "precision_supported": 0.9333,
+            "recall_supported": 0.8543,
+            "contradict_admitted": 0.0264,
+            "nei_admitted": 0.0577
+          }
+        },
+        "0.5": {
+          "jev": {
+            "precision_supported": 0.9518,
+            "recall_supported": 0.7776,
+            "contradict_admitted": 0.0113,
+            "nei_admitted": 0.0409
+          },
+          "num+jev": {
+            "precision_supported": 0.9539,
+            "recall_supported": 0.7736,
+            "contradict_admitted": 0.0113,
+            "nei_admitted": 0.0385
+          }
+        },
+        "0.7": {
+          "jev": {
+            "precision_supported": 0.9628,
+            "recall_supported": 0.6614,
+            "contradict_admitted": 0.0075,
+            "nei_admitted": 0.0264
+          },
+          "num+jev": {
+            "precision_supported": 0.9626,
+            "recall_supported": 0.6594,
+            "contradict_admitted": 0.0075,
+            "nei_admitted": 0.0264
+          }
+        },
+        "0.8": {
+          "jev": {
+            "precision_supported": 0.9644,
+            "recall_supported": 0.5335,
+            "contradict_admitted": 0.0038,
+            "nei_admitted": 0.0216
+          },
+          "num+jev": {
+            "precision_supported": 0.9643,
+            "recall_supported": 0.5315,
+            "contradict_admitted": 0.0038,
+            "nei_admitted": 0.0216
+          }
+        },
+        "0.9": {
+          "jev": {
+            "precision_supported": 0.9889,
+            "recall_supported": 0.3504,
+            "contradict_admitted": 0.0,
+            "nei_admitted": 0.0048
+          },
+          "num+jev": {
+            "precision_supported": 0.9889,
+            "recall_supported": 0.3504,
+            "contradict_admitted": 0.0,
+            "nei_admitted": 0.0048
+          }
+        },
+        "0.95": {
+          "jev": {
+            "precision_supported": 1.0,
+            "recall_supported": 0.1693,
+            "contradict_admitted": 0.0,
+            "nei_admitted": 0.0
+          },
+          "num+jev": {
+            "precision_supported": 1.0,
+            "recall_supported": 0.1693,
+            "contradict_admitted": 0.0,
+            "nei_admitted": 0.0
+          }
+        }
+      }
+    }
+  }
+}

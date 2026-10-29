@@ -1,0 +1,275 @@
+{
+ "suite": "jev-pairs",
+ "source": "pairs.jsonl",
+ "items": 148,
+ "missing": 0,
+ "summary": {
+  "cost_usd": 0.0039841619999999986,
+  "errors": [],
+  "failed_requests": 0,
+  "input_tokens": 94861,
+  "latency_ms_p50": 241,
+  "latency_ms_p95": 836,
+  "missing_answers": 0,
+  "model": "jev-1.13.0",
+  "requests": 148,
+  "route": "typesafe"
+ },
+ "signals": {
+  "restates": {
+   "n": 148,
+   "positives": 10,
+   "auc": 1.0,
+   "thresholds": {
+    "0.1": {
+     "precision": 1.0,
+     "recall": 1.0,
+     "false_positive_rate": 0.0
+    },
+    "0.2": {
+     "precision": 1.0,
+     "recall": 1.0,
+     "false_positive_rate": 0.0
+    },
+    "0.3": {
+     "precision": 1.0,
+     "recall": 1.0,
+     "false_positive_rate": 0.0
+    },
+    "0.5": {
+     "precision": 1.0,
+     "recall": 1.0,
+     "false_positive_rate": 0.0
+    },
+    "0.7": {
+     "precision": 1.0,
+     "recall": 1.0,
+     "false_positive_rate": 0.0
+    },
+    "0.8": {
+     "precision": 1.0,
+     "recall": 0.9,
+     "false_positive_rate": 0.0
+    },
+    "0.85": {
+     "precision": 1.0,
+     "recall": 0.9,
+     "false_positive_rate": 0.0
+    },
+    "0.9": {
+     "precision": 1.0,
+     "recall": 0.9,
+     "false_positive_rate": 0.0
+    },
+    "0.95": {
+     "precision": 1.0,
+     "recall": 0.3,
+     "false_positive_rate": 0.0
+    }
+   }
+  },
+  "same_slot": {
+   "n": 148,
+   "positives": 142,
+   "auc": 1.0,
+   "thresholds": {
+    "0.1": {
+     "precision": 1.0,
+     "recall": 1.0,
+     "false_positive_rate": 0.0
+    },
+    "0.2": {
+     "precision": 1.0,
+     "recall": 1.0,
+     "false_positive_rate": 0.0
+    },
+    "0.3": {
+     "precision": 1.0,
+     "recall": 1.0,
+     "false_positive_rate": 0.0
+    },
+    "0.5": {
+     "precision": 1.0,
+     "recall": 0.993,
+     "false_positive_rate": 0.0
+    },
+    "0.7": {
+     "precision": 1.0,
+     "recall": 0.9437,
+     "false_positive_rate": 0.0
+    },
+    "0.8": {
+     "precision": 1.0,
+     "recall": 0.8944,
+     "false_positive_rate": 0.0
+    },
+    "0.85": {
+     "precision": 1.0,
+     "recall": 0.831,
+     "false_positive_rate": 0.0
+    },
+    "0.9": {
+     "precision": 1.0,
+     "recall": 0.7958,
+     "false_positive_rate": 0.0
+    },
+    "0.95": {
+     "precision": 1.0,
+     "recall": 0.6197,
+     "false_positive_rate": 0.0
+    }
+   }
+  },
+  "contradicts": {
+   "n": 148,
+   "positives": 116,
+   "auc": 0.9661,
+   "thresholds": {
+    "0.1": {
+     "precision": 0.9739,
+     "recall": 0.9655,
+     "false_positive_rate": 0.0938
+    },
+    "0.2": {
+     "precision": 0.9737,
+     "recall": 0.9569,
+     "false_positive_rate": 0.0938
+    },
+    "0.3": {
+     "precision": 0.9813,
+     "recall": 0.9052,
+     "false_positive_rate": 0.0625
+    },
+    "0.5": {
+     "precision": 0.9787,
+     "recall": 0.7931,
+     "false_positive_rate": 0.0625
+    },
+    "0.7": {
+     "precision": 0.9882,
+     "recall": 0.7241,
+     "false_positive_rate": 0.0312
+    },
+    "0.8": {
+     "precision": 1.0,
+     "recall": 0.5948,
+     "false_positive_rate": 0.0
+    },
+    "0.85": {
+     "precision": 1.0,
+     "recall": 0.4483,
+     "false_positive_rate": 0.0
+    },
+    "0.9": {
+     "precision": 1.0,
+     "recall": 0.3448,
+     "false_positive_rate": 0.0
+    },
+    "0.95": {
+     "precision": 1.0,
+     "recall": 0.1293,
+     "false_positive_rate": 0.0
+    }
+   }
+  },
+  "old_ended": {
+   "n": 148,
+   "positives": 17,
+   "auc": 0.9877,
+   "thresholds": {
+    "0.1": {
+     "precision": 0.1504,
+     "recall": 1.0,
+     "false_positive_rate": 0.7328
+    },
+    "0.2": {
+     "precision": 0.1848,
+     "recall": 1.0,
+     "false_positive_rate": 0.5725
+    },
+    "0.3": {
+     "precision": 0.2297,
+     "recall": 1.0,
+     "false_positive_rate": 0.4351
+    },
+    "0.5": {
+     "precision": 0.3902,
+     "recall": 0.9412,
+     "false_positive_rate": 0.1908
+    },
+    "0.7": {
+     "precision": 0.8824,
+     "recall": 0.8824,
+     "false_positive_rate": 0.0153
+    },
+    "0.8": {
+     "precision": 1.0,
+     "recall": 0.8235,
+     "false_positive_rate": 0.0
+    },
+    "0.85": {
+     "precision": 1.0,
+     "recall": 0.7059,
+     "false_positive_rate": 0.0
+    },
+    "0.9": {
+     "precision": 1.0,
+     "recall": 0.6471,
+     "false_positive_rate": 0.0
+    },
+    "0.95": {
+     "precision": 1.0,
+     "recall": 0.4706,
+     "false_positive_rate": 0.0
+    }
+   }
+  }
+ },
+ "run": {
+  "cost_usd": 0.0039841619999999986,
+  "errors": [],
+  "failed_requests": 0,
+  "input_tokens": 94861,
+  "latency_ms_p50": 241,
+  "latency_ms_p95": 836,
+  "missing_answers": 0,
+  "model": "jev-1.13.0",
+  "requests": 148,
+  "route": "typesafe",
+  "summary": true
+ },
+ "action_accuracy": {
+  "handwritten": {
+   "n": 48,
+   "jev_rule": 48,
+   "llm_adjudicator": 43
+  },
+  "mab_single_update": {
+   "n": 100,
+   "jev_rule": 76,
+   "llm_adjudicator": 87
+  }
+ },
+ "llm_adjudicator_run": {
+  "model": "google/gemini-3.5-flash-lite",
+  "prompt": "facts.rs ADJUDICATION_PROMPT verbatim, no memory text",
+  "latency_s_p50": 1.892,
+  "latency_s_p95": 5.165,
+  "confusion": {
+   "coexist->coexist": 19,
+   "supersede->coexist": 10,
+   "supersede->supersede": 103,
+   "reject_new->reject_new": 8,
+   "reject_new->coexist": 1,
+   "reject_new->supersede": 1,
+   "coexist->supersede": 1,
+   "supersede->unknown_action": 1,
+   "supersede->reject_new": 4
+  }
+ },
+ "notes": [
+  "JEV rule: restates>=.5 -> reject_new; same_slot>=.5 and (contradicts>=.5 or old_ended>=.5) -> supersede; else coexist. Registry arity, safety and may_close stay in code.",
+  "All 24 JEV misses on the MAB pairs are dual citizenship / multiple languages / second employer, where MAB's construction forces 'later overwrites'; engram's registry treats these unknown relations as set-valued (coexist) anyway.",
+  "The LLM adjudicator sees only 'subject relation object' (no memory text); JEV's pair questions include the memory text -- an information difference, reported not hidden."
+ ]
+}

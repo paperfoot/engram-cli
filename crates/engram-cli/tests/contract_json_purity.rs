@@ -50,6 +50,13 @@ fn bare_cmd_in(home: &Path) -> Command {
     cmd.env_remove("GEMINI_API_KEY");
     cmd.env_remove("COHERE_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
+    cmd.env_remove("TYPESAFE_API_KEY");
+    cmd.env_remove("GEMINI_API_KEY_FALLBACKS");
+    cmd.env_remove("ENGRAM_JUDGE_STUB");
+    cmd.env_remove("ENGRAM_JUDGE_GROUNDING");
+    cmd.env_remove("ENGRAM_JUDGE_ADJUDICATE");
+    cmd.env_remove("ENGRAM_JUDGE_DEDUPE");
+    cmd.env_remove("ENGRAM_JUDGE_LOG");
     cmd.env_remove("RUST_LOG");
     // stderr is a pipe under a test harness anyway; pinning the seam means the
     // machine-readable branch is what these tests observe, not an accident of
@@ -199,12 +206,12 @@ fn remember_writes_one_object_to_stdout_and_its_notes_to_stderr() {
     assert_no_error_envelope(&out.stderr, "remember");
 }
 
-/// `agent-info` is pretty-printed, so its stdout opens with `{\n` and runs to
-/// 140 kB. Pretty-printing is not a purity violation; a banner around it would
-/// be. Pinned separately because it is the largest payload and the one most
-/// likely to grow a "generated at …" header.
+/// `agent-info` is the largest payload — compact on a pipe, pretty-printed on
+/// a terminal, and over 100 kB either way. Layout is not a purity violation; a
+/// banner around it would be. Pinned separately because it is the payload
+/// most likely to grow a "generated at …" header.
 #[test]
-fn the_pretty_printed_manifest_is_still_exactly_one_document() {
+fn the_manifest_is_still_exactly_one_document() {
     let h = home();
     let out = engram_in(&h)
         .args(["agent-info", "--json"])
