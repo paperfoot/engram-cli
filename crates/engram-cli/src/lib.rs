@@ -22,7 +22,7 @@ pub mod retrieval;
 
 use crate::cli::{
     AdminCommand, BudgetCommand, ChunksCommand, Cli, Command, ConfigCommand, DocumentsCommand,
-    EntitiesCommand, FactsCommand, GraphCommand, JobsCommand, KbCommand, LessonsCommand,
+    FactsCommand, JobsCommand, KbCommand, LessonsCommand,
     MemoryCommand, PeopleCommand,
 };
 use crate::error::CliError;
@@ -149,7 +149,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             all_kbs,
             diary,
             rerank_top_n,
-            graph_hops,
             allow_mixed_embeddings,
             since,
             until,
@@ -167,7 +166,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                     all_kbs,
                     diary,
                     rerank_top_n,
-                    graph_hops,
                     allow_mixed_embeddings,
                     since,
                     until,
@@ -182,7 +180,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             mode,
             diary,
             kb,
-            compile,
             dry_run,
             include,
             exclude,
@@ -191,7 +188,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             offline,
         } => {
             commands::ingest::run(
-                &ctx, path, mode, diary, kb, compile, dry_run, include, exclude, max_files, all,
+                &ctx, path, mode, diary, kb, dry_run, include, exclude, max_files, all,
                 offline,
             )
             .await
@@ -224,68 +221,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             KbCommand::Delete { name, confirm } => commands::kb::delete(&ctx, name, confirm),
             KbCommand::Repair { dry_run } => commands::kb::repair(&ctx, dry_run),
         },
-        Command::Compile {
-            kb,
-            all,
-            llm,
-            extraction_model,
-            synthesis_model,
-            max_llm_chunks,
-            r#async,
-        } => {
-            if r#async {
-                let params = serde_json::json!({
-                    "llm": llm,
-                    "extraction_model": extraction_model,
-                    "synthesis_model": synthesis_model,
-                    "max_llm_chunks": max_llm_chunks,
-                    "trigger": "manual",
-                });
-                commands::jobs::submit(
-                    &ctx,
-                    "compile".to_string(),
-                    kb,
-                    Some(params.to_string()),
-                    true,
-                    false,
-                )
-                .await
-            } else {
-                commands::compile::run(
-                    &ctx,
-                    kb,
-                    all,
-                    llm,
-                    extraction_model,
-                    synthesis_model,
-                    max_llm_chunks,
-                )
-                .await
-            }
-        }
-        Command::Research {
-            query,
-            kb,
-            all_kbs,
-            diary,
-            top_k,
-            profile,
-            allow_mixed_embeddings,
-            include_expired,
-        } => {
-            commands::research::run(
-                &ctx,
-                query,
-                kb,
-                all_kbs,
-                diary,
-                top_k,
-                profile,
-                allow_mixed_embeddings,
-                include_expired,
-            )
-            .await
-        }
         Command::Jobs(sub) => match sub {
             JobsCommand::List {
                 kb,
@@ -390,17 +325,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Reindex { kb, all, offline } => {
             commands::reindex::run(&ctx, kb, all, offline).await
         }
-        Command::Wiki { kb, path } => commands::wiki::run(&ctx, kb, path),
-        Command::Graph(sub) => match sub {
-            GraphCommand::Neighbors {
-                name,
-                kb,
-                hops,
-                min_weight,
-                limit,
-                typed_only,
-            } => commands::graph::neighbors(&ctx, name, kb, hops, min_weight, limit, typed_only),
-        },
         Command::Doctor {
             compiler,
             integrity,
@@ -470,7 +394,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                         all_kbs,
                         diary,
                         rerank_top_n: None,
-                        graph_hops: 1,
                         allow_mixed_embeddings: false,
                         since,
                         until,
@@ -507,15 +430,6 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             importance,
             offline,
         } => commands::edit::run(&ctx, id, content, importance, offline).await,
-        Command::Entities(sub) => match sub {
-            EntitiesCommand::List {
-                limit,
-                min_mentions,
-                kb,
-                cursor,
-            } => commands::entities::list(&ctx, limit, min_mentions, kb, cursor),
-            EntitiesCommand::Show { name, kb } => commands::entities::show(&ctx, name, kb),
-        },
         Command::People(sub) => match sub {
             PeopleCommand::List {
                 kb,
@@ -628,7 +542,6 @@ fn actor_for(command: &Command) -> String {
     let diary = match command {
         Command::Remember { diary, .. } => Some(diary.clone()),
         Command::Recall { diary, .. } => Some(diary.clone()),
-        Command::Research { diary, .. } => Some(diary.clone()),
         _ => None,
     };
     match diary {

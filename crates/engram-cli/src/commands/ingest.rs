@@ -25,7 +25,6 @@ pub async fn run(
     mode: String,
     diary: String,
     kb: String,
-    compile: String,
     dry_run: bool,
     include: Vec<String>,
     exclude: Vec<String>,
@@ -112,7 +111,6 @@ pub async fn run(
                 "require_scope": require_scope,
                 "kb": kb,
                 "mode": mode,
-                "compile": compile,
             }),
             meta,
             |data| println!("{}", serde_json::to_string_pretty(data).unwrap()),
@@ -140,8 +138,7 @@ pub async fn run(
         prompt_format,
     } = crate::retrieval::resolve_write_embedder("ingest", offline)?;
 
-    // Enforce spend guardrails before embedding (and, when --compile is set,
-    // before the compiler's own paid calls).
+    // Enforce spend guardrails before embedding.
     if have_gemini {
         crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     }
@@ -336,16 +333,6 @@ pub async fn run(
         )?;
     }
 
-    let compile_stats = match compile.as_str() {
-        "none" => None,
-        "evidence" => Some(crate::commands::compile::compile_kb(ctx, &kb).await?),
-        other => {
-            return Err(CliError::BadInput(format!(
-                "unknown compile mode: {other} (expected none|evidence)"
-            )))
-        }
-    };
-
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,
         ..Default::default()
@@ -360,12 +347,6 @@ pub async fn run(
     meta.add("embed_dimensions", dims);
     meta.add("embed_prompt_format", prompt_format.clone());
     meta.add("kb", kb.clone());
-    if let Some(stats) = &compile_stats {
-        meta.add("compiled_claims", stats.claims);
-        meta.add("compiled_entities", stats.entities);
-        meta.add("compiled_relations", stats.relations);
-        meta.add("compiled_wiki_pages", stats.wiki_pages);
-    }
     // The highest-volume embed surface must not be the one silent failover.
     if let Some(note) = embedder.degradation_note() {
         meta.add("embedder_degraded", note.clone());
@@ -393,8 +374,6 @@ pub async fn run(
             "require_scope": require_scope,
             "mode": mode,
             "kb": kb,
-            "compile": compile,
-            "compile_stats": compile_stats,
             "embed_chars": total_embedded_chars,
             "embed_tokens_estimated": tokens_estimated,
             "embed_cost_usd_estimated": gemini_cost_usd,

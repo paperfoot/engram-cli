@@ -14,9 +14,7 @@
 
 pub mod jobs;
 pub mod resolve;
-pub mod sleep;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -72,7 +70,6 @@ struct CoreInner {
     actor: RwLock<String>,
     metrics: CoreMetrics,
     jobs: JobRegistry,
-    sleep: sleep::SleepState,
 }
 
 struct WriterHandle {
@@ -96,7 +93,6 @@ struct CoreMetrics {
     last_write_ms: AtomicU64,
     last_wait_ms: AtomicU64,
     max_write_ms: AtomicU64,
-    last_write_at_ms: AtomicU64,
     writer_started: AtomicBool,
 }
 
@@ -167,7 +163,6 @@ impl Core {
                 actor: RwLock::new(actor.into()),
                 metrics: CoreMetrics::default(),
                 jobs: JobRegistry::with_builtin_runners(),
-                sleep: sleep::SleepState::default(),
             }),
         }
     }
@@ -192,10 +187,6 @@ impl Core {
 
     pub fn jobs(&self) -> &JobRegistry {
         &self.inner.jobs
-    }
-
-    pub(crate) fn sleep_state(&self) -> &sleep::SleepState {
-        &self.inner.sleep
     }
 
     /// The single mutation entry point.
@@ -383,18 +374,6 @@ impl Core {
         }
     }
 
-    /// Seconds since this process's last write through `Core`. `None` when it
-    /// has never written. A cheap upper bound on idleness and never the only
-    /// input to the sleep gate — writes from other processes are invisible
-    /// here, which is why the gate also reads the store.
-    pub fn seconds_since_last_write(&self) -> Option<u64> {
-        let at = self.inner.metrics.last_write_at_ms.load(Ordering::Relaxed);
-        if at == 0 {
-            return None;
-        }
-        Some(now_ms().saturating_sub(at) / 1000)
-    }
-
     /// Drain the queue and join the writer thread. A job mid-checkpoint
     /// finishes its transaction; one that has not started does not.
     pub async fn shutdown(&self, grace: Duration) {
@@ -538,15 +517,7 @@ impl CoreMetrics {
         self.last_wait_ms
             .store(waited.as_millis() as u64, Ordering::Relaxed);
         self.max_write_ms.fetch_max(ms, Ordering::Relaxed);
-        self.last_write_at_ms.store(now_ms(), Ordering::Relaxed);
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// `cli:<diary>` is not knowable before the subcommand is parsed, so the
@@ -554,6 +525,3 @@ fn now_ms() -> u64 {
 pub fn default_actor() -> String {
     "cli".to_string()
 }
-
-/// Per-KB counters keyed by name, used by `/health.sleep_compile`.
-pub type KbCounts = HashMap<String, i64>;

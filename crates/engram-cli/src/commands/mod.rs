@@ -4,16 +4,13 @@ pub mod admin;
 pub mod bench;
 pub mod budget;
 pub mod chunks;
-pub mod compile;
 pub mod config;
 pub mod doctor;
 pub mod documents;
 pub mod edit;
-pub mod entities;
 pub mod export;
 pub mod facts;
 pub mod forget;
-pub mod graph;
 pub mod import;
 pub mod ingest;
 pub mod jobs;
@@ -26,13 +23,11 @@ pub mod reflect;
 pub mod reindex;
 pub mod remember;
 pub mod repair;
-pub mod research;
 pub mod serve;
 pub mod skill;
 pub mod state;
 pub mod update;
 pub mod usage;
-pub mod wiki;
 
 /// Reject a diary name that is legal to READ but never legal to WRITE.
 ///

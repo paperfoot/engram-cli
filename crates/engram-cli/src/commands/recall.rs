@@ -36,7 +36,6 @@ pub struct RecallArgs {
     pub all_kbs: bool,
     pub diary: String,
     pub rerank_top_n: Option<usize>,
-    pub graph_hops: u8,
     pub allow_mixed_embeddings: bool,
     pub since: Option<String>,
     pub until: Option<String>,
@@ -64,7 +63,6 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         all_kbs,
         diary,
         rerank_top_n,
-        graph_hops,
         allow_mixed_embeddings,
         since,
         until,
@@ -119,7 +117,6 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         rerank_top_n: rerank_candidates,
         filters,
         mode: recall_mode,
-        graph_hops,
         allow_mixed_embeddings,
         defer_doc_cap: relevance_judge.is_some(),
     };
@@ -313,17 +310,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     meta.add("kb", scope.label());
     meta.add("kb_scope", scope.origin.as_str());
     meta.add("diary", if diary == "*" { "*" } else { diary.as_str() });
-    // Report anything the diary-isolation guard withheld, so a narrowed result
-    // set is explained rather than silently short.
-    if let Some(isolation) = notes.diary_isolation_json() {
-        meta.add("diary_isolation", isolation);
-    }
-    // Same contract for the temporal window: name the sources it withheld, so
-    // "no wiki page came back" reads as a scope decision, not an empty store.
-    if let Some(temporal) = notes.temporal_scope_json() {
-        meta.add("temporal_scope", temporal);
-    }
-    // And for validity: expired memories are withheld by default, and the
+    // Validity: expired memories are withheld by default, and the
     // withholding is always visible ("N memories expired; --include-expired
     // reaches them"), never a silent thinning of results.
     if let Some(expiry) = notes.expiry_json() {
@@ -444,17 +431,10 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         unreachable!("json! object literal");
     };
     // Present only when they say something, exactly as in the envelope's
-    // `metadata`: three `null`s on every call were bytes paid to learn nothing,
-    // and the contract already calls all three present-only-in-some.
+    // `metadata`: a `null` on every call is bytes paid to learn nothing.
     if let Some(Value::Object(inner)) = data.get_mut("metadata") {
-        for (key, note) in [
-            ("diary_isolation", notes.diary_isolation_json()),
-            ("temporal_scope", notes.temporal_scope_json()),
-            ("expiry", notes.expiry_json()),
-        ] {
-            if let Some(note) = note {
-                inner.insert(key.to_string(), note);
-            }
+        if let Some(note) = notes.expiry_json() {
+            inner.insert("expiry".to_string(), note);
         }
     }
     // `absence` lands only on `no_match`: a certificate of absence beside

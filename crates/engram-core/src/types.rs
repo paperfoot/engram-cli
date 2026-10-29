@@ -299,9 +299,5 @@ pub struct ScoredChunk {
 pub enum RetrievalSource {
     Dense,
     Lexical,
-    Claim,
-    Wiki,
-    Entity,
-    Graph,
     Reranker,
 }

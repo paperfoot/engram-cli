@@ -171,10 +171,6 @@ pub enum Command {
         #[arg(long)]
         rerank_top_n: Option<usize>,
 
-        /// Graph expansion hops. Explore mode may use 2 hops.
-        #[arg(long, default_value_t = 1)]
-        graph_hops: u8,
-
         /// Permit comparing chunks embedded with different metadata.
         #[arg(long)]
         allow_mixed_embeddings: bool,
@@ -211,10 +207,10 @@ Tips:
   - Defaults can be configured with ENGRAM_INGEST_REQUIRE_SCOPE, ENGRAM_INGEST_INCLUDE, ENGRAM_INGEST_EXCLUDE, and ENGRAM_INGEST_MAX_FILES.
 
 Examples:
-  engram ingest ./paper.pdf --kb ageing-biology --mode papers --compile evidence
+  engram ingest ./paper.pdf --kb ageing-biology --mode papers
   engram ingest ./papers --kb ageing-biology --mode papers --dry-run --include '*.pdf'
-  engram ingest ./papers --kb ageing-biology --mode papers --include '*.pdf' --max-files 20 --compile evidence
-  engram ingest ./papers --kb ageing-biology --mode papers --all --compile evidence
+  engram ingest ./papers --kb ageing-biology --mode papers --include '*.pdf' --max-files 20
+  engram ingest ./papers --kb ageing-biology --mode papers --all
 ")]
     Ingest {
         /// Path to file or directory.
@@ -231,10 +227,6 @@ Examples:
         /// Knowledge base/domain namespace.
         #[arg(long, default_value = "default")]
         kb: String,
-
-        /// Optional compiler mode after ingest: none|evidence.
-        #[arg(long, default_value = "none")]
-        compile: String,
 
         /// Preview matched files without storing anything.
         #[arg(long)]
@@ -277,59 +269,6 @@ Examples:
     /// Manage knowledge bases/domains.
     #[command(subcommand)]
     Kb(KbCommand),
-
-    /// Compile a KB into claims, entities, relations, takeaways, and wiki pages.
-    Compile {
-        /// Knowledge base/domain namespace.
-        #[arg(long, default_value = "default")]
-        kb: String,
-        /// Compile every document/chunk in the KB.
-        #[arg(long)]
-        all: bool,
-        /// Add LLM-assisted extraction and synthesis on top of deterministic compilation.
-        #[arg(long)]
-        llm: bool,
-        /// OpenRouter model for extraction. Defaults to Gemini 3.5 Flash-Lite.
-        #[arg(long)]
-        extraction_model: Option<String>,
-        /// OpenRouter model for synthesis/wiki overview. Defaults to Gemini 3.6 Flash.
-        #[arg(long)]
-        synthesis_model: Option<String>,
-        /// Limit LLM extraction chunks to control cost. Deterministic compile still scans all chunks.
-        #[arg(long)]
-        max_llm_chunks: Option<usize>,
-        /// Submit the compile as a background job and return its handle immediately.
-        #[arg(long = "async")]
-        r#async: bool,
-    },
-
-    /// Run an evidence-first research retrieval pass over a KB.
-    Research {
-        /// Research question.
-        query: String,
-        /// Knowledge base/domain namespace.
-        #[arg(long, default_value = "default")]
-        kb: String,
-        /// Search all KBs instead of only --kb.
-        #[arg(long)]
-        all_kbs: bool,
-        /// Specialist agent diary namespace, or "*" for all.
-        #[arg(long, default_value = "default")]
-        diary: String,
-        /// Number of evidence leads. `--limit` is accepted as an alias.
-        #[arg(long, default_value_t = 12, visible_alias = "limit")]
-        top_k: usize,
-        /// Retrieval profile: cloud_quality|fast|offline.
-        #[arg(long, default_value = "cloud_quality")]
-        profile: String,
-        /// Permit comparing chunks embedded with different metadata.
-        #[arg(long)]
-        allow_mixed_embeddings: bool,
-        /// Search memories whose `valid_until` has already passed. Same flag
-        /// as `recall --include-expired`.
-        #[arg(long)]
-        include_expired: bool,
-    },
 
     /// Inspect compile/daemon jobs.
     #[command(subcommand)]
@@ -401,19 +340,6 @@ Examples:
         #[arg(long)]
         offline: bool,
     },
-
-    /// Inspect generated wiki pages.
-    Wiki {
-        /// Knowledge base/domain namespace.
-        #[arg(long, default_value = "default")]
-        kb: String,
-        /// Optional page path such as index.md or entities/rapamycin.md.
-        path: Option<String>,
-    },
-
-    /// Inspect the SQLite graph layer.
-    #[command(subcommand)]
-    Graph(GraphCommand),
 
     /// Diagnose configuration, keys, schema, embeddings, and daemon port.
     Doctor {
@@ -491,10 +417,6 @@ Examples:
         #[arg(long)]
         offline: bool,
     },
-
-    /// Browse extracted entities.
-    #[command(subcommand)]
-    Entities(EntitiesCommand),
 
     /// Explore your network: who you know, and how they are connected.
     #[command(subcommand, visible_aliases = ["person"])]
@@ -977,27 +899,6 @@ pub enum BudgetCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum GraphCommand {
-    /// Show graph neighbors for one entity.
-    Neighbors {
-        name: String,
-        #[arg(long, default_value = "default")]
-        kb: String,
-        #[arg(long, default_value_t = 1)]
-        hops: u8,
-        /// Minimum relation weight to include.
-        #[arg(long, default_value_t = 1.0)]
-        min_weight: f32,
-        /// Max neighbor nodes to return (closest first).
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-        /// Drop weak `co_occurs_with` edges and keep only typed relations.
-        #[arg(long)]
-        typed_only: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 pub enum PeopleCommand {
     /// List people with their aliases, mention counts, and top relations.
     #[command(visible_aliases = ["ls"])]
@@ -1028,36 +929,6 @@ pub enum PeopleCommand {
         /// How many memory snippets to include.
         #[arg(long, default_value_t = 5)]
         snippets: usize,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum EntitiesCommand {
-    /// List entities by mention count.
-    #[command(visible_aliases = ["ls"])]
-    List {
-        /// Max entities to return.
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-        /// Minimum mention count filter.
-        #[arg(long, default_value_t = 1)]
-        min_mentions: u32,
-        /// Knowledge base/domain namespace. Pass "*" for all.
-        #[arg(long, default_value = "default")]
-        kb: String,
-        /// Opaque continuation token from a previous page's `cursor`. Do not
-        /// construct or parse it; pass it back verbatim.
-        #[arg(long)]
-        cursor: Option<String>,
-    },
-    /// Show details for one entity.
-    #[command(visible_aliases = ["get"])]
-    Show {
-        /// Entity name (case-insensitive).
-        name: String,
-        /// Knowledge base/domain namespace. Pass "*" for all.
-        #[arg(long, default_value = "default")]
-        kb: String,
     },
 }
 

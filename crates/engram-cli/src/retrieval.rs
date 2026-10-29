@@ -1,20 +1,17 @@
 //! Hybrid retrieval pipeline shared by the CLI and daemon.
 //!
 //! Pipeline:
-//!   query -> dense Gemini/stub search -> FTS5 BM25 -> claim/wiki/entity search
-//!        -> graph expansion -> RRF fusion -> optional Cohere rerank.
+//!   query -> dense Gemini/stub search + FTS5 BM25 over memory chunks
+//!        -> RRF fusion -> optional Cohere rerank.
 
 use crate::judge::{site_judge, JudgeMode, JudgeSite};
-use crate::read_surface::{
-    Provenance, RecallStats, DERIVED_ENTITY, DERIVED_RELATION, DERIVED_WIKI,
-};
+use crate::read_surface::{Provenance, RecallStats};
 use chrono::{DateTime, Utc};
 use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
 use engram_core::types::RetrievalSource;
 use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
-use engram_graph::extract_entities;
 use engram_llm::judge::questions::{
     relevance_request, RelevancePassage, RELEVANCE_FLOOR, RELEVANCE_PASSAGE_CHARS,
 };
@@ -25,7 +22,7 @@ use engram_rerank::cohere::CohereReranker;
 use engram_rerank::{passthrough::PassthroughReranker, RerankCandidate, Reranker};
 use engram_storage::{SourceCitation, SqliteStore, StoredChunkEmbedding};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -48,25 +45,22 @@ pub struct Filters {
     pub include_expired: bool,
 }
 
+/// `--mode`. Every mode runs the same chunk pipeline (dense + lexical over
+/// memories); `wiki`, `explore` and `agent` searched the compiled layer, which
+/// is gone, and are still accepted so existing calls keep working.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecallMode {
     Evidence,
     Raw,
-    Wiki,
-    Explore,
-    Agent,
 }
 
 impl RecallMode {
     pub fn parse(s: &str) -> Result<Self, crate::error::CliError> {
         match s.to_ascii_lowercase().as_str() {
-            "evidence" => Ok(Self::Evidence),
+            "evidence" | "wiki" | "explore" | "agent" => Ok(Self::Evidence),
             "raw" => Ok(Self::Raw),
-            "wiki" => Ok(Self::Wiki),
-            "explore" => Ok(Self::Explore),
-            "agent" => Ok(Self::Agent),
             other => Err(crate::error::CliError::BadInput(format!(
-                "unknown recall mode: {other} (expected evidence|raw|wiki|explore|agent)"
+                "unknown recall mode: {other} (expected evidence|raw)"
             ))),
         }
     }
@@ -75,9 +69,6 @@ impl RecallMode {
         match self {
             Self::Evidence => "evidence",
             Self::Raw => "raw",
-            Self::Wiki => "wiki",
-            Self::Explore => "explore",
-            Self::Agent => "agent",
         }
     }
 }
@@ -560,149 +551,35 @@ pub fn resolve_kb_scope(explicit: Option<&str>, all_kbs: bool) -> KbScope {
 /// source is visible to the agent instead of silently missing.
 #[derive(Debug, Clone, Default)]
 pub struct RecallNotes {
-    /// Diary this recall was confined to. `None` = every diary.
-    pub diary_scope: Option<String>,
-    /// Candidates withheld by the diary-isolation guard, keyed by source name.
-    pub diary_excluded: BTreeMap<&'static str, usize>,
-    /// `--since` bound of this recall, as RFC3339.
-    pub since: Option<String>,
-    /// `--until` bound of this recall, as RFC3339.
-    pub until: Option<String>,
-    /// Retrieval sources skipped because a temporal window was active.
-    pub temporal_excluded: BTreeSet<&'static str>,
     /// Distinct memories withheld because their `valid_until` has passed.
     /// Zero when nothing was expired OR when `--include-expired` was set.
     pub expired_excluded: usize,
-    /// Derived candidates (claim, wiki, entity, relation) withheld because
-    /// their KB holds at least one expired live memory. Derived content is a
-    /// rewrite/aggregate with no per-item memory provenance at recall time,
-    /// so KB-level confinement is the only sound test — the same shape as
-    /// diary isolation. Lifted by `--include-expired`.
-    pub expired_derived_excluded: BTreeMap<&'static str, usize>,
-    /// Derived candidates withheld because their KB holds a FORGOTTEN
-    /// expired memory that no compile has run over since its deletion.
-    /// NEVER lifted by `--include-expired` — retraction is not a validity
-    /// state — and reported separately so the remedy ("run compile") is
-    /// never confused with the expiry remedy (the flag).
-    pub retracted_derived_excluded: BTreeMap<&'static str, usize>,
     /// True when expired memories were admitted on request.
     pub include_expired: bool,
 }
 
 impl RecallNotes {
-    fn exclude(&mut self, source: &'static str, count: usize) {
-        if count > 0 {
-            *self.diary_excluded.entry(source).or_insert(0) += count;
-        }
-    }
-
-    fn exclude_temporal(&mut self, source: &'static str) {
-        self.temporal_excluded.insert(source);
-    }
-
-    fn exclude_expired_derived(&mut self, source: &'static str, count: usize) {
-        if count > 0 {
-            *self.expired_derived_excluded.entry(source).or_insert(0) += count;
-        }
-    }
-
-    fn exclude_retracted_derived(&mut self, source: &'static str, count: usize) {
-        if count > 0 {
-            *self.retracted_derived_excluded.entry(source).or_insert(0) += count;
-        }
-    }
-
-    /// JSON for response metadata, or `None` when no window was requested.
-    ///
-    /// Mirrors `diary_isolation_json`: a source the pipeline deliberately did
-    /// not consult is reported, never dropped in silence.
-    pub fn temporal_scope_json(&self) -> Option<serde_json::Value> {
-        if self.since.is_none() && self.until.is_none() {
-            return None;
-        }
-        Some(serde_json::json!({
-            "since": self.since,
-            "until": self.until,
-            "excluded_sources": self.temporal_excluded.iter().collect::<Vec<_>>(),
-            "reason": "derived content (claims, wiki pages, entities, relations) has no \
-                       event time of its own, so it cannot be placed inside or outside the \
-                       requested window; only raw memory chunks are searched",
-        }))
-    }
-
     /// JSON for response metadata, or `None` when expiry changed nothing.
     ///
-    /// Same contract as the other two: a memory the pipeline deliberately
-    /// withheld is reported, never dropped in silence. This reports validity
-    /// ("this memory's stated window has closed"), NOT absence — see gate-4
-    /// H9: an expired-and-withheld memory may still be the only record.
+    /// A memory the pipeline deliberately withheld is reported, never dropped
+    /// in silence. This reports validity ("this memory's stated window has
+    /// closed"), NOT absence: an expired-and-withheld memory may still be the
+    /// only record.
     pub fn expiry_json(&self) -> Option<serde_json::Value> {
-        if self.expired_excluded == 0
-            && self.expired_derived_excluded.is_empty()
-            && self.retracted_derived_excluded.is_empty()
-            && !self.include_expired
-        {
+        if self.expired_excluded == 0 && !self.include_expired {
             return None;
         }
-        let to_map =
-            |m: &BTreeMap<&'static str, usize>| -> serde_json::Map<String, serde_json::Value> {
-                m.iter()
-                    .map(|(k, v)| ((*k).to_string(), serde_json::json!(v)))
-                    .collect()
-            };
         let mut out = serde_json::json!({
             "expired_memories_excluded": self.expired_excluded,
-            "excluded_derived_candidates": to_map(&self.expired_derived_excluded),
             "include_expired": self.include_expired,
         });
-        // The live-expiry remedy appears ONLY when live expiry withheld
-        // something: on a retraction-only response, telling the caller to
-        // rerun with --include-expired prescribes a door that flag cannot
-        // open (gate round 5).
-        if self.expired_excluded > 0 || !self.expired_derived_excluded.is_empty() {
+        if self.expired_excluded > 0 {
             out["reason"] = serde_json::json!(
                 "these memories carry a valid_until that has passed; \
-                 derived candidates (claims, wiki, entities, relations) \
-                 from KBs holding expired memories are withheld with \
-                 them because they may paraphrase expired content; \
                  rerun with --include-expired to search them"
             );
         }
-        // Retraction quarantine is a DIFFERENT claim with a DIFFERENT remedy:
-        // --include-expired cannot reach it (and must not — forgotten is not
-        // a validity state). Only reported when it actually withheld
-        // something, so the remedy text can never point at the wrong door.
-        if !self.retracted_derived_excluded.is_empty() {
-            out["retracted_derived_candidates"] =
-                serde_json::json!(to_map(&self.retracted_derived_excluded));
-            out["retracted_reason"] = serde_json::json!(
-                "derived candidates from KBs where a forgotten expired memory \
-                 has not been recompiled away; NOT reachable via \
-                 --include-expired — run `engram compile --kb <kb> --all` to \
-                 rebuild the derived layer without the forgotten content"
-            );
-        }
         Some(out)
-    }
-
-    /// JSON for response metadata, or `None` when nothing was withheld.
-    pub fn diary_isolation_json(&self) -> Option<serde_json::Value> {
-        if self.diary_excluded.is_empty() {
-            return None;
-        }
-        let excluded: serde_json::Map<String, serde_json::Value> = self
-            .diary_excluded
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), serde_json::json!(v)))
-            .collect();
-        Some(serde_json::json!({
-            "diary": self.diary_scope,
-            "excluded_candidates": excluded,
-            "reason": "derived content (claims, wiki pages, entities, relations) \
-                       that could not be proven to come from this diary's memories; \
-                       a full `engram compile --kb <kb> --all` rebuilds the derived \
-                       layer from live memories and lifts this exclusion",
-        }))
     }
 }
 
@@ -726,24 +603,12 @@ pub struct HybridParams<'a> {
     pub rerank_top_n: usize,
     pub filters: Filters,
     pub mode: RecallMode,
-    pub graph_hops: u8,
     pub allow_mixed_embeddings: bool,
     /// Leave the per-document diversity cap ([`max_per_doc`]) to the caller.
     /// Set when the relevance judge runs: it applies the cap after judging,
     /// counting only passages it kept, so two misses from one document can
     /// no longer crowd out that document's answer before it is judged.
     pub defer_doc_cap: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CandidateRecord {
-    kind: String,
-    content: String,
-    kb: String,
-    citations: Vec<SourceCitation>,
-    /// For a claim candidate, the chunk it was derived from — used to drop a
-    /// claim that merely duplicates a chunk already in the result set.
-    parent_chunk: Option<Uuid>,
 }
 
 /// The query side of the dense scan's cosine, normalised once per recall
@@ -1148,33 +1013,8 @@ where
     let since = params.filters.since.map(|t| t.to_rfc3339());
     let until = params.filters.until.map(|t| t.to_rfc3339());
 
-    let mut notes = RecallNotes {
-        diary_scope: params.filters.diary.clone(),
-        since: since.clone(),
-        until: until.clone(),
-        ..RecallNotes::default()
-    };
+    let mut notes = RecallNotes::default();
 
-    // DIARY ISOLATION INVARIANT: a diary-scoped recall never returns content
-    // derived solely from another diary's memories.
-    //
-    // Raw chunks are filtered by `m.diary` in SQL, but the derived layers are
-    // not: claims and wiki pages are LLM/compiler rewrites of chunk text, and
-    // entities/relations are aggregates over it. Returning one of those for a
-    // recall scoped to diary X could hand back a paraphrase of diary Y's
-    // private memory. Claims carry provenance
-    // (claim_evidence -> chunks -> memories.diary) so they are filtered
-    // exactly; wiki pages, entities and relations record only a `kb`, so the
-    // only sound test available is KB-level confinement — a KB whose live
-    // memories all belong to X can only have produced X-derived artifacts.
-    // Anything withheld is reported in `RecallNotes` rather than dropped
-    // silently.
-    let mixed_diary_kbs = match diary {
-        Some(d) => Some(store.kbs_with_memories_outside_diary(d)?),
-        None => None,
-    };
-
-    let mut candidate_records: HashMap<Uuid, CandidateRecord> = HashMap::new();
     let mut source_map: HashMap<Uuid, HashSet<RetrievalSource>> = HashMap::new();
     let mut runs: Vec<Vec<RankedHit>> = Vec::new();
 
@@ -1204,29 +1044,11 @@ where
     };
     notes.include_expired = params.filters.include_expired;
     let now_rfc3339 = chrono::Utc::now().to_rfc3339();
-    // TWO quarantines, TWO opt-outs (gate round 3):
-    // - Live expired content is a validity state; `--include-expired` lifts
-    //   its withholding at both the chunk and the derived-KB level.
-    // - FORGOTTEN expired content is a retraction. `forget` leaves derived
-    //   aggregates in place until recompile, so KBs holding a forgotten
-    //   expired memory that no compile has run over since stay confined
-    //   REGARDLESS of the flag: "show me expired" must never mean "show me
-    //   retracted".
-    // Derived candidates (claims, wiki, entities, relations) are rewrites/
-    // aggregates with no per-item memory provenance at recall time, so
-    // KB-level confinement is the only sound test — same shape as diary
-    // isolation, reported the same loud way.
-    let quarantined_kbs = store.kbs_with_quarantined_expired_memories(&now_rfc3339)?;
-    let (expired_memories, mut expired_kbs): (HashSet<Uuid>, HashSet<String>) =
-        if params.filters.include_expired {
-            (HashSet::new(), HashSet::new())
-        } else {
-            (
-                store.expired_memory_ids(&now_rfc3339)?,
-                store.kbs_with_expired_memories(&now_rfc3339)?,
-            )
-        };
-    expired_kbs.extend(quarantined_kbs.iter().cloned());
+    let expired_memories: HashSet<Uuid> = if params.filters.include_expired {
+        HashSet::new()
+    } else {
+        store.expired_memory_ids(&now_rfc3339)?
+    };
     // The reported count is computed directly against the scope, NOT by
     // counting what the candidate stream surfaced: the FTS leg excludes
     // expired rows in SQL before this loop ever sees them, and an exclusion
@@ -1253,18 +1075,6 @@ where
     // The lexical (FTS) path queries the whole table independently, so it is
     // restricted to the same in-window chunk set as the dense path or the
     // window would leak out-of-window hits through FTS.
-    //
-    // The DERIVED layers have no per-item event time at all: a wiki page is a
-    // synthesis over a whole KB, an entity row an aggregate mention count, a
-    // relation an edge accumulated across chunks. A claim carries evidence
-    // links but is itself a rewrite with no timestamp. Admitting them would
-    // let `recall --since 2025-01-01` return a wiki page compiled from a 2010
-    // memory (reproduced), and filtering them "by their evidence" is
-    // ill-defined the moment evidence straddles the boundary. So a windowed
-    // recall is chunks-only: claim/wiki/entity/graph are EXCLUDED, and each
-    // exclusion is reported in `RecallNotes` (metadata.temporal_scope) rather
-    // than dropped silently — same contract as diary isolation. Drop the
-    // window to search the derived layers.
     let temporal_active = since.is_some() || until.is_some();
     let allowed_chunks: Option<HashSet<Uuid>> =
         temporal_active.then(|| chunks.iter().map(|c| c.chunk_id).collect());
@@ -1289,7 +1099,7 @@ where
         ..RecallStats::default()
     };
 
-    if params.mode != RecallMode::Wiki {
+    {
         let q_emb = embedder
             .embed_one(params.query, TaskMode::RetrievalQuery)
             .await?;
@@ -1312,7 +1122,7 @@ where
     }
 
     let fts_q = build_fts_query(params.query);
-    if !fts_q.is_empty() && params.mode != RecallMode::Wiki {
+    if !fts_q.is_empty() {
         // The expiry cutoff is applied IN SQL, before the LIMIT: a
         // client-side refill has a cap, and any cap is a deterministic
         // starvation boundary (257 expired hits beat a 256 cap — gate
@@ -1352,153 +1162,6 @@ where
         runs.push(lexical_run);
     }
 
-    let claims_wanted = !fts_q.is_empty()
-        && matches!(
-            params.mode,
-            RecallMode::Evidence | RecallMode::Explore | RecallMode::Agent
-        );
-    if claims_wanted && temporal_active {
-        notes.exclude_temporal("claim");
-    }
-    if claims_wanted && !temporal_active {
-        let mut claims = match store.claim_fts_search(&fts_q, kb, params.rerank_top_n) {
-            Ok(hits) => hits,
-            Err(e) => {
-                tracing::warn!("claim search failed, continuing without it: {e}");
-                Vec::new()
-            }
-        };
-        // Diary isolation (see invariant above): keep only claims whose
-        // evidence resolves into the requested diary.
-        if let Some(d) = diary {
-            let ids: Vec<Uuid> = claims.iter().map(|(id, _)| *id).collect();
-            let visible = store.claims_visible_in_diary(&ids, d)?;
-            let before = claims.len();
-            claims.retain(|(id, _)| visible.contains(id));
-            notes.exclude("claim", before - claims.len());
-        }
-        // Expiry confinement (see the validity-window block above): a claim
-        // is a compiler/LLM rewrite that may paraphrase an expired memory,
-        // and a KB holding any expired memory cannot prove its claims free of
-        // them. Withheld and counted, like every other exclusion here.
-        let mut expired_claims = 0usize;
-        let mut retracted_claims = 0usize;
-        for (id, _) in &claims {
-            if let Some(claim) = store.get_claim(*id)? {
-                if expired_kbs.contains(&claim.kb) {
-                    if quarantined_kbs.contains(&claim.kb) {
-                        retracted_claims += 1;
-                    } else {
-                        expired_claims += 1;
-                    }
-                    continue;
-                }
-                // Claims found via their own FTS index are a distinct
-                // provenance from raw-chunk lexical hits.
-                let parent_chunk = claim.citations.iter().find_map(|c| c.chunk_id);
-                candidate_records.insert(
-                    *id,
-                    CandidateRecord {
-                        kind: "claim".to_string(),
-                        content: claim.content,
-                        kb: claim.kb,
-                        citations: claim.citations,
-                        parent_chunk,
-                    },
-                );
-            }
-        }
-        notes.exclude_expired_derived("claim", expired_claims);
-        notes.exclude_retracted_derived("claim", retracted_claims);
-        claims.retain(|(id, _)| candidate_records.contains_key(id));
-        let claim_run = ranked_run(&claims, RetrievalSource::Claim, params.rerank_top_n);
-        mark_sources(&mut source_map, &claim_run);
-        runs.push(claim_run);
-    }
-
-    let wiki_wanted = !fts_q.is_empty()
-        && matches!(
-            params.mode,
-            RecallMode::Wiki | RecallMode::Explore | RecallMode::Agent
-        );
-    if wiki_wanted && temporal_active {
-        notes.exclude_temporal("wiki");
-    }
-    if wiki_wanted && !temporal_active {
-        let wiki_hits = match store.wiki_fts_search(&fts_q, kb, params.rerank_top_n) {
-            Ok(hits) => hits,
-            Err(e) => {
-                tracing::warn!("wiki search failed, continuing without it: {e}");
-                Vec::new()
-            }
-        };
-        // Diary isolation (see invariant above): a wiki page records only its
-        // KB, so it is admissible only when that KB is confined to the
-        // requested diary. Filtering happens BEFORE ranking so the surviving
-        // pages get contiguous ranks in the fused run.
-        let mut kept_wiki: Vec<(Uuid, f32)> = Vec::with_capacity(wiki_hits.len());
-        let mut wiki_excluded = 0usize;
-        let mut wiki_expired = 0usize;
-        let mut wiki_retracted = 0usize;
-        for (id, score) in wiki_hits {
-            let Some(page) = store.get_wiki_page_by_id(id)? else {
-                continue;
-            };
-            if mixed_diary_kbs
-                .as_ref()
-                .is_some_and(|mixed| mixed.contains(&page.kb))
-            {
-                wiki_excluded += 1;
-                continue;
-            }
-            // Expiry confinement: a wiki page is a synthesis over its whole
-            // KB and may paraphrase an expired memory.
-            if expired_kbs.contains(&page.kb) {
-                if quarantined_kbs.contains(&page.kb) {
-                    wiki_retracted += 1;
-                } else {
-                    wiki_expired += 1;
-                }
-                continue;
-            }
-            candidate_records.insert(
-                id,
-                CandidateRecord {
-                    kind: "wiki_page".to_string(),
-                    content: page.content,
-                    kb: page.kb,
-                    citations: Vec::new(),
-                    parent_chunk: None,
-                },
-            );
-            kept_wiki.push((id, score));
-        }
-        notes.exclude("wiki", wiki_excluded);
-        notes.exclude_expired_derived("wiki", wiki_expired);
-        notes.exclude_retracted_derived("wiki", wiki_retracted);
-        let wiki_run = ranked_run(&kept_wiki, RetrievalSource::Wiki, params.rerank_top_n);
-        mark_sources(&mut source_map, &wiki_run);
-        runs.push(wiki_run);
-    }
-
-    add_entity_and_graph_candidates(
-        store,
-        params.query,
-        kb,
-        params.mode,
-        params.graph_hops,
-        temporal_active,
-        mixed_diary_kbs.as_ref(),
-        &expired_kbs,
-        &quarantined_kbs,
-        &mut CandidateSink {
-            records: &mut candidate_records,
-            sources: &mut source_map,
-            runs: &mut runs,
-            notes: &mut notes,
-        },
-    )?;
-
     if runs.is_empty() {
         return Ok(RecallOutcome {
             results: Vec::new(),
@@ -1522,18 +1185,13 @@ where
     let pool_chunks: Vec<Uuid> = pool
         .iter()
         .map(|(id, _)| *id)
-        .filter(|id| !candidate_records.contains_key(id) && chunk_index.contains_key(id))
+        .filter(|id| chunk_index.contains_key(id))
         .collect();
     let chunk_text = store.chunk_contents(&pool_chunks)?;
     let mut rerank_candidates: Vec<RerankCandidate> = Vec::new();
     let mut candidate_ids: Vec<Uuid> = Vec::new();
     for (id, _) in pool {
-        let text = if let Some(c) = candidate_records.get(id) {
-            Some(c.content.clone())
-        } else {
-            chunk_text.get(id).cloned()
-        };
-        if let Some(text) = text {
+        if let Some(text) = chunk_text.get(id).cloned() {
             candidate_ids.push(*id);
             rerank_candidates.push(RerankCandidate {
                 id: id.to_string(),
@@ -1567,7 +1225,6 @@ where
     let using_reranker = reranker.is_some();
     let mut results = Vec::with_capacity(params.top_k);
     let mut per_doc: HashMap<Uuid, usize> = HashMap::new();
-    let mut emitted_chunks: HashSet<Uuid> = HashSet::new();
     for r in reranked {
         if results.len() >= params.top_k {
             break;
@@ -1577,45 +1234,10 @@ where
             .copied()
             .unwrap_or_else(Uuid::nil);
 
-        // Resolve the candidate: a materialized record (claim/wiki/entity/
-        // relation) or, failing that, a raw chunk from the index. Citations
-        // are fetched lazily here — for pool survivors only, not the whole KB.
-        let (kind, content, cand_kb, citations, parent_chunk) =
-            if let Some(c) = candidate_records.get(&id) {
-                let citations = if c.kind == "chunk" && c.citations.is_empty() {
-                    store.citations_for_chunk(id).unwrap_or_default()
-                } else {
-                    c.citations.clone()
-                };
-                (
-                    c.kind.clone(),
-                    c.content.clone(),
-                    c.kb.clone(),
-                    citations,
-                    c.parent_chunk,
-                )
-            } else if let (Some(chunk), Some(text)) = (chunk_index.get(&id), chunk_text.get(&id)) {
-                let citations = store.citations_for_chunk(id).unwrap_or_default();
-                (
-                    "chunk".to_string(),
-                    text.clone(),
-                    chunk.kb.clone(),
-                    citations,
-                    None,
-                )
-            } else {
-                continue;
-            };
-
-        // Drop a claim whose parent chunk is already in the result set — it
-        // would be a redundant restatement of a chunk we already returned.
-        if kind == "claim" {
-            if let Some(parent) = parent_chunk {
-                if emitted_chunks.contains(&parent) {
-                    continue;
-                }
-            }
-        }
+        let (Some(chunk), Some(content)) = (chunk_index.get(&id), chunk_text.get(&id)) else {
+            continue;
+        };
+        let citations = store.citations_for_chunk(id).unwrap_or_default();
 
         if let Some(doc) = citations.first().and_then(|cit| cit.document_id) {
             let seen = per_doc.entry(doc).or_insert(0);
@@ -1624,10 +1246,6 @@ where
             }
             *seen += 1;
         }
-        if kind == "chunk" {
-            emitted_chunks.insert(id);
-        }
-
         let mut sources: Vec<RetrievalSource> = source_map
             .get(&id)
             .cloned()
@@ -1638,72 +1256,28 @@ where
             sources.push(RetrievalSource::Reranker);
         }
         sources.sort_by_key(source_rank);
-        // Provenance, per kind. A derived row says WHY it has no memory
-        // instead of carrying a plausible-looking id that resolves to
-        // somebody else's memory.
-        let provenance = match kind.as_str() {
-            "chunk" => {
-                let chunk = chunk_index.get(&id);
-                Provenance {
-                    chunk_id: Some(id),
-                    memory_id: chunk.map(|c| c.memory_id),
-                    document_id: chunk
-                        .and_then(|c| c.document_id)
-                        .or_else(|| citations.first().and_then(|c| c.document_id)),
-                    kb: Some(cand_kb.clone()),
-                    diary: chunk.map(|c| c.diary.clone()),
-                    ..Provenance::default()
-                }
-            }
-            "claim" => {
-                let parent = parent_chunk.or_else(|| citations.first().and_then(|c| c.chunk_id));
-                let parent_row = parent.and_then(|p| chunk_index.get(&p));
-                Provenance {
-                    chunk_id: parent,
-                    // Filled in below for parents outside this scope's chunk
-                    // index — one batch query per response, never one per row.
-                    memory_id: parent_row.map(|c| c.memory_id),
-                    document_id: citations.first().and_then(|c| c.document_id),
-                    kb: Some(cand_kb.clone()),
-                    diary: parent_row.map(|c| c.diary.clone()),
-                    ..Provenance::default()
-                }
-            }
-            "wiki_page" => Provenance::derived(cand_kb.clone(), DERIVED_WIKI),
-            "entity" => Provenance::derived(cand_kb.clone(), DERIVED_ENTITY),
-            "relation" => Provenance::derived(cand_kb.clone(), DERIVED_RELATION),
-            _ => Provenance::for_kb(cand_kb.clone()),
+        let provenance = Provenance {
+            chunk_id: Some(id),
+            memory_id: Some(chunk.memory_id),
+            document_id: chunk
+                .document_id
+                .or_else(|| citations.first().and_then(|c| c.document_id)),
+            kb: Some(chunk.kb.clone()),
+            diary: Some(chunk.diary.clone()),
+            ..Provenance::default()
         };
         results.push(HybridResult {
             id,
-            kind,
-            content,
+            kind: "chunk".to_string(),
+            content: content.clone(),
             score: r.score,
             rerank_score: using_reranker.then_some(r.score),
-            kb: cand_kb,
+            kb: chunk.kb.clone(),
             citations,
             sources,
             provenance,
             relevance: None,
         });
-    }
-
-    // The claims whose parent chunk fell outside this scope's chunk index
-    // still have a memory behind them; one batch lookup resolves all of them.
-    let unresolved: Vec<Uuid> = results
-        .iter()
-        .filter(|r| r.provenance.memory_id.is_none())
-        .filter_map(|r| r.provenance.chunk_id)
-        .collect();
-    if !unresolved.is_empty() {
-        let map = store.memory_ids_for_chunks(&unresolved)?;
-        for r in results.iter_mut() {
-            if r.provenance.memory_id.is_none() {
-                if let Some(chunk) = r.provenance.chunk_id {
-                    r.provenance.memory_id = map.get(&chunk).copied();
-                }
-            }
-        }
     }
 
     Ok(RecallOutcome {
@@ -1717,11 +1291,7 @@ fn source_rank(s: &RetrievalSource) -> u8 {
     match s {
         RetrievalSource::Dense => 0,
         RetrievalSource::Lexical => 1,
-        RetrievalSource::Claim => 2,
-        RetrievalSource::Wiki => 3,
-        RetrievalSource::Entity => 4,
-        RetrievalSource::Graph => 5,
-        RetrievalSource::Reranker => 6,
+        RetrievalSource::Reranker => 2,
     }
 }
 
@@ -1783,196 +1353,6 @@ fn mark_sources(source_map: &mut HashMap<Uuid, HashSet<RetrievalSource>>, run: &
             .or_default()
             .insert(hit.source);
     }
-}
-
-/// Mutable collectors threaded through candidate generation.
-struct CandidateSink<'a> {
-    records: &'a mut HashMap<Uuid, CandidateRecord>,
-    sources: &'a mut HashMap<Uuid, HashSet<RetrievalSource>>,
-    runs: &'a mut Vec<Vec<RankedHit>>,
-    notes: &'a mut RecallNotes,
-}
-
-/// Maximum entity rows pulled per query term. In cross-KB mode one term can
-/// legitimately match one entity per KB; the cap keeps a common word from
-/// flooding the fused ranking.
-const ENTITY_MATCHES_PER_TERM: usize = 8;
-
-#[allow(clippy::too_many_arguments)]
-fn add_entity_and_graph_candidates(
-    store: &SqliteStore,
-    query: &str,
-    kb: Option<&str>,
-    mode: RecallMode,
-    graph_hops: u8,
-    temporal_active: bool,
-    mixed_diary_kbs: Option<&HashSet<String>>,
-    expired_kbs: &HashSet<String>,
-    quarantined_kbs: &HashSet<String>,
-    sink: &mut CandidateSink<'_>,
-) -> Result<(), crate::error::CliError> {
-    // Raw mode is chunks-only by definition. Every other mode runs entity and
-    // graph retrieval — including the unscoped (all-KBs) case, which used to
-    // bail out here and silently lose two of the pipeline's five sources.
-    if mode == RecallMode::Raw {
-        return Ok(());
-    }
-    // A windowed recall is chunks-only: entity rows are mention-count
-    // aggregates and relations are accumulated edges, so neither can be
-    // placed inside or outside `--since/--until`. See the temporal window
-    // semantics note in `hybrid_recall`.
-    if temporal_active {
-        sink.notes.exclude_temporal("entity");
-        if mode == RecallMode::Explore {
-            sink.notes.exclude_temporal("graph");
-        }
-        return Ok(());
-    }
-    // Match entity names from the query. `find_entities` already lowercases both
-    // sides, so a lowercased query term matches a Title-Case entity. Also try
-    // individual query tokens, so "rapamycin dose" matches the entity
-    // "Rapamycin" even though extract_entities (which wants capitalization)
-    // finds nothing in a lowercase query.
-    let mut entity_names: Vec<String> = extract_entities(query);
-    for tok in query.split(|c: char| !c.is_alphanumeric()) {
-        if tok.len() >= 3 {
-            entity_names.push(tok.to_string());
-        }
-    }
-    entity_names.sort();
-    entity_names.dedup();
-
-    let mut entity_scored = Vec::new();
-    let mut graph_scored = Vec::new();
-    let mut seen_entities: HashSet<Uuid> = HashSet::new();
-    let mut excluded = 0usize;
-    let mut expired_entities = 0usize;
-    let mut expired_relations = 0usize;
-    let mut retracted_entities = 0usize;
-    let mut retracted_relations = 0usize;
-    for name in entity_names {
-        for entity in store.find_entities(kb, &name, ENTITY_MATCHES_PER_TERM)? {
-            if !seen_entities.insert(entity.id) {
-                continue;
-            }
-            // Diary isolation: an entity row is an aggregate over a KB's chunks
-            // and carries no diary, so it is admissible only when its KB holds
-            // nothing but the requested diary's memories.
-            if mixed_diary_kbs.is_some_and(|mixed| mixed.contains(&entity.kb)) {
-                excluded += 1;
-                continue;
-            }
-            // Expiry confinement: an entity row aggregates mentions across
-            // its KB's chunks, expired ones included. Skipping the entity
-            // also suppresses its graph expansion, so in Explore mode the
-            // relations that would have been walked are counted too — the
-            // metadata must name every source it withheld, not just the
-            // first link in the chain.
-            if expired_kbs.contains(&entity.kb) {
-                let retracted = quarantined_kbs.contains(&entity.kb);
-                if retracted {
-                    retracted_entities += 1;
-                } else {
-                    expired_entities += 1;
-                }
-                if mode == RecallMode::Explore {
-                    let hops = graph_hops.clamp(1, 3);
-                    let n = store
-                        .graph_neighbors(&entity.kb, &entity.canonical_name, hops)?
-                        .len();
-                    if retracted {
-                        retracted_relations += n;
-                    } else {
-                        expired_relations += n;
-                    }
-                }
-                continue;
-            }
-            sink.records.insert(
-                entity.id,
-                CandidateRecord {
-                    kind: "entity".to_string(),
-                    content: format!(
-                        "{} ({}) mentioned {} times in KB {}",
-                        entity.canonical_name, entity.kind, entity.mention_count, entity.kb
-                    ),
-                    kb: entity.kb.clone(),
-                    citations: Vec::new(),
-                    parent_chunk: None,
-                },
-            );
-            entity_scored.push((entity.id, entity.mention_count as f32));
-
-            // Graph expansion only in Explore mode. co_occurs_with edges are
-            // uncited text-adjacency, not evidence — injecting them into the
-            // fused ranking of a precision recall (evidence/agent) let a
-            // frequently-co-mentioned but irrelevant entity displace a real
-            // passage. In Explore (a browsing mode) they're useful context.
-            // Expansion runs inside the matched entity's own KB, so an
-            // unscoped recall walks each KB's graph without merging them.
-            if mode == RecallMode::Explore {
-                let hops = graph_hops.clamp(1, 3);
-                for rel in store.graph_neighbors(&entity.kb, &entity.canonical_name, hops)? {
-                    // Expiry confinement, same reasoning as the entity row.
-                    if expired_kbs.contains(&rel.kb) {
-                        if quarantined_kbs.contains(&rel.kb) {
-                            retracted_relations += 1;
-                        } else {
-                            expired_relations += 1;
-                        }
-                        continue;
-                    }
-                    sink.records.insert(
-                        rel.id,
-                        CandidateRecord {
-                            kind: "relation".to_string(),
-                            content: format!(
-                                "{} --{}--> {}",
-                                rel.from_entity, rel.predicate, rel.to_entity
-                            ),
-                            kb: rel.kb,
-                            citations: Vec::new(),
-                            parent_chunk: None,
-                        },
-                    );
-                    graph_scored.push((rel.id, rel.weight));
-                }
-            }
-        }
-    }
-    sink.notes.exclude("entity", excluded);
-    sink.notes
-        .exclude_expired_derived("entity", expired_entities);
-    sink.notes
-        .exclude_expired_derived("relation", expired_relations);
-    sink.notes
-        .exclude_retracted_derived("entity", retracted_entities);
-    sink.notes
-        .exclude_retracted_derived("relation", retracted_relations);
-    // Highest mention count first: `find_entities` orders within a term, but
-    // candidates from different terms/KBs still have to be ranked against
-    // each other before the fused run is built.
-    entity_scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    graph_scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    let entity_run = ranked_run(&entity_scored, RetrievalSource::Entity, 20);
-    mark_sources(sink.sources, &entity_run);
-    if !entity_run.is_empty() {
-        sink.runs.push(entity_run);
-    }
-    let graph_run = ranked_run(&graph_scored, RetrievalSource::Graph, 20);
-    mark_sources(sink.sources, &graph_run);
-    if !graph_run.is_empty() {
-        sink.runs.push(graph_run);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2477,26 +1857,14 @@ mod tests {
     }
 
     #[test]
-    fn notes_report_nothing_when_no_source_was_withheld() {
+    fn expiry_note_appears_only_when_it_says_something() {
+        assert!(RecallNotes::default().expiry_json().is_none());
         let notes = RecallNotes {
-            diary_scope: Some("work".into()),
+            expired_excluded: 2,
             ..RecallNotes::default()
         };
-        assert!(notes.diary_isolation_json().is_none());
-    }
-
-    #[test]
-    fn notes_report_each_withheld_source() {
-        let mut notes = RecallNotes {
-            diary_scope: Some("work".into()),
-            ..RecallNotes::default()
-        };
-        notes.exclude("claim", 2);
-        notes.exclude("claim", 1);
-        notes.exclude("wiki", 0);
-        let json = notes.diary_isolation_json().expect("exclusions reported");
-        assert_eq!(json["diary"], "work");
-        assert_eq!(json["excluded_candidates"]["claim"], 3);
-        assert!(json["excluded_candidates"].get("wiki").is_none());
+        let json = notes.expiry_json().expect("withheld memories reported");
+        assert_eq!(json["expired_memories_excluded"], 2);
+        assert!(json["reason"].is_string());
     }
 }

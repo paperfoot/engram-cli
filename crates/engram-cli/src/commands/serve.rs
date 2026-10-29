@@ -1,4 +1,4 @@
-//! `engram serve` — local HTTP API over the same storage/retrieval/compiler code.
+//! `engram serve` — local HTTP API over the same storage and retrieval code.
 //!
 //! The HTTP half used to be one 64 KiB `read()`. That is not a parser, it is a
 //! guess: a body split across two TCP segments — any POST over ~1.4 KB on a
@@ -20,7 +20,7 @@
 
 use crate::commands::usage::{cohere_rerank_cost_usd, estimated_tokens, gemini_embed_cost_usd};
 use crate::context::AppContext;
-use crate::engine::{sleep, Core};
+use crate::engine::Core;
 use crate::error::CliError;
 use crate::respond;
 use crate::retrieval::{
@@ -122,7 +122,6 @@ struct Server {
     subscribers: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
     started_at: DateTime<Utc>,
-    sleep_cfg: sleep::SleepConfig,
 }
 
 impl Clone for Server {
@@ -134,7 +133,6 @@ impl Clone for Server {
             subscribers: self.subscribers.clone(),
             active: self.active.clone(),
             started_at: self.started_at,
-            sleep_cfg: self.sleep_cfg.clone(),
         }
     }
 }
@@ -247,7 +245,6 @@ pub async fn run(
         subscribers: Arc::new(AtomicUsize::new(0)),
         active: Arc::new(AtomicUsize::new(0)),
         started_at: Utc::now(),
-        sleep_cfg: sleep::SleepConfig::from_env(),
     };
 
     write_descriptor(&DaemonDescriptor {
@@ -318,7 +315,7 @@ fn readers_for() -> usize {
     (cores / 2).clamp(2, 8)
 }
 
-/// The scheduler and the sleep-time watcher, on one dedicated thread with its
+/// The job scheduler, on one dedicated thread with its
 /// own current-thread runtime.
 ///
 /// A runner reuses command code that holds a `SqliteStore` across its awaits,
@@ -342,7 +339,6 @@ impl Background {
 fn spawn_background(server: &Server) -> Background {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let core = server.core.clone();
-    let sleep_cfg = server.sleep_cfg.clone();
     let flag = stop.clone();
     let handle = std::thread::Builder::new()
         .name("engram-jobs".to_string())
@@ -358,21 +354,11 @@ fn spawn_background(server: &Server) -> Background {
                 }
             };
             rt.block_on(async move {
-                let mut last_sleep_tick =
-                    std::time::Instant::now() - Duration::from_secs(sleep_cfg.tick_s);
                 while !flag.load(Ordering::Relaxed) {
                     match claim_and_run_one(&core).await {
                         Ok(true) => continue, // a job ran; look for the next one
                         Ok(false) => {}
                         Err(e) => tracing::warn!("scheduler: {e}"),
-                    }
-                    if sleep_cfg.enabled
-                        && last_sleep_tick.elapsed() >= Duration::from_secs(sleep_cfg.tick_s)
-                    {
-                        last_sleep_tick = std::time::Instant::now();
-                        if let Err(e) = sleep::tick(&core, &sleep_cfg).await {
-                            tracing::warn!("sleep-time compile check: {e}");
-                        }
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
@@ -1110,7 +1096,6 @@ impl Server {
                 .await
             }
             ("POST", "/v1/ingest") => ingest_api(body).await,
-            ("POST", "/v1/compile") => self.compile_api(body).await,
             ("POST", "/v1/reindex") => {
                 let body = body.to_string();
                 // Reindex re-embeds every chunk and writes as it goes, so it
@@ -1129,14 +1114,6 @@ impl Server {
                     Ok(data(json!({ "job_id": null, "reindex": stats })))
                 })
                 .await
-            }
-            ("GET", "/v1/entities") => {
-                let kb = query_param(query, "kb");
-                let limit = query_param_usize(query, "limit").unwrap_or(100);
-                let entities = core
-                    .read(move |s| Ok(s.list_entities(kb.as_deref(), limit, 1)?))
-                    .await?;
-                Ok(data(json!({ "entities": entities })))
             }
             ("GET", "/v1/documents") => {
                 let kb = query_param(query, "kb");
@@ -1195,14 +1172,6 @@ impl Server {
                     .await?;
                 Ok(data(json!({ "scope": scope, "budget": budget })))
             }
-            ("POST", "/v1/research") => {
-                let body = body.to_string();
-                with_reader(core, move |s| async move {
-                    let out = research_body(&s, &body).await;
-                    (out, s)
-                })
-                .await
-            }
             _ if method == "GET" && path.starts_with("/v1/documents/") => {
                 let id = parse_uuid_path(path.trim_start_matches("/v1/documents/"))?;
                 let document = core.read(move |s| Ok(s.get_document(id)?)).await?;
@@ -1221,14 +1190,6 @@ impl Server {
                     })
                     .await?;
                 Ok(data(json!({ "document_id": id, "deleted": deleted })))
-            }
-            _ if method == "GET" && path.starts_with("/v1/entities/") => {
-                let name = path.trim_start_matches("/v1/entities/").to_string();
-                let kb = query_param(query, "kb");
-                let entity = core
-                    .read(move |s| Ok(s.find_entity(kb.as_deref(), &name)?))
-                    .await?;
-                Ok(data(json!({ "entity": entity })))
             }
             _ if method == "POST" && path.starts_with("/v1/jobs/") && path.ends_with("/cancel") => {
                 let id = parse_uuid_path(job_id_segment(path, "/cancel"))?;
@@ -1302,7 +1263,6 @@ impl Server {
                     "max_write_ms": metrics.max_write_ms,
                 },
                 "jobs": counts,
-                "sleep_compile": sleep::health(core, &self.sleep_cfg),
                 "connections": {
                     "active": self.active.load(Ordering::Relaxed),
                     "max": self.cfg.limits.max_connections,
@@ -1393,78 +1353,6 @@ impl Server {
         }
         let job = self.core.read(move |s| Ok(s.get_job(id)?)).await?;
         Ok(data(json!({ "job": job.map(|j| j.to_json()) })))
-    }
-
-    async fn compile_api(&self, body: &str) -> Result<serde_json::Value, CliError> {
-        let req: CompileRequest = serde_json::from_str(body)?;
-        let params = json!({
-            "llm": req.llm.unwrap_or(false),
-            "extraction_model": req.extraction_model,
-            "synthesis_model": req.synthesis_model,
-            "max_llm_chunks": req.max_llm_chunks,
-            "trigger": "api",
-        });
-        if req.r#async.unwrap_or(false) {
-            let (row, already_live) = self
-                .core
-                .submit_job("compile".to_string(), req.kb.clone(), params)
-                .await?;
-            return Ok(data(
-                json!({ "job": row.to_json(), "already_live": already_live }),
-            ));
-        }
-        // Default stays synchronous and returns the exact current shape.
-        with_own_store(&self.core, move |db| async move {
-            compile_sync(db, req, params).await
-        })
-        .await
-    }
-}
-
-async fn compile_sync(
-    db: std::path::PathBuf,
-    req: CompileRequest,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, CliError> {
-    {
-        let ctx = AppContext::with_db(crate::output::OutputFormat::Json, true, db)?;
-        let job_id = ctx.with_store_tx(|s| {
-            s.abandon_live_jobs("compile", &req.kb, "superseded by a synchronous compile")?;
-            Ok(s.create_compile_job(&req.kb, "evidence", params.clone())?)
-        })?;
-        let options = crate::commands::compile::CompileParams {
-            llm: req.llm.unwrap_or(false),
-            extraction_model: req.extraction_model.clone(),
-            synthesis_model: req.synthesis_model.clone(),
-            max_llm_chunks: req.max_llm_chunks,
-            budget_usd: None,
-            trigger: Some("api".to_string()),
-        }
-        .into_options();
-        match crate::commands::compile::compile_kb_with_options(&ctx, &req.kb, options).await {
-            Ok(stats) => {
-                ctx.store.finish_compile_job(
-                    job_id,
-                    "completed",
-                    None,
-                    json!({ "stats": stats }),
-                )?;
-                Ok(data(json!({ "job_id": job_id, "compile": stats })))
-            }
-            Err(err) => {
-                // The compile error is the one the caller needs; a job row
-                // that is no longer 'running' must not replace it.
-                if let Err(bookkeeping) = ctx.store.finish_compile_job(
-                    job_id,
-                    "failed",
-                    Some(&err.to_string()),
-                    json!({}),
-                ) {
-                    tracing::warn!("could not mark compile job {job_id} failed: {bookkeeping}");
-                }
-                Err(err)
-            }
-        }
     }
 }
 
@@ -1674,139 +1562,6 @@ fn daemon_diary(diary: Option<String>) -> Option<String> {
     }
 }
 
-async fn research_body(store: &SqliteStore, body: &str) -> Result<serde_json::Value, CliError> {
-    let req: ResearchRequest = serde_json::from_str(body)?;
-    // An empty query is refused BEFORE any provider or budget work, exactly as
-    // `engram research ""` is (exit 3 -> HTTP 400). It used to fall through to
-    // hybrid_recall, which embedded the empty string: a paid Gemini call, a
-    // recorded usage event and a budget decremented for a query that cannot
-    // match anything. With no key it was reported as a config error instead,
-    // which sends the caller to fix their keys over a typo.
-    if req.query.trim().is_empty() {
-        return Err(CliError::BadInput("query cannot be empty".into()));
-    }
-    let profile = RetrievalProfile::parse(req.profile.as_deref().unwrap_or("cloud_quality"))?;
-    let kb_filter = req.kb.clone().filter(|k| k != "*");
-    let rerank_candidates = req
-        .rerank_top_n
-        .unwrap_or_else(|| profile.default_rerank_top_n());
-    // The daemon is a retrieval surface like any other: a cloud profile with no
-    // key is a config error here too, and the caller's budget is checked before
-    // the paid call. It used to do neither and answer from the stub instead.
-    let backends = resolve_retrieval_backends(store, profile, kb_filter.as_deref())?;
-    let params = HybridParams {
-        query: &req.query,
-        top_k: req.top_k.unwrap_or(12),
-        rrf_k: 60.0,
-        rerank_top_n: rerank_candidates,
-        filters: Filters {
-            diary: daemon_diary(req.diary.clone()),
-            kb: kb_filter.clone(),
-            since: None,
-            until: None,
-            // Research assembles evidence for synthesis; expired memories are
-            // not evidence of current state. Same default and same request
-            // field as CLI research.
-            include_expired: req.include_expired.unwrap_or(false),
-        },
-        mode: RecallMode::Explore,
-        graph_hops: 2,
-        allow_mixed_embeddings: req.allow_mixed_embeddings.unwrap_or(false),
-        defer_doc_cap: false,
-    };
-    let outcome = hybrid_recall(
-        store,
-        backends.embedder.as_ref(),
-        backends.reranker.as_deref(),
-        params,
-    )
-    .await?;
-    let (results, notes) = (outcome.results, outcome.notes);
-    // A budget is a guardrail over RECORDED usage, so a surface that spends
-    // must record: this endpoint paid Gemini and told the ledger nothing, so
-    // daemon research traffic could never move a cap it now enforces.
-    if backends.cloud_embedder {
-        let tokens = estimated_tokens(&req.query);
-        store.record_usage_event(
-            "gemini",
-            "api_research_query_embed",
-            Some(backends.embed_model.as_str()),
-            kb_filter.as_deref(),
-            daemon_diary(req.diary.clone()).as_deref(),
-            1,
-            1,
-            tokens,
-            0,
-            0.0,
-            gemini_embed_cost_usd(tokens),
-            json!({ "estimated": true, "api": true }),
-        )?;
-    }
-    if backends.use_cohere() && !results.is_empty() {
-        let search_units = 1.0;
-        store.record_usage_event(
-            "cohere",
-            "api_research_rerank",
-            Some(backends.cohere_model.as_str()),
-            kb_filter.as_deref(),
-            daemon_diary(req.diary.clone()).as_deref(),
-            1,
-            rerank_candidates as i64,
-            0,
-            0,
-            search_units,
-            cohere_rerank_cost_usd(search_units),
-            json!({ "api": true }),
-        )?;
-    }
-    let status = if results.is_empty() {
-        "no_results"
-    } else {
-        "success"
-    };
-    let mut resp = json!({
-        "version": "1",
-        "status": status,
-        "data": {
-            "status": status,
-            "query": req.query,
-            "answer_context": render_answer_context(&results),
-            "results": results.iter().map(|r| json!({
-                "id": r.id.to_string(),
-                "kind": r.kind,
-                "score": r.score,
-                "rerank_score": r.rerank_score,
-                "kb": r.kb,
-                "content": r.content,
-                "citations": r.citations,
-                "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
-            })).collect::<Vec<_>>(),
-            "metadata": {
-                "profile": profile.as_str(),
-                // A caller cannot tell 1536-dim Gemini retrieval from the
-                // 64-dim offline stub out of `profile` alone: `offline` and a
-                // forced stub render the same word. The CLI's `research` has
-                // reported these since Wave 0; the daemon copy did not.
-                "embed_model": backends.embed_model,
-                "embed_dims": backends.embed_dims,
-                "prompt_format": backends.prompt_format,
-                "reranker": backends.reranker_label,
-                "candidates_considered": rerank_candidates,
-                "diary_isolation": notes.diary_isolation_json(),
-                "temporal_scope": notes.temporal_scope_json(),
-                "expiry": notes.expiry_json()
-            }
-        }
-    });
-    // Presence IS the signal: skill.md tells agents the field appears only in
-    // affected responses, so a healthy daemon must OMIT it — `json!` would
-    // render a None as `null` and make every presence check fire.
-    if let Some(note) = backends.embedder.degradation_note() {
-        resp["data"]["metadata"]["embedder_degraded"] = serde_json::json!(note);
-    }
-    Ok(resp)
-}
-
 async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Value, CliError> {
     let req: RecallRequest = serde_json::from_str(body)?;
     // An empty query is refused BEFORE any provider or budget work, exactly as
@@ -1852,7 +1607,6 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
             include_expired: req.include_expired.unwrap_or(false),
         },
         mode,
-        graph_hops: req.graph_hops.unwrap_or(1),
         allow_mixed_embeddings: req.allow_mixed_embeddings.unwrap_or(false),
         defer_doc_cap: false,
     };
@@ -1947,8 +1701,6 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
                 "tokens_used": used_tokens,
                 "kb": scope.label(),
                 "kb_scope": scope.origin.as_str(),
-                "diary_isolation": notes.diary_isolation_json(),
-                "temporal_scope": notes.temporal_scope_json(),
                 "expiry": notes.expiry_json()
             }
         }
@@ -2000,9 +1752,7 @@ async fn ingest_api(body: &str) -> Result<serde_json::Value, CliError> {
         .arg("--mode")
         .arg(req.mode.unwrap_or_else(|| "auto".to_string()))
         .arg("--diary")
-        .arg(req.diary.unwrap_or_else(|| "default".to_string()))
-        .arg("--compile")
-        .arg(req.compile.unwrap_or_else(|| "none".to_string()));
+        .arg(req.diary.unwrap_or_else(|| "default".to_string()));
     if req.dry_run.unwrap_or(false) {
         command.arg("--dry-run");
     }
@@ -2090,20 +1840,6 @@ struct KbCreateRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct CompileRequest {
-    kb: String,
-    llm: Option<bool>,
-    extraction_model: Option<String>,
-    synthesis_model: Option<String>,
-    max_llm_chunks: Option<usize>,
-    /// Opt-in. The default stays synchronous and returns the exact shape it
-    /// always has, because a caller that has not asked for a handle is not
-    /// expecting one.
-    #[serde(default)]
-    r#async: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
 struct JobSubmitRequest {
     kind: String,
     kb: Option<String>,
@@ -2125,7 +1861,6 @@ struct IngestRequest {
     kb: Option<String>,
     mode: Option<String>,
     diary: Option<String>,
-    compile: Option<String>,
     dry_run: Option<bool>,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
@@ -2147,24 +1882,10 @@ struct RecallRequest {
     layer: Option<String>,
     top_k: Option<usize>,
     rerank_top_n: Option<usize>,
-    graph_hops: Option<u8>,
     allow_mixed_embeddings: Option<bool>,
     since: Option<String>,
     until: Option<String>,
     /// Same contract as `recall --include-expired` (CLI/daemon parity).
-    include_expired: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResearchRequest {
-    query: String,
-    kb: Option<String>,
-    diary: Option<String>,
-    profile: Option<String>,
-    top_k: Option<usize>,
-    rerank_top_n: Option<usize>,
-    allow_mixed_embeddings: Option<bool>,
-    /// Same contract as `research --include-expired` (CLI/daemon parity).
     include_expired: Option<bool>,
 }
 

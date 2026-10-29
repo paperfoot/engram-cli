@@ -396,7 +396,6 @@ async fn run_scientific_mini(format: OutputFormat) -> Result<(), CliError> {
             )?;
         }
     }
-    let compile = crate::commands::compile::compile_kb(&fixture_ctx, kb).await?;
     let cases = [
         ("human rapamycin vaccine response", "everolimus"),
         ("metformin mortality confounding", "confounding"),
@@ -423,7 +422,6 @@ async fn run_scientific_mini(format: OutputFormat) -> Result<(), CliError> {
                     include_expired: false,
                 },
                 mode: RecallMode::Evidence,
-                graph_hops: 1,
                 allow_mixed_embeddings: false,
                 defer_doc_cap: false,
             },
@@ -451,7 +449,6 @@ async fn run_scientific_mini(format: OutputFormat) -> Result<(), CliError> {
         "questions_evaluated": cases.len(),
         "accuracy": accuracy,
         "correct": correct,
-        "compile": compile,
         "per_question": per_question,
     });
     print_success(format, payload, Metadata::default(), |data| {
@@ -570,7 +567,6 @@ async fn run_personal(
                     include_expired: false,
                 },
                 mode: RecallMode::Evidence,
-                graph_hops: 1,
                 allow_mixed_embeddings: false,
                 defer_doc_cap: relevance_judge.is_some(),
             },
@@ -607,7 +603,6 @@ async fn run_personal(
                         include_expired: false,
                     },
                     mode: RecallMode::Evidence,
-                    graph_hops: 1,
                     allow_mixed_embeddings: false,
                     defer_doc_cap: false,
                 },

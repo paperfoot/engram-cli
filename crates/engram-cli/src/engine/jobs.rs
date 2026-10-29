@@ -30,7 +30,7 @@ use crate::error::CliError;
 /// The kinds this build can actually run. `reflect` is deliberately absent:
 /// reasoning-layer registers it in wave 5, and until then submitting one is a
 /// named refusal rather than a queued row nothing will ever claim.
-pub const JOB_KINDS: &[&str] = &["compile", "backfill"];
+pub const JOB_KINDS: &[&str] = &["backfill"];
 
 /// How long a claim is good for before another worker may steal it.
 pub const LEASE: Duration = Duration::from_secs(60);
@@ -192,7 +192,6 @@ pub struct JobRegistry {
 impl JobRegistry {
     pub fn with_builtin_runners() -> JobRegistry {
         let mut r = JobRegistry::default();
-        r.register(Arc::new(crate::commands::compile::CompileRunner));
         r.register(Arc::new(BackfillRunner));
         r
     }
