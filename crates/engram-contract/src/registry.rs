@@ -1652,8 +1652,8 @@ const IMPORT_DATA: &[FieldSpec] = &[
     FieldSpec {
         name: "next_step",
         ty: Ty::Str,
-        doc: "the command that regenerates the derived tables an export deliberately omits",
-        always: true,
+        doc: "legacy v1 export only: the command that restores dense search (`engram reindex --all`)",
+        always: false,
     },
 ];
 

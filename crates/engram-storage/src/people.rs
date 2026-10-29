@@ -52,11 +52,18 @@ pub const PERSON_ATTRIBUTES: &[&str] = &[
     "has_nickname",
     "has_email",
     "has_phone_number",
+    "client_of",
+    "investor_in",
     "allergic_to",
     "takes_medication",
     "diagnosed_with",
     "blood_type",
 ];
+
+/// Attributes whose object is sometimes a person (`met_at` a conference or a
+/// colleague, `client_of` a firm or a consultant). The object does not become
+/// a person through them, but a person already known shows the link too.
+const OBJECT_MAY_BE_PERSON: &[&str] = &["met_at", "client_of", "investor_in"];
 
 /// Predicates whose object is another name for the subject.
 pub const ALIAS_PREDICATES: &[&str] = &["has_nickname", "also_known_as", "goes_by"];
@@ -85,6 +92,19 @@ fn kb_clause(kb: Option<&str>, args: &mut Vec<SqlValue>) -> &'static str {
             "AND kb = ?"
         }
         None => "",
+    }
+}
+
+/// The rows if they are all one person (one name, any number of KBs), else
+/// none: two people answering to one name is not an answer.
+fn unique_person(rows: Vec<PersonRow>) -> Vec<PersonRow> {
+    let mut norms: Vec<&str> = rows.iter().map(|p| p.name_norm.as_str()).collect();
+    norms.sort();
+    norms.dedup();
+    if norms.len() == 1 {
+        rows
+    } else {
+        Vec::new()
     }
 }
 
@@ -150,10 +170,11 @@ impl SqliteStore {
         limit: usize,
     ) -> Result<Vec<Fact>, StorageError> {
         let links = in_list(PERSON_LINKS);
+        let incoming = in_list(&[PERSON_LINKS, OBJECT_MAY_BE_PERSON].concat());
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {cols} FROM facts
              WHERE {OPEN_FACT} AND kb = ?1
-               AND (subject_norm = ?2 OR (object_norm = ?2 AND predicate IN ({links})))
+               AND (subject_norm = ?2 OR (object_norm = ?2 AND predicate IN ({incoming})))
              ORDER BY (predicate IN ({links})) DESC, created_at DESC
              LIMIT {limit}",
             cols = fact_columns("")
@@ -165,9 +186,9 @@ impl SqliteStore {
     }
 
     /// The person a name refers to, one row per KB, best-known first: the
-    /// exact name; else whoever a nickname fact names; else the one person
-    /// whose first name it is. A first name two people share resolves to
-    /// nobody rather than to a guess.
+    /// exact name; else whoever a nickname fact in scope names; else the one
+    /// person whose first name it is. A nickname or first name two people
+    /// share resolves to nobody rather than to a guess.
     pub fn resolve_person(&self, kb: Option<&str>, name: &str) -> Result<Vec<PersonRow>, StorageError> {
         let q = name.trim().to_lowercase();
         let (all, _) = self.list_people(kb, usize::MAX >> 1, 0, 1)?;
@@ -175,30 +196,31 @@ impl SqliteStore {
         if !exact.is_empty() {
             return Ok(exact);
         }
+        let mut args = vec![SqlValue::Text(q.clone())];
+        let kb_sql = kb_clause(kb, &mut args);
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT DISTINCT subject_norm FROM facts
-             WHERE {OPEN_FACT} AND object_norm = ?1 AND predicate IN ({})",
+            "SELECT DISTINCT kb, subject_norm FROM facts
+             WHERE {OPEN_FACT} AND object_norm = ? AND predicate IN ({}) {kb_sql}",
             in_list(ALIAS_PREDICATES)
         ))?;
-        let nicknamed: Vec<String> = stmt
-            .query_map([&q], |r| r.get(0))?
+        let nicknamed: Vec<(String, String)> = stmt
+            .query_map(params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
+        // The nickname must be on the same KB's row: a personal-KB nickname
+        // says nothing about a work-KB namesake.
         let by_nickname: Vec<_> = all
             .iter()
-            .filter(|p| nicknamed.contains(&p.name_norm))
+            .filter(|p| nicknamed.iter().any(|(k, n)| *k == p.kb && *n == p.name_norm))
             .cloned()
             .collect();
         if !by_nickname.is_empty() {
-            return Ok(by_nickname);
+            return Ok(unique_person(by_nickname));
         }
         let by_first: Vec<_> = all
             .into_iter()
             .filter(|p| p.name_norm.split_whitespace().next() == Some(q.as_str()))
             .collect();
-        let mut norms: Vec<&str> = by_first.iter().map(|p| p.name_norm.as_str()).collect();
-        norms.sort();
-        norms.dedup();
-        Ok(if norms.len() == 1 { by_first } else { Vec::new() })
+        Ok(unique_person(by_first))
     }
 }
 
@@ -299,6 +321,28 @@ mod tests {
         assert!(store.resolve_person(None, "noemi").unwrap().is_empty());
         fact(&store, memory, "Noemi Varkoni", "has_nickname", "Nomi");
         assert_eq!(store.resolve_person(None, "nomi").unwrap()[0].name, "Noemi Varkoni");
+        // A nickname two people share names nobody.
+        fact(&store, memory, "Noemi Brandtke", "has_nickname", "Nomi");
+        assert!(store.resolve_person(None, "nomi").unwrap().is_empty());
+        // A nickname outside the requested KB does not count.
+        assert!(store.resolve_person(Some("elsewhere"), "nomi").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_known_person_sees_an_incoming_met_at() {
+        let store = seeded();
+        let memory: Uuid = store
+            .conn
+            .query_row("SELECT id FROM memories LIMIT 1", [], |r| r.get::<_, String>(0))
+            .map(|id| Uuid::parse_str(&id).unwrap())
+            .unwrap();
+        fact(&store, memory, "Elias", "met_at", "Lira");
+        let lira = store.person_facts("network", "lira", 50).unwrap();
+        assert!(lira.iter().any(|f| f.predicate == "met_at"));
+        // ...but a conference is not made a person by being met at.
+        fact(&store, memory, "Elias", "met_at", "Basel Summit");
+        let (people, _) = store.list_people(None, 10, 0, 1).unwrap();
+        assert!(people.iter().all(|p| p.name != "Basel Summit"));
     }
 
     #[test]

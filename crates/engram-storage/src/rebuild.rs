@@ -12,7 +12,7 @@
 //! | `derivations`, `fact_extraction_log` | yes | from `derivation.ran`, minus the markers `memory.revised` cleared |
 //! | `lessons` | yes | from `lesson.recorded|confirmed|retracted` (D24) |
 //! | `memories`, `chunks` | **no** | access telemetry and chunk embeddings are deliberately not journaled |
-//! | `claims`, `entities`, `relations`, `wiki_pages`, `source_spans` | **no** | compiler caches; `engram compile` regenerates them |
+//! | `claims`, `entities`, `relations`, `wiki_pages`, `source_spans` | **no** | left by the removed compiler; nothing reads them |
 //!
 //! Three rules that are cheap to state and expensive to rediscover:
 //!
@@ -96,23 +96,23 @@ pub fn skipped_tables() -> Vec<SkippedTable> {
         },
         SkippedTable {
             table: "claims",
-            reason: "compiler cache; `engram compile` regenerates it",
+            reason: "left by the removed compiler; nothing reads it",
         },
         SkippedTable {
             table: "entities",
-            reason: "compiler cache; `engram compile` regenerates it",
+            reason: "left by the removed compiler; nothing reads it",
         },
         SkippedTable {
             table: "relations",
-            reason: "compiler cache; `engram compile` regenerates it",
+            reason: "left by the removed compiler; nothing reads it",
         },
         SkippedTable {
             table: "wiki_pages",
-            reason: "compiler cache; `engram compile` regenerates it",
+            reason: "left by the removed compiler; nothing reads it",
         },
         SkippedTable {
             table: "source_spans",
-            reason: "compiler cache; `engram compile` regenerates it",
+            reason: "left by the removed compiler; nothing reads it",
         },
     ]
 }

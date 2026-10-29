@@ -125,7 +125,6 @@ fn import_v3(
                 "facts": doc.facts.len().saturating_sub(report.facts),
                 "events": report.events_skipped_duplicate,
             },
-            "next_step": "run `engram compile --kb <name> --all` to regenerate derived claims/entities/wiki",
         }),
         meta,
     ))
@@ -222,7 +221,6 @@ fn import_v2(
                 "chunks": chunks.len() - counts.chunks,
                 "facts": facts.len() - counts.facts,
             },
-            "next_step": "run `engram compile --kb <name> --all` to regenerate derived claims/entities/wiki",
         }),
         meta,
     ))

@@ -31,7 +31,7 @@ pub struct SqliteStore {
     /// invariant 1 requires the event append and the projection write to share
     /// one transaction, which means they must share one connection.
     pub(crate) conn: Connection,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

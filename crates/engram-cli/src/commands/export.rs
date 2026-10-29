@@ -8,9 +8,8 @@
 //! silently costs money to restore is not a backup.
 //!
 //! A v2 consumer still finds `memories`/`chunks`/`facts` exactly where it left
-//! them; only the `version` discriminator moved. Derived tables — claims,
-//! entities, relations, wiki pages, source spans — remain compiler caches; run
-//! `engram compile --all` after import to regenerate them.
+//! them; only the `version` discriminator moved. Tables the removed compiler
+//! left (claims, entities, relations, wiki pages, source spans) are not exported.
 
 use crate::context::AppContext;
 use crate::error::CliError;
