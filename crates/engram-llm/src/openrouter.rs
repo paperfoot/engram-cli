@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 // Compiler defaults are separated below so evidence extraction can use a fast
 // model while synthesis uses a stronger one.
 const DEFAULT_MODEL: &str = "anthropic/claude-opus-5.5";
-/// Chosen by measurement over remember's own extraction set
-/// (benchmarks/models-2026-10.md): the only model to keep all 28 gold safety
-/// facts, 16.8% of facts unsupported by the JEV grounding judge (tied best),
-/// no failed calls, p50 4.2 s; $1.73 per 1,000 memories.
+/// Chosen by measurement under remember's production request
+/// (benchmarks/models-2026-10.md, models_extraction_fair.py): against
+/// deepseek-v4.1-flash-1017 it ties on safety facts (16/17 filed correctly, no
+/// false safety records) and wins on reliability: 80/80 usable outputs vs
+/// 64/80, p95 6.2 s vs 15.5 s, one first-party provider.
 pub const DEFAULT_EXTRACTION_MODEL: &str = "openai/gpt-6.1-terra";
 /// The reasoning effort the extraction default was measured at. `low` keeps
 /// default-effort grounding at half the latency and two thirds of the cost.
