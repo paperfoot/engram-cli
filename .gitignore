@@ -34,3 +34,6 @@ benchmarks/beir-*.json
 # Local experiment-loop config and notes
 autoresearch.toml
 program.md
+
+# Brand art: round originals live outside git (checksums in assets/brand/PROVENANCE.md)
+assets/brand/r*/*.png

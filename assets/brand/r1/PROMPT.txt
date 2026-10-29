@@ -1,0 +1,8 @@
+Generate four images with your native image generation tool and save each as a PNG at the exact path given (in this directory). Do not write code to draw them; use image generation, one image per option. After saving, reply with the list of files.
+
+Shared brief for every option: a project title logo with a fully transparent background, wide banner layout (about 3:1). Text, exactly spelled, one word, all caps: "ENGRAM". Style: chunky 3D blocky extruded lettering in the spirit of the Minecraft Java Edition title logo (pixel-textured faces, deep extrusion, dark outline, slight perspective), crisp edges, readable at small size on both light and dark GitHub pages, centered, nothing else in the frame. Transparent PNG background (alpha), no backdrop, no shadow box, no trademarks or real company logos. The project is a long-term memory engine for AI agents: the letters should feel like something carved to last.
+
+1. logo_a.png: polished dark deepslate blocks with thin glowing cyan veins running through the letter faces like stored memory traces (sculk-like), cool teal glow on the edges.
+2. logo_b.png: faceted amethyst crystal blocks, lavender and deep violet pixel texture, a few small crystal shards catching light on top edges.
+3. logo_c.png: weathered copper and polished stone blocks with glowing redstone-red circuit lines etched across the faces, warm and engineered.
+4. logo_d.png: obsidian blocks with a soft enchantment shimmer (purple-blue glints) and a small pixel brain-shaped glyph replacing nothing: the brain sits as a tiny emblem just above the letter A, same block style.
