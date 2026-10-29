@@ -574,13 +574,20 @@ pub fn compile_state(ctx: &AppContext, args: &StateArgs) -> Result<StateView, Cl
     // `--as-of` in the past and `--include-closed` both need the closed rows;
     // otherwise "current" is the only thing read, from the only source of it.
     let need_closed = args.include_closed || args.as_of.is_some();
-    let facts = ctx.store.open_intervals(
-        kb_filter,
-        diary_filter,
-        &subject_norm,
-        relation.as_deref(),
-        need_closed,
-    )?;
+    // `--relation` narrows by CANONICAL relation, here, not by the stored
+    // predicate in SQL: a row written before its spelling became an alias
+    // (`is_allergic_to`) keeps that spelling on disk, and an equality filter
+    // on `allergic_to` would answer "no allergy" about a person who has one.
+    let facts: Vec<Fact> = ctx
+        .store
+        .open_intervals(kb_filter, diary_filter, &subject_norm, None, need_closed)?
+        .into_iter()
+        .filter(|f| {
+            relation
+                .as_deref()
+                .is_none_or(|r| canonical_relation(&f.predicate) == r)
+        })
+        .collect();
 
     let (questions, contested_ids, contested_capped) =
         open_questions_for(ctx, &subject_norm, diary_filter, kb_filter)?;
