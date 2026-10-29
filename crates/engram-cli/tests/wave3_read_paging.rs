@@ -201,9 +201,7 @@ fn every_listing_surface_reports_returned_and_total() {
         vec!["facts", "conflicts"],
         vec!["facts", "conflicts", "--open"],
         vec!["people", "list"],
-        vec!["entities", "list", "--kb", "personal"],
         vec!["documents", "list", "--kb", "personal"],
-        vec!["wiki", "--kb", "personal"],
     ] {
         let v = run_json(dir.path(), &args);
         let data = &v["data"];
@@ -239,14 +237,6 @@ fn ranked_reads_publish_no_cursor() {
 
     for args in [
         vec!["recall", "Lisbon", "--profile", "offline"],
-        vec![
-            "research",
-            "Lisbon",
-            "--kb",
-            "personal",
-            "--profile",
-            "offline",
-        ],
         vec!["memory", "search", "Lisbon", "--profile", "offline"],
     ] {
         let v = run_json(dir.path(), &args);

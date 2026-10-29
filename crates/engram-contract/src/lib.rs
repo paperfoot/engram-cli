@@ -260,9 +260,9 @@ mod tests {
 
     #[test]
     fn nullable_renders_as_a_type_union() {
-        let s = jsonschema::schema_for("recall").unwrap();
-        let di = &s["properties"]["output"]["properties"]["data"]["properties"]["diary_isolation"];
-        assert_eq!(di["type"], serde_json::json!(["object", "null"]));
+        let s = jsonschema::schema_for("remember").unwrap();
+        let note = &s["properties"]["output"]["properties"]["data"]["properties"]["embed_truncation_note"];
+        assert_eq!(note["type"], serde_json::json!(["string", "null"]));
     }
 
     #[test]
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(scope("recall"), vec!["recall"]);
         assert_eq!(scope("search"), vec!["recall"]);
         assert_eq!(scope("  facts   show "), vec!["facts show"]);
-        assert_eq!(scope("wiki"), vec!["wiki"]);
+        assert_eq!(scope("bench"), vec!["bench"]);
         let facts = scope("facts");
         assert_eq!(facts.len(), 6, "{facts:?}");
         assert!(facts.iter().all(|p| p.starts_with("facts ")));
@@ -301,7 +301,7 @@ mod tests {
             memory.contains(&"edit") && memory.contains(&"forget"),
             "{memory:?}"
         );
-        assert_eq!(scope("entities"), vec!["entities list", "entities show"]);
+        assert_eq!(scope("chunks"), vec!["chunks repair"]);
     }
 
     #[test]

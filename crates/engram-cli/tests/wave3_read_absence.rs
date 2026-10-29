@@ -134,23 +134,13 @@ fn scope_metadata_is_present_on_every_read() {
 
     for args in [
         vec!["recall", "Lisbon", "--profile", "offline"],
-        vec![
-            "research",
-            "Lisbon",
-            "--kb",
-            "personal",
-            "--profile",
-            "offline",
-        ],
         vec!["memory", "search", "Lisbon", "--profile", "offline"],
         vec!["facts", "list", "--kb", "personal"],
         vec!["facts", "show", "Ana", "--kb", "personal", "--diary", "*"],
         vec!["facts", "conflicts"],
         vec!["facts", "conflicts", "--open"],
         vec!["people", "list"],
-        vec!["entities", "list", "--kb", "personal"],
         vec!["documents", "list", "--kb", "personal"],
-        vec!["wiki", "--kb", "personal"],
     ] {
         let v = run_json(dir.path(), &args);
         let scope = &v["metadata"]["scope"];
@@ -169,7 +159,6 @@ fn undiaried_surfaces_say_the_diary_does_not_apply() {
     let dir = store();
     remember(dir.path(), "Ana moved to Lisbon", "personal");
     for args in [
-        vec!["entities", "list", "--kb", "personal"],
         vec!["people", "list"],
         vec!["documents", "list", "--kb", "personal"],
     ] {

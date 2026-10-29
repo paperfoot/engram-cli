@@ -92,7 +92,7 @@ fn aliases_resolve_and_whitespace_does_not_matter() {
 fn every_key_shared_with_the_full_manifest_is_byte_identical() {
     let sb = Sandbox::new();
     let full = manifest(&sb);
-    let mut views: Vec<Value> = ["recall", "facts", "wiki", "serve", "config set"]
+    let mut views: Vec<Value> = ["recall", "facts", "bench", "serve", "config set"]
         .iter()
         .map(|p| scoped(&sb, p))
         .collect();
@@ -129,14 +129,14 @@ fn every_key_shared_with_the_full_manifest_is_byte_identical() {
 #[test]
 fn a_path_without_a_schema_answers_with_its_usage() {
     let sb = Sandbox::new();
-    let v = scoped(&sb, "wiki");
+    let v = scoped(&sb, "bench");
     assert!(v.get("command_schemas").is_none());
     let gaps = v["schema_unavailable"]
         .as_array()
         .expect("the gap is described");
     assert_eq!(gaps.len(), 1);
-    assert_eq!(gaps[0]["path"], "wiki");
-    assert!(gaps[0]["usage"].as_str().unwrap().contains("wiki"));
+    assert_eq!(gaps[0]["path"], "bench");
+    assert!(gaps[0]["usage"].as_str().unwrap().contains("bench"));
 }
 
 #[test]

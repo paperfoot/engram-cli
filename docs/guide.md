@@ -20,7 +20,7 @@ One binary. No runtime, no Python, no Docker, no services. From a checkout: `car
 | Provider | Env var / config key | Powers | Needed? | Without it | Balance visible to engram |
 |---|---|---|---|---|---|
 | Gemini | `GEMINI_API_KEY` / `keys.gemini`; fallbacks `GEMINI_API_KEY_FALLBACKS` / `keys.gemini_fallbacks` | embeddings for every write and cloud recall | **required** | writes refuse (exit 2), cloud recall is refused; only `--offline` stub vectors | no (no balance API) |
-| OpenRouter | `OPENROUTER_API_KEY` / `keys.openrouter` | fact extraction on `remember`, `compile --llm`, the judge's OpenRouter route | recommended | memories are stored without facts (`fact_extraction: skipped_no_openrouter_key`, or `failed` when the key or credit is dead); `engram facts backfill` catches up later | yes: the smaller of the key's remaining limit and the account's remaining credit; if the key may not read the account balance (OpenRouter documents `/credits` as management-key only), the key limit is shown as `key_limit_only` and the status is `unchecked` until you check the account |
+| OpenRouter | `OPENROUTER_API_KEY` / `keys.openrouter` | fact extraction on `remember`, the judge's OpenRouter route | recommended | memories are stored without facts (`fact_extraction: skipped_no_openrouter_key`, or `failed` when the key or credit is dead); `engram facts backfill` catches up later | yes: the smaller of the key's remaining limit and the account's remaining credit; if the key may not read the account balance (OpenRouter documents `/credits` as management-key only), the key limit is shown as `key_limit_only` and the status is `unchecked` until you check the account |
 | Cohere | `COHERE_API_KEY` / `keys.cohere` | rerank in `cloud_quality` recall | recommended | recall runs unreranked (lower precision). A broken key makes recall fail; `ENGRAM_RERANK_PROVIDER=none` recalls without rerank | no |
 | TypeSafe | `TYPESAFE_API_KEY` / `keys.typesafe` | the optional judge, direct route | optional | unset: nothing, and a `shadow`/`on` site routes through OpenRouter. Keyed but broken: judged calls fail, since a keyed TypeSafe route never falls back to OpenRouter | no (no usage or balance endpoint) |
 
@@ -105,8 +105,8 @@ engram kb create ageing-biology --description "Ageing biology and longevity scie
 engram kb list --json
 
 engram ingest ./papers --kb ageing-biology --mode papers --dry-run --include '*.pdf' --json
-engram ingest ./papers --kb ageing-biology --mode papers --include '*.pdf' --max-files 50 --compile evidence --json
-engram ingest ./takeaways --kb ageing-biology --mode takeaways --include '*.md' --max-files 25 --compile evidence --json
+engram ingest ./papers --kb ageing-biology --mode papers --include '*.pdf' --max-files 50 --json
+engram ingest ./takeaways --kb ageing-biology --mode takeaways --include '*.md' --max-files 25 --json
 
 engram recall "rapamycin dosing evidence in humans" \
   --kb ageing-biology \
@@ -119,7 +119,7 @@ engram usage --kb ageing-biology --json
 engram budget set --kb ageing-biology --daily-usd 5 --monthly-usd 100
 ```
 
-Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25, claim/entity search, graph expansion, and Cohere `rerank-v4.0-pro` when configured. The reranker sees a wide candidate pool (`cloud_quality` default 200, tunable via `ENGRAM_RERANK_CANDIDATES`), and the returned results are capped to at most N chunks per source document (default 2, tunable via `ENGRAM_RERANK_MAX_PER_DOC`; `0` = legacy/unlimited) so a few near-duplicate passages from one document cannot crowd out other sources. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
+Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25 and Cohere `rerank-v4.0-pro` when configured. The reranker sees a wide candidate pool (`cloud_quality` default 200, tunable via `ENGRAM_RERANK_CANDIDATES`), and the returned results are capped to at most N chunks per source document (default 2, tunable via `ENGRAM_RERANK_MAX_PER_DOC`; `0` = legacy/unlimited) so a few near-duplicate passages from one document cannot crowd out other sources. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
 
 `engram usage` summarizes recorded cloud usage by provider, operation, model, KB, estimated input/output tokens, Cohere search units, and estimated cost. Gemini embedding token counts use a local chars/4 estimate. Cohere is tracked as `search_units`; set `ENGRAM_COHERE_RERANK_USD_PER_SEARCH` if you want local dollar estimates. `engram budget` sets local daily/monthly guardrails that are **enforced**: before any paid embed/rerank/LLM call, `recall`, `ingest`, and `compile --llm` check recorded spend against the cap and refuse with exit code 4 when it's reached (override for one run with `ENGRAM_BUDGET_ENFORCE=off`). The gate reads recorded usage *estimates*; provider invoices remain the source of truth.
 
@@ -128,24 +128,24 @@ Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 
 ```bash
 # Medical / biology evidence base
 engram kb create ageing-biology --description "Ageing biology, longevity, rapamycin, senescence, mTOR, AMPK"
-engram ingest ./papers/ageing --kb ageing-biology --mode papers --include '*.pdf' --max-files 50 --compile evidence
+engram ingest ./papers/ageing --kb ageing-biology --mode papers --include '*.pdf' --max-files 50
 engram recall "human rapamycin dosing safety evidence" --kb ageing-biology --mode evidence --json
 
 # Bioinformatics or computational biology
 engram kb create bioinformatics --description "Pipelines, tools, genomics, alignment, variant calling"
-engram ingest ./docs/bioinformatics --kb bioinformatics --mode repos --include '*.md' --max-files 100 --compile evidence
+engram ingest ./docs/bioinformatics --kb bioinformatics --mode repos --include '*.md' --max-files 100
 engram recall "best current approach for single-cell RNA-seq batch correction" --kb bioinformatics --mode evidence --json
 
 # Coding/tool specialist
 engram kb create swiftui-ios --description "SwiftUI, iOS app architecture, Apple platform docs, local project decisions"
-engram ingest ./apple-docs --kb swiftui-ios --mode general --include '*.md' --max-files 100 --compile evidence
-engram ingest ./project-notes --kb swiftui-ios --mode takeaways --include '*.md' --max-files 25 --compile evidence
+engram ingest ./apple-docs --kb swiftui-ios --mode general --include '*.md' --max-files 100
+engram ingest ./project-notes --kb swiftui-ios --mode takeaways --include '*.md' --max-files 25
 engram recall "SwiftUI navigation stack migration pattern" --kb swiftui-ios --mode agent --json
 
 # Customer-support specialist
 engram kb create acme-support --description "Acme product help center, policies, support macros, resolved ticket lessons"
-engram ingest ./help-center --kb acme-support --mode general --include '*.md' --max-files 100 --compile evidence
-engram ingest ./support-takeaways --kb acme-support --mode takeaways --include '*.md' --max-files 25 --compile evidence
+engram ingest ./help-center --kb acme-support --mode general --include '*.md' --max-files 100
+engram ingest ./support-takeaways --kb acme-support --mode takeaways --include '*.md' --max-files 25
 engram recall "refund policy for annual plans" --kb acme-support --mode evidence --json
 ```
 
@@ -164,27 +164,17 @@ curl -sL -o bert.pdf  https://arxiv.org/pdf/1810.04805.pdf   # BERT
 # "Methods > Cell Culture" breadcrumbs) -> Gemini Embedding 2 (batched,
 # token-budgeted) -> SQLite BLOBs. Embeddings persist forever.
 engram ingest . --kb ageing-biology --mode papers --dry-run --include '*.pdf' --json
-engram ingest . --kb ageing-biology --mode papers --include '*.pdf' --max-files 10 --compile evidence
+engram ingest . --kb ageing-biology --mode papers --include '*.pdf' --max-files 10
 
 # Ask questions. Returns the exact chunks with scores and sources.
 engram recall "personalized pagerank for multi-hop retrieval" --kb ageing-biology --top-k 3 --json
 
-# Optional LLM compiler pass:
-# extraction defaults to openai/gpt-6.1-terra,
-# synthesis defaults to google/gemini-3.8-flash.
-engram compile --kb ageing-biology --all --llm --max-llm-chunks 25
-
-# Agentic research pass: returns a query plan, evidence leads, and citation readiness.
-engram research "what human evidence exists for rapamycin dosing?" --kb ageing-biology --json
-
 # Browse what engram extracted from the corpus
 engram documents list --kb ageing-biology --json
 engram jobs list --kb ageing-biology --json
-engram entities list --kb ageing-biology --limit 10
-# -> BERT (58), HippoRAG (56), LightRAG (52), LLM (39), RAG (36), ...
 ```
 
-Each result has `id`, `kind` (`claim|chunk|wiki_page|entity|relation`), `score`, `content`, citations, KB, and `sources`. **Your agent should quote the content and cite the source/chunk_id** so you can always re-run `engram recall` to verify a claim.
+Each result has `id`, `kind` (`chunk`), `score`, `content`, citations, KB, and `sources`. **Your agent should quote the content and cite the source/chunk_id** so you can always re-run `engram recall` to verify a claim.
 
 ### Grounded answers: cite or abstain
 
@@ -204,14 +194,14 @@ engram attaches the source to every chunk, so every answer stays independently v
 ```
         query
           │
- ┌────────┬────────┬────────────┬────────┐
- │        │        │            │        │
- ▼        ▼        ▼            ▼        ▼
-Dense    FTS5     Claims       Entity   Wiki
-(Gemini  BM25     /facts       aliases  pages
- 2)      chunks   search       + graph
- │        │        │            │        │
- └────────┴────────┴────────────┴────────┘
+ ┌────────┐
+ │        │
+ ▼        ▼
+Dense    FTS5
+(Gemini  BM25
+ 2)      chunks
+ │        │
+ └────────┘
           │
           ▼
  Reciprocal Rank Fusion
@@ -247,11 +237,11 @@ Cargo workspace layout:
 | Crate | Purpose |
 |---|---|
 | `engram-core` (`paperfoot-engram-core` on crates.io) | Pure types, fusion (RRF), memory layers, temporal validity. Zero I/O. |
-| `engram-storage` (`paperfoot-engram-storage`) | SQLite source of truth + FTS5 + chunk-embedding BLOBs + KB/claim/entity/wiki tables. |
+| `engram-storage` (`paperfoot-engram-storage`) | SQLite source of truth + FTS5 + chunk-embedding BLOBs + KB and fact tables. |
 | `engram-embed` (`paperfoot-engram-embed`) | `Embedder` trait + Gemini Embed 2 (batch + single) + deterministic offline stub. |
 | `engram-rerank` (`paperfoot-engram-rerank`) | `Reranker` trait + Cohere Rerank 4 (default `rerank-v4.0-pro`, env-overridable) + passthrough. |
 | `engram-ingest` (`paperfoot-engram-ingest`) | Mining modes: papers (PDF + section-aware), takeaways, conversations, repos, general, auto. |
-| `engram-graph` (`paperfoot-engram-graph`) | Deterministic entity extraction + SQLite graph expansion. |
+| `engram-graph` (`paperfoot-engram-graph`) | The fact-extraction prompt, predicate normalisation and fact semantics. |
 | `engram-bench` (`paperfoot-engram-bench`) | Hallucination-resistance harness: LitQA2 (precision-with-abstention), BEIR-sci (nDCG@10), BioGen CSR + ALCE citation P/R, RAGAS faithfulness, plus LongMemEval / LoCoMo-Plus retrieval+QA and the strict LLM judge. |
 | `engram-cli` (`paperfoot-engram`) | The single `engram` binary and the shared hybrid retrieval pipeline. |
 
@@ -284,23 +274,18 @@ ingest.require_scope true`, `ingest.include`, `ingest.exclude`, and
 | `engram memory add/search/update/delete/list` | CRUD aliases; `memory add` takes the same flags as `remember` |
 | `engram facts list \| show <subject> \| conflicts [--open] \| resolve <id> --action <a>` | Browse the fact store and contradiction record; `--open` lists contested (unresolved) conflicts; `resolve` records the calling agent's verdict |
 | `engram facts backfill --kb <name>` | Extract facts from memories stored before extraction was on. `--diary`, `--limit`, `--dry-run`. Idempotent, oldest-first, one LLM call per memory |
-| `engram people list \| show "<name>"` | The network view over person-typed entities: aliases, mention counts, and typed relations with provenance. `--kb '*'` for every KB |
-| `engram recall <query>` | Hybrid search across **every KB** by default. Flags: `--kb` (narrow; `'*'` = all), `--all-kbs`, `--diary`, `--mode evidence\|raw\|wiki\|explore\|agent`, `--profile cloud_quality\|fast\|offline`, `--top-k`, `--layer`, `--rerank-top-n`, `--graph-hops`, `--since`/`--until` (filter on `event_time`), `--allow-mixed-embeddings`. Metadata carries `kb_scope` and `diary_isolation` |
-| `engram research <query>` | Evidence-first research retrieval. Returns query plan, evidence leads, answer context, and citation-readiness checks |
-| `engram ingest <path>` | Mine one file, or a scoped directory. `--mode papers\|takeaways\|conversations\|repos\|general\|auto`, `--compile evidence`, `--dry-run`, `--include`, `--exclude`, `--max-files`, `--all` |
+| `engram people list \| show "<name>"` | Who you know, read from live facts: a person is the subject of a personal fact or either end of a link (friend_of, introduced_by…). Each relation is a fact with its source memory. `--kb '*'` for every KB |
+| `engram recall <query>` | Hybrid search across **every KB** by default. Flags: `--kb` (narrow; `'*'` = all), `--all-kbs`, `--diary`, `--mode evidence\|raw`, `--profile cloud_quality\|fast\|offline`, `--top-k`, `--layer`, `--rerank-top-n`, `--since`/`--until` (filter on `event_time`), `--allow-mixed-embeddings`. Metadata carries `kb_scope` |
+| `engram ingest <path>` | Mine one file, or a scoped directory. `--mode papers\|takeaways\|conversations\|repos\|general\|auto`, `--dry-run`, `--include`, `--exclude`, `--max-files`, `--all` |
 | `engram documents list/show/delete` | Inspect or remove ingested source documents |
-| `engram compile --kb <name> --all` | Derive claims, source spans, entities, relations, takeaways, and wiki pages. Add `--llm` for Gemini 3.5 Flash-Lite extraction + Gemini 3.6 Flash synthesis via OpenRouter |
-| `engram jobs list/show` | Inspect compile job history |
+| `engram jobs list/show` | Inspect background jobs (fact backfill) |
 | `engram reindex --kb <name> \| --all` | Re-embed chunks with current embedding metadata |
-| `engram wiki --kb <name> [path]` | Browse generated wiki pages |
-| `engram graph neighbors <entity> --kb <name>` | Browse SQLite graph expansion, closest first. `--hops 1\|2`, `--min-weight`, `--limit`, `--typed-only` (drop weak `co_occurs_with` edges) |
 | `engram doctor --json` | Verify keys, schema, embedding consistency, and daemon port. `--integrity` also reports lifecycle residue and unregistered KBs |
 | `engram serve` / `engramd` | Start local HTTP API |
 | `engram usage [--kb <name>] [--since <rfc3339>]` | Summarize recorded Gemini/Cohere usage |
 | `engram budget show/set/clear` | Configure local daily/monthly API usage guardrails |
 | `engram edit <id>` | Update memory content or importance |
 | `engram forget <id> --confirm` | Soft-delete (destructive, requires `--confirm`) |
-| `engram entities list \| show <name>` | Browse extracted entities |
 | `engram export` / `engram import <file>` | JSON backup / restore |
 | `engram bench <suite>` | Run benchmarks. Suites: `mini`, `mini-fts`, `personal`, `scientific-mini`, `longmemeval`, `longmemeval-qa`, `locomo-plus`, `mab`, `litqa2`, `beir`, `biogen`. `personal` is the offline personal-memory quality gate |
 | `engram config show \| set \| check` | Configuration. `retrieval.default_kb` pins reads to one KB (unset = every KB) |
@@ -313,9 +298,9 @@ ingest.require_scope true`, `ingest.include`, `ingest.exclude`, and
 engram serve --host 127.0.0.1 --port 8768
 ```
 
-The daemon is local-only by default and uses the same SQLite store and retrieval/compiler code as the CLI. Supported endpoints:
+The daemon is local-only by default and uses the same SQLite store and retrieval code as the CLI. Supported endpoints:
 
-`GET /health`, `GET|POST /v1/kbs`, `GET /v1/documents`, `GET|DELETE /v1/documents/{id}`, `POST /v1/recall`, `POST /v1/research`, `POST /v1/ingest`, `POST /v1/compile`, `POST /v1/reindex`, `GET /v1/entities`, `GET /v1/entities/{id}`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/usage`, `GET|POST /v1/budget`.
+`GET /health`, `GET|POST /v1/kbs`, `GET /v1/documents`, `GET|DELETE /v1/documents/{id}`, `POST /v1/recall`, `POST /v1/ingest`, `POST /v1/reindex`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/usage`, `GET|POST /v1/budget`.
 
 ## Development
 
@@ -336,23 +321,20 @@ Benchmarks and how to reproduce them: [`benchmarks.md`](benchmarks.md).
 - Persistent SQLite store with chunk-embedding BLOBs and KB/domain evidence tables
 - Full CRUD (`remember`, `recall`, `edit`, `forget`, `export`, `import`)
 - Write-path v2: semantic supersession (predicate canonicalization + subject alias/fuzzy cascade + embedding novelty gate), typed facts with bi-temporal validity, slot policies (last-writer-wins vs never-auto-supersede safety slots), and cooperative adjudication (`--autonomy`, `adjudication_needed`, `facts conflicts --open`, `facts resolve`)
-- KB CRUD, reindex, doctor, generated wiki pages, and local daemon/API
+- KB CRUD, reindex, doctor, and local daemon/API
 - Mining modes for papers, takeaways, conversations, repos, general
 - PDF ingestion with section-aware chunking
-- Evidence compiler for cited claims, source spans, entities, relations, and takeaways
 - Memory layers (L0–L3) with token budgeting
-- Diary namespaces for specialist agents, with recall-time isolation (a diary-scoped read cannot leak via compiled claims/wiki/entities, and reports what it withheld)
+- Diary namespaces for specialist agents, with recall-time isolation
 - All-KB recall by default: a plain `recall` spans every KB, `retrieval.default_kb` pins it, `--kb`/`--all-kbs` override, and `metadata.kb_scope` reports which applied
 - Fact extraction on by default on `remember`/`memory add`, `--event-time` for real event times honored by `recall --since/--until`, and `facts backfill` for pre-existing memories
-- Person-typed entities with hygiene filters, typed person↔person relationships with accumulating provenance, `people list`/`people show`, and person-centric `graph neighbors --typed-only`
-- Entity extraction, graph browsing, and graph expansion during recall
+- `people list`/`people show`: who you know and how, as a view over live facts, each relation citing its source memory
 - `engram bench personal`: an offline, deterministic personal-memory suite (no keys, no network, no writes to the live store)
 - `engram kb repair` to register KBs that hold memories but are missing from `kb list`
-- Document/job/budget UX plus local daemon endpoints for KBs, recall, research, compile, reindex, documents, entities, jobs, usage, and budgets
-- Optional LLM compiler pass: Gemini 3.5 Flash-Lite extraction + Gemini 3.6 Flash synthesis via OpenRouter
+- Document/job/budget UX plus local daemon endpoints for KBs, recall, ingest, reindex, documents, jobs, usage, and budgets
 - Hallucination-resistance harness (loaders + scorers + unit tests): LitQA2 precision-with-abstention, BEIR-sci nDCG@10, BioGen CSR, ALCE citation P/R, repaired RAGAS faithfulness
 - LongMemEval + LoCoMo-Plus retrieval/QA harness with strict evaluation
-- `scientific-mini` evidence compiler benchmark
+- `scientific-mini` evidence retrieval benchmark
 - Unit + integration test suite (run with `cargo test`)
 
 **Next up**

@@ -93,9 +93,8 @@ Every run logs per-question results, token counts and model IDs to [`benchmarks/
 ## How it works
 
 ```
- query ─┬─ dense (Gemini Embedding 2) ─┐
-        ├─ keyword (SQLite FTS5)       ├─ rank fusion ─ rerank ─ per-source cap ─ JSON
-        └─ facts, entities, graph     ─┘
+ query ─┬─ dense (Gemini Embedding 2) ─┬─ rank fusion ─ rerank ─ relevance judge ─ per-source cap ─ JSON
+        └─ keyword (SQLite FTS5)     ─┘
 ```
 
 - **SQLite is the source of truth.** Vectors, full-text index, facts and an append-only journal live in one file.

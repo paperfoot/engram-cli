@@ -9,7 +9,7 @@
 mod wave3_read_support;
 
 use serde_json::Value;
-use wave3_read_support::{engram, remember, remember_fact, run_json, store};
+use wave3_read_support::{remember, remember_fact, run_json, store};
 
 fn is_uuid(s: &str) -> bool {
     uuid::Uuid::parse_str(s).is_ok()
@@ -127,32 +127,6 @@ fn a_safety_relation_reports_itself_as_set_valued() {
     assert_eq!(f["safety"], Value::Bool(true));
 }
 
-/// `research` answers with the same three fields, because an agent should not
-/// have to learn a second shape to follow a citation home.
-#[test]
-fn research_hits_carry_the_same_provenance_fields() {
-    let dir = store();
-    remember(dir.path(), "Ana moved to Lisbon in March", "papers");
-    let v = run_json(
-        dir.path(),
-        &[
-            "research",
-            "Lisbon",
-            "--kb",
-            "papers",
-            "--profile",
-            "offline",
-        ],
-    );
-    let rows = v["data"]["results"].as_array().expect("results");
-    assert!(!rows.is_empty(), "{v}");
-    for row in rows {
-        assert!(row.get("memory_id").is_some(), "{row}");
-        assert!(row.get("handle").is_some(), "{row}");
-        assert!(row["provenance"].is_object(), "{row}");
-    }
-}
-
 /// A derived row must never carry a fabricated memory id. There is no cheap
 /// offline way to compile a wiki page, so this pins the rule at the surface
 /// that would publish one: `people show` snippets always resolve to a real
@@ -177,22 +151,3 @@ fn derived_rows_declare_their_derivation_instead_of_inventing_a_link() {
     assert_eq!(prov["chunk_id"], Value::Null);
 }
 
-#[test]
-fn a_wiki_page_carries_a_page_id_and_no_unresolvable_handle() {
-    let dir = store();
-    remember(dir.path(), "Ana moved to Lisbon", "personal");
-    let v = run_json(dir.path(), &["wiki", "--kb", "personal"]);
-    // Empty is fine — the point is the listing counters exist and no
-    // `wiki:` handle was invented.
-    assert!(v["data"].get("total").is_some(), "{v}");
-    assert!(v["data"]["pages"].is_array());
-    let out = engram(dir.path())
-        .args(["wiki", "--kb", "personal", "--path", "index", "--json"])
-        .output();
-    if let Ok(out) = out {
-        if out.status.success() {
-            let page: Value = serde_json::from_slice(&out.stdout).expect("json");
-            assert!(page["data"].get("handle").is_none(), "{page}");
-        }
-    }
-}
