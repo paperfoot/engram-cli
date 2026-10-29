@@ -90,6 +90,9 @@ fn canon(f: &Fact) -> String {
 /// partner). They make their subject or object a person only when the name
 /// reads as a person's.
 const NEEDS_A_NAME: &[&str] = &[
+    "has_nickname",
+    "also_known_as",
+    "goes_by",
     "has_email",
     "has_phone_number",
     "client_of",
@@ -473,9 +476,11 @@ mod tests {
         let m = memory_of(&store);
         fact(&store, m, "Acme Labs", "has_email", "support@example.com");
         fact(&store, m, "Acme Capital", "investor_in", "Example Labs");
+        fact(&store, m, "Acme Group", "also_known_as", "Acme");
         let not_org = |v: &str| name(v) && !v.contains("Acme") && !v.contains("Labs");
         let (people, _) = store.list_people(None, 50, 0, 1, &not_org).unwrap();
         assert!(people.iter().all(|p| !p.name.contains("Acme")), "{people:?}");
+        assert!(store.resolve_person(None, "acme", &not_org).unwrap().is_empty());
     }
 
     #[test]

@@ -429,19 +429,25 @@ impl SqliteStore {
         }))
     }
 
-    /// True when the journal holds this memory's whole life — its
-    /// `memory.written` event — and no `memory.revised` since.
+    /// True when the journal holds this memory's whole life — a REAL
+    /// `memory.written` event, not one v10 or a v2 import synthesized for a
+    /// memory that predates the journal — and no `memory.revised` since.
     fn text_never_revised(&self, memory_id: &str) -> Result<bool, StorageError> {
         let (written, revised): (i64, i64) = self.conn.query_row(
-            "SELECT COALESCE(SUM(kind = 'memory.written'), 0), COALESCE(SUM(kind = 'memory.revised'), 0)
+            "SELECT COALESCE(SUM(kind = 'memory.written' AND actor NOT IN (?2, ?3)), 0),
+                    COALESCE(SUM(kind = 'memory.revised'), 0)
              FROM events WHERE subject_id = ?1",
-            params![memory_id],
+            params![
+                memory_id,
+                crate::journal::ACTOR_MIGRATION_V10,
+                crate::journal::ACTOR_IMPORT_V2
+            ],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         Ok(written > 0 && revised == 0)
     }
 
-    /// The memory behind the first cited chunk that still exists, with its
+    /// The memory behind the newest cited chunk that still exists, with its
     /// diary and the time its event happened.
     fn live_source(
         &self,
@@ -457,6 +463,7 @@ impl SqliteStore {
             },
             _ => Vec::new(),
         };
+        let mut best: Option<(Uuid, String, Option<DateTime<Utc>>)> = None;
         for source in &sources {
             // The chunk, not the memory: an edit keeps the memory id but
             // replaces its chunks, so only a surviving chunk proves the
@@ -514,10 +521,15 @@ impl SqliteStore {
                 let at = at
                     .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
                     .map(|t| t.with_timezone(&Utc));
-                return Ok(Some((id, diary, at)));
+                // Sources accumulate in no particular order; the newest live
+                // one dates the link, so a relationship last confirmed in
+                // 2026 outranks one last seen in 2024.
+                if best.as_ref().map_or(true, |(_, _, b)| at > *b) {
+                    best = Some((id, diary, at));
+                }
             }
         }
-        Ok(None)
+        Ok(best)
     }
 }
 
@@ -763,6 +775,26 @@ mod tests {
     }
 
     #[test]
+    fn a_genesis_event_synthesized_by_v10_proves_nothing() {
+        let store = seeded();
+        cite_a_repaired_chunk(&store);
+        store
+            .conn
+            .execute(
+                "INSERT INTO events(id, ts, actor, kind, subject_id, payload)
+                 VALUES (?1, ?2, ?3, 'memory.written', ?4, '{}')",
+                params![
+                    Uuid::new_v4().to_string(),
+                    Utc::now().to_rfc3339(),
+                    crate::journal::ACTOR_MIGRATION_V10,
+                    MEMORY
+                ],
+            )
+            .unwrap();
+        assert_eq!(copy(&store).skipped_no_live_source, 1);
+    }
+
+    #[test]
     fn a_compiled_value_newer_than_a_closed_one_is_copied() {
         let store = seeded();
         set_link(&store, "e1", "e2", "married_to");
@@ -823,6 +855,28 @@ mod tests {
             .query_row("SELECT status FROM compile_jobs WHERE id = 'j1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn the_newest_live_source_dates_a_link() {
+        let store = seeded();
+        let newer = "8b0c2a1e-6d0b-4a55-9d1e-2b7c1f3e9a42";
+        let now = Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute_batch(&format!(
+                "UPDATE memories SET event_time = '2020-06-01T00:00:00+00:00' WHERE id = '{MEMORY}';
+                 INSERT INTO memories(id, content, created_at, event_time, importance, emotional_weight,
+                     access_count, stability, source_json, diary, tags_json, deleted, kb)
+                 VALUES ('{newer}', 'Lira introduced Elias again.', '{now}', '2026-06-01T00:00:00+00:00', 5, 0, 0,
+                     1.0, '{{\"type\":\"user\"}}', 'default', '[]', 0, 'network');
+                 INSERT INTO chunks(id, memory_id, content, position) VALUES ('c8', '{newer}', 'Lira introduced Elias again.', 0);
+                 UPDATE relations SET provenance_json = '{{\"sources\":[{{\"chunk_id\":\"{CHUNK}\",\"memory_id\":\"{MEMORY}\"}},{{\"chunk_id\":\"c8\",\"memory_id\":\"{newer}\"}}]}}' WHERE id = 'r1';"
+            ))
+            .unwrap();
+        copy(&store);
+        let fact = store.get_active_facts("elias", "introduced_by", "default").unwrap();
+        assert_eq!(fact[0].source_memory_id.to_string(), newer);
     }
 
     #[test]
