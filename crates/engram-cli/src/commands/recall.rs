@@ -227,6 +227,11 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             // Present only when the relevance judge answered for this row.
             if let Some(p) = r.relevance {
                 v["relevance"] = json!(engram_llm::judge::wire_decimal(p));
+                // The judge saw only the passage's prefix: the score is not
+                // a verdict on the whole, and the result was never dropped.
+                if crate::retrieval::judged_on_prefix(&r.content) {
+                    v["relevance_on_prefix"] = json!(true);
+                }
             }
             v
         })

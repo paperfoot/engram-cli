@@ -15,7 +15,9 @@ use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::extract_entities;
-use engram_llm::judge::questions::{relevance_request, RelevancePassage, RELEVANCE_FLOOR};
+use engram_llm::judge::questions::{
+    relevance_request, RelevancePassage, RELEVANCE_FLOOR, RELEVANCE_PASSAGE_CHARS,
+};
 use engram_llm::judge::{
     ask_batched, wire_decimal, Judge, JudgeResponse, MAX_QUESTIONS_PER_REQUEST,
 };
@@ -808,6 +810,10 @@ pub fn build_fts_query(text: &str) -> String {
 /// - `shadow`: every judged result carries `relevance`; nothing is dropped.
 /// - `on`: results below [`RELEVANCE_FLOOR`] are dropped; when none clears
 ///   it the recall abstains (`no_match`, reason `no_candidate_above_cutoff`).
+///   A passage longer than [`RELEVANCE_PASSAGE_CHARS`] is judged on its
+///   prefix only, so a low score says nothing about its tail: it is kept
+///   (see [`judged_on_prefix`]), never dropped and never the reason for
+///   `no_match`.
 /// - A failed call, or a result the judge did not answer, keeps today's
 ///   output for that result: an outage never empties a recall.
 pub struct RelevanceJudge {
@@ -824,6 +830,9 @@ pub struct RelevanceReport {
     pub judged: usize,
     /// Results dropped below the floor (`on` only).
     pub dropped: usize,
+    /// Results below the floor kept because the judge saw only their
+    /// prefix (`on` only).
+    pub kept_on_prefix: usize,
     /// Best P(answers) among the judged results.
     pub top_relevance: Option<f32>,
     /// True when `on` dropped every result: the recall abstains.
@@ -844,6 +853,7 @@ impl RelevanceReport {
             "floor": wire_decimal(self.floor),
             "judged": self.judged,
             "dropped": self.dropped,
+            "kept_on_prefix": self.kept_on_prefix,
             "top_relevance": self.top_relevance.map(wire_decimal),
             "abstained": self.abstained,
         });
@@ -884,6 +894,7 @@ impl RelevanceJudge {
             floor: RELEVANCE_FLOOR,
             judged: 0,
             dropped: 0,
+            kept_on_prefix: 0,
             top_relevance: None,
             abstained: false,
             error: None,
@@ -930,12 +941,24 @@ impl RelevanceJudge {
             });
         if self.mode == JudgeMode::On {
             let before = results.len();
-            results.retain(|r| r.relevance.is_none_or(|p| p >= RELEVANCE_FLOOR));
+            let below = |r: &HybridResult| r.relevance.is_some_and(|p| p < RELEVANCE_FLOOR);
+            report.kept_on_prefix = results
+                .iter()
+                .filter(|r| below(r) && judged_on_prefix(&r.content))
+                .count();
+            results.retain(|r| !below(r) || judged_on_prefix(&r.content));
             report.dropped = before - results.len();
             report.abstained = results.is_empty();
         }
         report
     }
+}
+
+/// True when the relevance judge sees only a prefix of `content` (it is cut
+/// to [`RELEVANCE_PASSAGE_CHARS`]): its score speaks for the prefix, not the
+/// passage, so it may be reported but never used to drop it.
+pub fn judged_on_prefix(content: &str) -> bool {
+    content.chars().nth(RELEVANCE_PASSAGE_CHARS).is_some()
 }
 
 /// A memory's date as the judge reads it: when it happened, else when it was
@@ -1826,6 +1849,40 @@ mod tests {
             provenance: Provenance::for_kb(kb),
             relevance: None,
         }
+    }
+
+    fn stub_judge(mode: JudgeMode, spec: &str) -> RelevanceJudge {
+        RelevanceJudge {
+            mode,
+            judge: Box::new(engram_llm::judge::stub::StubJudge::parse(spec).unwrap()),
+        }
+    }
+
+    /// The judge sees the first RELEVANCE_PASSAGE_CHARS of a passage. A wiki
+    /// page whose answer sits past that scored low on its introduction and
+    /// was dropped whole, and an all-dropped recall said `no_match`.
+    #[tokio::test]
+    async fn a_passage_judged_on_its_prefix_is_never_dropped() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let long = format!(
+            "{} Noemi Varkoni works at Halden Labs.",
+            "Background on the lab. ".repeat(100)
+        );
+        assert!(judged_on_prefix(&long));
+        let mut results = vec![
+            result("wiki", "personal", &long),
+            result("chunk", "personal", "Elias keeps his gear in the van."),
+        ];
+        let judge = stub_judge(JudgeMode::On, "0.02");
+        let report = judge
+            .apply(&store, "Where does Noemi work?", &mut results)
+            .await;
+        assert_eq!(results.len(), 1, "the short miss is dropped");
+        assert_eq!(results[0].content, long, "the long passage is kept");
+        assert_eq!(results[0].relevance, Some(0.02), "its score is reported");
+        assert_eq!(report.dropped, 1);
+        assert_eq!(report.kept_on_prefix, 1);
+        assert!(!report.abstained);
     }
 
     fn citation(source: Option<&str>, chunk_id: Option<Uuid>) -> SourceCitation {
