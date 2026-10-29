@@ -50,9 +50,13 @@ fn undecided() -> String {
 const NO_ANSWER: &str = r#"{"no question says this": 0.5}"#;
 
 /// `remember --facts-json … --autonomy full` with the judge scripted by `spec`.
+/// A TypeSafe key is configured, which is consent to judge; the stub beats
+/// every key, so nothing leaves the machine.
 fn judged(store: &std::path::Path, content: &str, facts_json: &str, spec: &str) -> Value {
     run_json(
-        engram(store).env("ENGRAM_JUDGE_STUB", spec),
+        engram(store)
+            .env("ENGRAM_JUDGE_STUB", spec)
+            .env("TYPESAFE_API_KEY", "ts-test-not-a-key"),
         &[
             "remember",
             content,
@@ -183,6 +187,74 @@ fn full_autonomy_without_a_judge_queues_like_assisted() {
     assert_eq!(queued(&v).len(), 1, "{v}");
     assert_eq!(v["metadata"]["adjudication"]["calls"], 0, "{v}");
     assert!(note_kinds(&v).is_empty(), "{v}");
+}
+
+/// An OpenRouter key was set for extraction; it is not consent to send the
+/// memory text to TypeSafe. `--autonomy full` with a judge reachable but no
+/// TypeSafe key and no `judge.adjudicate` setting used to ask anyway. Now
+/// nothing is sent and the pair queues with a reason the agent can read.
+#[test]
+fn full_autonomy_without_consent_sends_nothing_and_says_why() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
+    );
+    let mut cmd = engram(tmp.path());
+    // The stub stands in for the judge OpenRouter would reach.
+    cmd.env("ENGRAM_JUDGE_STUB", supersede())
+        .env("OPENROUTER_API_KEY", "sk-or-test-not-a-key");
+    let v = run_json(
+        &mut cmd,
+        &[
+            "remember",
+            "Ana was born 1990-04-13.",
+            "--kb",
+            "personal",
+            "--no-extract-facts",
+            "--autonomy",
+            "full",
+            "--facts-json",
+            &birthday("1990-04-13"),
+        ],
+    );
+    assert_eq!(queued(&v).len(), 1, "the pair is the agent's: {v}");
+    assert_eq!(v["metadata"]["adjudication"]["calls"], 0, "{v}");
+    let notes = v["data"]["plan_notes"].as_array().cloned().unwrap();
+    assert_eq!(notes.len(), 1, "{v}");
+    assert_eq!(notes[0]["kind"], "adjudication_failed", "{v}");
+    assert!(
+        notes[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("judge_not_consented"),
+        "{v}"
+    );
+
+    // An explicit judge.adjudicate opts in through the same route.
+    let mut cmd = engram(tmp.path());
+    cmd.env("ENGRAM_JUDGE_STUB", supersede())
+        .env("OPENROUTER_API_KEY", "sk-or-test-not-a-key")
+        .env("ENGRAM_JUDGE_ADJUDICATE", "on");
+    let v = run_json(
+        &mut cmd,
+        &[
+            "remember",
+            "Ana was born 1990-04-14.",
+            "--kb",
+            "personal",
+            "--no-extract-facts",
+            "--autonomy",
+            "full",
+            "--facts-json",
+            &birthday("1990-04-14"),
+        ],
+    );
+    assert!(
+        v["metadata"]["adjudication"]["calls"].as_u64().unwrap() >= 1,
+        "{v}"
+    );
 }
 
 // ----- a restatement discards the WHOLE observation ------------------------

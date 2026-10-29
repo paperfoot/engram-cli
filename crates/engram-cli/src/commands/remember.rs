@@ -24,9 +24,10 @@ use crate::context::AppContext;
 use crate::error::CliError;
 use crate::fact_llm::FactLlm;
 use crate::fact_write::{
-    write_fact_batch, Autonomy, FactBatch, FactBatchError, FactExtractionMarker, FactWriteCtx,
-    FactWriteOutcome, GroundingJudge, MemoryTime,
+    write_fact_batch, Adjudicator, Autonomy, FactBatch, FactBatchError, FactExtractionMarker,
+    FactWriteCtx, FactWriteOutcome, GroundingJudge, MemoryTime,
 };
+use crate::judge::JudgeSite;
 use crate::output::{print_success, Metadata};
 use crate::retrieval::{resolve_write_embedder, WriteEmbedder};
 use chrono::{DateTime, Utc};
@@ -35,7 +36,6 @@ use engram_core::types::{Memory, MemorySource, SourceKind};
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::facts::{extract_facts, ExtractedFact};
 use engram_ingest::memory::chunk_memory;
-use engram_llm::judge::Judge;
 use serde_json::json;
 use std::time::Instant;
 use uuid::Uuid;
@@ -253,11 +253,22 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // the memory is stored and its fact batch fails.
     crate::fact_write::gate_thresholds()?;
     let grounding = GroundingJudge::resolve(offline)?;
-    // `--autonomy full` settles queued pairs with the JEV conflict rule; with
-    // no judge reachable they queue, exactly as under `assisted`.
-    let adjudicator = match autonomy {
-        Autonomy::Full => crate::judge::resolve_judge(offline)?,
+    // `--autonomy full` settles queued pairs with the JEV conflict rule, if
+    // judge.adjudicate consents (a TypeSafe key, or an explicit shadow|on).
+    // With no judge reachable they queue, exactly as under `assisted`; with
+    // a judge reachable but no consent they queue and the envelope says so.
+    let adjudication_judge = match autonomy {
+        Autonomy::Full => crate::judge::site_judge(JudgeSite::Adjudicate, offline)?,
         _ => None,
+    };
+    let adjudicator = match &adjudication_judge {
+        Some((mode, judge)) => Adjudicator::Judge(judge.as_ref(), *mode),
+        None if autonomy == Autonomy::Full
+            && crate::judge::withheld(JudgeSite::Adjudicate, offline)? =>
+        {
+            Adjudicator::Withheld
+        }
+        None => Adjudicator::None,
     };
 
     // The KB budget guards PAID calls: cloud embedding, LLM extraction /
@@ -271,7 +282,10 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     let extraction_may_spend = !no_extract_facts
         && crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
             .is_some();
-    if write_embedder.cloud || extraction_may_spend || grounding.is_some() || adjudicator.is_some()
+    if write_embedder.cloud
+        || extraction_may_spend
+        || grounding.is_some()
+        || adjudication_judge.is_some()
     {
         crate::commands::budget::enforce_budget(ctx, Some(&kb))?;
     }
@@ -329,7 +343,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                         created_at: stored_created,
                     },
                     autonomy,
-                    adjudicator: adjudicator.as_deref(),
+                    adjudicator,
                     embedder: write_embedder.embedder.as_ref(),
                     facts: &caller_facts,
                     marker: None,
@@ -626,7 +640,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 created_at: now,
             },
             autonomy,
-            adjudicator: adjudicator.as_deref(),
+            adjudicator,
             embedder: embedder.as_ref(),
             facts: &caller_facts,
             marker: None,
@@ -650,7 +664,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
                 created_at: now,
             },
             autonomy,
-            adjudicator: adjudicator.as_deref(),
+            adjudicator,
             embedder: embedder.as_ref(),
             facts: &extracted,
             marker,
@@ -793,7 +807,7 @@ struct FactBatchPlan<'a> {
     autonomy: Autonomy,
     /// The judge `--autonomy full` asks about queued pairs (see
     /// `fact_write::conflict_rule`).
-    adjudicator: Option<&'a dyn Judge>,
+    adjudicator: Adjudicator<'a>,
     /// The SAME embedder the chunks were written with. The novelty gate has to
     /// agree with the index it is gating: `novelty_gate` skips candidates of a
     /// different width, so a gate on another embedder calls every fact novel.

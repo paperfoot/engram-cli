@@ -4,7 +4,7 @@
 //!   query -> dense Gemini/stub search -> FTS5 BM25 -> claim/wiki/entity search
 //!        -> graph expansion -> RRF fusion -> optional Cohere rerank.
 
-use crate::judge::{judge_mode, resolve_judge, JudgeMode, JudgeSite};
+use crate::judge::{site_judge, JudgeMode, JudgeSite};
 use crate::read_surface::{
     Provenance, RecallStats, DERIVED_ENTITY, DERIVED_RELATION, DERIVED_WIKI,
 };
@@ -883,15 +883,13 @@ impl RelevanceJudge {
     /// or no judge is reachable (no key, `--offline`,
     /// `ENGRAM_BENCH_FORCE_STUB`). A bad setting is exit 2.
     pub fn resolve(offline: bool) -> Result<Option<Self>, crate::error::CliError> {
-        let mode = judge_mode(JudgeSite::Relevance)?;
-        if mode == JudgeMode::Off {
-            return Ok(None);
-        }
-        Ok(resolve_judge(offline)?.map(|judge| RelevanceJudge {
-            mode,
-            judge,
-            deadline: RELEVANCE_DEADLINE,
-        }))
+        Ok(
+            site_judge(JudgeSite::Relevance, offline)?.map(|(mode, judge)| RelevanceJudge {
+                mode,
+                judge,
+                deadline: RELEVANCE_DEADLINE,
+            }),
+        )
     }
 
     pub fn mode(&self) -> JudgeMode {

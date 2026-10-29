@@ -1209,7 +1209,7 @@ pub async fn backfill(
                 created_at: memory.created_at,
             },
             embedder: Some(gate_embedder.as_ref()),
-            adjudicator: None,
+            adjudicator: crate::fact_write::Adjudicator::None,
             autonomy: Autonomy::default(),
             source_kind: SourceKind::AgentExtracted,
         };

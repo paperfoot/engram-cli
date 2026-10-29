@@ -37,7 +37,7 @@
 
 use crate::context::AppContext;
 use crate::error::CliError;
-use crate::judge::{judge_mode, record_judge_usage, resolve_judge, JudgeMode, JudgeSite};
+use crate::judge::{record_judge_usage, site_judge, JudgeMode, JudgeSite};
 use chrono::{DateTime, Utc};
 use engram_core::interval::{may_close, CloseAuthority, CloseReason, CloseVerdict, Interval};
 use engram_core::relations::{canonical_relation, cessation_of, member_identity, relation_spec};
@@ -548,11 +548,35 @@ pub struct FactWriteCtx<'a> {
     pub memory_time: MemoryTime,
     /// Powers the novelty gate. `None` = gate off, exact path only.
     pub embedder: Option<&'a dyn Embedder>,
-    /// The JEV judge `--autonomy full` asks about queued pairs. `None` under
-    /// any other autonomy, or when no judge is reachable: the pairs queue.
-    pub adjudicator: Option<&'a dyn Judge>,
+    /// Who settles queued pairs under `--autonomy full`.
+    pub adjudicator: Adjudicator<'a>,
     pub autonomy: Autonomy,
     pub source_kind: SourceKind,
+}
+
+/// Who settles queued pairs under `--autonomy full` (see `judge.adjudicate`).
+#[derive(Clone, Copy, Default)]
+pub enum Adjudicator<'a> {
+    /// Any other autonomy, or no judge reachable: the pairs queue, as under
+    /// `assisted`.
+    #[default]
+    None,
+    /// A judge is reachable but `judge.adjudicate` is off (unset with no
+    /// TypeSafe key: no consent). Nothing is sent; the pairs queue with
+    /// `adjudication_failed`, reason `judge_not_consented`.
+    Withheld,
+    /// Asked about every routine pair. Under `shadow` the verdict is
+    /// recorded but not applied (reason `judge_shadow`).
+    Judge(&'a dyn Judge, JudgeMode),
+}
+
+impl<'a> Adjudicator<'a> {
+    pub fn judge(self) -> Option<&'a dyn Judge> {
+        match self {
+            Adjudicator::Judge(judge, _) => Some(judge),
+            _ => None,
+        }
+    }
 }
 
 /// Write one extracted fact through the write-path v2 pipeline.
@@ -749,11 +773,8 @@ impl GroundingJudge {
     /// `ENGRAM_BENCH_FORCE_STUB`). Resolve once per command, before anything
     /// is written: a bad setting is exit 2, not a half-write.
     pub fn resolve(offline: bool) -> Result<Option<Self>, CliError> {
-        let mode = judge_mode(JudgeSite::Grounding)?;
-        if mode == JudgeMode::Off {
-            return Ok(None);
-        }
-        Ok(resolve_judge(offline)?.map(|judge| GroundingJudge { mode, judge }))
+        Ok(site_judge(JudgeSite::Grounding, offline)?
+            .map(|(mode, judge)| GroundingJudge { mode, judge }))
     }
 }
 
@@ -977,8 +998,9 @@ pub async fn write_fact_batch(
     };
 
     let judged = match (w.autonomy, w.adjudicator) {
-        (Autonomy::Full, Some(judge)) => {
-            gather_judgements(ctx, w, &facts, &cache, judge, batch.source_text)
+        (Autonomy::Full, Adjudicator::Judge(judge, mode)) => {
+            let shadow = mode == JudgeMode::Shadow;
+            gather_judgements(ctx, w, &facts, &cache, judge, shadow, batch.source_text)
                 .await
                 .map_err(|(i, e)| fail(i, e))?
         }
@@ -1134,6 +1156,7 @@ async fn gather_judgements(
     facts: &[ExtractedFact],
     cache: &FactEmbedCache,
     judge: &dyn Judge,
+    shadow: bool,
     source_text: &str,
 ) -> Result<Vec<Option<Judged>>, (usize, CliError)> {
     let mut discarded = FactWriteOutcome::default();
@@ -1158,7 +1181,12 @@ async fn gather_judgements(
                 if pairs.is_empty() {
                     None
                 } else {
-                    let judgement = judge_pairs(judge, source_text, &p.observation, &pairs).await;
+                    let mut judgement =
+                        judge_pairs(judge, source_text, &p.observation, &pairs).await;
+                    // Shadow: asked and paid for, never applied.
+                    if shadow && judgement.answers.is_ok() {
+                        judgement.answers = Err("judge_shadow");
+                    }
                     if let Some(r) = &judgement.response {
                         record_judge_usage(
                             ctx,
@@ -1635,7 +1663,20 @@ async fn write_judged_fact(
             .get(&q.old_fact_id)
             .is_some_and(|old| !pair_is_safety(&p.observation, old))
     });
-    if !applied && w.autonomy == Autonomy::Full && w.adjudicator.is_some() && routine_queued {
+    if !applied
+        && w.autonomy == Autonomy::Full
+        && matches!(w.adjudicator, Adjudicator::Withheld)
+        && routine_queued
+    {
+        // No consent to send this memory to the judge: the agent decides.
+        plan.notes.push(PlanNote::AdjudicationFailed {
+            reason: "judge_not_consented",
+        });
+    } else if !applied
+        && w.autonomy == Autonomy::Full
+        && w.adjudicator.judge().is_some()
+        && routine_queued
+    {
         // The store moved between judging and writing (an earlier fact of
         // this batch landed), so no verdict answers THESE pairs. Either the
         // judge answered different pairs, or it was never asked: the pairs

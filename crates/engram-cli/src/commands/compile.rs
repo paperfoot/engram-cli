@@ -758,7 +758,9 @@ async fn gather_llm(
     // `off` never resolves a judge, so none of its settings are read.
     let judge = match mode {
         JudgeMode::Off => None,
-        JudgeMode::Shadow | JudgeMode::On => crate::judge::resolve_judge(false)?,
+        JudgeMode::Shadow | JudgeMode::On => {
+            crate::judge::site_judge(JudgeSite::Grounding, false)?.map(|(_, judge)| judge)
+        }
     };
     stats.judge_mode = Some(mode.as_str().to_string());
     if mode != JudgeMode::Off {
@@ -1082,7 +1084,7 @@ async fn insert_llm_evidence(
         // plus the classifier do the work, and an embedding call per fact
         // inside the compile transaction is a paid round trip per fact.
         embedder: None,
-        adjudicator: None,
+        adjudicator: crate::fact_write::Adjudicator::None,
         // `assisted`, not `strict`: a compile must still be able to record
         // that a 2024 paper supersedes a 2015 one. `strict` would queue that
         // too, which is how a corpus rebuilds the backlog nobody reads.

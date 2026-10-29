@@ -37,14 +37,16 @@ fn seeded() -> tempfile::TempDir {
 }
 
 /// `recall` with a scripted judge; `mode` `None` leaves the site at its
-/// default.
+/// default. With a judge, a TypeSafe key is configured too (the consent the
+/// default needs); the stub beats every key, so nothing leaves the machine.
 fn recall(store: &Path, query: &str, mode: Option<&str>, judge: Option<&str>) -> Value {
     let mut cmd = engram(store);
     if let Some(m) = mode {
         cmd.env("ENGRAM_JUDGE_RELEVANCE", m);
     }
     if let Some(spec) = judge {
-        cmd.env("ENGRAM_JUDGE_STUB", spec);
+        cmd.env("ENGRAM_JUDGE_STUB", spec)
+            .env("TYPESAFE_API_KEY", "ts-test-not-a-key");
     }
     run_json(&mut cmd, &["recall", query])
 }
@@ -190,6 +192,14 @@ fn only_a_typesafe_key_turns_relevance_on_by_default() {
     let v = show(("OPENROUTER_API_KEY", "sk-or-test"));
     let j = &v["data"]["judge"];
     assert_eq!(j["relevance"], "off", "{v}");
+    assert_eq!(j["adjudicate"], "off", "one consent rule: {v}");
+    assert!(
+        j["adjudicate_source"]
+            .as_str()
+            .unwrap()
+            .starts_with("default off"),
+        "{v}"
+    );
     assert!(
         j["relevance_source"]
             .as_str()
@@ -200,6 +210,7 @@ fn only_a_typesafe_key_turns_relevance_on_by_default() {
     let v = show(("TYPESAFE_API_KEY", "ts-test"));
     let j = &v["data"]["judge"];
     assert_eq!(j["relevance"], "on", "{v}");
+    assert_eq!(j["adjudicate"], "on", "{v}");
     assert!(
         j["relevance_source"]
             .as_str()

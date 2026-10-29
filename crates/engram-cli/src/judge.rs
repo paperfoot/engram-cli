@@ -8,21 +8,24 @@
 //!   used). Env `ENGRAM_JUDGE_<SITE>` overrides config `judge.<site>`; blank
 //!   means unset, as for every engram setting. Any other value is a config
 //!   error (exit 2), never a silent default.
-//! - [`resolve_judge`]: `ENGRAM_JUDGE_STUB` (a scripted offline judge, see
+//! - [`site_judge`]: the ONE way a site gets a judge. `None` when the site
+//!   is off, which is also the consent gate below; otherwise the route.
+//!   Route precedence: `ENGRAM_JUDGE_STUB` (a scripted offline judge, see
 //!   [`StubJudge`]) beats everything. Otherwise `--offline` and
 //!   `ENGRAM_BENCH_FORCE_STUB` mean no judge, because a judge call is a
 //!   network call. Then TypeSafe direct (`TYPESAFE_API_KEY` /
 //!   `keys.typesafe`), then TypeSafe via OpenRouter (`OPENROUTER_API_KEY` /
 //!   `keys.openrouter`), else none.
 //!
-//! A judge request carries a memory to a third party, and engram stores
-//! personal and medical memories, so every site defaults to `off` except
-//! `relevance`: without it recall cannot say "nothing stored answers this".
-//! Its default is `on` only when a TypeSafe key is configured
-//! (`TYPESAFE_API_KEY` / `keys.typesafe`): configuring TypeSafe is opting
-//! into TypeSafe. An OpenRouter key alone was set for another purpose and is
-//! not consent, so with only that key the site stays `off` until
-//! `judge.relevance` is set explicitly. See [`relevance_default`].
+//! Consent, one rule for every site: a judge request carries a memory to a
+//! third party, and engram stores personal and medical memories, so a site
+//! may send content only if a TypeSafe key is configured (`TYPESAFE_API_KEY`
+//! / `keys.typesafe`: configuring TypeSafe is opting into TypeSafe) or its
+//! own setting is explicitly `shadow` or `on`. An OpenRouter key alone was
+//! set for extraction and is not consent. `relevance` (recall abstention)
+//! and `adjudicate` (`remember --autonomy full`) default to `on` with a
+//! TypeSafe key; grounding and dedupe default to `off` regardless. See
+//! [`mode_source`].
 
 use crate::commands::config;
 use crate::context::AppContext;
@@ -118,19 +121,21 @@ impl JudgeSite {
     }
 
     /// Whether any command in this build asks the judge for this site.
-    /// Adjudicate and dedupe are read and reported only: setting them to
-    /// shadow or on changes nothing, and status says so.
+    /// Dedupe is read and reported only: setting it to shadow or on changes
+    /// nothing, and status says so. Adjudicate is asked by `remember
+    /// --autonomy full`.
     pub fn consulted(self) -> bool {
-        matches!(self, JudgeSite::Grounding | JudgeSite::Relevance)
+        !matches!(self, JudgeSite::Dedupe)
     }
 
     /// The mode when neither env nor config sets one. `consented`: the user
-    /// configured TypeSafe itself (see [`typesafe_consented`]). Relevance is
-    /// then on: its eval cleared the bar (see `questions::RELEVANCE_FLOOR`),
-    /// and without it recall cannot abstain at all. Every other site is off.
+    /// configured TypeSafe itself (see [`typesafe_consented`]). Relevance and
+    /// adjudicate are then on: their evals cleared the bar (see
+    /// `questions::RELEVANCE_FLOOR` and `fact_write::conflict_rule`). Every
+    /// other site, and every site without consent, is off.
     pub fn default_mode(self, consented: bool) -> JudgeMode {
         match self {
-            JudgeSite::Relevance if consented => JudgeMode::On,
+            JudgeSite::Relevance | JudgeSite::Adjudicate if consented => JudgeMode::On,
             _ => JudgeMode::Off,
         }
     }
@@ -158,18 +163,16 @@ pub fn judge_mode(site: JudgeSite) -> Result<JudgeMode, CliError> {
 }
 
 /// Whether the user opted into TypeSafe judging by configuring TypeSafe: a
-/// TypeSafe key (`TYPESAFE_API_KEY` / `keys.typesafe`) resolves, or the
-/// offline test stub stands in for the judge (nothing leaves the machine).
-/// An OpenRouter key is not consent: it was set for extraction.
+/// TypeSafe key (`TYPESAFE_API_KEY` / `keys.typesafe`) resolves. An
+/// OpenRouter key is not consent: it was set for extraction. The test stub
+/// is a route, not consent: tests opt in like users do.
 pub fn typesafe_consented() -> bool {
-    std::env::var(STUB_ENV).is_ok_and(|s| !s.trim().is_empty())
-        || config::resolve_secret("TYPESAFE_API_KEY", "keys.typesafe").is_some()
+    config::resolve_secret("TYPESAFE_API_KEY", "keys.typesafe").is_some()
 }
 
-/// Why `judge.relevance` has the mode it has, for `config check` and
+/// Why `site` has the mode it has, for `config show`, `config check` and
 /// `doctor`: set by env, set in config, or which default applies.
-pub fn relevance_default() -> String {
-    let site = JudgeSite::Relevance;
+pub fn mode_source(site: JudgeSite) -> String {
     if std::env::var(site.env_var()).is_ok_and(|v| !v.trim().is_empty()) {
         return format!("set by {}", site.env_var());
     }
@@ -177,16 +180,22 @@ pub fn relevance_default() -> String {
     {
         return format!("set by {} in config.toml", site.config_key());
     }
-    relevance_default_why(typesafe_consented())
+    default_why(site, typesafe_consented())
 }
 
-fn relevance_default_why(consented: bool) -> String {
-    if consented {
-        "default on: a TypeSafe key is configured, which opts into TypeSafe judging;          `engram config set judge.relevance off` stops it"
-            .into()
-    } else {
-        "default off: no TypeSafe key is configured, and an OpenRouter key alone is not          consent to send recalled passages to TypeSafe; `engram config set judge.relevance on`          opts in through either key"
-            .into()
+fn default_why(site: JudgeSite, consented: bool) -> String {
+    let key = site.config_key();
+    match site.default_mode(consented) {
+        JudgeMode::On => format!(
+            "default on: a TypeSafe key is configured, which opts into TypeSafe judging; \
+             `engram config set {key} off` stops it"
+        ),
+        _ if site.default_mode(true) == JudgeMode::On => format!(
+            "default off: no TypeSafe key is configured, and an OpenRouter key alone is not \
+             consent to send memory text to TypeSafe; `engram config set {key} on` opts in \
+             through either key"
+        ),
+        _ => format!("default off: `engram config set {key} on` opts in"),
     }
 }
 
@@ -293,10 +302,33 @@ fn route_from(
     Ok(openrouter_key().map(Route::OpenRouter))
 }
 
+/// The judge `site` may ask, with its mode, or `None` when the site is off
+/// (unset with no TypeSafe key is off: the consent rule) or no judge is
+/// reachable (no key, `--offline`, `ENGRAM_BENCH_FORCE_STUB`). Every judged
+/// site resolves through here, so no site can send content without consent.
+/// A bad setting is exit 2. Build it once per command: the TypeSafe client
+/// pools its connections.
+pub fn site_judge(
+    site: JudgeSite,
+    offline: bool,
+) -> Result<Option<(JudgeMode, Box<dyn Judge>)>, CliError> {
+    let mode = judge_mode(site)?;
+    if mode == JudgeMode::Off {
+        return Ok(None);
+    }
+    Ok(resolve_judge(offline)?.map(|judge| (mode, judge)))
+}
+
+/// True when `site` is off but a judge is reachable: the consent rule, not
+/// a missing key, is what keeps its content on this machine.
+pub fn withheld(site: JudgeSite, offline: bool) -> Result<bool, CliError> {
+    Ok(judge_mode(site)? == JudgeMode::Off && route_name(offline)? != "none")
+}
+
 /// The judge to ask, or `None` when there is none (no key, `--offline`, or
 /// `ENGRAM_BENCH_FORCE_STUB`). Errors only on a malformed `ENGRAM_JUDGE_STUB`.
-/// Build it once per command: the TypeSafe client pools its connections.
-pub fn resolve_judge(offline: bool) -> Result<Option<Box<dyn Judge>>, CliError> {
+/// Private: sites go through [`site_judge`], which applies consent.
+fn resolve_judge(offline: bool) -> Result<Option<Box<dyn Judge>>, CliError> {
     Ok(route(offline)?.map(|r| -> Box<dyn Judge> {
         match r {
             Route::Stub(stub) => Box::new(stub),
@@ -364,8 +396,9 @@ pub struct JudgeStatus {
     pub adjudicate: Option<JudgeMode>,
     pub dedupe: Option<JudgeMode>,
     pub relevance: Option<JudgeMode>,
-    /// Why `relevance` has its mode: set by env, set in config, or which
-    /// default applies (on only when a TypeSafe key is configured).
+    /// Why `adjudicate` and `relevance` have their modes: set by env, set
+    /// in config, or which default applies (on only with a TypeSafe key).
+    pub adjudicate_source: String,
     pub relevance_source: String,
     /// The route a networked command would take (see [`route_name`]);
     /// `null` when `ENGRAM_JUDGE_STUB` is malformed (see `errors`).
@@ -399,7 +432,8 @@ pub fn status() -> JudgeStatus {
         adjudicate: modes[1],
         dedupe: modes[2],
         relevance: modes[3],
-        relevance_source: relevance_default(),
+        adjudicate_source: mode_source(JudgeSite::Adjudicate),
+        relevance_source: mode_source(JudgeSite::Relevance),
         route,
         warnings: warnings_for(&modes, route),
         errors,
@@ -493,8 +527,10 @@ mod tests {
             mode_from(site, Some("on"), no_file, || panic!("asked")).unwrap(),
             JudgeMode::On
         );
-        assert!(relevance_default_why(false).starts_with("default off"));
-        assert!(relevance_default_why(true).starts_with("default on"));
+        let site = JudgeSite::Relevance;
+        assert!(default_why(site, false).starts_with("default off: no TypeSafe key"));
+        assert!(default_why(site, true).starts_with("default on"));
+        assert!(default_why(JudgeSite::Grounding, true).starts_with("default off"));
     }
 
     fn file(v: toml::Value) -> impl FnOnce() -> Result<Option<toml::Value>, CliError> {
@@ -562,13 +598,16 @@ mod tests {
             .unwrap(),
             JudgeMode::Off
         );
-        for site in [
-            JudgeSite::Grounding,
-            JudgeSite::Adjudicate,
-            JudgeSite::Dedupe,
-        ] {
+        for site in [JudgeSite::Grounding, JudgeSite::Dedupe] {
             assert_eq!(mode_ts(site, None, no_file).unwrap(), JudgeMode::Off);
         }
+        // The adjudicator follows the same consent rule as relevance.
+        let adj = JudgeSite::Adjudicate;
+        assert_eq!(mode_ts(adj, None, no_file).unwrap(), JudgeMode::On);
+        assert_eq!(
+            mode_from(adj, None, no_file, || false).unwrap(),
+            JudgeMode::Off
+        );
     }
 
     #[test]
@@ -708,7 +747,7 @@ mod tests {
 
     #[test]
     fn an_unconsulted_site_in_shadow_or_on_always_warns_and_never_asks_for_a_key() {
-        let modes = [None, Some(JudgeMode::On), Some(JudgeMode::Shadow)];
+        let modes = [None, Some(JudgeMode::Off), Some(JudgeMode::Shadow)];
         for route in [
             Some("typesafe"),
             Some("openrouter"),
@@ -717,18 +756,18 @@ mod tests {
             None,
         ] {
             let w = warnings_for(&modes, route);
-            assert_eq!(w.len(), 2, "{route:?}: {w:?}");
+            assert_eq!(w.len(), 1, "{route:?}: {w:?}");
             assert_eq!(
                 w[0],
-                "judge.adjudicate is on but no command consults it in this build; it has no effect"
-            );
-            assert_eq!(
-                w[1],
                 "judge.dedupe is shadow but no command consults it in this build; it has no effect"
             );
             assert!(w.iter().all(|w| !w.contains("KEY")), "{w:?}");
         }
         assert!(warnings_for(&[Some(JudgeMode::Off); 3], Some("typesafe")).is_empty());
+        // `remember --autonomy full` consults the adjudicator: no "no effect".
+        let adjudicate_on = [None, Some(JudgeMode::On), None];
+        assert!(warnings_for(&adjudicate_on, Some("typesafe")).is_empty());
+        assert!(JudgeSite::Adjudicate.consulted());
     }
 
     fn response(provider: &'static str) -> JudgeResponse {
