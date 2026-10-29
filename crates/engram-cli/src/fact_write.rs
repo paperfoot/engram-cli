@@ -29,10 +29,11 @@
 //! `queue` and an empty `closes`, and that is an assertion over fixtures.
 //!
 //! The caller is a frontier agent with conversation context this store cannot
-//! see — `assisted` mode hands it the adjudication instead of paying for a
-//! worse-informed LLM call here. Under `full` the LLM may adjudicate, but it
-//! is a `Heuristic` authority: it can no longer close a safety interval, clear
-//! a safety question, or discard a safety observation.
+//! see — `assisted` mode hands it the adjudication. Under `full` a JEV judge
+//! answers four calibrated questions per queued pair and a code rule
+//! ([`conflict_rule`]) settles what they make clear. It is a `Heuristic`
+//! authority: it never closes a safety interval, clears a safety question, or
+//! discards a safety observation, and safety pairs are never sent to it.
 
 use crate::context::AppContext;
 use crate::error::CliError;
@@ -43,10 +44,7 @@ use engram_core::relations::{canonical_relation, cessation_of, member_identity, 
 use engram_core::temporal::parse_moment;
 use engram_core::types::{Fact, FactType, SourceKind};
 use engram_embed::{Embedder, TaskMode};
-use engram_graph::facts::{
-    adjudicate, canonical_predicate, date_valued_predicate, normalize, AdjudicationAction,
-    ExtractedFact, FactExtractionError,
-};
+use engram_graph::facts::{canonical_predicate, date_valued_predicate, normalize, ExtractedFact};
 use engram_graph::gate::{novelty_gate, GateDecision};
 use engram_graph::semantics::{
     classify_mode_for, compile_resolution, end_resolution_tag, plan_write, DecisionLedger,
@@ -55,10 +53,10 @@ use engram_graph::semantics::{
 };
 use engram_llm::judge::lexical::{negated_object, numbers_ok};
 use engram_llm::judge::questions::{
-    admits, fact_as_claim_with_state, grounding_request, REMEMBER_SAFETY_ADMIT_P,
+    admits, fact_as_claim_with_state, grounding_request, pair_request, FactTriple, PairAnswers,
+    REMEMBER_SAFETY_ADMIT_P,
 };
-use engram_llm::judge::{ask_batched, Judge};
-use engram_llm::ChatLlm;
+use engram_llm::judge::{ask_batched, Judge, JudgeError};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
@@ -550,8 +548,9 @@ pub struct FactWriteCtx<'a> {
     pub memory_time: MemoryTime,
     /// Powers the novelty gate. `None` = gate off, exact path only.
     pub embedder: Option<&'a dyn Embedder>,
-    /// Powers full-autonomy adjudication.
-    pub llm: Option<&'a dyn ChatLlm>,
+    /// The JEV judge `--autonomy full` asks about queued pairs. `None` under
+    /// any other autonomy, or when no judge is reachable: the pairs queue.
+    pub adjudicator: Option<&'a dyn Judge>,
     pub autonomy: Autonomy,
     pub source_kind: SourceKind,
 }
@@ -977,10 +976,12 @@ pub async fn write_fact_batch(
         None => FactEmbedCache::empty(),
     };
 
-    let judged = match (w.autonomy, w.llm) {
-        (Autonomy::Full, Some(llm)) => gather_judgements(ctx, w, &facts, &cache, llm)
-            .await
-            .map_err(|(i, e)| fail(i, e))?,
+    let judged = match (w.autonomy, w.adjudicator) {
+        (Autonomy::Full, Some(judge)) => {
+            gather_judgements(ctx, w, &facts, &cache, judge, batch.source_text)
+                .await
+                .map_err(|(i, e)| fail(i, e))?
+        }
         _ => Vec::new(),
     };
 
@@ -1117,7 +1118,8 @@ fn build_observation(
 
 /// GATHER: every judge call a batch needs, made BEFORE the write lock is
 /// taken. Each observation is planned read-only against the store as it is
-/// now; the ones that would queue a pair are judged, one call each.
+/// now; the ones that would queue a routine pair are judged, one batched
+/// request each.
 ///
 /// The verdict is only a PROPOSAL. The apply pass plans again inside the
 /// transaction — earlier facts of the same batch have landed by then — and
@@ -1131,7 +1133,8 @@ async fn gather_judgements(
     w: &FactWriteCtx<'_>,
     facts: &[ExtractedFact],
     cache: &FactEmbedCache,
-    llm: &dyn ChatLlm,
+    judge: &dyn Judge,
+    source_text: &str,
 ) -> Result<Vec<Option<Judged>>, (usize, CliError)> {
     let mut discarded = FactWriteOutcome::default();
     let mut out = Vec::with_capacity(facts.len());
@@ -1142,18 +1145,32 @@ async fn gather_judgements(
         let judged = match prepared {
             Prepared::Planned(p) if !p.plan.queue.is_empty() => {
                 let by_id = p.by_id();
-                let pairs: Vec<(&PlannedConflict, &Fact)> = p
+                // A safety pair is the caller's whatever a judge says, so it
+                // is never sent: that would carry someone's medication list
+                // to a third party for an answer nothing may use.
+                let pairs: Vec<&Fact> = p
                     .plan
                     .queue
                     .iter()
-                    .filter_map(|q| by_id.get(&q.old_fact_id).map(|old| (q, *old)))
+                    .filter_map(|q| by_id.get(&q.old_fact_id).copied())
+                    .filter(|old| !pair_is_safety(&p.observation, old))
                     .collect();
                 if pairs.is_empty() {
                     None
                 } else {
+                    let judgement = judge_pairs(judge, source_text, &p.observation, &pairs).await;
+                    if let Some(r) = &judgement.response {
+                        record_judge_usage(
+                            ctx,
+                            JudgeSite::Adjudicate.operation(),
+                            r,
+                            Some(w.kb),
+                            Some(w.diary),
+                        );
+                    }
                     Some(Judged {
                         about: JudgedPairs::of(&p.observation, &p.plan.queue),
-                        judgement: judge_pairs(llm, &p.text, &pairs).await,
+                        judgement,
                     })
                 }
             }
@@ -1164,60 +1181,158 @@ async fn gather_judgements(
     Ok(out)
 }
 
-/// One judge's answer about ONE observation's queued pairs.
-pub struct Judgement {
-    /// Who answered, as the journal names it: `judge:<judge>`.
-    pub judge: &'static str,
-    pub model: String,
-    /// `Err` = no verdict (the call failed, or the reply was not one). The
-    /// reason is a stable word, never the reply.
-    pub action: Result<AdjudicationAction, &'static str>,
+/// A pair no machine may settle: the observation or the stored fact is on a
+/// safety relation.
+fn pair_is_safety(observation: &Observation, old: &Fact) -> bool {
+    observation.spec.is_safety() || is_safety_fact(old)
 }
 
-impl Judgement {
-    /// The answer as one word, for the journal note.
-    fn action_word(&self) -> &'static str {
-        match &self.action {
-            Ok(AdjudicationAction::Supersede(_)) => "supersede",
-            Ok(AdjudicationAction::Coexist) => "coexist",
-            Ok(AdjudicationAction::RejectNew) => "reject_new",
-            Err(_) => "failed",
+/// What [`conflict_rule`] makes of one pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRuling {
+    /// The new fact says what the stored one says: store nothing new.
+    Restates,
+    /// The new text says the stored value ended or was replaced.
+    Supersede,
+    /// Both hold: different attributes, or compatible values.
+    Coexist,
+    /// The signals do not settle it: the pair stays queued for the caller.
+    Undecided,
+}
+
+impl PairRuling {
+    fn word(self) -> &'static str {
+        match self {
+            PairRuling::Restates => "reject_new",
+            PairRuling::Supersede => "supersede",
+            PairRuling::Coexist => "coexist",
+            PairRuling::Undecided => "undecided",
         }
     }
 }
 
-/// THE JUDGE SEAM: one observation (`new_fact`, rendered "subject relation
-/// object") and its queued pairs, each the classifier's question (rule,
-/// semantic key, suggested action) with the stored fact it is about, in; one
-/// verdict out.
+// The rule's cuts, fitted on a random half of the 148 labelled pairs
+// (`benchmarks/jev/adjudicate_rule.py`, jev-1.13.0) and scored on the other
+// half: 68/73 held-out against the prompted LLM's 63/73, 24/24 against 22/24
+// on the pairs engram's planner can actually queue, rule >= LLM on 49 of 50
+// random splits. They belong to that judge model: refit on a model change.
+
+/// At or above: the new fact restates the stored one. High, because a false
+/// yes throws the caller's fact away.
+pub const RULE_RESTATES_P: f32 = 0.9;
+/// Below: the judge is sure the two facts fill different attributes.
+pub const RULE_OTHER_SLOT_P: f32 = 0.05;
+/// At or above (with [`RULE_OLD_ENDED_P`]): the values cannot both hold.
+pub const RULE_CONTRADICTS_P: f32 = 0.2;
+/// At or above: the text says the STORED value ended. `contradicts` is
+/// symmetric; this is the direction check, so an extractor that emitted the
+/// newer value first cannot have it closed by the older one.
+pub const RULE_OLD_ENDED_P: f32 = 0.1;
+/// Below: the values are compatible and coexist.
+pub const RULE_COMPATIBLE_P: f32 = 0.1;
+
+/// The whole adjudication policy, in code: four calibrated probabilities in,
+/// one ruling out. Nothing here knows about safety or authority; the applier
+/// enforces both whatever this returns.
+pub fn conflict_rule(a: &PairAnswers) -> PairRuling {
+    if a.restates >= RULE_RESTATES_P {
+        PairRuling::Restates
+    } else if a.same_slot < RULE_OTHER_SLOT_P {
+        PairRuling::Coexist
+    } else if a.contradicts >= RULE_CONTRADICTS_P && a.old_ended >= RULE_OLD_ENDED_P {
+        PairRuling::Supersede
+    } else if a.contradicts < RULE_COMPATIBLE_P {
+        PairRuling::Coexist
+    } else {
+        PairRuling::Undecided
+    }
+}
+
+/// One judge's answers about ONE observation's routine queued pairs.
+pub struct Judgement {
+    /// Who answered, as the journal names it: `judge:<provider>`.
+    pub judge: &'static str,
+    pub model: String,
+    /// Per stored fact asked about: its four signals, or `None` when the
+    /// judge left any of them unanswered (that pair stays queued). `Err` =
+    /// the call failed; every pair stays queued. The reason is a stable word.
+    pub answers: Result<Vec<(Uuid, Option<PairAnswers>)>, &'static str>,
+    /// For the usage ledger; never journaled.
+    response: Option<engram_llm::judge::JudgeResponse>,
+}
+
+impl Judgement {
+    /// The rule's ruling on one stored fact: `Undecided` for a pair that was
+    /// not asked about, not answered, or whose call failed.
+    fn ruling(&self, old_fact_id: Uuid) -> PairRuling {
+        self.answers
+            .as_ref()
+            .ok()
+            .and_then(|all| all.iter().find(|(id, _)| *id == old_fact_id))
+            .and_then(|(_, a)| a.as_ref())
+            .map_or(PairRuling::Undecided, conflict_rule)
+    }
+
+    /// Whether the judge was asked about this stored fact.
+    fn asked(&self, old_fact_id: Uuid) -> bool {
+        self.answers
+            .as_ref()
+            .map_or(true, |all| all.iter().any(|(id, _)| *id == old_fact_id))
+    }
+}
+
+/// THE JUDGE SEAM: the memory text, the observation and the stored facts its
+/// routine queued pairs are about, in; one batched JEV request (four nouls per
+/// stored fact); answers out.
 ///
 /// Called with no transaction open. Whatever it returns, the applier enforces
 /// the same limits: a failure keeps every pair queued, a safety pair is never
-/// cleared or discarded, a close needs `may_close`. A different judge is a
-/// function of this shape swapped in at the one call in
-/// [`gather_judgements`]; it inherits all three limits, and its answers are
-/// journaled under its own name (`judge:<judge>`, see [`record_judgement`]).
+/// cleared or discarded, a close needs `may_close`.
 pub async fn judge_pairs(
-    llm: &dyn ChatLlm,
-    new_fact: &str,
-    pairs: &[(&PlannedConflict, &Fact)],
+    judge: &dyn Judge,
+    source_text: &str,
+    observation: &Observation,
+    pairs: &[&Fact],
 ) -> Judgement {
-    // The LLM prompt only reads the stored facts; the rule and key are there
-    // for a judge that uses them.
-    let rendered: Vec<String> = pairs
+    let new_fact = FactTriple::new(
+        observation.subject.as_str(),
+        observation.relation.as_str(),
+        observation.object.as_str(),
+    );
+    let existing: Vec<(String, FactTriple)> = pairs
         .iter()
-        .map(|(_, f)| format!("{} | {} {} {}", f.id, f.subject, f.predicate, f.object))
+        .map(|f| {
+            (
+                f.id.to_string(),
+                FactTriple::new(f.subject.as_str(), f.predicate.as_str(), f.object.as_str()),
+            )
+        })
         .collect();
-    let action = adjudicate(llm, new_fact, &rendered).await.map_err(|e| {
-        // Logged, never echoed into the envelope: the error is sanitized,
-        // but the note only needs to say that nobody decided.
-        tracing::warn!("adjudication gave no verdict; the pairs stay queued: {e}");
-        failure_reason(&e)
-    });
-    Judgement {
-        judge: "llm",
-        model: llm.model_id().to_string(),
-        action,
+    let request = pair_request(source_text, &new_fact, &existing);
+    match ask_batched(judge, &request).await {
+        Ok(response) => Judgement {
+            judge: response.provider,
+            model: response.model.clone(),
+            answers: Ok(pairs
+                .iter()
+                .map(|f| {
+                    let a = PairAnswers::from_response(&response, &f.id.to_string()).ok();
+                    (f.id, a)
+                })
+                .collect()),
+            response: Some(response),
+        },
+        Err(e) => {
+            // Logged, never echoed into the envelope: the note only needs to
+            // say that nobody decided.
+            tracing::warn!("adjudication judge gave no answer; the pairs stay queued: {e}");
+            Judgement {
+                judge: judge.name(),
+                model: judge.model_id().to_string(),
+                answers: Err(failure_reason(&e)),
+                response: None,
+            }
+        }
     }
 }
 
@@ -1270,8 +1385,6 @@ struct PreparedPlan {
     siblings: Vec<Fact>,
     others: Vec<(Fact, f32)>,
     embedding: Option<Vec<f32>>,
-    /// "subject relation object", the string the judge and the embedder see.
-    text: String,
     plan: WritePlan,
 }
 
@@ -1405,7 +1518,6 @@ async fn prepare(
         siblings,
         others,
         embedding,
-        text,
         plan,
     })))
 }
@@ -1470,7 +1582,13 @@ async fn write_judged_fact(
         Some(j) => settle_judgement(ctx, w, j, Some((&mut plan, &p)), outcome)?,
         None => false,
     };
-    if !applied && w.autonomy == Autonomy::Full && w.llm.is_some() && !plan.queue.is_empty() {
+    let by_id = p.by_id();
+    let routine_queued = plan.queue.iter().any(|q| {
+        by_id
+            .get(&q.old_fact_id)
+            .is_some_and(|old| !pair_is_safety(&p.observation, old))
+    });
+    if !applied && w.autonomy == Autonomy::Full && w.adjudicator.is_some() && routine_queued {
         // The store moved between judging and writing (an earlier fact of
         // this batch landed), so no verdict answers THESE pairs. Either the
         // judge answered different pairs, or it was never asked: the pairs
@@ -1508,12 +1626,20 @@ fn settle_judgement(
 ) -> Result<bool, CliError> {
     let counts = &mut outcome.adjudication;
     counts.calls += 1;
-    counts.pairs_in += judged.about.pairs.len();
-    match &judged.judgement.action {
-        Ok(AdjudicationAction::Supersede(_)) => counts.supersede += 1,
-        Ok(AdjudicationAction::Coexist) => counts.coexist += 1,
-        Ok(AdjudicationAction::RejectNew) => counts.reject_new += 1,
+    let j = &judged.judgement;
+    match &j.answers {
         Err(_) => counts.failed += 1,
+        Ok(answers) => {
+            counts.pairs_in += answers.len();
+            for (id, _) in answers {
+                match j.ruling(*id) {
+                    PairRuling::Supersede => counts.supersede += 1,
+                    PairRuling::Coexist => counts.coexist += 1,
+                    PairRuling::Restates => counts.reject_new += 1,
+                    PairRuling::Undecided => {}
+                }
+            }
+        }
     }
     let fresh = planned.filter(|(plan, p)| {
         !plan.queue.is_empty() && judged.about == JudgedPairs::of(&p.observation, &plan.queue)
@@ -1524,120 +1650,108 @@ fn settle_judgement(
         return Ok(false);
     };
     let closes = plan.closes.len();
-    apply_judgement(plan, &p.observation, &p.by_id(), &judged.judgement);
+    apply_judgement(plan, &p.observation, &p.by_id(), j);
     counts.pairs_closed += plan.closes.len().saturating_sub(closes);
     counts.pairs_kept += plan.queue.len();
     Ok(true)
 }
 
-/// `--autonomy full`: let a machine judge settle what the classifier queued.
+/// `--autonomy full`: let [`conflict_rule`] settle what the classifier
+/// queued, pair by pair.
 ///
-/// The judge is a `Heuristic` authority and nothing more. Its `supersede` can
-/// close a routine interval and CANNOT close a safety one — `may_close`
-/// refuses, the pair stays queued, and the caller (who has the conversation)
-/// decides. Its `coexist` and `reject_new` are refused on a safety pair for
-/// the same reason. That is the one behaviour change `--autonomy full` sees:
-/// more queued pairs on medical content, fewer everywhere else.
+/// The rule is a `Heuristic` authority and nothing more. A safety pair was
+/// never sent to the judge and stays queued; the caller (who has the
+/// conversation) decides it. A `Supersede` closes only what `may_close`
+/// allows. A `Restates` discards the observation only when no safety pair is
+/// queued with it. An `Undecided` pair stays queued.
 ///
-/// A failed adjudication is not an error: the pairs stay queued, which is what
+/// A failed call is not an error: every pair stays queued, which is what
 /// `assisted` would have done anyway, and the envelope says so
-/// (`adjudication_failed`). It used to read as `Coexist`, which clears the
-/// queue — every judge outage silently deleted the questions it was asked.
+/// (`adjudication_failed`).
 fn apply_judgement(
     plan: &mut WritePlan,
     observation: &Observation,
     by_id: &HashMap<Uuid, &Fact>,
     judgement: &Judgement,
 ) {
-    let action = match judgement.action {
-        Ok(ref action) => action,
-        Err(reason) => {
-            plan.notes.push(PlanNote::AdjudicationFailed { reason });
-            return;
-        }
-    };
-    // A safety pair is the caller's, whatever the judge says. `may_close`
-    // only guards CLOSES, and the two other answers dispose of a question
-    // too: `reject_new` drops the caller's observation (a dose change vanished
-    // and was reported as a duplicate), `coexist` deletes the question. The
-    // contract is "their intervals are closed only on your explicit
-    // instruction, never by a heuristic" (IN-19), and an absorb or a cleared
-    // question is the same outcome reached by another door.
+    if let Err(reason) = judgement.answers {
+        plan.notes.push(PlanNote::AdjudicationFailed { reason });
+        return;
+    }
     let is_safety = |q: &PlannedConflict| {
         observation.spec.is_safety() || by_id.get(&q.old_fact_id).is_some_and(|f| is_safety_fact(f))
     };
-    match action {
-        AdjudicationAction::RejectNew if plan.queue.iter().any(is_safety) => {
+    if plan
+        .queue
+        .iter()
+        .any(|q| judgement.ruling(q.old_fact_id) == PairRuling::Restates)
+    {
+        if plan.queue.iter().any(is_safety) {
+            // Dropping the observation would dispose of the safety question
+            // queued with it: the same outcome as a close, by another door.
             plan.notes.push(PlanNote::AdjudicationKeptSafety {
                 action: "reject_new",
             });
+        } else {
+            // The planner's own absorb, not a hand-rolled half of it: a
+            // close, confirmation or replay planned on behalf of an
+            // observation that is then discarded would retire a value on the
+            // word of a fact that never reaches the store.
+            plan.absorb("semantic_jev");
         }
-        // The planner's own absorb, not a hand-rolled half of it: a close,
-        // confirmation or replay planned on behalf of an observation that is
-        // then discarded would retire a value on the word of a fact that
-        // never reaches the store.
-        AdjudicationAction::RejectNew => plan.absorb("semantic_llm"),
-        AdjudicationAction::Coexist => {
-            plan.queue.retain(|q| is_safety(q));
-            if !plan.queue.is_empty() {
-                plan.notes
-                    .push(PlanNote::AdjudicationKeptSafety { action: "coexist" });
-            }
+        return;
+    }
+    let authority = CloseAuthority::Heuristic {
+        rule: "semantic_jev",
+    };
+    let mut refused = false;
+    let mut kept: Vec<PlannedConflict> = Vec::new();
+    for q in std::mem::take(&mut plan.queue) {
+        if is_safety(&q) || !judgement.asked(q.old_fact_id) {
+            kept.push(q);
+            continue;
         }
-        AdjudicationAction::Supersede(ids) => {
-            let authority = CloseAuthority::Heuristic {
-                rule: "semantic_llm",
-            };
-            let mut kept: Vec<PlannedConflict> = Vec::new();
-            let mut refused = false;
-            for q in std::mem::take(&mut plan.queue) {
-                let named = ids.iter().any(|i| i == &q.old_fact_id.to_string());
+        match judgement.ruling(q.old_fact_id) {
+            PairRuling::Coexist => {}
+            PairRuling::Supersede => {
                 let allowed = by_id
                     .get(&q.old_fact_id)
                     .map(|f| relation_spec(&canonical_predicate(&f.predicate)))
-                    .map(|spec| may_close(&spec, &authority) == CloseVerdict::Allow)
-                    .unwrap_or(false);
-                match (named, allowed) {
-                    (true, true) => plan.closes.push(PlannedClose {
+                    .is_some_and(|spec| may_close(&spec, &authority) == CloseVerdict::Allow);
+                if allowed {
+                    plan.closes.push(PlannedClose {
                         fact_id: q.old_fact_id,
                         at: observation.interval.from,
                         reason: CloseReason::Superseded,
                         authority: authority.clone(),
                         closed_by: Some(observation.fact_id),
-                        resolution_tag: "semantic_llm",
-                    }),
-                    // Named but refused: an LLM is not evidence that a
-                    // medication stopped, and the note says why the close
-                    // the judge asked for did not happen.
-                    (true, false) => {
-                        refused = true;
-                        kept.push(q);
-                    }
-                    // Not named: the judge said nothing about this pair, and
-                    // silence is not an answer — it used to be dropped, an
-                    // unrecorded coexist.
-                    (false, _) => kept.push(q),
+                        resolution_tag: "semantic_jev",
+                    });
+                } else {
+                    refused = true;
+                    kept.push(q);
                 }
             }
-            plan.queue = kept;
-            if refused {
-                plan.notes.push(PlanNote::AdjudicationKeptSafety {
-                    action: "supersede",
-                });
-            }
+            PairRuling::Restates | PairRuling::Undecided => kept.push(q),
         }
+    }
+    plan.queue = kept;
+    if refused {
+        plan.notes.push(PlanNote::AdjudicationKeptSafety {
+            action: "supersede",
+        });
     }
 }
 
-/// Journal WHICH judge answered: one `void` machine decision per pair the
-/// verdict was about, on the existing `decision.recorded` event, so it
-/// survives `admin rebuild` (the close's `resolution` tag does not).
+/// Journal WHICH judge answered and WHAT it said: one `void` machine decision
+/// per pair it was asked about, on the existing `decision.recorded` event, so
+/// it survives `admin rebuild` (the close's `resolution` tag does not). The
+/// note carries the ruling and the four probabilities, which is what a later
+/// refit of the rule's cuts reads.
 ///
 /// `void` because the row must record without binding. `lookup_decision`
 /// never selects a void and `replay` treats one as not binding, so the next
-/// write on the same key is planned exactly as if this row did not exist. A
-/// machine `keep_both` would be replayed as the answer to that question on
-/// every later write, safety dose changes included.
+/// write on the same key is planned exactly as if this row did not exist.
 ///
 /// A stale verdict (judged against a store that moved before the write)
 /// keeps the judge's real answer and adds `applied=false`: it was paid for
@@ -1649,11 +1763,33 @@ fn record_judgement(
     stale: bool,
 ) -> Result<(), CliError> {
     let j = &judged.judgement;
-    let action = j.action_word();
     let applied = if stale { " applied=false" } else { "" };
     let actor = format!("judge:{}", j.judge);
-    for (_, rule, key) in &judged.about.pairs {
-        let note = format!("action={action}{applied} model={} rule={rule}", j.model);
+    for (old_fact_id, rule, key) in &judged.about.pairs {
+        if !j.asked(*old_fact_id) {
+            continue;
+        }
+        let action = match j.answers {
+            Err(_) => "failed",
+            Ok(_) => j.ruling(*old_fact_id).word(),
+        };
+        let signals = j
+            .answers
+            .as_ref()
+            .ok()
+            .and_then(|all| all.iter().find(|(id, _)| id == old_fact_id))
+            .and_then(|(_, a)| a.as_ref())
+            .map(|a| {
+                format!(
+                    " restates={} same_slot={} contradicts={} old_ended={}",
+                    a.restates, a.same_slot, a.contradicts, a.old_ended
+                )
+            })
+            .unwrap_or_default();
+        let note = format!(
+            "action={action}{applied} model={} rule={rule}{signals}",
+            j.model
+        );
         ctx.store.record_decision(
             w.kb,
             w.diary,
@@ -1671,12 +1807,13 @@ fn record_judgement(
 }
 
 /// Why a judge gave no verdict, as a stable word for the envelope.
-fn failure_reason(e: &FactExtractionError) -> &'static str {
+fn failure_reason(e: &JudgeError) -> &'static str {
     match e {
-        FactExtractionError::Llm(_) => "llm_error",
-        FactExtractionError::Parse { .. } | FactExtractionError::NotAVerdict { .. } => {
-            "not_a_verdict"
-        }
+        JudgeError::Transport { .. } | JudgeError::Status { .. } => "judge_unreachable",
+        JudgeError::InvalidResponse { .. }
+        | JudgeError::MissingAnswer { .. }
+        | JudgeError::WrongAnswerType { .. } => "not_a_verdict",
+        JudgeError::InvalidRequest(_) => "invalid_request",
     }
 }
 
@@ -2118,7 +2255,7 @@ mod tests {
     /// A judge that is never reachable: a timeout, a 401, exhausted retries.
     struct Unreachable;
 
-    impl ChatLlm for Unreachable {
+    impl Judge for Unreachable {
         fn name(&self) -> &'static str {
             "unreachable"
         }
@@ -2127,13 +2264,13 @@ mod tests {
             "unreachable-model"
         }
 
-        fn chat<'life0, 'life1, 'async_trait>(
+        fn ask<'life0, 'life1, 'async_trait>(
             &'life0 self,
-            _messages: &'life1 [engram_llm::ChatMessage],
+            _request: &'life1 engram_llm::judge::JudgeRequest,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
-                        Output = Result<engram_llm::ChatResponse, engram_llm::LlmError>,
+                        Output = Result<engram_llm::judge::JudgeResponse, JudgeError>,
                     > + Send
                     + 'async_trait,
             >,
@@ -2143,12 +2280,18 @@ mod tests {
             'life1: 'async_trait,
             Self: 'async_trait,
         {
-            Box::pin(async { Err(engram_llm::LlmError::RateLimited { provider: "test" }) })
+            Box::pin(async {
+                Err(JudgeError::Status {
+                    provider: "unreachable",
+                    status: 503,
+                    message: "down".into(),
+                })
+            })
         }
     }
 
-    fn metformin(object: &str) -> Observation {
-        let relation = "takes_medication".to_string();
+    fn observation(relation: &str, object: &str) -> Observation {
+        let relation = relation.to_string();
         let object_norm = normalize(object);
         Observation {
             fact_id: Uuid::new_v4(),
@@ -2175,12 +2318,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_unreachable_judge_gives_no_verdict_and_every_pair_survives() {
-        let old = metformin("metformin 500 mg").to_fact(moment("2025-01-01"));
-        let new = metformin("metformin 1000 mg");
+    fn metformin(object: &str) -> Observation {
+        observation("takes_medication", object)
+    }
+
+    /// A routine pair the planner queues: two cities out of ONE memory.
+    fn same_source_cities() -> (Observation, Fact, WritePlan) {
+        let mut old_obs = observation("lives_in", "Lisbon");
+        let mut new = observation("lives_in", "Berlin");
+        old_obs.source_memory_id = new.source_memory_id;
+        new.interval.from = moment("2026-01-01");
+        let old = old_obs.to_fact(moment("2026-01-01"));
         let prior = |_: &SemanticKey| Ok(None);
-        let mut plan = plan_write(
+        let plan = plan_write(
             &new,
             std::slice::from_ref(&old),
             &[],
@@ -2188,16 +2338,53 @@ mod tests {
             &prior,
         )
         .unwrap();
-        assert_eq!(plan.queue.len(), 1, "a dose change is a question");
+        assert_eq!(plan.queue.len(), 1, "one text, two cities: a question");
+        (new, old, plan)
+    }
+
+    fn answered(old: &Fact, a: PairAnswers) -> Judgement {
+        Judgement {
+            judge: "stub",
+            model: "stub".into(),
+            answers: Ok(vec![(old.id, Some(a))]),
+            response: None,
+        }
+    }
+
+    fn signals(restates: f32, same_slot: f32, contradicts: f32, old_ended: f32) -> PairAnswers {
+        PairAnswers {
+            restates,
+            same_slot,
+            contradicts,
+            old_ended,
+        }
+    }
+
+    #[test]
+    fn the_rule_maps_signals_to_the_four_outcomes() {
+        use PairRuling::*;
+        // Measured on the pair set: a move, a correction, a restatement.
+        assert_eq!(conflict_rule(&signals(0.02, 0.97, 0.78, 0.86)), Supersede);
+        assert_eq!(conflict_rule(&signals(0.01, 0.95, 0.81, 0.98)), Supersede);
+        assert_eq!(conflict_rule(&signals(0.97, 0.98, 0.05, 0.02)), Restates);
+        // A second language: compatible, both kept.
+        assert_eq!(conflict_rule(&signals(0.02, 0.84, 0.05, 0.03)), Coexist);
+        // Confidently different attributes.
+        assert_eq!(conflict_rule(&signals(0.01, 0.02, 0.5, 0.5)), Coexist);
+        // They clash but the text never says the STORED value ended: the
+        // direction is unknown, so the caller decides.
+        assert_eq!(conflict_rule(&signals(0.02, 0.95, 0.6, 0.05)), Undecided);
+        // Weak clash, nothing ended: the caller decides.
+        assert_eq!(conflict_rule(&signals(0.02, 0.93, 0.15, 0.3)), Undecided);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_judge_gives_no_verdict_and_every_pair_survives() {
+        let (new, old, mut plan) = same_source_cities();
         let before = plan.queue.clone();
 
-        let judgement = judge_pairs(
-            &Unreachable,
-            "Ana takes_medication metformin 1000 mg",
-            &[(&before[0], &old)],
-        )
-        .await;
-        assert_eq!(judgement.action, Err("llm_error"));
+        let judgement = judge_pairs(&Unreachable, "Ana lives in Berlin.", &new, &[&old]).await;
+        assert_eq!(judgement.answers, Err("judge_unreachable"));
         assert_eq!(judgement.model, "unreachable-model");
 
         let by_id: HashMap<Uuid, &Fact> = HashMap::from([(old.id, &old)]);
@@ -2207,9 +2394,73 @@ mod tests {
         assert_eq!(
             plan.notes,
             [PlanNote::AdjudicationFailed {
-                reason: "llm_error"
+                reason: "judge_unreachable"
             }]
         );
+    }
+
+    #[test]
+    fn a_routine_supersede_closes_through_may_close() {
+        let (new, old, mut plan) = same_source_cities();
+        let by_id: HashMap<Uuid, &Fact> = HashMap::from([(old.id, &old)]);
+        let j = answered(&old, signals(0.02, 0.97, 0.78, 0.86));
+        apply_judgement(&mut plan, &new, &by_id, &j);
+        assert!(plan.queue.is_empty());
+        assert_eq!(plan.closes.len(), 1);
+        assert_eq!(plan.closes[0].fact_id, old.id);
+        assert_eq!(plan.closes[0].resolution_tag, "semantic_jev");
+    }
+
+    #[test]
+    fn an_undecided_or_unanswered_pair_stays_queued() {
+        let (new, old, mut plan) = same_source_cities();
+        let before = plan.queue.clone();
+        let by_id: HashMap<Uuid, &Fact> = HashMap::from([(old.id, &old)]);
+        apply_judgement(
+            &mut plan,
+            &new,
+            &by_id,
+            &answered(&old, signals(0.02, 0.95, 0.6, 0.05)),
+        );
+        assert_eq!(plan.queue, before);
+        let unanswered = Judgement {
+            judge: "stub",
+            model: "stub".into(),
+            answers: Ok(vec![(old.id, None)]),
+            response: None,
+        };
+        apply_judgement(&mut plan, &new, &by_id, &unanswered);
+        assert_eq!(plan.queue, before);
+        assert!(plan.closes.is_empty() && plan.absorbed.is_none());
+    }
+
+    #[test]
+    fn no_ruling_closes_clears_or_discards_a_safety_pair() {
+        let old = metformin("metformin 500 mg").to_fact(moment("2025-01-01"));
+        let new = metformin("metformin 1000 mg");
+        let prior = |_: &SemanticKey| Ok(None);
+        let by_id: HashMap<Uuid, &Fact> = HashMap::from([(old.id, &old)]);
+        for a in [
+            signals(0.01, 0.97, 0.95, 0.97),
+            signals(0.01, 0.97, 0.01, 0.01),
+            signals(0.99, 0.99, 0.01, 0.01),
+            signals(0.01, 0.01, 0.01, 0.01),
+        ] {
+            let mut plan = plan_write(
+                &new,
+                std::slice::from_ref(&old),
+                &[],
+                ClassifyMode::Write,
+                &prior,
+            )
+            .unwrap();
+            let before = plan.queue.clone();
+            assert_eq!(before.len(), 1, "a dose change is a question");
+            apply_judgement(&mut plan, &new, &by_id, &answered(&old, a));
+            assert_eq!(plan.queue, before, "{a:?}");
+            assert!(plan.closes.is_empty() && plan.absorbed.is_none(), "{a:?}");
+            assert!(plan.insert.is_some(), "{a:?}");
+        }
     }
 
     #[test]

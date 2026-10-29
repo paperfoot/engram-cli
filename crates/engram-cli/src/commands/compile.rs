@@ -1082,7 +1082,7 @@ async fn insert_llm_evidence(
         // plus the classifier do the work, and an embedding call per fact
         // inside the compile transaction is a paid round trip per fact.
         embedder: None,
-        llm: None,
+        adjudicator: None,
         // `assisted`, not `strict`: a compile must still be able to record
         // that a 2024 paper supersedes a 2015 one. `strict` would queue that
         // too, which is how a corpus rebuilds the backlog nobody reads.
