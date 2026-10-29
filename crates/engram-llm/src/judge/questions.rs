@@ -171,6 +171,37 @@ pub fn grounding_verdict(p: f32) -> Grounding {
 }
 
 // ---------------------------------------------------------------------------
+// Relevance: does a recalled passage answer the query?
+// ---------------------------------------------------------------------------
+
+/// Plain wording, as the September evals favoured: no edge-case criteria.
+pub const RELEVANCE_QUESTION: &str = "Does `passage` contain information that answers `query`?";
+
+/// A recall result is kept at P(answers) >= this; when none is, recall
+/// abstains. Fitted on `engram bench personal` (see the commit that set it).
+pub const RELEVANCE_FLOOR: f32 = 0.5;
+
+/// A passage is cut to this many characters before it is judged: a wiki page
+/// can run to pages, and the answer to a recall query sits in its opening
+/// far more often than past it.
+pub const RELEVANCE_PASSAGE_CHARS: usize = 2_000;
+
+/// One request per recall: state = the query, one noul per passage, the
+/// passage riding in the question's own instructions. `passages` are
+/// `(id, text)`; answers come back keyed by id.
+pub fn relevance_request(query: &str, passages: &[(String, &str)]) -> JudgeRequest {
+    let mut request = JudgeRequest::new(json!({ "query": query }));
+    for (id, text) in passages {
+        let passage: String = text.chars().take(RELEVANCE_PASSAGE_CHARS).collect();
+        request.push(
+            id.clone(),
+            Question::noul(json!({ "passage": passage, "question": RELEVANCE_QUESTION })),
+        );
+    }
+    request
+}
+
+// ---------------------------------------------------------------------------
 // Pair judge: a new fact against existing facts (dedupe and adjudication).
 // ---------------------------------------------------------------------------
 
@@ -376,6 +407,34 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&req.questions_wire()).unwrap(),
             r#"{"c1":{"type":"noul","instructions":{"claim":"Rapamycin extends lifespan.","question":"Does `passage` directly support `claim`?"},"criteria":{"true":"The passage states or directly implies the claim.","false":"The passage does not state the claim, contradicts it, or only discusses the topic."}}}"#
+        );
+    }
+
+    #[test]
+    fn relevance_wording_is_pinned_and_passages_ride_in_instructions() {
+        let long = "x".repeat(RELEVANCE_PASSAGE_CHARS + 50);
+        let req = relevance_request(
+            "Where does Noemi work?",
+            &[
+                ("r0".to_string(), "Noemi joined Halden Labs."),
+                ("r1".to_string(), long.as_str()),
+            ],
+        );
+        req.validate().unwrap();
+        assert_eq!(
+            serde_json::to_string(&req.state).unwrap(),
+            r#"{"query":"Where does Noemi work?"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&req.questions[0].1).unwrap(),
+            r#"{"type":"noul","instructions":{"passage":"Noemi joined Halden Labs.","question":"Does `passage` contain information that answers `query`?"}}"#
+        );
+        let Question::Noul { instructions, .. } = &req.questions[1].1 else {
+            panic!("noul expected");
+        };
+        assert_eq!(
+            instructions["passage"].as_str().unwrap().chars().count(),
+            RELEVANCE_PASSAGE_CHARS
         );
     }
 

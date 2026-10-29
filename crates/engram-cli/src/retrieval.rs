@@ -4,9 +4,15 @@
 //!   query -> dense Gemini/stub search -> FTS5 BM25 -> claim/wiki/entity search
 //!        -> graph expansion -> RRF fusion -> optional Cohere rerank.
 
+use crate::judge::{judge_mode, resolve_judge, JudgeMode, JudgeSite};
 use crate::read_surface::{
     Provenance, RecallStats, DERIVED_ENTITY, DERIVED_RELATION, DERIVED_WIKI,
 };
+use engram_llm::judge::questions::{relevance_request, RELEVANCE_FLOOR};
+use engram_llm::judge::{
+    ask_batched, wire_decimal, Judge, JudgeResponse, MAX_QUESTIONS_PER_REQUEST,
+};
+use serde::Serialize;
 use chrono::{DateTime, Utc};
 use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
 use engram_core::types::RetrievalSource;
@@ -312,6 +318,9 @@ pub struct HybridResult {
     /// `edit`/`forget` reject those: the agent that hit it concluded the
     /// memory had been deleted and rewrote it by hand.
     pub provenance: Provenance,
+    /// P(this passage answers the query) from the relevance judge; `None`
+    /// when the judge did not run or gave no answer for this result.
+    pub relevance: Option<f32>,
 }
 
 /// Identifier of the answer-context envelope, reported by `engram agent-info`
@@ -785,6 +794,132 @@ pub fn build_fts_query(text: &str) -> String {
         tokens.push(format!("\"{}\"", lower));
     }
     tokens.join(" OR ")
+}
+
+/// The relevance judge for a recall: does each returned passage answer the
+/// query?
+///
+/// Fused and reranked scores are ranks, not probabilities: a query about
+/// something the store never heard of still returns its ten nearest
+/// neighbours at full confidence, and no score cut fixes that. The judge
+/// returns a calibrated P(answers) per passage, one batched request per
+/// recall (state = the query, one noul per result), after rerank.
+///
+/// - `shadow`: every judged result carries `relevance`; nothing is dropped.
+/// - `on`: results below [`RELEVANCE_FLOOR`] are dropped; when none clears
+///   it the recall abstains (`no_match`, reason `no_candidate_above_cutoff`).
+/// - A failed call, or a result the judge did not answer, keeps today's
+///   output for that result: an outage never empties a recall.
+pub struct RelevanceJudge {
+    mode: JudgeMode,
+    judge: Box<dyn Judge>,
+}
+
+/// What the relevance judge did to one recall, for response metadata.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelevanceReport {
+    pub mode: JudgeMode,
+    pub floor: f32,
+    /// Results the judge answered for.
+    pub judged: usize,
+    /// Results dropped below the floor (`on` only).
+    pub dropped: usize,
+    /// Best P(answers) among the judged results.
+    pub top_relevance: Option<f32>,
+    /// True when `on` dropped every result: the recall abstains.
+    pub abstained: bool,
+    /// Why the judge's verdict was not used, when it was not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip)]
+    pub response: Option<JudgeResponse>,
+}
+
+impl RelevanceReport {
+    /// The `metadata.relevance` block: probabilities as the provider's
+    /// decimals, never widened f32 noise.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "mode": self.mode,
+            "floor": wire_decimal(self.floor),
+            "judged": self.judged,
+            "dropped": self.dropped,
+            "top_relevance": self.top_relevance.map(wire_decimal),
+            "abstained": self.abstained,
+        });
+        if let Some(e) = &self.error {
+            v["error"] = serde_json::json!(e);
+        }
+        v
+    }
+}
+
+impl RelevanceJudge {
+    /// The relevance judge a read should use, or `None` when the site is off
+    /// or no judge is reachable (no key, `--offline`,
+    /// `ENGRAM_BENCH_FORCE_STUB`). A bad setting is exit 2.
+    pub fn resolve(offline: bool) -> Result<Option<Self>, crate::error::CliError> {
+        let mode = judge_mode(JudgeSite::Relevance)?;
+        if mode == JudgeMode::Off {
+            return Ok(None);
+        }
+        Ok(resolve_judge(offline)?.map(|judge| RelevanceJudge { mode, judge }))
+    }
+
+    /// Judge every returned result in one request and, under `on`, drop the
+    /// ones below the floor. `results` keeps its order.
+    pub async fn apply(&self, query: &str, results: &mut Vec<HybridResult>) -> RelevanceReport {
+        let mut report = RelevanceReport {
+            mode: self.mode,
+            floor: RELEVANCE_FLOOR,
+            judged: 0,
+            dropped: 0,
+            top_relevance: None,
+            abstained: false,
+            error: None,
+            response: None,
+        };
+        // One request holds at most MAX_QUESTIONS_PER_REQUEST questions; a
+        // tail past that stays unjudged and is kept.
+        let n = results.len().min(MAX_QUESTIONS_PER_REQUEST);
+        if n == 0 {
+            return report;
+        }
+        let passages: Vec<(String, &str)> = results[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (format!("r{i}"), r.content.as_str()))
+            .collect();
+        let request = relevance_request(query, &passages);
+        let response = match ask_batched(self.judge.as_ref(), &request).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("relevance judge failed; results returned unjudged: {e}");
+                report.error = Some(format!("relevance judge failed; results are unjudged: {e}"));
+                return report;
+            }
+        };
+        for (i, r) in results[..n].iter_mut().enumerate() {
+            // A probability outside [0, 1] is a provider fault, not a verdict.
+            r.relevance = response
+                .noul(&format!("r{i}"))
+                .ok()
+                .filter(|p| (0.0..=1.0).contains(p));
+        }
+        report.response = Some(response);
+        report.judged = results.iter().filter(|r| r.relevance.is_some()).count();
+        report.top_relevance = results
+            .iter()
+            .filter_map(|r| r.relevance)
+            .fold(None, |best: Option<f32>, p| Some(best.map_or(p, |b| b.max(p))));
+        if self.mode == JudgeMode::On {
+            let before = results.len();
+            results.retain(|r| r.relevance.is_none_or(|p| p >= RELEVANCE_FLOOR));
+            report.dropped = before - results.len();
+            report.abstained = results.is_empty();
+        }
+        report
+    }
 }
 
 pub async fn hybrid_recall<E, R>(
@@ -1354,6 +1489,7 @@ where
             citations,
             sources,
             provenance,
+            relevance: None,
         });
     }
 
@@ -1664,6 +1800,7 @@ mod tests {
             citations: Vec::new(),
             sources: Vec::new(),
             provenance: Provenance::for_kb(kb),
+            relevance: None,
         }
     }
 

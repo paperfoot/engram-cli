@@ -99,6 +99,9 @@ pub const ABSENCE_REASON: &[&str] = &[
     // reaches it — validity withholding is not search absence.
     "all_candidates_expired",
     "no_candidate_matched",
+    // Candidates fused, and the relevance judge found none that answers the
+    // query at P >= `threshold` (`top_score` is the best P, same unit).
+    "no_candidate_above_cutoff",
     "trimmed_by_layer_budget",
     "subject_not_found",
     "no_open_values",
@@ -633,6 +636,12 @@ const RECALL_METADATA: &[FieldSpec] = &[
         name: "expiry",
         ty: Ty::Object,
         doc: "only when expiry changed the answer: { expired_memories_excluded, excluded_derived_candidates, include_expired, reason }. Memories past their valid_until are withheld by default; derived candidates from KBs holding expired memories are withheld with them",
+        always: false,
+    },
+    FieldSpec {
+        name: "relevance",
+        ty: Ty::Object,
+        doc: "only when the relevance judge ran (judge.relevance shadow|on): { mode, floor, judged, dropped, top_relevance, abstained, error? }. Each result then carries `relevance`, P(the passage answers the query). Under `on`, results below `floor` are dropped and an all-dropped recall is `no_match` with reason no_candidate_above_cutoff; `error` means the judge failed and results are unjudged",
         always: false,
     },
     FieldSpec {

@@ -287,8 +287,8 @@ pub struct RequestShape {
 ///
 /// `hybrid_recall` does not tag its own emptiness, so the reason is inferred
 /// from the stats in a fixed order, first match wins. `no_candidate_above_cutoff`
-/// is deliberately ABSENT from this vocabulary: there is no score cutoff
-/// anywhere in the retrieval path, so the value could only ever be a lie.
+/// is not inferred here: only the relevance judge applies a cutoff, and it
+/// reports through [`absence_below_cutoff`].
 pub fn absence_reason(stats: &RecallStats, req: RequestShape) -> &'static str {
     if stats.chunks_considered == 0 {
         if req.has_window {
@@ -328,6 +328,24 @@ pub fn absence_from(stats: &RecallStats, searched_kbs: Vec<String>, req: Request
         stats.chunks_considered,
     )
     .with_scores(stats.top_score, None)
+}
+
+/// The absence certificate for a ranked read the relevance judge emptied:
+/// candidates fused, and none answered the query at P >= `floor`.
+/// `top_score` is the best judged probability, in the same unit as
+/// `threshold`.
+pub fn absence_below_cutoff(
+    stats: &RecallStats,
+    searched_kbs: Vec<String>,
+    top_relevance: Option<f32>,
+    floor: f32,
+) -> Absence {
+    Absence::new(
+        "no_candidate_above_cutoff",
+        searched_kbs,
+        stats.chunks_considered,
+    )
+    .with_scores(top_relevance, Some(floor))
 }
 
 /// The absence certificate for an ENUMERATING read (`facts list`, `people

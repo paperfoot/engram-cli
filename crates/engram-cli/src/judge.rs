@@ -72,13 +72,16 @@ pub enum JudgeSite {
     Adjudicate,
     /// Does a new fact restate an existing one?
     Dedupe,
+    /// Does a recalled passage answer the query?
+    Relevance,
 }
 
 impl JudgeSite {
-    pub const ALL: [JudgeSite; 3] = [
+    pub const ALL: [JudgeSite; 4] = [
         JudgeSite::Grounding,
         JudgeSite::Adjudicate,
         JudgeSite::Dedupe,
+        JudgeSite::Relevance,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -86,6 +89,7 @@ impl JudgeSite {
             JudgeSite::Grounding => "grounding",
             JudgeSite::Adjudicate => "adjudicate",
             JudgeSite::Dedupe => "dedupe",
+            JudgeSite::Relevance => "relevance",
         }
     }
 
@@ -94,6 +98,7 @@ impl JudgeSite {
             JudgeSite::Grounding => "ENGRAM_JUDGE_GROUNDING",
             JudgeSite::Adjudicate => "ENGRAM_JUDGE_ADJUDICATE",
             JudgeSite::Dedupe => "ENGRAM_JUDGE_DEDUPE",
+            JudgeSite::Relevance => "ENGRAM_JUDGE_RELEVANCE",
         }
     }
 
@@ -102,6 +107,7 @@ impl JudgeSite {
             JudgeSite::Grounding => "judge.grounding",
             JudgeSite::Adjudicate => "judge.adjudicate",
             JudgeSite::Dedupe => "judge.dedupe",
+            JudgeSite::Relevance => "judge.relevance",
         }
     }
 
@@ -109,7 +115,12 @@ impl JudgeSite {
     /// Adjudicate and dedupe are read and reported only: setting them to
     /// shadow or on changes nothing, and status says so.
     pub fn consulted(self) -> bool {
-        matches!(self, JudgeSite::Grounding)
+        matches!(self, JudgeSite::Grounding | JudgeSite::Relevance)
+    }
+
+    /// The mode when neither env nor config sets one.
+    pub fn default_mode(self) -> JudgeMode {
+        JudgeMode::Off
     }
 
     /// The usage-ledger operation for this site's judge calls.
@@ -118,11 +129,12 @@ impl JudgeSite {
             JudgeSite::Grounding => "judge_grounding",
             JudgeSite::Adjudicate => "judge_adjudicate",
             JudgeSite::Dedupe => "judge_dedupe",
+            JudgeSite::Relevance => "judge_relevance",
         }
     }
 }
 
-/// The mode for `site`: env, then config.toml, then `off`.
+/// The mode for `site`: env, then config.toml, then the site's default.
 pub fn judge_mode(site: JudgeSite) -> Result<JudgeMode, CliError> {
     let env = std::env::var(site.env_var()).ok();
     mode_from(site, env.as_deref(), || {
@@ -145,8 +157,8 @@ fn mode_from(
         return JudgeMode::parse(v).ok_or_else(|| invalid(format!("{}={v:?}", site.env_var())));
     }
     match file()? {
-        None => Ok(JudgeMode::Off),
-        Some(toml::Value::String(s)) if s.trim().is_empty() => Ok(JudgeMode::Off),
+        None => Ok(site.default_mode()),
+        Some(toml::Value::String(s)) if s.trim().is_empty() => Ok(site.default_mode()),
         Some(toml::Value::String(s)) => {
             JudgeMode::parse(&s).ok_or_else(|| invalid(format!("{} = {s:?}", site.config_key())))
         }
@@ -301,6 +313,7 @@ pub struct JudgeStatus {
     pub grounding: Option<JudgeMode>,
     pub adjudicate: Option<JudgeMode>,
     pub dedupe: Option<JudgeMode>,
+    pub relevance: Option<JudgeMode>,
     /// The route a networked command would take (see [`route_name`]);
     /// `null` when `ENGRAM_JUDGE_STUB` is malformed (see `errors`).
     pub route: Option<&'static str>,
@@ -332,6 +345,7 @@ pub fn status() -> JudgeStatus {
         grounding: modes[0],
         adjudicate: modes[1],
         dedupe: modes[2],
+        relevance: modes[3],
         route,
         warnings: warnings_for(&modes, route),
         errors,
