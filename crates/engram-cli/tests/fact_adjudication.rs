@@ -408,6 +408,55 @@ fn each_pair_is_ruled_on_its_own() {
     assert_eq!(open_objects(tmp.path()), ["1990-04-13", "1990-04-14"]);
 }
 
+/// `judge.adjudicate=shadow`: the judge is asked and its real ruling is
+/// journaled with `applied=false`, but nothing is applied — the pair stays
+/// queued. Shadow used to replace the answers with a failure, so a shadow run
+/// journaled `action=failed` and could never be used to evaluate the rule.
+#[test]
+fn shadow_journals_the_real_ruling_and_applies_nothing() {
+    let tmp = store();
+    remember_facts(
+        tmp.path(),
+        "Ana was born 1990-04-12.",
+        &birthday("1990-04-12"),
+    );
+    let v = run_json(
+        engram(tmp.path())
+            .env("ENGRAM_JUDGE_STUB", supersede())
+            .env("TYPESAFE_API_KEY", "ts-test-not-a-key")
+            .env("ENGRAM_JUDGE_ADJUDICATE", "shadow"),
+        &[
+            "remember",
+            "Ana was born 1990-04-13.",
+            "--kb",
+            "personal",
+            "--autonomy",
+            "full",
+            "--facts-json",
+            &birthday("1990-04-13"),
+        ],
+    );
+    let asked = queued(&v);
+    assert_eq!(asked.len(), 1, "shadow applied the verdict: {v}");
+    assert_eq!(
+        open_objects(tmp.path()),
+        ["1990-04-12", "1990-04-13"],
+        "shadow closed a fact: {v}"
+    );
+    let ledger = engram_storage::SqliteStore::open(tmp.path().join("db.sqlite"))
+        .expect("the temp store opens");
+    let rows = ledger
+        .decisions_for_key("personal", asked[0]["decision_key"].as_str().unwrap())
+        .expect("history");
+    assert_eq!(rows.len(), 1, "{v}");
+    let note = rows[0].note.as_deref().unwrap_or_default();
+    assert!(
+        note.starts_with("action=supersede applied=false model="),
+        "{note}"
+    );
+    assert!(note.contains("contradicts="), "signals journaled: {note}");
+}
+
 // ----- judged outside the write lock, applied only to what it saw ----------
 
 /// Two facts in one batch. The judge sees both BEFORE the transaction, when

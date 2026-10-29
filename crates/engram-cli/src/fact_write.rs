@@ -1181,12 +1181,8 @@ async fn gather_judgements(
                 if pairs.is_empty() {
                     None
                 } else {
-                    let mut judgement =
+                    let judgement =
                         judge_pairs(judge, source_text, &p.observation, &pairs).await;
-                    // Shadow: asked and paid for, never applied.
-                    if shadow && judgement.answers.is_ok() {
-                        judgement.answers = Err("judge_shadow");
-                    }
                     if let Some(r) = &judgement.response {
                         record_judge_usage(
                             ctx,
@@ -1199,6 +1195,7 @@ async fn gather_judgements(
                     Some(Judged {
                         about: JudgedPairs::of(&p.observation, &p.plan.queue),
                         judgement,
+                        shadow,
                     })
                 }
             }
@@ -1442,6 +1439,9 @@ impl JudgedPairs {
 struct Judged {
     about: JudgedPairs,
     judgement: Judgement,
+    /// Shadow: asked and paid for, journaled with its real ruling and
+    /// `applied=false`, never applied — so a shadow run can evaluate the rule.
+    shadow: bool,
 }
 
 /// One observation, planned against the store as it is now. Reads only.
@@ -1732,11 +1732,17 @@ fn settle_judgement(
     let fresh = planned.filter(|(plan, p)| {
         !plan.queue.is_empty() && judged.about == JudgedPairs::of(&p.observation, &plan.queue)
     });
-    record_judgement(ctx, w, judged, fresh.is_none())?;
+    record_judgement(ctx, w, judged, fresh.is_none() || judged.shadow)?;
     let Some((plan, p)) = fresh else {
         counts.stale += 1;
         return Ok(false);
     };
+    if judged.shadow {
+        plan.notes.push(PlanNote::AdjudicationFailed {
+            reason: "judge_shadow",
+        });
+        return Ok(false);
+    }
     let closes = plan.closes.len();
     apply_judgement(plan, &p.observation, &p.by_id(), j);
     counts.pairs_closed += plan.closes.len().saturating_sub(closes);
