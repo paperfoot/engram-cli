@@ -17,7 +17,8 @@ Usage:
   curl -L https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz | tar xz -C data/scifact --strip-components=1
   python3 benchmarks/jev/scifact_grounding_probe.py build
   python3 benchmarks/jev/scifact_grounding_probe.py probe plain     # needs the TypeSafe key in Keychain
-  python3 benchmarks/jev/scifact_grounding_probe.py score plain strict --save benchmarks/jev-grounding-probe-scifact-<ts>.json
+  JEV_MODEL=jev-1.14.0 python3 benchmarks/jev/scifact_grounding_probe.py probe plain
+  python3 benchmarks/jev/scifact_grounding_probe.py score plain@jev-1.13.0 plain@jev-1.14.0 --save benchmarks/jev-grounding-probe-scifact-<ts>.json
 
 The key is read from the macOS Keychain item `typesafe-jev-api-key` (or
 TYPESAFE_API_KEY) and never printed. SciFact is CC-BY-NC: data stays in the
@@ -27,6 +28,8 @@ import collections, concurrent.futures as cf, json, os, re, subprocess, sys, tim
 
 DATA = os.environ.get('SCIFACT_DIR', 'data/scifact')
 URL = 'https://api.typesafe.ai/v1/systemone'
+# Pinned like typesafe.rs; set JEV_MODEL to compare versions (results land in probe-<variant>@<model>.json).
+MODEL = os.environ.get('JEV_MODEL', 'jev-1.13.0')
 
 
 # ---- compile.rs heuristic, ported verbatim ---------------------------------
@@ -129,7 +132,7 @@ def api_key():
 
 
 def ask(key, state, questions, retries=4):
-    body = json.dumps({'model': 'jev-latest', 'state': state, 'questions': questions}).encode()
+    body = json.dumps({'model': MODEL, 'state': state, 'questions': questions}).encode()
     err = None
     for i in range(retries):
         t = time.time()
@@ -172,9 +175,9 @@ def probe(variant, workers=8):
             for qid, a in resp['answers'].items():
                 scores[qid] = a.get('noul')
     lat.sort()
-    out = {'variant': variant, 'model': 'jev-latest', 'scores': scores, 'requests': len(lat),
+    out = {'variant': variant, 'model': MODEL, 'scores': scores, 'requests': len(lat),
            'latency_p50_s': lat[len(lat) // 2], 'latency_p95_s': lat[int(len(lat) * .95)], 'input_tokens': toks}
-    json.dump(out, open(f'{DATA}/probe-{variant}.json', 'w'))
+    json.dump(out, open(f'{DATA}/probe-{variant}@{MODEL}.json', 'w'))
     print(variant, 'requests', len(lat), 'p50 %.2fs p95 %.2fs' % (out['latency_p50_s'], out['latency_p95_s']),
           'input tokens', toks, 'usd %.4f' % (toks * 0.042e-6))
 
