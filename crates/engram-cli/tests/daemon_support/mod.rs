@@ -49,6 +49,7 @@ impl Store {
             .env_remove("ENGRAM_JUDGE_GROUNDING")
             .env_remove("ENGRAM_JUDGE_ADJUDICATE")
             .env_remove("ENGRAM_JUDGE_DEDUPE")
+            .env_remove("ENGRAM_JUDGE_RELEVANCE")
             .env_remove("ENGRAM_JUDGE_LOG");
         cmd
     }
@@ -143,6 +144,7 @@ impl Daemon {
             .env_remove("ENGRAM_JUDGE_GROUNDING")
             .env_remove("ENGRAM_JUDGE_ADJUDICATE")
             .env_remove("ENGRAM_JUDGE_DEDUPE")
+            .env_remove("ENGRAM_JUDGE_RELEVANCE")
             .env_remove("ENGRAM_JUDGE_LOG")
             .env_remove("ENGRAM_BENCH_FORCE_STUB")
             // Off unless a test asks for it: a background compile firing in the

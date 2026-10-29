@@ -139,7 +139,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     // that answer the query rather than on the ones they displaced.
     let relevance = match &relevance_judge {
         Some(judge) => {
-            let report = judge.apply(&query, &mut results).await;
+            let report = judge.apply(&ctx.store, &query, &mut results).await;
             if let Some(response) = &report.response {
                 crate::judge::record_judge_usage(
                     ctx,

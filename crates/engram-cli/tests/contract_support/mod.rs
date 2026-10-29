@@ -42,6 +42,7 @@ impl Sandbox {
             .env_remove("ENGRAM_JUDGE_GROUNDING")
             .env_remove("ENGRAM_JUDGE_ADJUDICATE")
             .env_remove("ENGRAM_JUDGE_DEDUPE")
+            .env_remove("ENGRAM_JUDGE_RELEVANCE")
             .env_remove("ENGRAM_FORCE_TTY");
         c
     }

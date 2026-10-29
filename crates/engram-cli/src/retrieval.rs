@@ -8,7 +8,7 @@ use crate::judge::{judge_mode, resolve_judge, JudgeMode, JudgeSite};
 use crate::read_surface::{
     Provenance, RecallStats, DERIVED_ENTITY, DERIVED_RELATION, DERIVED_WIKI,
 };
-use engram_llm::judge::questions::{relevance_request, RELEVANCE_FLOOR};
+use engram_llm::judge::questions::{relevance_request, RelevancePassage, RELEVANCE_FLOOR};
 use engram_llm::judge::{
     ask_batched, wire_decimal, Judge, JudgeResponse, MAX_QUESTIONS_PER_REQUEST,
 };
@@ -866,9 +866,19 @@ impl RelevanceJudge {
         Ok(resolve_judge(offline)?.map(|judge| RelevanceJudge { mode, judge }))
     }
 
+    pub fn mode(&self) -> JudgeMode {
+        self.mode
+    }
+
     /// Judge every returned result in one request and, under `on`, drop the
-    /// ones below the floor. `results` keeps its order.
-    pub async fn apply(&self, query: &str, results: &mut Vec<HybridResult>) -> RelevanceReport {
+    /// ones below the floor. `results` keeps its order. `store` supplies each
+    /// memory's date.
+    pub async fn apply(
+        &self,
+        store: &SqliteStore,
+        query: &str,
+        results: &mut Vec<HybridResult>,
+    ) -> RelevanceReport {
         let mut report = RelevanceReport {
             mode: self.mode,
             floor: RELEVANCE_FLOOR,
@@ -885,10 +895,14 @@ impl RelevanceJudge {
         if n == 0 {
             return report;
         }
-        let passages: Vec<(String, &str)> = results[..n]
+        let passages: Vec<RelevancePassage<'_>> = results[..n]
             .iter()
             .enumerate()
-            .map(|(i, r)| (format!("r{i}"), r.content.as_str()))
+            .map(|(i, r)| RelevancePassage {
+                id: format!("r{i}"),
+                text: r.content.as_str(),
+                date: memory_date(store, r.provenance.memory_id),
+            })
             .collect();
         let request = relevance_request(query, &passages);
         let response = match ask_batched(self.judge.as_ref(), &request).await {
@@ -920,6 +934,14 @@ impl RelevanceJudge {
         }
         report
     }
+}
+
+/// A memory's date as the judge reads it: when it happened, else when it was
+/// written down. `None` for derived rows and on any lookup failure (the
+/// judge then sees the passage alone).
+fn memory_date(store: &SqliteStore, memory_id: Option<Uuid>) -> Option<String> {
+    let (event, created) = store.memory_times(memory_id?).ok()??;
+    Some(event.unwrap_or(created).format("%Y-%m-%d").to_string())
 }
 
 pub async fn hybrid_recall<E, R>(

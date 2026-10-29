@@ -213,7 +213,8 @@ fn bench_mini_fts_opens_no_store_on_the_default_path() {
             .env_remove("ENGRAM_JUDGE_STUB")
             .env_remove("ENGRAM_JUDGE_GROUNDING")
             .env_remove("ENGRAM_JUDGE_ADJUDICATE")
-            .env_remove("ENGRAM_JUDGE_DEDUPE");
+            .env_remove("ENGRAM_JUDGE_DEDUPE")
+            .env_remove("ENGRAM_JUDGE_RELEVANCE");
         c
     };
 

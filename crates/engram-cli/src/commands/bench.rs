@@ -571,7 +571,7 @@ async fn run_personal(
         )
         .await?;
         if let Some(judge) = &relevance_judge {
-            judge.apply(q.text, &mut results.results).await;
+            judge.apply(&store, q.text, &mut results.results).await;
         }
         let latency_ms = start.elapsed().as_millis() as u64;
         let retrieved = to_items(&results.results, &seeded);
@@ -635,6 +635,11 @@ async fn run_personal(
     meta.add("profile", profile_enum.as_str());
     meta.add("embedder", embedder.model());
     meta.add("reranker", reranker_name);
+    // Which recall the numbers describe: judged or not.
+    meta.add(
+        "relevance_judge",
+        relevance_judge.as_ref().map_or("off", |j| j.mode().as_str()),
+    );
     meta.add("memories_seeded", report.memories_seeded);
     meta.add("queries_evaluated", report.queries_evaluated);
     if let Some(path) = &save {

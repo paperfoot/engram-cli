@@ -16,7 +16,10 @@
 //!   `keys.openrouter`), else none.
 //!
 //! A judge request carries a memory to a third party, and engram stores
-//! personal and medical memories, so every site defaults to `off`.
+//! personal and medical memories, so every site defaults to `off` except
+//! `relevance`: without it recall cannot say "nothing stored answers this".
+//! It sends only the passages a recall returns, and only when a TypeSafe or
+//! OpenRouter key is set; `engram config set judge.relevance off` stops it.
 
 use crate::commands::config;
 use crate::context::AppContext;
@@ -118,9 +121,14 @@ impl JudgeSite {
         matches!(self, JudgeSite::Grounding | JudgeSite::Relevance)
     }
 
-    /// The mode when neither env nor config sets one.
+    /// The mode when neither env nor config sets one. Relevance is on: its
+    /// eval cleared the bar (see `questions::RELEVANCE_FLOOR`), and without
+    /// it recall cannot abstain at all.
     pub fn default_mode(self) -> JudgeMode {
-        JudgeMode::Off
+        match self {
+            JudgeSite::Relevance => JudgeMode::On,
+            _ => JudgeMode::Off,
+        }
     }
 
     /// The usage-ledger operation for this site's judge calls.
@@ -442,6 +450,34 @@ mod tests {
             mode_from(site, None, file(toml::Value::String(String::new()))).unwrap(),
             JudgeMode::Off
         );
+    }
+
+    #[test]
+    fn relevance_alone_defaults_on_and_off_still_turns_it_off() {
+        assert_eq!(
+            mode_from(JudgeSite::Relevance, None, no_file).unwrap(),
+            JudgeMode::On
+        );
+        assert_eq!(
+            mode_from(JudgeSite::Relevance, Some(" "), no_file).unwrap(),
+            JudgeMode::On
+        );
+        assert_eq!(
+            mode_from(JudgeSite::Relevance, Some("off"), no_file).unwrap(),
+            JudgeMode::Off
+        );
+        assert_eq!(
+            mode_from(
+                JudgeSite::Relevance,
+                None,
+                file(toml::Value::String("off".into()))
+            )
+            .unwrap(),
+            JudgeMode::Off
+        );
+        for site in [JudgeSite::Grounding, JudgeSite::Adjudicate, JudgeSite::Dedupe] {
+            assert_eq!(mode_from(site, None, no_file).unwrap(), JudgeMode::Off);
+        }
     }
 
     #[test]

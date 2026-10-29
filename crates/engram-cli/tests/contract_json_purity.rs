@@ -56,6 +56,7 @@ fn bare_cmd_in(home: &Path) -> Command {
     cmd.env_remove("ENGRAM_JUDGE_GROUNDING");
     cmd.env_remove("ENGRAM_JUDGE_ADJUDICATE");
     cmd.env_remove("ENGRAM_JUDGE_DEDUPE");
+    cmd.env_remove("ENGRAM_JUDGE_RELEVANCE");
     cmd.env_remove("ENGRAM_JUDGE_LOG");
     cmd.env_remove("RUST_LOG");
     // stderr is a pipe under a test harness anyway; pinning the seam means the

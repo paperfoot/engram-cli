@@ -22,6 +22,7 @@ fn engram_bare() -> assert_cmd::Command {
         .env_remove("ENGRAM_JUDGE_GROUNDING")
         .env_remove("ENGRAM_JUDGE_ADJUDICATE")
         .env_remove("ENGRAM_JUDGE_DEDUPE")
+        .env_remove("ENGRAM_JUDGE_RELEVANCE")
         .env_remove("ENGRAM_JUDGE_LOG")
         .env("ENGRAM_BENCH_FORCE_STUB", "1");
     cmd

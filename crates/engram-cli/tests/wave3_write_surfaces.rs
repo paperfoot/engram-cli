@@ -40,6 +40,7 @@ fn engram(store: &Path) -> Command {
     cmd.env_remove("ENGRAM_JUDGE_GROUNDING");
     cmd.env_remove("ENGRAM_JUDGE_ADJUDICATE");
     cmd.env_remove("ENGRAM_JUDGE_DEDUPE");
+    cmd.env_remove("ENGRAM_JUDGE_RELEVANCE");
     cmd.env_remove("ENGRAM_JUDGE_LOG");
     cmd.env_remove("GEMINI_API_KEY");
     cmd.env_remove("COHERE_API_KEY");
