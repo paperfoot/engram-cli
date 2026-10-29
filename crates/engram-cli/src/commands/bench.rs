@@ -638,7 +638,9 @@ async fn run_personal(
     // Which recall the numbers describe: judged or not.
     meta.add(
         "relevance_judge",
-        relevance_judge.as_ref().map_or("off", |j| j.mode().as_str()),
+        relevance_judge
+            .as_ref()
+            .map_or("off", |j| j.mode().as_str()),
     );
     meta.add("memories_seeded", report.memories_seeded);
     meta.add("queries_evaluated", report.queries_evaluated);

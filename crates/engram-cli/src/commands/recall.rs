@@ -201,7 +201,8 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     let answer_context = render_answer_context(layered.iter().copied());
     let results_json: Vec<_> = layered
         .iter()
-        .map(|r| json!({
+        .map(|r| {
+            let mut v = json!({
             "id": r.id.to_string(),
             // The id a mutator accepts. `id` keeps its meaning (the row's own
             // id, which for a chunk hit is a chunk id) and this is the one to
@@ -212,7 +213,6 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             "kind": r.kind,
             "score": round_score(r.score),
             "rerank_score": r.rerank_score.map(round_score),
-            "relevance": r.relevance.map(engram_llm::judge::wire_decimal),
             "kb": r.kb,
             "content": r.content,
             "citations": r.citations.iter().map(|c| json!({
@@ -223,7 +223,13 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
                 "source": c.source,
             })).collect::<Vec<_>>(),
             "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
-        }))
+            });
+            // Present only when the relevance judge answered for this row.
+            if let Some(p) = r.relevance {
+                v["relevance"] = json!(engram_llm::judge::wire_decimal(p));
+            }
+            v
+        })
         .collect();
 
     let query_tokens_estimated = estimated_tokens(&query);

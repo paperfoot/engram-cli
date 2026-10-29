@@ -8,11 +8,6 @@ use crate::judge::{judge_mode, resolve_judge, JudgeMode, JudgeSite};
 use crate::read_surface::{
     Provenance, RecallStats, DERIVED_ENTITY, DERIVED_RELATION, DERIVED_WIKI,
 };
-use engram_llm::judge::questions::{relevance_request, RelevancePassage, RELEVANCE_FLOOR};
-use engram_llm::judge::{
-    ask_batched, wire_decimal, Judge, JudgeResponse, MAX_QUESTIONS_PER_REQUEST,
-};
-use serde::Serialize;
 use chrono::{DateTime, Utc};
 use engram_core::fusion::{reciprocal_rank_fusion, RankedHit};
 use engram_core::types::RetrievalSource;
@@ -20,9 +15,14 @@ use engram_embed::gemini::GeminiEmbedder;
 use engram_embed::stub::StubEmbedder;
 use engram_embed::{Embedder, TaskMode};
 use engram_graph::extract_entities;
+use engram_llm::judge::questions::{relevance_request, RelevancePassage, RELEVANCE_FLOOR};
+use engram_llm::judge::{
+    ask_batched, wire_decimal, Judge, JudgeResponse, MAX_QUESTIONS_PER_REQUEST,
+};
 use engram_rerank::cohere::CohereReranker;
 use engram_rerank::{passthrough::PassthroughReranker, RerankCandidate, Reranker};
 use engram_storage::{SourceCitation, SqliteStore, StoredChunkEmbedding};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
@@ -925,7 +925,9 @@ impl RelevanceJudge {
         report.top_relevance = results
             .iter()
             .filter_map(|r| r.relevance)
-            .fold(None, |best: Option<f32>, p| Some(best.map_or(p, |b| b.max(p))));
+            .fold(None, |best: Option<f32>, p| {
+                Some(best.map_or(p, |b| b.max(p)))
+            });
         if self.mode == JudgeMode::On {
             let before = results.len();
             results.retain(|r| r.relevance.is_none_or(|p| p >= RELEVANCE_FLOOR));

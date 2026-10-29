@@ -24,7 +24,13 @@ fn seeded() -> tempfile::TempDir {
     for content in [NOEMI, ELIAS] {
         run_json(
             &mut engram(tmp.path()),
-            &["remember", content, "--kb", "personal", "--no-extract-facts"],
+            &[
+                "remember",
+                content,
+                "--kb",
+                "personal",
+                "--no-extract-facts",
+            ],
         );
     }
     tmp
@@ -55,7 +61,12 @@ fn contents(v: &Value) -> Vec<String> {
 #[test]
 fn on_by_default_an_unknown_subject_is_no_match_below_the_cutoff() {
     let tmp = seeded();
-    let v = recall(tmp.path(), "What is Rosalie's blood type?", None, Some("0.01"));
+    let v = recall(
+        tmp.path(),
+        "What is Rosalie's blood type?",
+        None,
+        Some("0.01"),
+    );
     assert_eq!(v["data"]["verdict"], "no_match", "{v}");
     assert_eq!(v["data"]["status"], "no_results", "{v}");
     assert!(contents(&v).is_empty(), "{v}");

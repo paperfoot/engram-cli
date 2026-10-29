@@ -475,7 +475,11 @@ mod tests {
             .unwrap(),
             JudgeMode::Off
         );
-        for site in [JudgeSite::Grounding, JudgeSite::Adjudicate, JudgeSite::Dedupe] {
+        for site in [
+            JudgeSite::Grounding,
+            JudgeSite::Adjudicate,
+            JudgeSite::Dedupe,
+        ] {
             assert_eq!(mode_from(site, None, no_file).unwrap(), JudgeMode::Off);
         }
     }
