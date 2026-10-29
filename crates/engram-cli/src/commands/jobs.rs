@@ -165,6 +165,12 @@ pub async fn resume(ctx: &AppContext, id: String, force: bool) -> Result<(), Cli
             handle: format!("job:{id}"),
         });
     };
+    if !crate::engine::jobs::JOB_KINDS.contains(&job.kind.as_str()) {
+        return Err(CliError::BadInput(format!(
+            "job {id} is a `{}` job, and engram no longer runs that kind; nothing to resume",
+            job.kind
+        )));
+    }
     // Re-spending a caller's money silently is not acceptable. Without move
     // 3's derivation cache, resuming an LLM compile re-runs extraction on
     // chunks that were already paid for, so it refuses and names the cost.

@@ -328,7 +328,7 @@ fn the_job_lifecycle_is_journalled() {
 }
 
 #[test]
-fn resume_refuses_to_re_spend_without_a_derivation_cache() {
+fn resume_refuses_a_kind_engram_no_longer_runs() {
     let store = seeded();
     let s = store.open();
     let SubmitOutcome::Submitted(id) = s
@@ -360,9 +360,11 @@ fn resume_refuses_to_re_spend_without_a_derivation_cache() {
         .expect("engram runs");
     assert!(!out.status.success());
     let text = String::from_utf8_lossy(&out.stderr);
+    // A paused compile job from before the cut has no runner: resuming it
+    // would requeue work nothing will ever pick up.
     assert!(
-        text.contains("already paid for") && text.contains("--force"),
-        "silently re-spending a caller's money is not acceptable: {text}"
+        text.contains("no longer runs that kind"),
+        "a compile job must not be requeued: {text}"
     );
 }
 

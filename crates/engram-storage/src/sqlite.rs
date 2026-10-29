@@ -4899,21 +4899,16 @@ impl SqliteStore {
     /// Resolve a name against the compile-time entity alias table: returns
     /// the canonical entity name when `alias_norm` is a recorded alias in
     /// this KB. Part of the subject-canonicalization cascade.
+    /// The subject a name is an alias of in `kb`: the one live nickname fact
+    /// (`has_nickname`, `also_known_as`, `goes_by`) that names it, if exactly
+    /// one subject does. The compiled `entity_aliases` table is no longer
+    /// written or read; a correction to a nickname fact takes effect here.
     pub fn resolve_entity_alias(
         &self,
         kb: &str,
         alias_norm: &str,
     ) -> Result<Option<String>, StorageError> {
-        self.conn
-            .query_row(
-                "SELECT e.canonical_name
-                 FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
-                 WHERE a.kb = ?1 AND a.alias_norm = ?2",
-                params![kb, alias_norm],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(StorageError::from)
+        self.nickname_subject(kb, alias_norm)
     }
 
     /// Distinct (display, norm) subjects of active facts in (diary, kb).

@@ -10,6 +10,7 @@ use crate::error::CliError;
 use crate::output::{print_success, Listing, Metadata, Scope};
 use crate::read_surface::{self, CursorKey, Provenance};
 use engram_core::handle::HandleKind;
+use engram_core::relations::canonical_relation;
 use engram_core::types::Fact;
 use engram_storage::people::{ALIAS_PREDICATES, PERSON_LINKS};
 use engram_storage::PersonRow;
@@ -41,7 +42,7 @@ pub fn list(
     };
     let (people, total) = ctx
         .store
-        .list_people(kb_filter, limit, offset, min_mentions)?;
+        .list_people(kb_filter, limit, offset, min_mentions, &engram_graph::people::looks_like_person_name)?;
 
     let mut rows = Vec::with_capacity(people.len());
     for person in &people {
@@ -130,7 +131,9 @@ pub fn list(
 /// grouped by their own KB so provenance survives the merge.
 pub fn show(ctx: &AppContext, name: String, kb: String, snippets: usize) -> Result<(), CliError> {
     let kb_filter = if kb == "*" { None } else { Some(kb.as_str()) };
-    let matches = ctx.store.resolve_person(kb_filter, &name)?;
+    let matches = ctx
+        .store
+        .resolve_person(kb_filter, &name, &engram_graph::people::looks_like_person_name)?;
     let Some(primary) = matches.first().cloned() else {
         let scope = if kb == "*" {
             "any kb".to_string()
@@ -284,7 +287,7 @@ struct Edge<'a> {
 fn edges<'a>(person: &PersonRow, facts: &'a [Fact]) -> Vec<Edge<'a>> {
     facts
         .iter()
-        .filter(|f| !ALIAS_PREDICATES.contains(&f.predicate.as_str()))
+        .filter(|f| !ALIAS_PREDICATES.contains(&canonical_relation(&f.predicate).as_str()))
         .map(|fact| {
             let outgoing = fact.subject_norm == person.name_norm;
             Edge {
@@ -300,7 +303,7 @@ fn aliases(person: &PersonRow, facts: &[Fact]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for f in facts {
         if f.subject_norm == person.name_norm
-            && ALIAS_PREDICATES.contains(&f.predicate.as_str())
+            && ALIAS_PREDICATES.contains(&canonical_relation(&f.predicate).as_str())
             && !f.object.eq_ignore_ascii_case(&person.name)
             && !out.iter().any(|a| a.eq_ignore_ascii_case(&f.object))
         {
@@ -317,7 +320,7 @@ fn edge_json(edge: &Edge) -> Value {
         "object": edge.fact.object,
         "other": edge.other,
         "direction": edge.direction,
-        "link": PERSON_LINKS.contains(&edge.fact.predicate.as_str()),
+        "link": PERSON_LINKS.contains(&canonical_relation(&edge.fact.predicate).as_str()),
         "confidence": edge.fact.confidence,
         "fact_id": edge.fact.id.to_string(),
         "handle": read_surface::handle(HandleKind::Fact, edge.fact.id),

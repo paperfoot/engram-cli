@@ -482,7 +482,7 @@ pub fn canonicalize_subject(
             return (raw_subject.to_string(), raw_norm);
         }
     }
-    // Alias table: a compile pass may have recorded this name as an alias.
+    // Alias: a live nickname fact names exactly one subject.
     if let Ok(Some(canonical)) = ctx.store.resolve_entity_alias(kb, &raw_norm) {
         let canon_norm = normalize(&canonical);
         if !canon_norm.is_empty() {

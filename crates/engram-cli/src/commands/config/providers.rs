@@ -51,7 +51,7 @@ impl Provider {
         match self {
             Self::Gemini => "embeddings for every write and cloud recall",
             Self::OpenRouter => {
-                "fact extraction on remember, `compile --llm`, the judge's OpenRouter route"
+                "fact extraction on remember, the judge's OpenRouter route"
             }
             Self::Cohere => "rerank in cloud_quality recall",
             Self::TypeSafe => "the optional judge, direct route (judge sites default off)",
@@ -61,7 +61,7 @@ impl Provider {
     fn degrades(self) -> &'static str {
         match self {
             Self::Gemini => "without a serving key, remember/ingest refuse to write (exit 2) and cloud recall is refused; only --offline / --profile offline stub vectors work",
-            Self::OpenRouter => "remember stores memories without facts (fact_extraction: skipped_no_openrouter_key, or failed when the key is broken), `compile --llm` fails, and a shadow/on judge site has no route unless TypeSafe is keyed",
+            Self::OpenRouter => "remember stores memories without facts (fact_extraction: skipped_no_openrouter_key, or failed when the key is broken), and a shadow/on judge site has no route unless TypeSafe is keyed",
             Self::Cohere => "unset: recall runs unreranked (reranker passthrough, lower precision); a broken key makes recall fail unless ENGRAM_RERANK_PROVIDER=none",
             Self::TypeSafe => "unset: nothing, and a shadow/on judge site routes through OpenRouter; keyed but broken: every judged call on a shadow/on site fails, because a keyed TypeSafe route never falls back to OpenRouter",
         }

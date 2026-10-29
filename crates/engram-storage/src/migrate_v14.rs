@@ -7,7 +7,7 @@
 //! are things the owner wrote down, and `people` now reads facts, so each one
 //! the facts have never recorded is copied into `facts` once.
 //!
-//! Nothing is deleted or rewritten: the copy only INSERTs, through the same
+//! No memory or fact is deleted or rewritten: the copy only INSERTs, through the same
 //! row writer and `fact.observed` event every fact uses, so a journal rebuild
 //! reproduces it. Every copied fact is `source_kind = compile_llm` (the
 //! compiler extracted the link), sourced to the first cited chunk that still
@@ -17,6 +17,11 @@
 //! `VACUUM INTO` backup first, like v10; if links appear after that check, the
 //! migration refuses to write without one.
 //!
+//! Compile jobs still queued, running or paused are marked `cancelled` with
+//! the reason — the only rows v14 changes, and they are job bookkeeping.
+//!
+//! A one-value relation (`married_to`) the facts already hold for either
+//! person, with anyone, is not copied: the facts are newer than the compile.
 //! A link the facts have EVER recorded in that KB and diary — open, closed or
 //! superseded, under any alias of the predicate, either direction for the
 //! symmetric ones — is skipped: a closed fact is a correction, and copying the
@@ -26,7 +31,7 @@
 use crate::error::StorageError;
 use crate::sqlite::SqliteStore;
 use chrono::{DateTime, Utc};
-use engram_core::relations::canonical_relation;
+use engram_core::relations::{canonical_relation, relation_spec};
 use engram_core::types::{Fact, FactType, SourceKind};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -85,6 +90,16 @@ pub struct RelationCopyReport {
     /// linked). Not a person link; left in `relations`.
     #[serde(default)]
     pub skipped_not_people: usize,
+    /// A one-value relation (`married_to`, `partner_of`) that the facts
+    /// already hold for one of the two people, with anyone, open or closed:
+    /// the facts are newer than the compile, so the compiled value is not
+    /// set beside them. Left in `relations`.
+    #[serde(default)]
+    pub skipped_slot_recorded: usize,
+    /// Compile jobs still queued, running or paused when compile was removed;
+    /// marked `cancelled` so nothing waits on a runner that no longer exists.
+    #[serde(default)]
+    pub compile_jobs_cancelled: usize,
     pub copied: Vec<CopiedRelation>,
     #[serde(default)]
     pub backup_path: Option<PathBuf>,
@@ -147,6 +162,7 @@ impl SqliteStore {
             ));
         }
         let mut report = self.copy_typed_relations_to_facts()?;
+        report.compile_jobs_cancelled = self.cancel_compile_jobs()?;
         report.backup_path = backup_path;
         self.conn.execute(
             "INSERT OR REPLACE INTO migration_log(version, ran_at, summary_json)
@@ -215,6 +231,14 @@ impl SqliteStore {
                 report.already_facts += 1;
                 continue;
             }
+            if relation_spec(&predicate).is_single_valued()
+                && (self.slot_recorded(&rel.kb, &diary, &predicate, &subject_norm)?
+                    || (symmetric(&predicate)
+                        && self.slot_recorded(&rel.kb, &diary, &predicate, &object_norm)?))
+            {
+                report.skipped_slot_recorded += 1;
+                continue;
+            }
             let fact = Fact {
                 id: Uuid::new_v4(),
                 source_memory_id: memory_id,
@@ -249,6 +273,63 @@ impl SqliteStore {
             });
         }
         Ok(report)
+    }
+
+    /// Does any fact in this KB and diary — open, closed or superseded — give
+    /// `norm` a value for this relation, from either end when it is symmetric?
+    fn slot_recorded(
+        &self,
+        kb: &str,
+        diary: &str,
+        predicate: &str,
+        norm: &str,
+    ) -> Result<bool, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT predicate, subject_norm = ?3 FROM facts
+             WHERE kb = ?1 AND diary = ?2 AND (subject_norm = ?3 OR object_norm = ?3)",
+        )?;
+        let rows: Vec<(String, bool)> = stmt
+            .query_map(params![kb, diary, norm], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows
+            .iter()
+            .any(|(p, as_subject)| fact_predicate(p) == predicate && (*as_subject || symmetric(predicate))))
+    }
+
+    /// Mark compile jobs that can never finish as cancelled. Job bookkeeping,
+    /// not memory: the rows stay, with the reason.
+    fn cancel_compile_jobs(&self) -> Result<usize, StorageError> {
+        // The job columns arrive with `ensure_jobs_schema`, which runs after
+        // migrate on an old store: use only what exists. Before `kind`
+        // existed every job was a compile job.
+        let columns: Vec<String> = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(compile_jobs)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if columns.is_empty() {
+            return Ok(0);
+        }
+        let has = |c: &str| columns.iter().any(|x| x == c);
+        let mut set = vec!["status = 'cancelled'", "message = 'compile was removed in schema v14'", "updated_at = ?1"];
+        if has("finished_at") {
+            set.push("finished_at = COALESCE(finished_at, ?1)");
+        }
+        if has("lease_owner") {
+            set.push("lease_owner = NULL");
+        }
+        if has("lease_expires_at") {
+            set.push("lease_expires_at = NULL");
+        }
+        let kind = if has("kind") { "kind = 'compile' AND" } else { "" };
+        Ok(self.conn.execute(
+            &format!(
+                "UPDATE compile_jobs SET {} WHERE {kind}
+                 status NOT IN ('completed', 'failed', 'cancelled', 'abandoned')",
+                set.join(", ")
+            ),
+            params![Utc::now().to_rfc3339()],
+        )?)
     }
 
     /// Has any fact in this KB and diary — open, closed or superseded — ever
@@ -301,7 +382,7 @@ impl SqliteStore {
             let Some(chunk) = source.get("chunk_id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let row: Option<(String, String, Option<String>)> = self
+            let mut row: Option<(String, String, Option<String>)> = self
                 .conn
                 .query_row(
                     "SELECT m.id, m.diary, COALESCE(m.event_time, m.created_at)
@@ -311,6 +392,32 @@ impl SqliteStore {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
+            // `chunks repair` re-chunks a memory without changing its text, so
+            // the chunk id is gone but the sentence is not. The memory still
+            // supports the link if its current text contains that sentence.
+            if row.is_none() {
+                if let (Some(memory), Some(sentence)) = (
+                    source.get("memory_id").and_then(|v| v.as_str()),
+                    source.get("sentence").and_then(|v| v.as_str()),
+                ) {
+                    let current: Option<(String, String, Option<String>, String)> = self
+                        .conn
+                        .query_row(
+                            "SELECT id, diary, COALESCE(event_time, created_at), content
+                             FROM memories WHERE id = ?1 AND deleted = 0",
+                            params![memory],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()?;
+                    if let Some((id, diary, at, content)) = current {
+                        let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let sentence = flat(sentence);
+                        if !sentence.is_empty() && flat(&content).contains(&sentence) {
+                            row = Some((id, diary, at));
+                        }
+                    }
+                }
+            }
             if let Some((id, diary, at)) = row {
                 let Ok(id) = Uuid::parse_str(&id) else {
                     continue;
@@ -513,6 +620,49 @@ mod tests {
         let report = copy(&store);
         assert_eq!(report.skipped_not_people, 1);
         assert!(fact_rows(&store).is_empty());
+    }
+
+    #[test]
+    fn a_one_value_relation_the_facts_already_hold_is_not_set_twice() {
+        let store = seeded();
+        set_link(&store, "e1", "e2", "married_to");
+        existing_fact(&store, "Elias", "married_to", "Carol", "default", true);
+        let report = copy(&store);
+        assert_eq!(report.skipped_slot_recorded, 1);
+        assert_eq!(fact_rows(&store).len(), 1, "Carol stays the only spouse on record");
+    }
+
+    #[test]
+    fn a_repaired_chunk_still_supports_the_link_when_the_sentence_is_unchanged() {
+        let store = seeded();
+        store
+            .conn
+            .execute_batch(&format!(
+                "UPDATE relations SET provenance_json = '{{\"sources\":[{{\"chunk_id\":\"gone\",\"memory_id\":\"{MEMORY}\",\"sentence\":\"Lira introduced me to  Elias\"}}]}}' WHERE id = 'r1';"
+            ))
+            .unwrap();
+        assert_eq!(copy(&store).copied.len(), 1);
+    }
+
+    #[test]
+    fn unfinishable_compile_jobs_are_cancelled_with_a_reason() {
+        let store = seeded();
+        store.ensure_jobs_schema().unwrap();
+        let now = Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO compile_jobs(id, kb, status, mode, created_at, updated_at, kind)
+                 VALUES ('j1', 'network', 'queued', 'evidence', '{now}', '{now}', 'compile'),
+                        ('j2', 'network', 'completed', 'evidence', '{now}', '{now}', 'compile');"
+            ))
+            .unwrap();
+        assert_eq!(store.with_tx(|s| s.cancel_compile_jobs()).unwrap(), 1);
+        let status: String = store
+            .conn
+            .query_row("SELECT status FROM compile_jobs WHERE id = 'j1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "cancelled");
     }
 
     #[test]
