@@ -1253,6 +1253,8 @@ pub struct Judgement {
     /// Who answered, as the journal names it: `judge:<provider>`.
     pub judge: &'static str,
     pub model: String,
+    /// The stored facts the judge was asked about (never a safety pair).
+    pub asked: Vec<Uuid>,
     /// Per stored fact asked about: its four signals, or `None` when the
     /// judge left any of them unanswered (that pair stays queued). `Err` =
     /// the call failed; every pair stays queued. The reason is a stable word.
@@ -1275,9 +1277,7 @@ impl Judgement {
 
     /// Whether the judge was asked about this stored fact.
     fn asked(&self, old_fact_id: Uuid) -> bool {
-        self.answers
-            .as_ref()
-            .map_or(true, |all| all.iter().any(|(id, _)| *id == old_fact_id))
+        self.asked.contains(&old_fact_id)
     }
 }
 
@@ -1309,19 +1309,32 @@ pub async fn judge_pairs(
         })
         .collect();
     let request = pair_request(source_text, &new_fact, &existing);
+    let asked: Vec<Uuid> = pairs.iter().map(|f| f.id).collect();
     match ask_batched(judge, &request).await {
-        Ok(response) => Judgement {
-            judge: response.provider,
-            model: response.model.clone(),
-            answers: Ok(pairs
+        Ok(response) => {
+            let answers: Vec<(Uuid, Option<PairAnswers>)> = pairs
                 .iter()
                 .map(|f| {
                     let a = PairAnswers::from_response(&response, &f.id.to_string()).ok();
                     (f.id, a)
                 })
-                .collect()),
-            response: Some(response),
-        },
+                .collect();
+            // A reply that settles no pair at all is no verdict, and the
+            // envelope says so; a pair left partly unanswered stays queued.
+            let answers = if answers.iter().all(|(_, a)| a.is_none()) {
+                tracing::warn!("adjudication judge left every pair unanswered; they stay queued");
+                Err("not_a_verdict")
+            } else {
+                Ok(answers)
+            };
+            Judgement {
+                judge: response.provider,
+                model: response.model.clone(),
+                asked,
+                answers,
+                response: Some(response),
+            }
+        }
         Err(e) => {
             // Logged, never echoed into the envelope: the note only needs to
             // say that nobody decided.
@@ -1329,6 +1342,7 @@ pub async fn judge_pairs(
             Judgement {
                 judge: judge.name(),
                 model: judge.model_id().to_string(),
+                asked,
                 answers: Err(failure_reason(&e)),
                 response: None,
             }
@@ -1769,16 +1783,19 @@ fn record_judgement(
         if !j.asked(*old_fact_id) {
             continue;
         }
-        let action = match j.answers {
-            Err(_) => "failed",
-            Ok(_) => j.ruling(*old_fact_id).word(),
-        };
-        let signals = j
+        let answers = j
             .answers
             .as_ref()
             .ok()
             .and_then(|all| all.iter().find(|(id, _)| id == old_fact_id))
-            .and_then(|(_, a)| a.as_ref())
+            .and_then(|(_, a)| a.as_ref());
+        let action = match (&j.answers, answers) {
+            (Err(_), _) => "failed",
+            (Ok(_), None) => "unanswered",
+            (Ok(_), Some(_)) => j.ruling(*old_fact_id).word(),
+        };
+        // The provider's decimals, so a refit reads what the rule read.
+        let signals = answers
             .map(|a| {
                 format!(
                     " restates={} same_slot={} contradicts={} old_ended={}",
@@ -2346,6 +2363,7 @@ mod tests {
         Judgement {
             judge: "stub",
             model: "stub".into(),
+            asked: vec![old.id],
             answers: Ok(vec![(old.id, Some(a))]),
             response: None,
         }
@@ -2426,6 +2444,7 @@ mod tests {
         let unanswered = Judgement {
             judge: "stub",
             model: "stub".into(),
+            asked: vec![old.id],
             answers: Ok(vec![(old.id, None)]),
             response: None,
         };

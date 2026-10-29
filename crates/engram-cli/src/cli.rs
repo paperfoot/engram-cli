@@ -105,8 +105,9 @@ pub enum Command {
 
         /// Conflict-resolution authority: `assisted` (default) queues
         /// uncertain contradictions for YOU to resolve via `facts resolve`
-        /// (you have the conversation context); `full` lets engram
-        /// adjudicate with its own LLM call; `strict` never auto-supersedes.
+        /// (you have the conversation context); `full` lets engram settle
+        /// routine ones with its JEV judge and a code rule (safety pairs
+        /// still queue); `strict` never auto-supersedes.
         #[arg(long, default_value = "assisted")]
         autonomy: String,
 

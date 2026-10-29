@@ -744,7 +744,7 @@ const REMEMBER_FLAGS: &[FlagSpec] = &[
         ty: Ty::Enum(AUTONOMY),
         default: Some("assisted"),
         required: false,
-        doc: "who adjudicates a contradiction: assisted queues it for YOU (you have the conversation context), full lets engram decide with its own LLM call, strict never auto-supersedes",
+        doc: "who adjudicates a contradiction: assisted queues it for YOU (you have the conversation context), full lets engram settle routine ones with its JEV judge and a code rule (safety pairs still queue for you), strict never auto-supersedes",
     },
     FlagSpec {
         name: "allow_duplicate",
@@ -887,7 +887,7 @@ const REMEMBER_DATA: &[FieldSpec] = &[
 /// facts backfill).
 const FACT_WRITE_COUNTERS_DOC_GATE: &str = "measurement: what the novelty gate did, one count per fact that reached it — {ran, skipped_has_siblings (the subject+relation already had facts, gate not run), duplicate (absorbed as a restatement of the same subject's fact on another relation; never when either side is a safety relation — that is counted as uncertain and the classifier decides), novel, uncertain, uncertain_candidates}";
 const FACT_WRITE_COUNTERS_DOC_QUEUED: &str = "measurement: questions handed to you in adjudication_needed, counted by the classifier rule that queued them ({rule: count}; {} when none)";
-const FACT_WRITE_COUNTERS_DOC_ADJ: &str = "measurement: the --autonomy full judge — {calls, failed (no verdict), supersede, coexist, reject_new, stale (verdict not applied: the store changed), not_asked (observations whose pairs arose after judging, e.g. inside one batch; kept queued), pairs_in, pairs_closed, pairs_kept}; all zero under assisted and strict";
+const FACT_WRITE_COUNTERS_DOC_ADJ: &str = "measurement: the --autonomy full judge — {calls, failed (no verdict; pairs stay queued), supersede, coexist, reject_new (pairs the rule settled that way; safety pairs are never sent), stale (verdict not applied: the store changed), not_asked (observations whose pairs arose after judging, e.g. inside one batch; kept queued), pairs_in, pairs_closed, pairs_kept}; all zero under assisted and strict";
 
 const REMEMBER_METADATA: &[FieldSpec] = &[
     FieldSpec {
