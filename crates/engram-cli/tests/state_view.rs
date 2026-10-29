@@ -698,6 +698,162 @@ fn relation_narrowing_accepts_an_alias_of_the_relation() {
     assert_eq!(groups[0]["relation"], json!("allergic_to"));
 }
 
+/// An extractor that spells a safety relation its own way. `is_allergic_to`
+/// and `takes` used to stay relations of their own: no safety flag, no safety
+/// gate, and `state --relation allergic_to` answered "no allergy" about a
+/// person whose allergy was stored.
+#[test]
+fn an_extracted_safety_fact_under_another_spelling_is_still_a_safety_fact() {
+    let dir = store();
+    let out = engram(dir.path())
+        .env(
+            "ENGRAM_FACT_LLM_STUB",
+            r#"{"*":[
+                {"subject":"Rosalie Brandtke-Wendel","predicate":"is_allergic_to","object":"penicillin"},
+                {"subject":"Rosalie Brandtke-Wendel","predicate":"takes","object":"ramipril"},
+                {"subject":"Rosalie Brandtke-Wendel","predicate":"has_condition","object":"hypertension"}]}"#,
+        )
+        .args([
+            "remember",
+            "Rosalie is allergic to penicillin, has hypertension and takes ramipril.",
+            "--kb",
+            "personal",
+            "--offline",
+            "--json",
+        ])
+        .output()
+        .expect("engram ran");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = state(dir.path(), "Rosalie Brandtke-Wendel", &[]);
+    for (relation, object) in [
+        ("allergic_to", "penicillin"),
+        ("takes_medication", "ramipril"),
+        ("diagnosed_with", "hypertension"),
+    ] {
+        let group = v["data"]["state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["relation"] == relation)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {relation} group: {v}"));
+        assert_eq!(group["safety"], json!(true), "{group}");
+        assert_eq!(group["values"][0]["object"], json!(object), "{group}");
+    }
+
+    let allergies = state(
+        dir.path(),
+        "Rosalie Brandtke-Wendel",
+        &["--relation", "allergic_to"],
+    );
+    assert_eq!(
+        allergies["data"]["verdict"],
+        json!("results"),
+        "{allergies}"
+    );
+    assert_eq!(
+        group_values(&allergies, "allergic_to")[0]["object"],
+        json!("penicillin")
+    );
+}
+
+/// The safety gate on the caller path. A dose change on a medication is a
+/// question for a person, never a silent supersession; under the `takes`
+/// spelling it used to be an ordinary relation and skipped that gate.
+#[test]
+fn a_dose_change_under_another_spelling_is_still_a_safety_question() {
+    let dir = store();
+    remember_facts(
+        dir.path(),
+        "personal",
+        "Elias takes metformin 500 mg daily.",
+        r#"[{"subject":"Elias","predicate":"takes","object":"metformin 500 mg daily"}]"#,
+    );
+    remember_facts(
+        dir.path(),
+        "personal",
+        "Elias's metformin went up to 1000 mg daily.",
+        r#"[{"subject":"Elias","predicate":"takes","object":"metformin 1000 mg daily"}]"#,
+    );
+    let v = state(dir.path(), "Elias", &["--relation", "takes_medication"]);
+    let questions = v["data"]["open_questions"].as_array().cloned().unwrap();
+    assert_eq!(questions.len(), 1, "one member, two doses: {v}");
+    assert_eq!(questions[0]["relation"], json!("takes_medication"));
+    assert_eq!(questions[0]["safety"], json!(true), "{v}");
+    assert_eq!(
+        questions[0]["suggested_action"],
+        json!("requires_context"),
+        "a safety pair is never advised toward a supersession: {v}"
+    );
+}
+
+/// Import keeps the file's predicate on disk, and refuses a safety close only
+/// when it recognises the relation. An allergy spelled `is_allergic_to` used
+/// to import CLOSED, and `--relation allergic_to` filtered on the stored
+/// spelling, so the answer was "no allergy" twice over.
+#[test]
+fn an_imported_allergy_under_another_spelling_lands_open_and_is_found() {
+    let source = store();
+    remember_facts(
+        source.path(),
+        "personal",
+        "Lira is allergic to penicillin.",
+        r#"[{"subject":"Lira","predicate":"allergic_to","object":"penicillin"}]"#,
+    );
+    let mut doc = run_json(source.path(), &["export"])["data"].clone();
+    // The file another tool wrote: the allergy under its own spelling, row
+    // and journal alike, and a journal close for it.
+    let fact_id = doc["facts"][0]["id"].as_str().unwrap().to_string();
+    let valid_from = doc["facts"][0]["valid_from"].clone();
+    doc["facts"][0]["predicate"] = json!("is_allergic_to");
+    doc["facts"][0]["valid_until"] = valid_from.clone();
+    doc["facts"][0]["close_reason"] = json!("stopped");
+    let mut events = doc["events"].as_array().cloned().unwrap();
+    for e in &mut events {
+        if e["kind"] == "fact.observed" {
+            e["payload"]["relation"] = json!("is_allergic_to");
+        }
+    }
+    events.push(json!({
+        "seq": events.len() + 1,
+        "id": "11111111-2222-4333-8444-555555555555",
+        "ts": "2026-08-02T04:00:00Z",
+        "actor": "legacy-tool",
+        "kind": "fact.interval_closed",
+        "subject_id": fact_id,
+        "kb": "personal",
+        "diary": "default",
+        "payload": {
+            "fact_id": fact_id,
+            "valid_until": valid_from,
+            "reason": "stopped",
+            "authority": "person",
+            "sets_superseded_by": false,
+        }
+    }));
+    doc["counts"]["events"] = json!(events.len());
+    doc["events"] = json!(events);
+    let file = source.path().join("legacy.json");
+    std::fs::write(&file, serde_json::to_vec(&doc).unwrap()).unwrap();
+
+    let target = store();
+    run_json(target.path(), &["import", file.to_str().unwrap()]);
+    let v = state(target.path(), "Lira", &["--relation", "allergic_to"]);
+    assert_eq!(v["data"]["verdict"], json!("results"), "{v}");
+    let values = group_values(&v, "allergic_to");
+    assert_eq!(values.len(), 1, "{v}");
+    assert_eq!(values[0]["object"], json!("penicillin"));
+    assert!(
+        values[0]["valid_until"].is_null(),
+        "she is still allergic: {v}"
+    );
+}
+
 /// The isolation gate (CD-6), asserted rather than trusted.
 #[test]
 fn this_suite_never_reaches_for_the_real_store() {

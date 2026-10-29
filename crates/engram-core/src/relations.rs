@@ -174,8 +174,46 @@ pub fn canonical_relation(raw: &str) -> String {
         "role" | "position" | "job_title" | "title" => "has_role",
         "spouse" | "spouse_of" | "wife_of" | "husband_of" => "married_to",
         "dating" | "girlfriend_of" | "boyfriend_of" | "in_relationship_with" => "partner_of",
-        "allergy" | "has_allergy" | "allergic" => "allergic_to",
-        "medication" | "on_medication" | "takes_drug" | "prescribed" => "takes_medication",
+        // Safety aliases. The safety gate, the grounding cut and the import
+        // close refusal all key on the CANONICAL relation, so a safety fact
+        // spelled any other way skips every one of them and `state --relation
+        // allergic_to` reports no allergy. Over-mapping costs a misfiled
+        // non-medical fact; under-mapping costs an unguarded allergy.
+        "allergy"
+        | "has_allergy"
+        | "allergic"
+        | "is_allergic_to"
+        | "allergies"
+        | "has_allergies"
+        | "allergy_to"
+        | "has_allergy_to"
+        | "allergic_reaction_to" => "allergic_to",
+        "medication"
+        | "medications"
+        | "on_medication"
+        | "is_on_medication"
+        | "takes_drug"
+        | "prescribed"
+        | "is_prescribed"
+        | "was_prescribed"
+        | "prescribed_medication"
+        | "takes"
+        | "taking"
+        | "is_taking"
+        | "takes_medicine"
+        | "takes_medications" => "takes_medication",
+        "diagnosis"
+        | "has_diagnosis"
+        | "diagnosed"
+        | "is_diagnosed_with"
+        | "was_diagnosed_with"
+        | "has_condition"
+        | "condition"
+        | "medical_condition"
+        | "has_medical_condition"
+        | "suffers_from"
+        | "has_disease" => "diagnosed_with",
+        "has_blood_type" | "bloodtype" | "blood_group" | "has_blood_group" => "blood_type",
         "favorite_language" | "preferred_language" | "codes_in" => "prefers_language",
         _ => return p,
     }
@@ -492,5 +530,39 @@ mod tests {
         assert_eq!(canonical_relation("Has Allergy"), "allergic_to");
         assert_eq!(canonical_relation("codes-in"), "prefers_language");
         assert_eq!(canonical_relation("novel_predicate"), "novel_predicate");
+    }
+
+    #[test]
+    fn every_safety_spelling_lands_on_a_safety_relation() {
+        // An unregistered spelling of a safety predicate used to stay its own
+        // non-safety relation: `is_allergic_to penicillin` skipped the safety
+        // gate, the grounding cut and the import close refusal, and
+        // `state --relation allergic_to` answered "no allergy".
+        let cases = [
+            ("is_allergic_to", "allergic_to"),
+            ("Is Allergic To", "allergic_to"),
+            ("allergy", "allergic_to"),
+            ("allergic", "allergic_to"),
+            ("has_allergies", "allergic_to"),
+            ("takes", "takes_medication"),
+            ("on_medication", "takes_medication"),
+            ("is-taking", "takes_medication"),
+            ("prescribed", "takes_medication"),
+            ("diagnosis", "diagnosed_with"),
+            ("has_condition", "diagnosed_with"),
+            ("was_diagnosed_with", "diagnosed_with"),
+            ("suffers_from", "diagnosed_with"),
+            ("has_blood_type", "blood_type"),
+            ("blood_group", "blood_type"),
+        ];
+        for (raw, want) in cases {
+            let canonical = canonical_relation(raw);
+            assert_eq!(canonical, want, "{raw}");
+            assert!(is_safety_slot(&canonical), "{raw} must be gated");
+        }
+        // Cessation phrasings still name the END of an interval, not a
+        // relation: aliasing must not swallow them.
+        assert_eq!(cessation_of("stopped_taking"), Some("takes_medication"));
+        assert_eq!(canonical_relation("stopped_taking"), "stopped_taking");
     }
 }
