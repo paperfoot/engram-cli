@@ -21,20 +21,10 @@ const LIST_RELATIONS: usize = 5;
 /// Every fact about a person: the count, the aliases and the page agree.
 const ALL: usize = usize::MAX;
 
-/// Words that make a name an organisation's, whatever its shape.
-const ORGANISATION_WORDS: &[&str] = &[
-    "ag", "ai", "bank", "capital", "clinic", "co", "company", "corp", "corporation", "foundation",
-    "fund", "gmbh", "group", "holdings", "hospital", "inc", "institute", "lab", "labs", "llc",
-    "ltd", "partners", "pte", "studio", "studios", "technologies", "tech", "university",
-    "ventures",
-];
-
-/// Reads as a person's name: the graph crate's check, minus organisation words.
+/// Reads as a person's name (the graph crate's check; organisation words are
+/// excluded in storage for every fact).
 fn person_name(name: &str) -> bool {
     engram_graph::people::looks_like_person_name(name)
-        && !name
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|w| ORGANISATION_WORDS.contains(&w.to_lowercase().as_str()))
 }
 
 pub fn list(

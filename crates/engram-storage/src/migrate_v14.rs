@@ -335,20 +335,24 @@ impl SqliteStore {
         predicate: &str,
         norm: &str,
     ) -> Result<SlotState, StorageError> {
+        let names = self.name_variants(kb, norm)?;
         let mut stmt = self.conn.prepare(
-            "SELECT predicate, subject_norm = ?3, valid_until IS NULL AND superseded_by IS NULL,
+            "SELECT predicate, subject_norm, object_norm,
+                    valid_until IS NULL AND superseded_by IS NULL,
                     COALESCE(valid_until, superseded_at, created_at)
-             FROM facts
-             WHERE kb = ?1 AND diary = ?2 AND (subject_norm = ?3 OR object_norm = ?3)",
+             FROM facts WHERE kb = ?1 AND diary = ?2",
         )?;
-        let rows: Vec<(String, bool, bool, Option<String>)> = stmt
-            .query_map(params![kb, diary, norm], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        let rows: Vec<(String, String, String, bool, Option<String>)> = stmt
+            .query_map(params![kb, diary], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<Result<_, _>>()?;
         let mut state = SlotState::default();
-        for (p, as_subject, open, ended) in rows {
-            if fact_predicate(&p) != predicate || !(as_subject || symmetric(predicate)) {
+        for (p, s, o, open, ended) in rows {
+            let as_subject = names.contains(&s);
+            if fact_predicate(&p) != predicate
+                || !(as_subject || (symmetric(predicate) && names.contains(&o)))
+            {
                 continue;
             }
             if open {
@@ -403,7 +407,8 @@ impl SqliteStore {
     }
 
     /// Has any fact in this KB and diary — open, closed or superseded — ever
-    /// recorded this link, under any spelling of its predicate?
+    /// recorded this link, under any spelling of its predicate or of either
+    /// person's name?
     fn fact_ever_recorded(
         &self,
         kb: &str,
@@ -412,21 +417,47 @@ impl SqliteStore {
         subject_norm: &str,
         object_norm: &str,
     ) -> Result<bool, StorageError> {
+        let subjects = self.name_variants(kb, subject_norm)?;
+        let objects = self.name_variants(kb, object_norm)?;
         let mut stmt = self.conn.prepare(
-            "SELECT predicate, subject_norm FROM facts
-             WHERE kb = ?1 AND diary = ?2
-               AND ((subject_norm = ?3 AND object_norm = ?4)
-                    OR (subject_norm = ?4 AND object_norm = ?3))",
+            "SELECT predicate, subject_norm, object_norm FROM facts WHERE kb = ?1 AND diary = ?2",
         )?;
-        let rows: Vec<(String, String)> = stmt
-            .query_map(params![kb, diary, subject_norm, object_norm], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map(params![kb, diary], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?;
-        Ok(rows.iter().any(|(p, s)| {
-            let same = fact_predicate(p) == predicate;
-            same && (s == subject_norm || symmetric(predicate))
+        Ok(rows.iter().any(|(p, s, o)| {
+            fact_predicate(p) == predicate
+                && ((subjects.contains(s) && objects.contains(o))
+                    || (symmetric(predicate) && subjects.contains(o) && objects.contains(s)))
         }))
+    }
+
+    /// A name and every name a nickname fact in this KB makes the same
+    /// person ("Li" for "Lira" and back), so a correction recorded under
+    /// either spelling is found.
+    fn name_variants(&self, kb: &str, norm: &str) -> Result<Vec<String>, StorageError> {
+        let aliases = crate::people::ALIAS_PREDICATES
+            .iter()
+            .map(|p| format!("'{p}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT subject_norm, object_norm FROM facts
+             WHERE kb = ?1 AND (subject_norm = ?2 OR object_norm = ?2) AND predicate IN ({aliases})"
+        ))?;
+        let mut out = vec![norm.to_string()];
+        let rows = stmt.query_map(params![kb, norm], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (s, o) = row?;
+            for n in [s, o] {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// True when the journal holds this memory's whole life — a REAL
@@ -877,6 +908,15 @@ mod tests {
         copy(&store);
         let fact = store.get_active_facts("elias", "introduced_by", "default").unwrap();
         assert_eq!(fact[0].source_memory_id.to_string(), newer);
+    }
+
+    #[test]
+    fn a_correction_recorded_under_a_nickname_still_counts() {
+        let store = seeded();
+        existing_fact(&store, "Elias", "introduced_by", "Li", "default", false);
+        existing_fact(&store, "Lira", "has_nickname", "Li", "default", true);
+        assert_eq!(copy(&store).already_facts, 1);
+        assert!(store.get_active_facts("elias", "introduced_by", "default").unwrap().is_empty());
     }
 
     #[test]

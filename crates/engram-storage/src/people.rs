@@ -103,8 +103,23 @@ const NEEDS_A_NAME: &[&str] = &[
     "collaborates_with",
 ];
 
+/// Words that make a name an organisation's, whatever fact it appears in.
+const ORGANISATION_WORDS: &[&str] = &[
+    "ag", "ai", "bank", "capital", "clinic", "co", "company", "corp", "corporation", "foundation",
+    "fund", "gmbh", "group", "holdings", "hospital", "inc", "institute", "lab", "labs", "llc",
+    "ltd", "partners", "pte", "studio", "studios", "technologies", "tech", "university",
+    "ventures",
+];
+
+/// Applied before any fact promotes a name to a person.
+pub fn is_organisation(name: &str) -> bool {
+    name.split(|c: char| !c.is_alphanumeric())
+        .any(|w| ORGANISATION_WORDS.contains(&w.to_lowercase().as_str()))
+}
+
 fn subject_is_person(f: &Fact, canon: &str, is_name: PersonName) -> bool {
-    (PERSON_LINKS.contains(&canon)
+    !is_organisation(&f.subject)
+        && (PERSON_LINKS.contains(&canon)
         || PERSON_ATTRIBUTES.contains(&canon)
         || ALIAS_PREDICATES.contains(&canon))
         && (!NEEDS_A_NAME.contains(&canon) || is_name(&f.subject))
@@ -116,8 +131,9 @@ fn subject_is_person(f: &Fact, canon: &str, is_name: PersonName) -> bool {
 pub type PersonName<'a> = &'a dyn Fn(&str) -> bool;
 
 fn object_is_person(f: &Fact, canon: &str, is_name: PersonName) -> bool {
-    (PERSON_LINKS.contains(&canon) && (!NEEDS_A_NAME.contains(&canon) || is_name(&f.object)))
-        || (OBJECT_MAY_BE_PERSON.contains(&canon) && is_name(&f.object))
+    !is_organisation(&f.object)
+        && ((PERSON_LINKS.contains(&canon) && (!NEEDS_A_NAME.contains(&canon) || is_name(&f.object)))
+            || (OBJECT_MAY_BE_PERSON.contains(&canon) && is_name(&f.object)))
 }
 
 /// Does this fact belong on `norm`'s page?
@@ -477,7 +493,8 @@ mod tests {
         fact(&store, m, "Acme Labs", "has_email", "support@example.com");
         fact(&store, m, "Acme Capital", "investor_in", "Example Labs");
         fact(&store, m, "Acme Group", "also_known_as", "Acme");
-        let not_org = |v: &str| name(v) && !v.contains("Acme") && !v.contains("Labs");
+        fact(&store, m, "Acme Labs", "has_role", "sponsor");
+        let not_org = |v: &str| name(v);
         let (people, _) = store.list_people(None, 50, 0, 1, &not_org).unwrap();
         assert!(people.iter().all(|p| !p.name.contains("Acme")), "{people:?}");
         assert!(store.resolve_person(None, "acme", &not_org).unwrap().is_empty());
