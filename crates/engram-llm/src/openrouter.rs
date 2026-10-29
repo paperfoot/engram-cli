@@ -1,6 +1,6 @@
 //! OpenRouter chat client. OpenAI-compatible, routes to 350+ frontier models.
 //!
-//! Default model is `anthropic/claude-opus-5`. Every benchmark/compiler call
+//! Default model is `anthropic/claude-opus-5.5`. Every benchmark/compiler call
 //! site overrides this with `with_model(...)`, so the default only applies to
 //! ad-hoc callers; pick an explicit slug via the `with_model` builder.
 
@@ -11,9 +11,18 @@ use serde::{Deserialize, Serialize};
 // Default to a current cross-family flagship for generic chat/bench work.
 // Compiler defaults are separated below so evidence extraction can use a fast
 // model while synthesis uses a stronger one.
-const DEFAULT_MODEL: &str = "anthropic/claude-opus-5";
-pub const DEFAULT_EXTRACTION_MODEL: &str = "google/gemini-3.5-flash-lite";
-pub const DEFAULT_SYNTHESIS_MODEL: &str = "google/gemini-3.6-flash";
+const DEFAULT_MODEL: &str = "anthropic/claude-opus-5.5";
+/// Chosen by measurement over remember's own extraction set
+/// (benchmarks/models-2026-10.md): against gemini-3.5-flash-lite, 16.8% vs
+/// 28.1% of facts unsupported by the JEV grounding judge, 2.8x the facts,
+/// safety recall 25/28 vs 24/28, 10% cheaper per memory; p50 4.7 s vs 0.9 s.
+pub const DEFAULT_EXTRACTION_MODEL: &str = "openai/gpt-5.6-luna";
+/// The reasoning effort the extraction default was measured at. `low` keeps
+/// default-effort grounding at half the latency and two thirds of the cost.
+/// Sent only with [`DEFAULT_EXTRACTION_MODEL`]: an overridden model gets the
+/// provider's own default, as before.
+pub const DEFAULT_EXTRACTION_REASONING_EFFORT: &str = "low";
+pub const DEFAULT_SYNTHESIS_MODEL: &str = "google/gemini-3.8-flash";
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 pub struct OpenRouterClient {
@@ -63,6 +72,20 @@ struct ChatRequest<'a> {
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<Reasoning>,
+}
+
+#[derive(Serialize)]
+struct Reasoning {
+    effort: &'static str,
+}
+
+/// The measured effort travels with the measured model, never with an override.
+fn reasoning_for(model: &str) -> Option<Reasoning> {
+    (model == DEFAULT_EXTRACTION_MODEL).then_some(Reasoning {
+        effort: DEFAULT_EXTRACTION_REASONING_EFFORT,
+    })
 }
 
 #[derive(Serialize)]
@@ -121,6 +144,7 @@ impl ChatLlm for OpenRouterClient {
             messages: req_msgs,
             temperature: self.temperature,
             max_tokens: self.max_tokens,
+            reasoning: reasoning_for(&self.model),
         };
 
         // Bulletproof retry covering the FULL request lifecycle:
@@ -361,6 +385,32 @@ mod tests {
         match serde_json::from_str::<ChatResponseBody>(body) {
             Ok(_) => panic!("the fixture must not decode: {body}"),
             Err(e) => e,
+        }
+    }
+
+    fn request_json(model: &str) -> serde_json::Value {
+        serde_json::to_value(ChatRequest {
+            model,
+            messages: vec![],
+            temperature: 0.0,
+            max_tokens: Some(2048),
+            reasoning: reasoning_for(model),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_extraction_default_is_sent_at_its_measured_effort() {
+        let body = request_json(DEFAULT_EXTRACTION_MODEL);
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn an_overridden_model_gets_no_reasoning_field() {
+        // Effort was measured for one model; on another (a Gemini flash-lite,
+        // say) it could switch thinking ON and change cost and latency.
+        for model in ["google/gemini-3.5-flash-lite", DEFAULT_SYNTHESIS_MODEL, DEFAULT_MODEL] {
+            assert!(request_json(model).get("reasoning").is_none(), "{model}");
         }
     }
 

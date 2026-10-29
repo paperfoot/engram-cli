@@ -544,8 +544,8 @@ Examples:
         #[arg(long)]
         limit: Option<usize>,
 
-        /// Answerer model (OpenRouter slug, default anthropic/claude-opus-5).
-        #[arg(long, default_value = "anthropic/claude-opus-5")]
+        /// Answerer model (OpenRouter slug, default anthropic/claude-opus-5.5).
+        #[arg(long, default_value = "anthropic/claude-opus-5.5")]
         answerer: String,
 
         /// Judge model (OpenRouter slug, default google/gemini-3.1-pro-preview).
