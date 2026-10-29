@@ -641,7 +641,7 @@ const RECALL_METADATA: &[FieldSpec] = &[
     FieldSpec {
         name: "relevance",
         ty: Ty::Object,
-        doc: "only when the relevance judge ran (judge.relevance shadow|on): { mode, floor, judged, dropped, kept_on_prefix, top_relevance, abstained, error? }. Each result then carries `relevance`, P(it answers the query). Under `on`, results below `floor` are dropped, bar one over 2,000 chars, judged on its prefix (kept: `relevance_on_prefix`) and an all-dropped recall is `no_match` with reason no_candidate_above_cutoff; `error` means the judge failed and results are unjudged",
+        doc: "only when the relevance judge ran (shadow|on): { mode, floor, judged, dropped, kept_on_prefix, top_relevance, abstained, error? }. Each result then carries `relevance`, P(it answers the query). Under `on`, results below `floor` are dropped, bar one over 2,000 chars, judged on its prefix (kept: `relevance_on_prefix`) and an all-dropped recall is `no_match` with reason no_candidate_above_cutoff; `error`: judge failed or timed out (1.5 s), results unjudged",
         always: false,
     },
     FieldSpec {

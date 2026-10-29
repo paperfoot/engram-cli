@@ -1294,6 +1294,23 @@ pub async fn judge_pairs(
     observation: &Observation,
     pairs: &[&Fact],
 ) -> Judgement {
+    judge_pairs_within(ADJUDICATE_DEADLINE, judge, source_text, observation, pairs).await
+}
+
+/// The whole adjudication call for one observation, retries included, gets
+/// this long. The judge answers in ~0.2 s; its client allows three 5 s
+/// attempts plus backoff, which held a write for ~16.5 s per fact during an
+/// outage. Past the deadline nobody decided: the pairs stay queued for the
+/// agent (`adjudication_failed`, reason `judge_timeout`).
+pub const ADJUDICATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn judge_pairs_within(
+    deadline: std::time::Duration,
+    judge: &dyn Judge,
+    source_text: &str,
+    observation: &Observation,
+    pairs: &[&Fact],
+) -> Judgement {
     let new_fact = FactTriple::new(
         observation.subject.as_str(),
         observation.relation.as_str(),
@@ -1310,7 +1327,23 @@ pub async fn judge_pairs(
         .collect();
     let request = pair_request(source_text, &new_fact, &existing);
     let asked: Vec<Uuid> = pairs.iter().map(|f| f.id).collect();
-    match ask_batched(judge, &request).await {
+    let response = match tokio::time::timeout(deadline, ask_batched(judge, &request)).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(
+                "adjudication judge took over {} ms; the pairs stay queued",
+                deadline.as_millis()
+            );
+            return Judgement {
+                judge: judge.name(),
+                model: judge.model_id().to_string(),
+                asked,
+                answers: Err("judge_timeout"),
+                response: None,
+            };
+        }
+    };
+    match response {
         Ok(response) => {
             let answers: Vec<(Uuid, Option<PairAnswers>)> = pairs
                 .iter()
@@ -2394,6 +2427,65 @@ mod tests {
         assert_eq!(conflict_rule(&signals(0.02, 0.95, 0.6, 0.05)), Undecided);
         // Weak clash, nothing ended: the caller decides.
         assert_eq!(conflict_rule(&signals(0.02, 0.93, 0.15, 0.3)), Undecided);
+    }
+
+    /// A judge that never answers, like a provider stuck in retries.
+    struct Hanging;
+
+    impl Judge for Hanging {
+        fn name(&self) -> &'static str {
+            "hanging"
+        }
+
+        fn model_id(&self) -> &str {
+            "hanging-model"
+        }
+
+        fn ask<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _request: &'life1 engram_llm::judge::JudgeRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<engram_llm::judge::JudgeResponse, JudgeError>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                unreachable!("the deadline fires first")
+            })
+        }
+    }
+
+    /// An outage held the write for the judge client's whole retry budget.
+    /// Past one overall deadline the pairs stay queued for the agent.
+    #[tokio::test]
+    async fn a_judge_past_its_deadline_decides_nothing_and_the_write_goes_on() {
+        let (new, old, mut plan) = same_source_cities();
+        let before = plan.queue.clone();
+        let started = std::time::Instant::now();
+        let judgement = judge_pairs_within(
+            std::time::Duration::from_millis(50),
+            &Hanging,
+            "Ana lives in Berlin.",
+            &new,
+            &[&old],
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(judgement.answers, Err("judge_timeout"));
+        let by_id: HashMap<Uuid, &Fact> = HashMap::from([(old.id, &old)]);
+        apply_judgement(&mut plan, &new, &by_id, &judgement);
+        assert_eq!(plan.queue, before, "no verdict decides nothing");
+        assert!(plan.insert.is_some() && plan.closes.is_empty());
+        assert!(ADJUDICATE_DEADLINE <= std::time::Duration::from_secs(3));
     }
 
     #[tokio::test]

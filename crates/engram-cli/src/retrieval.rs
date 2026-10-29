@@ -819,7 +819,14 @@ pub fn build_fts_query(text: &str) -> String {
 pub struct RelevanceJudge {
     mode: JudgeMode,
     judge: Box<dyn Judge>,
+    deadline: std::time::Duration,
 }
+
+/// The whole relevance call, retries included, gets this long. The judge
+/// answers in ~0.2 s; its client allows three 5 s attempts plus backoff, so
+/// an outage used to hold every already-retrieved recall for ~16.5 s. Past
+/// the deadline the results are returned unjudged, as on a judge error.
+pub const RELEVANCE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);
 
 /// With the judge active, recall retrieves at least this many candidates,
 /// judges them in one request, drops the misses and only then cuts to
@@ -879,7 +886,11 @@ impl RelevanceJudge {
         if mode == JudgeMode::Off {
             return Ok(None);
         }
-        Ok(resolve_judge(offline)?.map(|judge| RelevanceJudge { mode, judge }))
+        Ok(resolve_judge(offline)?.map(|judge| RelevanceJudge {
+            mode,
+            judge,
+            deadline: RELEVANCE_DEADLINE,
+        }))
     }
 
     pub fn mode(&self) -> JudgeMode {
@@ -940,11 +951,20 @@ impl RelevanceJudge {
             })
             .collect();
         let request = relevance_request(query, &passages);
-        let response = match ask_batched(self.judge.as_ref(), &request).await {
-            Ok(r) => r,
-            Err(e) => {
+        let asked = ask_batched(self.judge.as_ref(), &request);
+        let response = match tokio::time::timeout(self.deadline, asked).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 tracing::warn!("relevance judge failed; results returned unjudged: {e}");
                 report.error = Some(format!("relevance judge failed; results are unjudged: {e}"));
+                return report;
+            }
+            Err(_) => {
+                let ms = self.deadline.as_millis();
+                tracing::warn!("relevance judge took over {ms} ms; results returned unjudged");
+                report.error = Some(format!(
+                    "relevance judge took over {ms} ms; results are unjudged"
+                ));
                 return report;
             }
         };
@@ -1879,7 +1899,77 @@ mod tests {
         RelevanceJudge {
             mode,
             judge: Box::new(engram_llm::judge::stub::StubJudge::parse(spec).unwrap()),
+            deadline: RELEVANCE_DEADLINE,
         }
+    }
+
+    /// A judge that never answers, like a provider stuck in retries.
+    struct Hanging;
+
+    impl Judge for Hanging {
+        fn name(&self) -> &'static str {
+            "hanging"
+        }
+
+        fn model_id(&self) -> &str {
+            "hanging-model"
+        }
+
+        fn ask<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _request: &'life1 engram_llm::judge::JudgeRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<JudgeResponse, engram_llm::judge::JudgeError>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                unreachable!("the deadline fires first")
+            })
+        }
+    }
+
+    /// An outage held already-retrieved results for the client's whole retry
+    /// budget (~16.5 s). One overall deadline returns them unjudged instead.
+    #[tokio::test]
+    async fn a_judge_past_its_deadline_returns_the_results_unjudged() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut results = vec![
+            result("chunk", "personal", "Noemi works at Halden Labs."),
+            result("chunk", "personal", "Elias keeps his gear in the van."),
+        ];
+        let judge = RelevanceJudge {
+            mode: JudgeMode::On,
+            judge: Box::new(Hanging),
+            deadline: std::time::Duration::from_millis(50),
+        };
+        let started = std::time::Instant::now();
+        let report = judge
+            .apply(&store, "Where does Noemi work?", &mut results, 10)
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(results.len(), 2, "nothing dropped");
+        assert!(results.iter().all(|r| r.relevance.is_none()));
+        assert_eq!(report.judged, 0);
+        assert!(!report.abstained);
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unjudged")),
+            "{:?}",
+            report.error
+        );
+        assert!(RELEVANCE_DEADLINE <= std::time::Duration::from_millis(1_500));
     }
 
     /// The judge sees the first RELEVANCE_PASSAGE_CHARS of a passage. A wiki
