@@ -997,7 +997,9 @@ impl RelevanceJudge {
                     }
                     report.kept_on_prefix += 1;
                 }
-                if admit(&r, cap, &mut per_doc) {
+                // A batch is never smaller than RELEVANCE_BATCH, so it can
+                // hold more survivors than the page has room for.
+                if kept.len() < top_k && admit(&r, cap, &mut per_doc) {
                     kept.push(r);
                 }
             }
@@ -2029,6 +2031,24 @@ mod tests {
         assert_eq!(got.len(), max_per_doc() + 1, "{got:?}");
         assert_eq!(got.last(), Some(&"a memory of its own"));
         assert_eq!(report.judged, 5, "one batch covers the page");
+    }
+
+    /// A judged batch holds at least RELEVANCE_BATCH candidates, more than a
+    /// small page: every survivor used to be kept, so `--top-k 1` returned
+    /// up to ten results. The page is exactly `top_k`, in rank order.
+    #[tokio::test]
+    async fn judged_survivors_never_overflow_the_page() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for top_k in [1usize, 3] {
+            let mut results: Vec<HybridResult> = (0..25)
+                .map(|i| result("chunk", "personal", &format!("passage {i}")))
+                .collect();
+            let judge = stub_judge(JudgeMode::On, "0.9");
+            judge.apply(&store, "anything", &mut results, top_k).await;
+            let got: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+            let want: Vec<String> = (0..top_k).map(|i| format!("passage {i}")).collect();
+            assert_eq!(got, want, "top_k {top_k}");
+        }
     }
 
     /// A pool of 5,000 and a judge that answers instantly and rejects
