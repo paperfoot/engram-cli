@@ -436,26 +436,31 @@ impl SqliteStore {
     /// person ("Li" for "Lira" and back), so a correction recorded under
     /// either spelling is found.
     fn name_variants(&self, kb: &str, norm: &str) -> Result<Vec<String>, StorageError> {
+        // The whole nickname chain: Li → Lira → Lee are one person, so walk
+        // the alias graph to its closure, not one hop.
         let aliases = crate::people::ALIAS_PREDICATES
             .iter()
             .map(|p| format!("'{p}'"))
             .collect::<Vec<_>>()
             .join(", ");
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT subject_norm, object_norm FROM facts
-             WHERE kb = ?1 AND (subject_norm = ?2 OR object_norm = ?2) AND predicate IN ({aliases})"
+            "SELECT subject_norm, object_norm FROM facts WHERE kb = ?1 AND predicate IN ({aliases})"
         ))?;
+        let edges: Vec<(String, String)> = stmt
+            .query_map(params![kb], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
         let mut out = vec![norm.to_string()];
-        let rows = stmt.query_map(params![kb, norm], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (s, o) = row?;
-            for n in [s, o] {
-                if !out.contains(&n) {
-                    out.push(n);
+        let mut i = 0;
+        while i < out.len() {
+            let at = out[i].clone();
+            for (a, b) in &edges {
+                for (from, to) in [(a, b), (b, a)] {
+                    if *from == at && !out.contains(to) {
+                        out.push(to.clone());
+                    }
                 }
             }
+            i += 1;
         }
         Ok(out)
     }
@@ -917,6 +922,19 @@ mod tests {
         existing_fact(&store, "Lira", "has_nickname", "Li", "default", true);
         assert_eq!(copy(&store).already_facts, 1);
         assert!(store.get_active_facts("elias", "introduced_by", "default").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_nickname_chain_is_one_person() {
+        let store = seeded();
+        existing_fact(&store, "Lira", "has_nickname", "Li", "default", true);
+        existing_fact(&store, "Lira", "goes_by", "Lee", "default", true);
+        existing_fact(&store, "Elias", "introduced_by", "Li", "default", false);
+        store
+            .conn
+            .execute("UPDATE entities SET canonical_name = 'Lee' WHERE id = 'e2'", [])
+            .unwrap();
+        assert_eq!(copy(&store).already_facts, 1);
     }
 
     #[test]

@@ -103,18 +103,27 @@ const NEEDS_A_NAME: &[&str] = &[
     "collaborates_with",
 ];
 
-/// Words that make a name an organisation's, whatever fact it appears in.
-const ORGANISATION_WORDS: &[&str] = &[
-    "ag", "ai", "bank", "capital", "clinic", "co", "company", "corp", "corporation", "foundation",
-    "fund", "gmbh", "group", "holdings", "hospital", "inc", "institute", "lab", "labs", "llc",
-    "ltd", "partners", "pte", "studio", "studios", "technologies", "tech", "university",
-    "ventures",
+/// The closing word of an organisation's name ("Acme Labs", "Oxford
+/// College"). Only the LAST word counts: "Ai Chen" is a person.
+const ORGANISATION_SUFFIXES: &[&str] = &[
+    "academy", "ag", "ai", "associates", "bank", "biotech", "biotechnologies", "capital",
+    "clinic", "co", "college", "company", "corp", "corporation", "foundation", "fund", "gmbh",
+    "group", "holdings", "hospital", "inc", "institute", "lab", "labs", "llc", "llp", "ltd",
+    "partners", "pharma", "pharmaceuticals", "plc", "pte", "sa", "school", "studio", "studios",
+    "systems", "technologies", "tech", "therapeutics", "trust", "university", "ventures",
 ];
 
-/// Applied before any fact promotes a name to a person.
+/// Applied before any fact promotes a name to a person. A one-word name is
+/// never judged an organisation by this rule.
 pub fn is_organisation(name: &str) -> bool {
-    name.split(|c: char| !c.is_alphanumeric())
-        .any(|w| ORGANISATION_WORDS.contains(&w.to_lowercase().as_str()))
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.len() > 1
+        && words
+            .last()
+            .is_some_and(|w| ORGANISATION_SUFFIXES.contains(&w.to_lowercase().as_str()))
 }
 
 fn subject_is_person(f: &Fact, canon: &str, is_name: PersonName) -> bool {
@@ -169,22 +178,68 @@ impl SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Live facts with every endpoint that is a nickname rewritten to the one
+    /// person who holds it, so "Bob friend_of Ally" counts for Alice Smith.
+    /// Only the norms move; the written names stay as the facts spell them.
+    fn facts_by_person(&self, kb: Option<&str>) -> Result<Vec<Fact>, StorageError> {
+        let mut facts = self.live_facts(kb)?;
+        let mut holders: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for f in &facts {
+            if ALIAS_PREDICATES.contains(&canon(f).as_str()) {
+                holders
+                    .entry((f.kb.clone(), f.object_norm.clone()))
+                    .or_default()
+                    .insert(f.subject_norm.clone());
+            }
+        }
+        let resolve = |kb: &str, norm: &str| -> Option<String> {
+            let mut at = norm.to_string();
+            // A chain (Li → Lira, Lira → Lira Varkoni) resolves to its end;
+            // a nickname two people hold resolves to nobody.
+            for _ in 0..4 {
+                match holders.get(&(kb.to_string(), at.clone())) {
+                    Some(h) if h.len() == 1 => at = h.iter().next().unwrap().clone(),
+                    _ => break,
+                }
+            }
+            (at != norm).then_some(at)
+        };
+        for f in &mut facts {
+            if ALIAS_PREDICATES.contains(&canon(f).as_str()) {
+                continue;
+            }
+            if let Some(n) = resolve(&f.kb, &f.subject_norm) {
+                f.subject_norm = n;
+            }
+            if let Some(n) = resolve(&f.kb, &f.object_norm) {
+                f.object_norm = n;
+            }
+        }
+        Ok(facts)
+    }
+
     /// Every person, one row per KB, ranked by how many live facts name them.
     fn all_people(&self, kb: Option<&str>, is_name: PersonName) -> Result<Vec<PersonRow>, StorageError> {
-        let facts = self.live_facts(kb)?;
+        let facts = self.facts_by_person(kb)?;
         // Who is a person, with the first spelling seen (newest fact first).
-        let mut people: BTreeMap<(String, String), String> = BTreeMap::new();
+        // (display, spelled as the norm): a name reached through a nickname
+        // is replaced by the person's own spelling when one is seen.
+        let mut people: BTreeMap<(String, String), (String, bool)> = BTreeMap::new();
         for f in &facts {
             let c = canon(f);
             if subject_is_person(f, &c, is_name) && !f.subject_norm.is_empty() {
-                people
-                    .entry((f.kb.clone(), f.subject_norm.clone()))
-                    .or_insert_with(|| f.subject.clone());
+                let spelled = f.subject.trim().to_lowercase() == f.subject_norm;
+                let e = people.entry((f.kb.clone(), f.subject_norm.clone())).or_insert((f.subject.clone(), spelled));
+                if spelled && !e.1 {
+                    *e = (f.subject.clone(), true);
+                }
             }
             if object_is_person(f, &c, is_name) && !f.object_norm.is_empty() {
-                people
-                    .entry((f.kb.clone(), f.object_norm.clone()))
-                    .or_insert_with(|| f.object.clone());
+                let spelled = f.object.trim().to_lowercase() == f.object_norm;
+                let e = people.entry((f.kb.clone(), f.object_norm.clone())).or_insert((f.object.clone(), spelled));
+                if spelled && !e.1 {
+                    *e = (f.object.clone(), true);
+                }
             }
         }
         let mut counts: BTreeMap<(String, String), u32> = BTreeMap::new();
@@ -201,7 +256,7 @@ impl SqliteStore {
         }
         let mut rows: Vec<PersonRow> = people
             .into_iter()
-            .map(|((kb, norm), name)| PersonRow {
+            .map(|((kb, norm), (name, _))| PersonRow {
                 facts: counts.get(&(kb.clone(), norm.clone())).copied().unwrap_or(0),
                 name,
                 name_norm: norm,
@@ -245,7 +300,7 @@ impl SqliteStore {
         limit: usize,
     ) -> Result<Vec<Fact>, StorageError> {
         let mut facts: Vec<(bool, Fact)> = self
-            .live_facts(Some(kb))?
+            .facts_by_person(Some(kb))?
             .into_iter()
             .filter_map(|f| {
                 let c = canon(&f);
@@ -498,6 +553,27 @@ mod tests {
         let (people, _) = store.list_people(None, 50, 0, 1, &not_org).unwrap();
         assert!(people.iter().all(|p| !p.name.contains("Acme")), "{people:?}");
         assert!(store.resolve_person(None, "acme", &not_org).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_link_to_a_nickname_belongs_to_the_person_who_holds_it() {
+        let store = seeded();
+        let m = memory_of(&store);
+        fact(&store, m, "Alice Smith", "has_nickname", "Ally");
+        fact(&store, m, "Alice Smith", "has_age", "40");
+        fact(&store, m, "Bob Jones", "friend_of", "Ally");
+        let (people, _) = store.list_people(None, 50, 0, 1, &name).unwrap();
+        assert!(people.iter().all(|p| p.name != "Ally"), "{people:?}");
+        let alice = store.person_facts("network", "alice smith", 50).unwrap();
+        assert!(alice.iter().any(|f| f.predicate == "friend_of"));
+    }
+
+    #[test]
+    fn only_a_closing_organisation_word_marks_an_organisation() {
+        assert!(is_organisation("Oxford College"));
+        assert!(is_organisation("Acme Biotechnologies"));
+        assert!(!is_organisation("Ai Chen"));
+        assert!(!is_organisation("Labs"));
     }
 
     #[test]
