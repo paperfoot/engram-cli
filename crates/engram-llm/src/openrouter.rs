@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 // model while synthesis uses a stronger one.
 const DEFAULT_MODEL: &str = "anthropic/claude-opus-5.5";
 /// Chosen by measurement over remember's own extraction set
-/// (benchmarks/models-2026-10.md): against gemini-3.5-flash-lite, 16.8% vs
-/// 28.1% of facts unsupported by the JEV grounding judge, 2.8x the facts,
-/// safety recall 25/28 vs 24/28, 10% cheaper per memory; p50 4.7 s vs 0.9 s.
-pub const DEFAULT_EXTRACTION_MODEL: &str = "openai/gpt-5.6-luna";
+/// (benchmarks/models-2026-10.md): the only model to keep all 28 gold safety
+/// facts, 16.8% of facts unsupported by the JEV grounding judge (tied best),
+/// no failed calls, p50 4.2 s; $1.73 per 1,000 memories.
+pub const DEFAULT_EXTRACTION_MODEL: &str = "openai/gpt-6.1-terra";
 /// The reasoning effort the extraction default was measured at. `low` keeps
 /// default-effort grounding at half the latency and two thirds of the cost.
 /// Sent only with [`DEFAULT_EXTRACTION_MODEL`]: an overridden model gets the

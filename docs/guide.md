@@ -170,7 +170,7 @@ engram ingest . --kb ageing-biology --mode papers --include '*.pdf' --max-files 
 engram recall "personalized pagerank for multi-hop retrieval" --kb ageing-biology --top-k 3 --json
 
 # Optional LLM compiler pass:
-# extraction defaults to openai/gpt-5.6-luna,
+# extraction defaults to openai/gpt-6.1-terra,
 # synthesis defaults to google/gemini-3.8-flash.
 engram compile --kb ageing-biology --all --llm --max-llm-chunks 25
 
