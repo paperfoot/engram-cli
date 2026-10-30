@@ -5,10 +5,14 @@ so its arms differ only in what recall prints. This one does the opposite:
 nothing is pinned, so Gemini embedding, Cohere rerank and the JEV relevance
 judge all run exactly as a user's recall runs them, and it measures what
 comes back. Reuses the frozen per-question stores `longmemeval_cli.py build`
-made, and writes `runs/<cond>/recall.json` in the same shape, so
-`longmemeval_cli.py answer --cond <cond>` scores answers on these recalls.
+made, and writes `runs/<cond>/recall.json`. With --keep-text the rows
+carry recall's stdout, the shape `longmemeval_cli.py answer --cond <cond>`
+needs to score answers; without it they hold ids and metrics only, so no
+passage text outlives the copied store.
 
-  recall  --bin B --cond C [--env K=V ...]   one recall per question
+  recall  --bin B --cond C [--env K=V ...] [--keep-text] [--daemon D]
+                                             one recall per question; --daemon
+                                             asks engramd's /v1/recall instead
   report  --conds A,B[,...]                  evidence recall@5/@10, A/A deltas
   accuracy --conds A,B[,...]                 answer accuracy over EVERY question
                                              (after `longmemeval_cli.py answer`)
@@ -16,9 +20,12 @@ made, and writes `runs/<cond>/recall.json` in the same shape, so
 Evidence recall@k: the share of a question's gold evidence sessions
 (LongMemEval `answer_session_ids`) whose memory is among the first k results.
 Keys come from the environment: GEMINI_API_KEY, COHERE_API_KEY,
-TYPESAFE_API_KEY.
+TYPESAFE_API_KEY. Never pass a key with --env: meta.json records only the
+NAMES of --env variables, but the value would still sit in your shell
+history.
 """
-import argparse, concurrent.futures as cf, json, os, shutil, sqlite3, statistics, subprocess, sys, time
+import argparse, concurrent.futures as cf, json, os, shutil, socket, sqlite3, statistics, subprocess, sys, time
+import urllib.request
 
 WORK = os.environ.get('LME_WORK', '/tmp/lme')
 
@@ -48,7 +55,50 @@ def session_of(store, q):
     return out
 
 
-def recall_one(binary, cond, q, extra_env, top_k):
+def free_port():
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def daemon_recall(daemon, store, env, question, top_k):
+    """One /v1/recall on a daemon of its own over `store`: (code, stdout, stderr)."""
+    port = free_port()
+    proc = subprocess.Popen([daemon, '--port', str(port), '--store', store], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(200):
+            try:
+                socket.create_connection(('127.0.0.1', port), 0.2).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        body = json.dumps({'query': question, 'top_k': top_k}).encode()
+        req = urllib.request.Request(f'http://127.0.0.1:{port}/v1/recall', body,
+                                     {'content-type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return 0, r.read().decode(), ''
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(), ''
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def memory_of_chunk(store):
+    con = sqlite3.connect(f'{store}/db.sqlite')
+    rows = dict(con.execute('select id, memory_id from chunks').fetchall())
+    con.close()
+    return rows
+
+
+def recall_one(binary, cond, q, extra_env, top_k, keep_text=False, daemon=None):
     src = f'{WORK}/stores/{q["qid"]}'
     if not os.path.exists(f'{src}/.built'):
         return {'qid': q['qid'], 'failure': 'store not built'}
@@ -56,26 +106,35 @@ def recall_one(binary, cond, q, extra_env, top_k):
     shutil.rmtree(dst, ignore_errors=True)
     shutil.copytree(src, dst)
     env = dict(os.environ, ENGRAM_STORE=dst, NO_COLOR='1', **extra_env)
-    argv = [binary, 'recall', q['question'], '--json', '--top-k', str(top_k)]
     t = time.time()
-    p = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=300)
+    if daemon:
+        code, out, err = daemon_recall(daemon, dst, env, q['question'], top_k)
+    else:
+        argv = [binary, 'recall', q['question'], '--json', '--top-k', str(top_k)]
+        p = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=300)
+        code, out, err = p.returncode, p.stdout, p.stderr
     secs = time.time() - t
-    row = {'qid': q['qid'], 'code': p.returncode, 'stdout': p.stdout, 'bytes': len(p.stdout.encode()),
-           'secs': round(secs, 3)}
+    row = {'qid': q['qid'], 'code': code, 'bytes': len(out.encode()), 'secs': round(secs, 3)}
+    if keep_text:
+        row['stdout'] = out
     try:
-        data = json.loads(p.stdout)['data']
+        envelope = json.loads(out)
+        data = envelope['data']
         sids = session_of(dst, q)
+        chunk_memory = memory_of_chunk(dst)
         results = data.get('results', [])
         row['result_ids'] = [r['id'] for r in results]
-        row['sessions'] = [sids.get(r.get('memory_id')) for r in results]
+        row['sessions'] = [sids.get(r.get('memory_id') or chunk_memory.get(r['id'])) for r in results]
         row['relevance'] = [r.get('relevance') for r in results]
-        row['judge'] = (data.get('metadata') or {}).get('relevance')
-        env_meta = json.loads(p.stdout).get('metadata') or {}
-        row['judge'] = env_meta.get('relevance', row['judge'])
-        row['reranker'] = env_meta.get('reranker')
+        meta = envelope.get('metadata') or {}
+        inner = data.get('metadata') or {}
+        row['judge'] = meta.get('relevance', inner.get('relevance'))
+        row['reranker'] = meta.get('reranker', inner.get('reranker'))
         row['status'] = data.get('status')
+        row['verdict'] = data.get('verdict')
     except Exception:
-        row['failure'] = f'recall exit {p.returncode}: {p.stderr[-200:]}'
+        # Exit code only: stderr can quote what the store holds.
+        row['failure'] = f'recall exit {code}'
     shutil.rmtree(dst, ignore_errors=True)
     return row
 
@@ -84,10 +143,14 @@ def recall(args):
     qs = jload(f'{WORK}/questions.json')
     extra = dict(kv.split('=', 1) for kv in args.env)
     with cf.ThreadPoolExecutor(args.workers) as ex:
-        rows = list(ex.map(lambda q: recall_one(args.bin, args.cond, q, extra, args.top_k), qs))
+        rows = list(ex.map(lambda q: recall_one(args.bin, args.cond, q, extra, args.top_k,
+                                                args.keep_text, args.daemon), qs))
     jdump(f'{WORK}/runs/{args.cond}/recall.json', rows)
-    jdump(f'{WORK}/runs/{args.cond}/meta.json', {'binary': args.bin, 'env': extra, 'top_k': args.top_k,
-                                                 'pipeline': 'full default'})
+    # Variable NAMES only: a value may be a credential.
+    jdump(f'{WORK}/runs/{args.cond}/meta.json', {
+        'binary': args.daemon or args.bin, 'surface': 'daemon' if args.daemon else 'cli',
+        'env_names': sorted(extra), 'top_k': args.top_k, 'text_kept': args.keep_text,
+        'pipeline': 'full default'})
     fails = [r for r in rows if r.get('failure')]
     errs = sum(1 for r in rows if (r.get('judge') or {}).get('error'))
     print(args.cond, 'recalls', len(rows), 'failures', len(fails), 'judge errors', errs,
@@ -163,9 +226,12 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('recall')
-    p.add_argument('--bin', required=True)
+    p.add_argument('--bin')
+    p.add_argument('--daemon', help='engramd binary: ask /v1/recall instead of the CLI')
     p.add_argument('--cond', required=True)
     p.add_argument('--env', action='append', default=[])
+    p.add_argument('--keep-text', action='store_true',
+                   help="keep recall's stdout (passage text) in recall.json, for longmemeval_cli.py answer")
     p.add_argument('--top-k', type=int, default=10)
     p.add_argument('--workers', type=int, default=8)
     p = sub.add_parser('report')
@@ -173,6 +239,8 @@ def main():
     p = sub.add_parser('accuracy')
     p.add_argument('--conds', required=True)
     args = ap.parse_args()
+    if args.cmd == 'recall' and not (args.bin or args.daemon):
+        ap.error('recall needs --bin or --daemon')
     {'recall': recall, 'report': report, 'accuracy': accuracy}[args.cmd](args)
 
 
