@@ -257,9 +257,23 @@ pub async fn run(
         token_required: cfg.token.is_some(),
     });
     let background = spawn_background(&server);
+    // A phone call cannot wait on handshakes: open the provider connections
+    // now and keep them open, so the first recall and one after a quiet
+    // spell start warm. Recalls then skip opening them per request.
+    crate::retrieval::keep_connections_warm();
+    let warmer = tokio::spawn(async {
+        loop {
+            crate::retrieval::warm_provider_connections().await;
+            match crate::retrieval::keep_warm_interval() {
+                Some(every) => tokio::time::sleep(every).await,
+                None => break,
+            }
+        }
+    });
 
     eprintln!("engramd listening on http://{host}:{}", bound.port());
     let outcome = accept_loop(listener, server).await;
+    warmer.abort();
     background.stop();
     remove_descriptor();
     outcome

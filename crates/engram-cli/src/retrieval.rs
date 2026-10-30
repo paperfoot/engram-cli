@@ -1212,6 +1212,45 @@ fn connections_kept_warm() -> bool {
     CONNECTIONS_KEPT_WARM.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Open (or refresh) a pooled connection to every provider a cloud recall
+/// would call, as configured right now: Gemini, Cohere unless reranking is
+/// off, and the relevance judge with one connection per parallel part.
+/// Sends no key and bills nothing. A provider without a key, or a setting
+/// that fails to resolve, is skipped: the next recall reports it.
+pub async fn warm_provider_connections() {
+    let embed = async {
+        if let Some(key) = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini")
+        {
+            cloud_gemini(key).preconnect().await;
+        }
+    };
+    let rerank = async {
+        let off = crate::commands::config::rerank_disabled() || judge_ranks();
+        if let Some(key) = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere")
+            .filter(|_| !off)
+        {
+            CohereReranker::new(key).preconnect().await;
+        }
+    };
+    let judge = async {
+        if let Ok(Some(judge)) = RelevanceJudge::resolve(false) {
+            judge.judge.preconnect(BATCH_CONCURRENCY).await;
+        }
+    };
+    tokio::join!(embed, rerank, judge);
+}
+
+/// How often a daemon refreshes its provider connections:
+/// `ENGRAM_KEEP_WARM_SECS`, default 45 (under the shortest idle timeout a
+/// pooled connection has, Gemini's 60 s); 0 turns it off.
+pub fn keep_warm_interval() -> Option<std::time::Duration> {
+    let secs = std::env::var("ENGRAM_KEEP_WARM_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(45);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 /// THE recall pipeline, for every surface that answers one: hybrid
 /// retrieval, then the relevance judge over the reranked pool.
 ///
