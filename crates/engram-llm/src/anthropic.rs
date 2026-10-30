@@ -11,8 +11,9 @@
 //! - No `temperature`: Claude Haiku 5.5 rejects a non-default value. Depth is
 //!   set with `output_config.effort` instead.
 //! - Haiku 5.5 thinks adaptively, and thinking counts against `max_tokens`,
-//!   so the cap leaves room for both; a cap sized for the answer alone cuts
-//!   the answer off mid-JSON.
+//!   so the cap leaves room for both. 8,192 cut off 9 of 460 backfilled
+//!   memories (the long ones, which yield the most facts); the cap is now
+//!   32,768, and only generated tokens are billed.
 //! - The answer is the `text` blocks joined; `thinking` blocks are skipped.
 //!   A `max_tokens` or `refusal` stop is an error, never a silently partial
 //!   answer.
@@ -58,14 +59,15 @@ impl AnthropicClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                // A long memory can take minutes to extract at the raised cap.
+                .timeout(std::time::Duration::from_secs(300))
                 .connect_timeout(std::time::Duration::from_secs(15))
                 .user_agent(concat!("engram/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to build reqwest client"),
             api_key: api_key.into(),
             model: DEFAULT_EXTRACTION_MODEL.to_string(),
-            max_tokens: 8192,
+            max_tokens: 32_768,
         }
     }
 
@@ -327,8 +329,9 @@ mod tests {
         assert_eq!(body["output_config"]["effort"], DEFAULT_EXTRACTION_EFFORT);
         // Haiku 5.5 answers a non-default temperature with a 400.
         assert!(body.get("temperature").is_none());
-        // Thinking counts against the cap: 2,048 would truncate answers.
-        assert!(body["max_tokens"].as_u64().unwrap() >= 8192);
+        // Thinking counts against the cap, and long memories yield many
+        // facts: 8,192 truncated real extractions.
+        assert!(body["max_tokens"].as_u64().unwrap() >= 32_768);
     }
 
     #[test]
