@@ -142,9 +142,17 @@ pub fn route() -> (Provider, String) {
     route_for(model_override(), Provider::Anthropic.key().is_some())
 }
 
-/// True when the routed provider has a key, i.e. extraction may spend.
+/// True when the routed provider has a key (what `doctor` reports).
 pub fn key_configured() -> bool {
     route().0.key().is_some()
+}
+
+/// True when [`resolve`] would hand back a paid client: the routed provider
+/// has a key and neither stub rule applies. The spend cap gates on this, so a
+/// stubbed write that calls nobody is never refused for budget.
+pub fn may_spend() -> bool {
+    let scripted = std::env::var(STUB_ENV).is_ok_and(|s| !s.trim().is_empty());
+    !scripted && !crate::commands::config::stub_forced() && key_configured()
 }
 
 /// Resolve the fact-layer LLM. `Ok(None)` means "no LLM available" — the

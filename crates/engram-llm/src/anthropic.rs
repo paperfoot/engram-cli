@@ -1,8 +1,10 @@
 //! Anthropic Messages API client: fact extraction with Claude, direct.
 //!
 //! Raw HTTP, because Rust has no official Anthropic SDK. Same `ChatLlm`
-//! contract and the same error hygiene as [`crate::openrouter`]: only the
-//! structured error message ever reaches an error string, never a body.
+//! contract as [`crate::openrouter`], with stricter error hygiene: an error
+//! string carries the status and Anthropic's documented error type, never the
+//! provider's message or body. The message is free text, and a validation
+//! error can quote the request, which is someone's memory.
 //!
 //! Where the request differs from an OpenAI-shaped one:
 //! - System messages go in the top-level `system` field.
@@ -15,7 +17,7 @@
 //!   A `max_tokens` or `refusal` stop is an error, never a silently partial
 //!   answer.
 
-use crate::openrouter::{decode_failure_message, status_error_message};
+use crate::openrouter::decode_failure_message;
 use crate::{ChatLlm, ChatMessage, ChatResponse, LlmError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,19 @@ pub const DEFAULT_EXTRACTION_EFFORT: &str = "medium";
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const PROVIDER: &str = "anthropic";
+/// Anthropic's documented `error.type` values: a closed vocabulary, so one
+/// can travel in an error string without carrying request text.
+const ERROR_TYPES: &[&str] = &[
+    "invalid_request_error",
+    "authentication_error",
+    "billing_error",
+    "permission_error",
+    "not_found_error",
+    "request_too_large",
+    "rate_limit_error",
+    "api_error",
+    "overloaded_error",
+];
 
 pub struct AnthropicClient {
     client: reqwest::Client,
@@ -204,7 +219,7 @@ impl AnthropicClient {
             let body_text = resp.text().await.unwrap_or_default();
             let err = LlmError::Api {
                 provider: PROVIDER,
-                message: status_error_message(status, &body_text),
+                message: status_error(status, &body_text),
             };
             // 529 is Anthropic's "overloaded", a server-side condition.
             return Err(if status.is_server_error() || status.as_u16() == 529 {
@@ -253,9 +268,41 @@ impl AnthropicClient {
     }
 }
 
+/// A non-2xx answer as an error string: the status and, when the body names
+/// one, the documented error type. Nothing else from the body is kept.
+fn status_error(status: reqwest::StatusCode, body: &str) -> String {
+    let kind = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/error/type")?.as_str().map(str::to_owned))
+        .filter(|t| ERROR_TYPES.contains(&t.as_str()));
+    match kind {
+        Some(kind) => format!("status {status}: {kind}"),
+        None => format!("status {status}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_names_the_status_and_type_but_never_the_message() {
+        // A validation message can quote the request, and the request is the
+        // memory being read.
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid input: QUOKKA-ANTHROPIC-DO-NOT-ECHO"},"request_id":"req_1"}"#;
+        let msg = status_error(reqwest::StatusCode::BAD_REQUEST, body);
+        assert_eq!(msg, "status 400 Bad Request: invalid_request_error");
+        // An undocumented type is free text too.
+        let odd = r#"{"error":{"type":"QUOKKA-ANTHROPIC-DO-NOT-ECHO"}}"#;
+        assert_eq!(
+            status_error(reqwest::StatusCode::BAD_REQUEST, odd),
+            "status 400 Bad Request"
+        );
+        assert_eq!(
+            status_error(reqwest::StatusCode::BAD_GATEWAY, "<html>QUOKKA</html>"),
+            "status 502 Bad Gateway"
+        );
+    }
 
     fn request_json(client: &AnthropicClient, messages: &[ChatMessage]) -> serde_json::Value {
         serde_json::to_value(client.request(messages)).unwrap()

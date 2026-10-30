@@ -279,7 +279,7 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // nothing, so a zero spend cap must not block it — a free operation
     // failing with a budget error is a new failure mode with no money
     // behind it.
-    let extraction_may_spend = !no_extract_facts && crate::fact_llm::key_configured();
+    let extraction_may_spend = !no_extract_facts && crate::fact_llm::may_spend();
     if write_embedder.cloud
         || extraction_may_spend
         || grounding.is_some()

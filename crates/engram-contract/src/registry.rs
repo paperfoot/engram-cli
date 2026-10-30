@@ -566,7 +566,7 @@ const RECALL_DATA: &[FieldSpec] = &[
     FieldSpec {
         name: "conflicts",
         ty: Ty::Array(&Ty::Object),
-        doc: "`superseded` (a fact was updated — cite the current value or surface the change) and `contested` (an UNRESOLVED contradiction: both values are listed). Do not pick a value silently: run the included `resolve` object (program + args), or the `resolve_command` string if you shell out. A value from a memory that was forgotten, expired (without --include-expired) or edited since is never listed; a `superseded` entry whose replacement is hidden that way has `new_object: null`",
+        doc: "`superseded` (a fact was updated — cite the current value or surface the change) and `contested` (an UNRESOLVED contradiction: both values are listed). Do not pick a value silently: run the included `resolve` object (program + args), or the `resolve_command` string if you shell out. A value from a memory that was forgotten, or whose content was edited since, is never listed; a `superseded` entry whose replacement is hidden that way has `new_object: null`",
         always: true,
     },
     FieldSpec {

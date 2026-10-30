@@ -350,6 +350,28 @@ fn a_zero_spend_cap_does_not_block_a_free_offline_write() {
     assert_eq!(v["data"]["stored"], true, "{v}");
 }
 
+/// Review finding (Codex): with only an Anthropic key configured, the cap
+/// refused a stubbed write that calls no provider at all. Under the bench stub
+/// hook extraction is never live, so the write spends nothing.
+#[test]
+fn a_zero_spend_cap_does_not_block_a_stubbed_write_with_an_anthropic_key() {
+    let tmp = home();
+    run_json(
+        &mut stub_cmd_in(tmp.path()),
+        &["budget", "set", "--kb", "capped", "--daily-usd", "0"],
+    );
+    let v = run_json(
+        stub_cmd_in(tmp.path()).env("ANTHROPIC_API_KEY", "sk-ant-test-not-a-key"),
+        &[
+            "remember",
+            "A stubbed note under a zero cap.",
+            "--kb",
+            "capped",
+        ],
+    );
+    assert_eq!(v["data"]["stored"], true, "{v}");
+}
+
 /// Same rule on `edit`: an --offline re-embed spends nothing, so the cap
 /// cannot block it.
 #[test]

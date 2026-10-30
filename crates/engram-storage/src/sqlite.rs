@@ -885,6 +885,28 @@ pub const CURRENT_VERSION: i32 = 14;
 /// languages and a test pins them equal.
 pub(crate) const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND superseded_by IS NULL)";
 
+/// SQL that is true when fact `alias` may still be shown to a reader: the
+/// memory it came from is not forgotten, and its content has not changed
+/// since the fact was written.
+///
+/// Forget and edit close a fact but keep its text, and an open conflict row
+/// outlives both, so recall's conflicts list filters on this. An edit that
+/// leaves the content as it was (its `memory.revised` hashes match) keeps
+/// the memory's facts open and visible. Times compare through `julianday`,
+/// which reads the offset but only the milliseconds, so a revision in the
+/// same millisecond as the fact counts as later, and one whose time does not
+/// parse counts as a change: hiding a value is the safe mistake.
+pub(crate) fn fact_visible_sql(alias: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM memories vm WHERE vm.id = {alias}.source_memory_id AND vm.deleted = 0) \
+         AND NOT EXISTS (SELECT 1 FROM events ve WHERE ve.subject_id = {alias}.source_memory_id \
+             AND ve.kind = '{kind}' \
+             AND json_extract(ve.payload, '$.content_hash') IS NOT json_extract(ve.payload, '$.prev_content_hash') \
+             AND COALESCE(julianday(ve.ts) >= julianday({alias}.created_at), 1))",
+        kind = engram_core::events::EventKind::MemoryRevised.as_str()
+    )
+}
+
 /// The fact projection, in `parse_fact_row` order. Written once so a `SELECT`
 /// and its parser cannot drift: a wrong column offset mis-parses silently,
 /// which is how a fact's `object` ends up in its `subject_norm`.
@@ -4734,7 +4756,9 @@ impl SqliteStore {
     /// contains any of the given lowercase terms. Used by `recall` to surface
     /// contradictions relevant to the query ("this drug's dose was updated"),
     /// so the read path can actually deliver the "resolves contradictions"
-    /// promise instead of silently returning stale facts.
+    /// promise instead of silently returning stale facts. Only facts a reader
+    /// may still see ([`fact_visible_sql`]), so the limit is never spent on
+    /// hidden ones.
     pub fn facts_matching_terms(
         &self,
         kb: Option<&str>,
@@ -4745,7 +4769,11 @@ impl SqliteStore {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sql = format!("SELECT {} FROM facts WHERE ", fact_columns(""));
+        let mut sql = format!(
+            "SELECT {} FROM facts WHERE {} AND ",
+            fact_columns(""),
+            fact_visible_sql("facts")
+        );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(k) = kb {
             binds.push(Box::new(k.to_string()));
@@ -4783,101 +4811,32 @@ impl SqliteStore {
         Ok(rows)
     }
 
-    /// The facts among `ids` a reader may still see: the memory each was
-    /// extracted from is not forgotten, not expired (unless `include_expired`;
-    /// recall's own rule) and not edited since the fact was written.
-    ///
-    /// Forget and edit close a fact but keep its text, and an open conflict
-    /// row outlives both, so recall's conflicts list asks here before it
-    /// prints a value. Otherwise a forgotten value comes back as a
-    /// `retracted` or `contested` entry.
+    /// The facts among `ids` a reader may still see ([`fact_visible_sql`]).
+    /// Recall uses it for the fact that replaced a closed one.
     pub fn visible_facts(
         &self,
         ids: &[Uuid],
-        include_expired: bool,
     ) -> Result<std::collections::HashSet<Uuid>, StorageError> {
-        let mut out = std::collections::HashSet::new();
         if ids.is_empty() {
-            return Ok(out);
+            return Ok(std::collections::HashSet::new());
         }
-        let marks = (2..ids.len() + 2)
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // The expiry test is `expired_memory_ids`' own predicate, so a fact
-        // is hidden exactly when recall hides its passage.
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT f.id, f.created_at, m.id,
-                    m.valid_until IS NOT NULL AND datetime(m.valid_until) < datetime(?1)
-             FROM facts f JOIN memories m ON m.id = f.source_memory_id
-             WHERE m.deleted = 0 AND f.id IN ({marks})"
-        ))?;
-        let mut binds: Vec<String> = vec![chrono::Utc::now().to_rfc3339()];
-        binds.extend(ids.iter().map(Uuid::to_string));
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, bool>(3)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let memories: Vec<&String> = rows.iter().map(|(_, _, m, _)| m).collect();
-        let revisions = self.revision_times(&memories)?;
-        let instant = |t: &str| {
-            chrono::DateTime::parse_from_rfc3339(t)
-                .ok()
-                .map(|t| t.with_timezone(&chrono::Utc))
-        };
-        for (fact, created, memory, expired) in rows {
-            if expired && !include_expired {
-                continue;
-            }
-            // Instants, not strings or whole seconds: an edit can follow its
-            // remember within the same second. A time that does not parse
-            // counts as an edit, because hiding a value is the safe mistake.
-            let edited_since = revisions.get(&memory).is_some_and(|times| {
-                times.iter().any(|t| match (instant(t), instant(&created)) {
-                    (Some(edit), Some(made)) => edit > made,
-                    _ => true,
-                })
-            });
-            if !edited_since {
-                if let Ok(id) = Uuid::parse_str(&fact) {
-                    out.insert(id);
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// When each of `memory_ids` had its content edited (`memory.revised`).
-    fn revision_times(
-        &self,
-        memory_ids: &[&String],
-    ) -> Result<std::collections::HashMap<String, Vec<String>>, StorageError> {
-        let mut out: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        if memory_ids.is_empty() {
-            return Ok(out);
-        }
-        let marks = (2..memory_ids.len() + 2)
+        let marks = (1..=ids.len())
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(", ");
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT subject_id, ts FROM events WHERE kind = ?1 AND subject_id IN ({marks})"
+            "SELECT f.id FROM facts f WHERE f.id IN ({marks}) AND {}",
+            fact_visible_sql("f")
         ))?;
-        let mut binds: Vec<&str> = vec![engram_core::events::EventKind::MemoryRevised.as_str()];
-        binds.extend(memory_ids.iter().map(|m| m.as_str()));
+        let binds: Vec<String> = ids.iter().map(Uuid::to_string).collect();
         let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            r.get::<_, String>(0)
         })?;
+        let mut out = std::collections::HashSet::new();
         for row in rows {
-            let (memory, ts) = row?;
-            out.entry(memory).or_default().push(ts);
+            if let Ok(id) = Uuid::parse_str(&row?) {
+                out.insert(id);
+            }
         }
         Ok(out)
     }
@@ -5471,7 +5430,8 @@ impl SqliteStore {
 
     /// Open conflicts in a KB whose facts mention any of the query terms —
     /// used by `recall` to surface contested values instead of silently
-    /// returning one side of an unresolved contradiction.
+    /// returning one side of an unresolved contradiction. Only pairs whose two
+    /// facts a reader may still see ([`fact_visible_sql`]).
     pub fn open_conflicts_matching_terms(
         &self,
         kb: Option<&str>,
@@ -5494,8 +5454,10 @@ impl SqliteStore {
              FROM fact_conflict_queue q
              JOIN facts nf ON nf.id = q.new_fact_id
              JOIN facts of ON of.id = q.old_fact_id
-             WHERE q.status = 'open' AND ",
-            conflict_columns("q.")
+             WHERE q.status = 'open' AND {} AND {} AND ",
+            conflict_columns("q."),
+            fact_visible_sql("nf"),
+            fact_visible_sql("of")
         );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(k) = kb {
@@ -6676,6 +6638,83 @@ mod tests {
             close_authority: None,
             kb: "default".into(),
         }
+    }
+
+    /// Recall's conflicts queries see only facts a reader may still see, in
+    /// the page AND the count: a forgotten memory's fact and an edited-away
+    /// one are gone from both, and an edit that writes the same content back
+    /// hides nothing.
+    #[test]
+    fn conflict_queries_skip_forgotten_and_edited_away_facts() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let pair = |dose_a: &str, dose_b: &str| {
+            let a = test_fact(&store, "Ana", "takes_medication", dose_a);
+            let b = test_fact(&store, "Ana", "takes_medication", dose_b);
+            store.insert_fact(&a).unwrap();
+            store.insert_fact(&b).unwrap();
+            store
+                .insert_fact_conflict(
+                    Uuid::new_v4(),
+                    b.id,
+                    a.id,
+                    "default",
+                    "default",
+                    "slot",
+                    None,
+                    "ask",
+                    "",
+                    "",
+                    engram_core::relations::REGISTRY_VERSION,
+                )
+                .unwrap();
+            b
+        };
+        let terms = ["atorvastatin".to_string()];
+        let shown = |s: &SqliteStore| {
+            (
+                s.open_conflicts_matching_terms(None, None, &terms, 10)
+                    .unwrap()
+                    .len(),
+                s.count_open_conflicts_matching_terms(None, None, &terms)
+                    .unwrap(),
+            )
+        };
+        let edited = pair("atorvastatin 10 mg", "atorvastatin 20 mg");
+        let forgotten = pair("atorvastatin 30 mg", "atorvastatin 40 mg");
+        assert_eq!(shown(&store), (2, 2));
+
+        let same = "Ana takes_medication atorvastatin 20 mg";
+        store
+            .update_memory(edited.source_memory_id, Some(same), None)
+            .unwrap();
+        assert_eq!(
+            shown(&store),
+            (2, 2),
+            "an unchanged edit keeps the question"
+        );
+        assert!(store
+            .visible_facts(&[edited.id])
+            .unwrap()
+            .contains(&edited.id));
+
+        store
+            .update_memory(
+                edited.source_memory_id,
+                Some("Ana's appointment moved."),
+                None,
+            )
+            .unwrap();
+        assert_eq!(shown(&store), (1, 1));
+        assert!(store.visible_facts(&[edited.id]).unwrap().is_empty());
+
+        store
+            .soft_delete_memory(forgotten.source_memory_id)
+            .unwrap();
+        assert_eq!(shown(&store), (0, 0));
+        assert!(store
+            .facts_matching_terms(None, None, &["40".to_string()], 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

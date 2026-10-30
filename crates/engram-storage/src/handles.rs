@@ -257,12 +257,16 @@ impl SqliteStore {
         if terms.is_empty() {
             return Ok(0);
         }
-        let mut sql = String::from(
+        // The same visibility rule as the page it totals, or the count would
+        // say a forgotten value still matches the query.
+        let mut sql = format!(
             "SELECT COUNT(*) FROM fact_conflict_queue q
                JOIN facts nf ON nf.id = q.new_fact_id
                JOIN facts of ON of.id = q.old_fact_id
               WHERE q.status = 'open' AND (?1 IS NULL OR q.kb = ?1)
-                AND (?2 IS NULL OR q.diary = ?2) AND ",
+                AND (?2 IS NULL OR q.diary = ?2) AND {} AND {} AND ",
+            crate::sqlite::fact_visible_sql("nf"),
+            crate::sqlite::fact_visible_sql("of")
         );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(kb.map(|s| s.to_string())),

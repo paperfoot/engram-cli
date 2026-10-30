@@ -1772,6 +1772,9 @@ fn recall_conflicts_never_print_a_forgotten_or_edited_away_value() {
         !after.contains("20 mg"),
         "a forgotten value came back: {after}"
     );
+    // Nor does the count say that something forgotten still matches.
+    let v: Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(v["data"]["conflicts_total"], 0, "{after}");
 
     // Edit away the value that superseded another.
     remember_with_facts(
@@ -1803,6 +1806,42 @@ fn recall_conflicts_never_print_a_forgotten_or_edited_away_value() {
     );
     // The older value is still reported as not current.
     assert!(superseded_by(&after, Value::Null), "{after}");
+}
+
+/// An expired memory is withheld, not gone (`--include-expired` brings it
+/// back), so its side of an unresolved pair stays listed: hiding it would make
+/// the other value look settled when nobody settled it.
+#[test]
+fn an_expired_side_keeps_its_contested_pair_listed() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_with_facts(
+        &tmp,
+        "Leo takes lisinopril 5 mg.",
+        r#"[{"subject":"Leo","predicate":"takes_medication","object":"lisinopril 5 mg"}]"#,
+        "assisted",
+    );
+    json_cmd(
+        &tmp,
+        &[
+            "remember",
+            "Leo takes lisinopril 40 mg.",
+            "--facts-json",
+            r#"[{"subject":"Leo","predicate":"takes_medication","object":"lisinopril 40 mg"}]"#,
+            "--autonomy",
+            "strict",
+            "--valid-until",
+            "2020-01-01",
+        ],
+    );
+    let v = json_cmd(&tmp, &["recall", "lisinopril"]);
+    assert!(
+        v["data"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["status"] == "contested"),
+        "{v}"
+    );
 }
 
 /// THE ASSERTION WAS THE BUG (spec-fact-semantics §5.41, CLP-1).
