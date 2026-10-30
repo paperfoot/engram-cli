@@ -72,6 +72,9 @@ pub struct RememberArgs {
 /// agent can react instead of assuming facts were captured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExtractionStatus {
+    /// Handed to a background extractor: `remember` does not wait on a
+    /// network model. The memory stays pending (no marker) until it runs.
+    Queued,
     Ran,
     /// Offline deterministic script (tests/CI).
     RanStub,
@@ -99,6 +102,7 @@ enum ExtractionStatus {
 impl ExtractionStatus {
     fn as_str(&self) -> &'static str {
         match self {
+            ExtractionStatus::Queued => "queued",
             ExtractionStatus::Ran => "ran",
             ExtractionStatus::RanStub => "ran_stub",
             ExtractionStatus::Disabled => "disabled",
@@ -121,6 +125,11 @@ impl ExtractionStatus {
     /// The one sentence a caller needs when facts did NOT get captured.
     fn note(&self, kb: &str) -> Option<String> {
         match self {
+            ExtractionStatus::Queued => Some(format!(
+                "facts are being extracted in the background; `engram facts list --kb {kb}` shows \
+                 them within seconds (pass --facts-json to supply them yourself, or \
+                 --extract-facts to wait for extraction)"
+            )),
             ExtractionStatus::SkippedNoKey => Some(format!(
                 "fact extraction skipped: {}",
                 crate::fact_llm::no_llm_hint()
@@ -585,6 +594,14 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
         ExtractionStatus::CallerSupplied
     } else {
         match &llm {
+            // A live model is a network round trip of seconds: the caller is
+            // not kept waiting for it. Routine extraction (default autonomy,
+            // no --extract-facts) runs in the background job instead; an
+            // explicit --autonomy or --extract-facts keeps it in this call, so
+            // the caller gets the adjudication it asked for.
+            Some(llm) if llm.is_live() && !force_extract_facts && autonomy == Autonomy::default() => {
+                ExtractionStatus::Queued
+            }
             Some(llm) => {
                 extraction_model = Some(llm.model());
                 match extract_into(
@@ -785,7 +802,41 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
             adjudication_needed.len()
         )
     });
+    if status == ExtractionStatus::Queued {
+        // After the answer is printed. A failed spawn leaves the memory
+        // pending, which is exactly what the note already tells the caller.
+        if let Err(e) = spawn_background_extraction(&kb) {
+            if !ctx.quiet {
+                eprintln!("note: could not start background extraction ({e}); run `engram facts backfill --kb {kb}`");
+            }
+        }
+    }
     Ok(())
+}
+
+/// Start extraction of this KB's pending memories in a detached process and
+/// return at once. It goes through the job system, which runs one backfill per
+/// KB: a burst of writes shares one extractor instead of racing it, and the
+/// job keeps taking batches until nothing is pending. The child inherits the
+/// store (`--store` is exported as ENGRAM_STORE) and outlives this process.
+fn spawn_background_extraction(kb: &str) -> std::io::Result<()> {
+    let mut exe = std::env::current_exe()?;
+    if exe.file_name().and_then(|n| n.to_str()) == Some("engramd") {
+        exe.set_file_name("engram");
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["--json", "--quiet", "jobs", "submit", "--kind", "backfill", "--kb", kb])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own process group: a Ctrl-C or a killed shell aimed at the
+        // caller does not take the extractor with it.
+        cmd.process_group(0);
+    }
+    cmd.spawn().map(|_| ())
 }
 
 /// `data.facts_grounding`, only when grounding judged a fact or dropped one:

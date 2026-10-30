@@ -232,7 +232,7 @@ fn manifest() -> Value {
             "remember": [
                 "File personal facts under --kb personal, work/company facts under --kb business, project context under the project's own KB. Writing to a KB registers it.",
                 "Set --event-time for anything dated — birthdays, anniversaries, when a decision was made. Without it the memory is only findable by content, never by time.",
-                "Check `fact_extraction` in the response. `skipped_no_openrouter_key` means no facts were captured: either configure the key or run `engram facts backfill` later. A `failed*` status also leaves work for backfill.",
+                "Check `fact_extraction` in the response. `queued` means a live model is extracting facts in the background (remember did not wait): they appear in `facts list` within seconds — supply them yourself with --facts-json, or pass --extract-facts to wait. `skipped_no_openrouter_key` means no facts were captured: either configure the key or run `engram facts backfill` later. A `failed*` status also leaves work for backfill.",
                 "Never write with `--diary '*'` — it is a read-side wildcard and every write path rejects it with exit 3.",
                 "Handle `adjudication_needed` rather than ignoring it — you have the conversation context the resolver lacks.",
                 "If a write exits 2 saying no Gemini key is configured, do not reach for --offline just to make it pass: a store holding both stub and cloud vectors is what makes `recall` refuse later. Configure the key, or use --offline deliberately for a store you keep offline."
