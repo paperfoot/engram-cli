@@ -1499,8 +1499,16 @@ fn job_id_segment<'a>(path: &'a str, suffix: &str) -> &'a str {
 /// Retrieval embeds the query with a provider mid-call, so its future owns the
 /// store while it is suspended — and `SqliteStore` is `Send` but not `Sync`,
 /// which makes such a future un-spawnable. It therefore runs on a blocking
-/// thread with its own current-thread runtime, and the connection is handed
-/// back to the pool afterwards rather than being reopened per request.
+/// thread, and the connection is handed back to the pool afterwards rather
+/// than being reopened per request.
+///
+/// The blocking thread drives the future with the DAEMON's runtime handle,
+/// not a runtime of its own. It used to build a current-thread runtime per
+/// request, and hyper spawns each HTTP connection's task on the runtime that
+/// opened it: when the request's runtime was dropped, every provider
+/// connection died with it, so each recall paid fresh TCP and TLS handshakes
+/// to Gemini, Cohere and TypeSafe. On the daemon's runtime the pooled
+/// connections outlive the request.
 async fn with_reader<T, F, Fut>(core: &Core, f: F) -> Result<T, CliError>
 where
     F: FnOnce(SqliteStore) -> Fut + Send + 'static,
@@ -1508,24 +1516,8 @@ where
     T: Send + 'static,
 {
     let (store, pooled) = core.checkout_parts()?;
-    let joined = tokio::task::spawn_blocking(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                return (
-                    Err(CliError::Transient(format!(
-                        "could not start a request runtime: {e}"
-                    ))),
-                    store,
-                )
-            }
-        };
-        rt.block_on(f(store))
-    })
-    .await;
+    let runtime = tokio::runtime::Handle::current();
+    let joined = tokio::task::spawn_blocking(move || runtime.block_on(f(store))).await;
     match joined {
         Ok((out, store)) => {
             core.checkin_parts(store, pooled);

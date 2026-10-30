@@ -27,14 +27,29 @@ pub struct CohereReranker {
     model: String,
 }
 
-impl CohereReranker {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::builder()
+/// One HTTP client per process, shared by every reranker built in it.
+///
+/// A client per reranker threw its pooled connection away with the reranker:
+/// fine for a CLI that reranks once, but `engramd` builds one per request,
+/// so every recall paid a fresh TCP and TLS handshake to Cohere. Cloning a
+/// `reqwest::Client` shares its pool.
+fn shared_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .user_agent(concat!("engram/", env!("CARGO_PKG_VERSION")))
                 .build()
-                .expect("failed to build reqwest client"),
+                .expect("failed to build reqwest client")
+        })
+        .clone()
+}
+
+impl CohereReranker {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            client: shared_client(),
             api_key: api_key.into(),
             model: resolve_model(),
         }

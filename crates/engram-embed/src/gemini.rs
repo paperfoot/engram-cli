@@ -49,16 +49,32 @@ pub struct GeminiEmbedder {
     endpoint: String,
 }
 
-impl GeminiEmbedder {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::builder()
+/// One HTTP client per process, shared by every embedder built in it.
+///
+/// A client per embedder threw its pooled connection away with the
+/// embedder: fine for a CLI that embeds once, but `engramd` builds one per
+/// request, so every recall paid a fresh TCP and TLS handshake to Gemini.
+/// Cloning a `reqwest::Client` shares its pool; key rotation stays per
+/// embedder, as before.
+fn shared_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(180))
                 .connect_timeout(std::time::Duration::from_secs(15))
                 .user_agent(concat!("engram/", env!("CARGO_PKG_VERSION")))
                 .pool_idle_timeout(std::time::Duration::from_secs(60))
                 .build()
-                .expect("failed to build reqwest client"),
+                .expect("failed to build reqwest client")
+        })
+        .clone()
+}
+
+impl GeminiEmbedder {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            client: shared_client(),
             keys: vec![api_key.into()],
             active: std::sync::atomic::AtomicUsize::new(0),
             rotation_reason: std::sync::Mutex::new(None),
@@ -822,9 +838,8 @@ mod tests {
 
     #[test]
     fn a_healthy_embedder_reports_no_degradation_and_a_rotated_one_masks_the_key() {
-        let e = GeminiEmbedder::new("primary-key-aaaaaaaa").with_fallback_keys(vec![
-            "AQ.REDACTED-REVOKED-KEY".to_string(),
-        ]);
+        let e = GeminiEmbedder::new("primary-key-aaaaaaaa")
+            .with_fallback_keys(vec!["AQ.REDACTED-REVOKED-KEY".to_string()]);
         assert!(e.degradation_note().is_none(), "healthy = silent");
         e.rotate_from(0, "test");
         let note = e.degradation_note().expect("rotated = loud");

@@ -1,7 +1,7 @@
 //! TypeSafe JEV over HTTP: the direct API, or the same API served by
 //! OpenRouter (identical answers; OpenRouter also reports `usage.cost`).
 //!
-//! One pooled client per judge: server time is ~100 ms, and a fresh TLS
+//! One pooled client per process: server time is ~100 ms, and a fresh TLS
 //! handshake costs 0.8-1.1 s, so connection reuse is most of the latency.
 //! Retries follow the provider SDKs: two retries on 408/429/5xx and transport
 //! errors, 0.5 s doubling, `retry-after` honoured up to 5 s.
@@ -69,6 +69,22 @@ impl std::fmt::Debug for TypeSafeJudge {
     }
 }
 
+/// One HTTP client per process, shared by every judge built in it: a
+/// long-lived process (`engramd`) builds a judge per request, and a client
+/// per judge paid a fresh TLS handshake every time.
+fn shared_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .user_agent(concat!("engram/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("failed to build reqwest client")
+        })
+        .clone()
+}
+
 impl TypeSafeJudge {
     pub fn new(route: TypeSafeRoute) -> Self {
         let (provider, endpoint, model, key) = match route {
@@ -78,11 +94,7 @@ impl TypeSafeJudge {
             }
         };
         Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .user_agent(concat!("engram/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("failed to build reqwest client"),
+            client: shared_client(),
             provider,
             endpoint: endpoint.to_string(),
             model,
