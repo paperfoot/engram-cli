@@ -1631,7 +1631,13 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
     let run = run_recall(store, &backends, relevance_judge.as_ref(), params).await?;
     let relevance = run.relevance;
     let retrieved_any = run.retrieved_any;
-    let (results, notes, timings) = (run.outcome.results, run.outcome.notes, run.outcome.timings);
+    let (results, notes, timings, stats) = (
+        run.outcome.results,
+        run.outcome.notes,
+        run.outcome.timings,
+        run.outcome.stats,
+    );
+    let has_window = since.is_some() || until.is_some();
     if let Some(response) = relevance.as_ref().and_then(|r| r.response.as_ref()) {
         crate::judge::record_store_judge_usage(
             store,
@@ -1759,6 +1765,21 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
     )?;
     if let Some(report) = &relevance {
         resp["data"]["metadata"]["relevance"] = report.to_json();
+    }
+    // The CLI's verdict and absence certificate, from the same builder: an
+    // abstention (every candidate below the relevance cutoff) is `no_match`
+    // with reason `no_candidate_above_cutoff`, its threshold and its scope.
+    let verdict = crate::commands::recall::recall_verdict(
+        store,
+        &scope,
+        &stats,
+        daemon_diary(req_diary.clone()).as_deref().unwrap_or("*"),
+        has_window,
+        relevance.as_ref(),
+        results.is_empty(),
+    )?;
+    if let Some(data) = resp["data"].as_object_mut() {
+        verdict.attach(data);
     }
     resp["data"]["conflicts"] = json!(conflicts.items);
     resp["data"]["metadata"]["conflicts_total"] = json!(conflicts.total);

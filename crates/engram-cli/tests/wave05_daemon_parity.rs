@@ -258,6 +258,13 @@ fn daemon_recall_honours_an_explicit_relevance_mode() {
     let relevance = &body["data"]["metadata"]["relevance"];
     assert_eq!(relevance["mode"], "on", "{body}");
     assert_eq!(relevance["abstained"], true, "{body}");
+    // The CLI's absence contract, word for word.
+    assert_eq!(body["data"]["verdict"], "no_match", "{body}");
+    let absence = &body["data"]["absence"];
+    assert_eq!(absence["reason"], "no_candidate_above_cutoff", "{body}");
+    assert_eq!(absence["threshold"].as_f64(), Some(0.15), "{body}");
+    assert!(absence["searched_chunks"].as_u64().unwrap() > 0, "{body}");
+    assert!(absence["searched_kbs"].is_array(), "{body}");
     drop(daemon);
 
     // A judge that accepts: every result carries its probability.
@@ -270,6 +277,8 @@ fn daemon_recall_honours_an_explicit_relevance_mode() {
     let (status, body) = post(daemon.port, "/v1/recall", query);
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["data"]["status"], "success", "{body}");
+    assert_eq!(body["data"]["verdict"], "results", "{body}");
+    assert!(body["data"].get("absence").is_none(), "{body}");
     let results = body["data"]["results"].as_array().expect("results");
     assert!(!results.is_empty(), "{body}");
     assert!(

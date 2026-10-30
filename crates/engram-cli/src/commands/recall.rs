@@ -363,28 +363,15 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     // things.
     let empty = results_json.is_empty();
     let status = if empty { "no_results" } else { "success" };
-    let searched_kbs = if scope.as_deref().is_some() {
-        vec![scope.label().to_string()]
-    } else if stats.kbs_searched.is_empty() {
-        vec!["*".to_string()]
-    } else {
-        stats.kbs_searched.clone()
-    };
-    let verdict = if let Some(report) = relevance.as_ref().filter(|r| r.abstained) {
-        // Candidates were found and every one was judged not to answer: a
-        // real cutoff rejected real candidates, so the certificate names it.
-        Verdict::NoMatch(read_surface::absence_below_cutoff(
-            &stats,
-            searched_kbs,
-            report.top_relevance,
-            report.floor,
-        ))
-    } else if empty {
-        let shape = request_shape(&ctx.store, &diary, since_dt.is_some() || until_dt.is_some())?;
-        Verdict::NoMatch(read_surface::absence_from(&stats, searched_kbs, shape))
-    } else {
-        Verdict::Results
-    };
+    let verdict = recall_verdict(
+        &ctx.store,
+        &scope,
+        &stats,
+        &diary,
+        since_dt.is_some() || until_dt.is_some(),
+        relevance.as_ref(),
+        empty,
+    )?;
 
     let Value::Object(mut data) = json!({
         "status": status,
@@ -444,6 +431,42 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         }
     });
     Ok(())
+}
+
+/// The verdict a recall reports, and its absence certificate on `no_match`:
+/// one builder for the CLI and the daemon, so an HTTP client reads the same
+/// contract. `diary` is the filter as the CLI spells it (`*` for all).
+pub fn recall_verdict(
+    store: &SqliteStore,
+    scope: &crate::retrieval::KbScope,
+    stats: &read_surface::RecallStats,
+    diary: &str,
+    has_window: bool,
+    relevance: Option<&crate::retrieval::RelevanceReport>,
+    empty: bool,
+) -> Result<Verdict, CliError> {
+    let searched_kbs = if scope.as_deref().is_some() {
+        vec![scope.label().to_string()]
+    } else if stats.kbs_searched.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        stats.kbs_searched.clone()
+    };
+    Ok(if let Some(report) = relevance.filter(|r| r.abstained) {
+        // Candidates were found and every one was judged not to answer: a
+        // real cutoff rejected real candidates, so the certificate names it.
+        Verdict::NoMatch(read_surface::absence_below_cutoff(
+            stats,
+            searched_kbs,
+            report.top_relevance,
+            report.floor,
+        ))
+    } else if empty {
+        let shape = request_shape(store, diary, has_window)?;
+        Verdict::NoMatch(read_surface::absence_from(stats, searched_kbs, shape))
+    } else {
+        Verdict::Results
+    })
 }
 
 /// Which filter to blame for an empty read.
