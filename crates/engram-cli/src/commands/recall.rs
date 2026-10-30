@@ -7,7 +7,7 @@ use crate::output::{print_envelope, round_score, Metadata, Scope, Verdict};
 use crate::read_surface::{self, RequestShape};
 use crate::respond;
 use crate::retrieval::{
-    hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
+    render_answer_context, resolve_kb_scope, resolve_retrieval_backends, run_recall, Filters,
     HybridParams, RecallMode, RelevanceJudge, RetrievalProfile,
 };
 use chrono::{DateTime, Utc};
@@ -110,19 +110,13 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     let relevance_judge = RelevanceJudge::resolve(profile_enum == RetrievalProfile::Offline)?;
     let params = HybridParams {
         query: &query,
-        // With the judge active, retrieve a wider pool: the misses are
-        // dropped before the cut to top_k, not after it.
-        top_k: if relevance_judge.is_some() {
-            RelevanceJudge::pool(top_k, rerank_candidates)
-        } else {
-            top_k
-        },
+        top_k,
         rrf_k,
         rerank_top_n: rerank_candidates,
         filters,
         mode: recall_mode,
         allow_mixed_embeddings,
-        defer_doc_cap: relevance_judge.is_some(),
+        defer_doc_cap: false,
     };
 
     // Provider choice, the missing-key hard error and the spend guardrail all
@@ -130,40 +124,24 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     // drifted, and research and the daemon kept silently falling back to the
     // 64-dim stub long after recall stopped.
     let backends = resolve_retrieval_backends(&ctx.store, profile_enum, scope.as_deref())?;
-    let outcome = hybrid_recall(
-        &ctx.store,
-        backends.embedder.as_ref(),
-        backends.reranker.as_deref(),
-        params,
-    )
-    .await?;
-
-    let mut results = outcome.results;
-    let notes = outcome.notes;
-    let stats = outcome.stats;
-    let mut timings = outcome.timings;
-    let fused_any = !results.is_empty();
-
     // Judged before the layer budget, so the budget is spent on passages
     // that answer the query rather than on the ones they displaced.
-    let relevance = match &relevance_judge {
-        Some(judge) => {
-            let judging = Instant::now();
-            let report = judge.apply(&ctx.store, &query, &mut results, top_k).await;
-            timings.judge_ms = crate::retrieval::ms_since(judging);
-            if let Some(response) = &report.response {
-                crate::judge::record_judge_usage(
-                    ctx,
-                    crate::judge::JudgeSite::Relevance.operation(),
-                    response,
-                    scope.as_deref(),
-                    if diary == "*" { None } else { Some(&diary) },
-                );
-            }
-            Some(report)
-        }
-        None => None,
-    };
+    let run = run_recall(&ctx.store, &backends, relevance_judge.as_ref(), params).await?;
+    let relevance = run.relevance;
+    let results = run.outcome.results;
+    let notes = run.outcome.notes;
+    let stats = run.outcome.stats;
+    let timings = run.outcome.timings;
+    let fused_any = run.retrieved_any;
+    if let Some(response) = relevance.as_ref().and_then(|r| r.response.as_ref()) {
+        crate::judge::record_judge_usage(
+            ctx,
+            crate::judge::JudgeSite::Relevance.operation(),
+            response,
+            scope.as_deref(),
+            if diary == "*" { None } else { Some(&diary) },
+        );
+    }
 
     // The memory-layer token budget trims the returned set to fit an agent's
     // context window. But it must never silently return FEWER than the caller's

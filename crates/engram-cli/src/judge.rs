@@ -360,6 +360,18 @@ pub fn record_judge_usage(
     record_usage(&ctx.store, operation, response, kb, diary);
 }
 
+/// [`record_judge_usage`] for a surface that holds a store, not an
+/// `AppContext` (the daemon).
+pub fn record_store_judge_usage(
+    store: &engram_storage::SqliteStore,
+    operation: &str,
+    response: &JudgeResponse,
+    kb: Option<&str>,
+    diary: Option<&str>,
+) {
+    record_usage(store, operation, response, kb, diary);
+}
+
 fn record_usage(
     store: &engram_storage::SqliteStore,
     operation: &str,

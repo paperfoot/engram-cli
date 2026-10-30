@@ -24,8 +24,8 @@ use crate::engine::Core;
 use crate::error::CliError;
 use crate::respond;
 use crate::retrieval::{
-    hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
-    HybridParams, RecallMode, RetrievalProfile,
+    render_answer_context, resolve_kb_scope, resolve_retrieval_backends, run_recall, Filters,
+    HybridParams, RecallMode, RelevanceJudge, RetrievalProfile,
 };
 use chrono::{DateTime, Utc};
 use engram_core::layers::approx_tokens;
@@ -1601,6 +1601,9 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
     // `resolve_retrieval_backends`): no key under a cloud profile is a config
     // error, not stub results dressed up as gemini ones. The embedder is also
     // asked what it is rather than being hardcoded here.
+    // Resolved before any paid call, as on the CLI: a bad `judge.relevance`
+    // fails the request with nothing spent.
+    let relevance_judge = RelevanceJudge::resolve(profile == RetrievalProfile::Offline)?;
     let backends = resolve_retrieval_backends(store, profile, scope.as_deref())?;
     let params = HybridParams {
         query: &req.query,
@@ -1618,14 +1621,20 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
         allow_mixed_embeddings: req.allow_mixed_embeddings.unwrap_or(false),
         defer_doc_cap: false,
     };
-    let outcome = hybrid_recall(
-        store,
-        backends.embedder.as_ref(),
-        backends.reranker.as_deref(),
-        params,
-    )
-    .await?;
-    let (results, notes, timings) = (outcome.results, outcome.notes, outcome.timings);
+    // The CLI's pipeline, relevance judge included: see `run_recall`.
+    let run = run_recall(store, &backends, relevance_judge.as_ref(), params).await?;
+    let relevance = run.relevance;
+    let retrieved_any = run.retrieved_any;
+    let (results, notes, timings) = (run.outcome.results, run.outcome.notes, run.outcome.timings);
+    if let Some(response) = relevance.as_ref().and_then(|r| r.response.as_ref()) {
+        crate::judge::record_store_judge_usage(
+            store,
+            crate::judge::JudgeSite::Relevance.operation(),
+            response,
+            scope.as_deref(),
+            daemon_diary(req_diary.clone()).as_deref(),
+        );
+    }
     // Same layer contract as `engram recall`: the token budget only trims what
     // exceeds the caller's own top_k, so a layer can never return FEWER results
     // than were asked for. Reported so a caller can see which budget applied.
@@ -1657,7 +1666,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
             json!({ "estimated": true, "api": true }),
         )?;
     }
-    if backends.use_cohere() && !results.is_empty() {
+    if backends.use_cohere() && retrieved_any {
         let search_units = 1.0;
         store.record_usage_event(
             "cohere",
@@ -1702,6 +1711,13 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
                 if full {
                     v["content"] = json!(r.content);
                 }
+                // As the CLI: present only when the judge answered for it.
+                if let Some(p) = r.relevance {
+                    v["relevance"] = json!(engram_llm::judge::wire_decimal(p));
+                    if crate::retrieval::judged_on_prefix(&r.content) {
+                        v["relevance_on_prefix"] = json!(true);
+                    }
+                }
                 v
             }).collect::<Vec<_>>(),
             "metadata": {
@@ -1735,6 +1751,9 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
         &req.query,
         10,
     )?;
+    if let Some(report) = &relevance {
+        resp["data"]["metadata"]["relevance"] = report.to_json();
+    }
     resp["data"]["conflicts"] = json!(conflicts.items);
     resp["data"]["metadata"]["conflicts_total"] = json!(conflicts.total);
     // Presence IS the signal: skill.md tells agents the field appears only in

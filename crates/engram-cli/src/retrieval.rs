@@ -1057,6 +1057,63 @@ fn memory_date(store: &SqliteStore, memory_id: Option<Uuid>) -> Option<String> {
     Some(event.unwrap_or(created).format("%Y-%m-%d").to_string())
 }
 
+/// One finished recall: the retrieved results, already judged and cut to
+/// the caller's `top_k`, and what the relevance judge did.
+pub struct RecallRun {
+    pub outcome: RecallOutcome,
+    pub relevance: Option<RelevanceReport>,
+    /// Retrieval returned results before the judge saw them: the paid
+    /// rerank ran on a non-empty pool, whatever the judge then dropped.
+    pub retrieved_any: bool,
+}
+
+/// THE recall pipeline, for every surface that answers one: hybrid
+/// retrieval, then the relevance judge over the reranked pool.
+///
+/// The daemon used to call [`hybrid_recall`] alone: `POST /v1/recall` never
+/// ran the relevance judge, so an agent over HTTP got the unjudged top ten
+/// that `engram recall` would have filtered and refilled. One function, so
+/// the two surfaces cannot drift again. `params.top_k` is the caller's page
+/// size; with a judge, the pool retrieved is widened here and the cut to
+/// `top_k` happens after judging (see [`RelevanceJudge::apply`]).
+pub async fn run_recall(
+    store: &SqliteStore,
+    backends: &RetrievalBackends,
+    judge: Option<&RelevanceJudge>,
+    mut params: HybridParams<'_>,
+) -> Result<RecallRun, crate::error::CliError> {
+    let top_k = params.top_k;
+    let query = params.query;
+    if judge.is_some() {
+        // A wider pool: the misses are dropped before the cut to top_k,
+        // not after it.
+        params.top_k = RelevanceJudge::pool(top_k, params.rerank_top_n);
+        params.defer_doc_cap = true;
+    }
+    let mut outcome = hybrid_recall(
+        store,
+        backends.embedder.as_ref(),
+        backends.reranker.as_deref(),
+        params,
+    )
+    .await?;
+    let retrieved_any = !outcome.results.is_empty();
+    let relevance = match judge {
+        Some(judge) => {
+            let judging = std::time::Instant::now();
+            let report = judge.apply(store, query, &mut outcome.results, top_k).await;
+            outcome.timings.judge_ms = ms_since(judging);
+            Some(report)
+        }
+        None => None,
+    };
+    Ok(RecallRun {
+        outcome,
+        relevance,
+        retrieved_any,
+    })
+}
+
 pub async fn hybrid_recall<E, R>(
     store: &SqliteStore,
     embedder: &E,

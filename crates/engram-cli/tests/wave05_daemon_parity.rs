@@ -162,7 +162,9 @@ fn post(port: u16, path: &str, body: &str) -> (u16, Value) {
 /// The text of every returned passage, read from `answer_context` — the one
 /// copy both surfaces print (results[] repeats it only with `full`).
 fn contents(body: &Value) -> Vec<String> {
-    let ctx = body["data"]["answer_context"].as_str().expect("answer_context");
+    let ctx = body["data"]["answer_context"]
+        .as_str()
+        .expect("answer_context");
     ctx.split("<engram-result ")
         .skip(1)
         .filter_map(|el| {
@@ -184,6 +186,56 @@ fn assert_blank_query_refused(status: u16, body: &Value) {
 /// A key that is never spent: every test using it expects the refusal to fire
 /// before the first network call.
 const UNUSED_KEY: &str = "fake-key-not-used-because-the-guard-blocks-first";
+
+#[test]
+fn daemon_recall_runs_the_relevance_judge_as_the_cli_does() {
+    // `/v1/recall` used to skip the relevance judge entirely: an agent over
+    // HTTP got the unjudged top ten that `engram recall` filters. The stub
+    // judge beats every key, so nothing leaves the machine.
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    seed(
+        tmp.path(),
+        &[
+            "remember",
+            "The harbour office opens at nine on weekdays.",
+            "--kb",
+            "judge",
+            "--no-facts",
+        ],
+    );
+    let query = "{\"query\":\"harbour office hours\",\"profile\":\"offline\"}";
+
+    // A judge that rejects everything: the daemon abstains, as the CLI does.
+    let stub = [
+        ("ENGRAM_JUDGE_STUB", "0.01"),
+        ("TYPESAFE_API_KEY", "ts-test-not-a-key"),
+    ];
+    let daemon = start_daemon(tmp.path(), &stub);
+    let (status, body) = post(daemon.port, "/v1/recall", query);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["status"], "no_results", "{body}");
+    assert!(contents(&body).is_empty(), "{body}");
+    let relevance = &body["data"]["metadata"]["relevance"];
+    assert_eq!(relevance["mode"], "on", "{body}");
+    assert_eq!(relevance["abstained"], true, "{body}");
+    drop(daemon);
+
+    // A judge that accepts: every result carries its probability.
+    let stub = [
+        ("ENGRAM_JUDGE_STUB", "0.9"),
+        ("TYPESAFE_API_KEY", "ts-test-not-a-key"),
+    ];
+    let daemon = start_daemon(tmp.path(), &stub);
+    let (status, body) = post(daemon.port, "/v1/recall", query);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["status"], "success", "{body}");
+    let results = body["data"]["results"].as_array().expect("results");
+    assert!(!results.is_empty(), "{body}");
+    assert!(
+        results.iter().all(|r| r["relevance"].as_f64() == Some(0.9)),
+        "{body}"
+    );
+}
 
 #[test]
 fn daemon_recall_refuses_an_empty_query() {
