@@ -107,12 +107,17 @@ def recall_one(binary, cond, q, extra_env, top_k, keep_text=False, daemon=None):
     shutil.copytree(src, dst)
     env = dict(os.environ, ENGRAM_STORE=dst, NO_COLOR='1', **extra_env)
     t = time.time()
-    if daemon:
-        code, out, err = daemon_recall(daemon, dst, env, q['question'], top_k)
-    else:
-        argv = [binary, 'recall', q['question'], '--json', '--top-k', str(top_k)]
-        p = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=300)
-        code, out, err = p.returncode, p.stdout, p.stderr
+    try:
+        if daemon:
+            code, out, err = daemon_recall(daemon, dst, env, q['question'], top_k)
+        else:
+            argv = [binary, 'recall', q['question'], '--json', '--top-k', str(top_k)]
+            p = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=300)
+            code, out, err = p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        # The copied store holds memory text: it never outlives a failure.
+        shutil.rmtree(dst, ignore_errors=True)
+        return {'qid': q['qid'], 'failure': f'recall raised {type(e).__name__}'}
     secs = time.time() - t
     row = {'qid': q['qid'], 'code': code, 'bytes': len(out.encode()), 'secs': round(secs, 3)}
     if keep_text:
@@ -128,7 +133,12 @@ def recall_one(binary, cond, q, extra_env, top_k, keep_text=False, daemon=None):
         row['relevance'] = [r.get('relevance') for r in results]
         meta = envelope.get('metadata') or {}
         inner = data.get('metadata') or {}
-        row['judge'] = meta.get('relevance', inner.get('relevance'))
+        judge = dict(meta.get('relevance', inner.get('relevance')) or {})
+        # A provider error message can quote a rejected passage: keep only
+        # that there was one.
+        if judge.get('error'):
+            judge['error'] = 'withheld'
+        row['judge'] = judge
         row['reranker'] = meta.get('reranker', inner.get('reranker'))
         row['status'] = data.get('status')
         row['verdict'] = data.get('verdict')

@@ -1015,7 +1015,8 @@ impl RelevanceJudge {
             doc_of(r).is_some_and(|d| per_doc.get(&d).is_some_and(|&n| n >= cap))
         };
         let mut pool = std::mem::take(results).into_iter();
-        let mut kept: Vec<HybridResult> = Vec::with_capacity(top_k);
+        // Capacity from what exists, never from what was asked for.
+        let mut kept: Vec<HybridResult> = Vec::with_capacity(top_k.min(pool.len()));
         // A batch the judge could not answer: unjudged, first in line.
         let mut unanswered: Vec<HybridResult> = Vec::new();
         let mut asked = 0usize;
@@ -1647,7 +1648,9 @@ where
     let max_per_doc = max_per_doc();
 
     let using_reranker = reranker.is_some();
-    let mut results = Vec::with_capacity(params.top_k);
+    // The pool size is a request (it can be any number the caller passes);
+    // capacity comes from the candidates that exist.
+    let mut results = Vec::with_capacity(params.top_k.min(reranked.len()));
     let mut per_doc: HashMap<Uuid, usize> = HashMap::new();
     for r in reranked {
         if results.len() >= params.top_k {

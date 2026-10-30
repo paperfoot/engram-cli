@@ -58,7 +58,7 @@ impl Provider {
             }
             Self::OpenRouter => "fact extraction on remember, the judge's OpenRouter route",
             Self::Cohere => "rerank in cloud_quality recall",
-            Self::TypeSafe => "the optional judge, direct route (judge sites default off)",
+            Self::TypeSafe => "the judge, direct route (with this key recall's relevance site defaults to shadow; the other sites default off)",
         }
     }
 
@@ -512,7 +512,9 @@ fn judge_one(
         // A resolvable TypeSafe key always takes the direct route and never
         // retries through OpenRouter, so a broken key fails every judged
         // call — an error once a site is shadow/on, a warning while all are
-        // off (judge sites default off).
+        // off (the grounding, adjudicate and dedupe sites default off; the
+        // relevance site's shadow default only annotates, so its failures
+        // degrade nothing).
         let severity = if judge_active {
             Severity::Error
         } else {
