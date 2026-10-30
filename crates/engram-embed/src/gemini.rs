@@ -340,6 +340,15 @@ impl Embedder for GeminiEmbedder {
         "gemini"
     }
 
+    async fn preconnect(&self) {
+        let _ = self
+            .client
+            .head(&self.endpoint)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+    }
+
     fn dimensions(&self) -> usize {
         self.dimensions
     }

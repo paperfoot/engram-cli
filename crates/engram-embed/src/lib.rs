@@ -87,6 +87,12 @@ pub trait Embedder: Send + Sync {
         None
     }
 
+    /// Open a pooled connection to the provider without calling the API
+    /// (no key is sent, nothing is billed), so the next real call skips the
+    /// TCP and TLS handshakes. Best effort: errors are ignored. The default
+    /// does nothing (local providers have no connection to open).
+    async fn preconnect(&self) {}
+
     async fn embed_one(&self, text: &str, mode: TaskMode) -> Result<Vec<f32>, EmbedError>;
 
     /// Embed a batch. Errors here discard the partial-spend accounting; a

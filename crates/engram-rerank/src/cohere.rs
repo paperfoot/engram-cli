@@ -92,6 +92,15 @@ impl Reranker for CohereReranker {
         "cohere"
     }
 
+    async fn preconnect(&self) {
+        let _ = self
+            .client
+            .head(ENDPOINT)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+    }
+
     async fn rerank(
         &self,
         query: &str,

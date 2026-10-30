@@ -435,6 +435,13 @@ pub trait Judge: Send + Sync {
     /// One request, one round trip (plus retries). Callers with an unbounded
     /// question list use [`ask_batched`].
     async fn ask(&self, request: &JudgeRequest) -> Result<JudgeResponse, JudgeError>;
+
+    /// Open up to `connections` pooled connections to the provider without calling the API
+    /// (no key is sent, nothing is billed), so the next real call skips the
+    /// TCP and TLS handshakes; [`ask_batched`] sends up to
+    /// [`BATCH_CONCURRENCY`] parts at once, each on a connection of its own. Best effort: errors are ignored. The default
+    /// does nothing (local providers have no connection to open).
+    async fn preconnect(&self, _connections: usize) {}
 }
 
 /// Split `request` into parts of at most [`MAX_QUESTIONS_PER_REQUEST`]

@@ -204,6 +204,16 @@ impl Judge for TypeSafeJudge {
         self.model
     }
 
+    async fn preconnect(&self, connections: usize) {
+        let open = (0..connections.max(1)).map(|_| {
+            self.client
+                .head(&self.endpoint)
+                .timeout(Duration::from_secs(5))
+                .send()
+        });
+        let _ = futures_util::future::join_all(open).await;
+    }
+
     async fn ask(&self, request: &JudgeRequest) -> Result<JudgeResponse, JudgeError> {
         request.validate()?;
         let body = serde_json::to_vec(&WireRequest {

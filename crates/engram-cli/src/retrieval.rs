@@ -16,7 +16,7 @@ use engram_llm::judge::questions::{
     relevance_request, RelevancePassage, RELEVANCE_FLOOR, RELEVANCE_PASSAGE_CHARS,
 };
 use engram_llm::judge::{
-    ask_batched, wire_decimal, Judge, JudgeResponse, MAX_QUESTIONS_PER_REQUEST,
+    ask_batched, wire_decimal, Judge, JudgeResponse, BATCH_CONCURRENCY, MAX_QUESTIONS_PER_REQUEST,
 };
 use engram_rerank::cohere::CohereReranker;
 use engram_rerank::{passthrough::PassthroughReranker, RerankCandidate, Reranker};
@@ -1199,6 +1199,19 @@ pub struct RecallRun {
     pub retrieved_any: bool,
 }
 
+static CONNECTIONS_KEPT_WARM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once by a long-lived process that keeps provider connections warm
+/// itself (`engramd`): recalls then skip opening them per request.
+pub fn keep_connections_warm() {
+    CONNECTIONS_KEPT_WARM.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn connections_kept_warm() -> bool {
+    CONNECTIONS_KEPT_WARM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// THE recall pipeline, for every surface that answers one: hybrid
 /// retrieval, then the relevance judge over the reranked pool.
 ///
@@ -1222,14 +1235,35 @@ pub async fn run_recall(
         params.top_k = RelevanceJudge::pool(top_k, params.rerank_top_n);
         params.defer_doc_cap = true;
     }
-    let mut outcome = retrieve(
+    // A fresh process (the CLI) holds no connection to Cohere or TypeSafe
+    // yet: open them while the query is embedded, so the rerank and the
+    // judge's parallel parts start on warm connections instead of paying
+    // their handshakes after it. A daemon keeps its pool warm itself.
+    let warm = async {
+        if connections_kept_warm() {
+            return;
+        }
+        let rerank = async {
+            if let Some(r) = backends.reranker.as_deref() {
+                r.preconnect().await;
+            }
+        };
+        let judge = async {
+            if let Some(j) = judge {
+                j.judge.preconnect(BATCH_CONCURRENCY).await;
+            }
+        };
+        tokio::join!(rerank, judge);
+    };
+    let retrieval = retrieve(
         store,
         backends.embedder.as_ref(),
         backends.reranker.as_deref(),
         params,
         judge.map(|j| (j, top_k)),
-    )
-    .await?;
+    );
+    let ((), outcome) = tokio::join!(warm, retrieval);
+    let mut outcome = outcome?;
     let retrieved_any = !outcome.results.is_empty();
     let relevance = match judge {
         Some(judge) => {
