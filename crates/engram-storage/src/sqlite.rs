@@ -894,11 +894,9 @@ pub(crate) const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND super
 /// outlives both, so recall's conflicts list filters on this: a value is
 /// printed only while its memory still holds it. An edit that leaves the
 /// content as it was (matching `memory.revised` hashes) is no change; one
-/// whose payload has no hashes is. A revision in the same millisecond as the
-/// fact (all `julianday` can resolve) or with a time that does not parse
-/// counts as later: hiding a value is the safe mistake, and a fact extracted
-/// from the new text still passes on the text. `+ve.kind` keeps the planner
-/// on the per-memory event index.
+/// whose payload has no hashes is. Times compare exactly ([`after`]); one
+/// that does not parse counts as later, because hiding a value is the safe
+/// mistake. `+ve.kind` keeps the planner on the per-memory event index.
 pub(crate) fn fact_visible_sql(alias: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM memories vm \
@@ -907,16 +905,18 @@ pub(crate) fn fact_visible_sql(alias: &str) -> String {
                         WHERE ve.subject_id = vm.id AND +ve.kind = '{kind}' \
                           AND CASE WHEN json_valid(ve.payload) THEN COALESCE(json_extract(ve.payload, '$.content_hash') \
                                   = json_extract(ve.payload, '$.prev_content_hash'), 0) ELSE 0 END = 0 \
-                          AND COALESCE(julianday(ve.ts) >= julianday({alias}.created_at), 1)) \
+                          AND COALESCE(engram_after(ve.ts, {alias}.created_at), 1)) \
                     OR engram_says(vm.content, {alias}.subject, {alias}.object)))",
         kind = engram_core::events::EventKind::MemoryRevised.as_str()
     )
 }
 
 /// True when `text` states `needle` as a whole phrase: both lowercased the
-/// Unicode way and with whitespace runs collapsed, the match bounded by
-/// non-alphanumerics or the ends. SQLite's `lower()` folds only ASCII, and a
-/// bare substring test finds "hiv" inside "archive".
+/// Unicode way and with whitespace runs collapsed. In scripts written with
+/// spaces between words the match must stand alone, so "hiv" is not found in
+/// "archive"; scripts written without them (Chinese, Japanese, Korean
+/// particles, Thai and its neighbours) have no such edge, so "李明" is found
+/// in "李明服用". SQLite's `lower()` folds only ASCII.
 pub(crate) fn says(text: &str, needle: &str) -> bool {
     let fold = |s: &str| {
         s.split_whitespace()
@@ -928,11 +928,37 @@ pub(crate) fn says(text: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
+    // A spaced-script letter or digit, which would run into its neighbour.
+    let spaced = |c: char| {
+        c.is_alphanumeric()
+            && !matches!(c as u32,
+                0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1100..=0x11FF | 0x1780..=0x17FF | 0x2E80..)
+    };
+    let first = needle.chars().next().is_some_and(spaced);
+    let last = needle.chars().next_back().is_some_and(spaced);
     text.match_indices(&needle).any(|(at, m)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + m.len()..].chars().next();
-        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        let joined_before = first && text[..at].chars().next_back().is_some_and(spaced);
+        let joined_after = last && text[at + m.len()..].chars().next().is_some_and(spaced);
+        !joined_before && !joined_after
     })
+}
+
+/// True when instant `a` is strictly later than instant `b`, both read at
+/// full precision whatever their spelling (`Z` or an offset, any number of
+/// fractional digits, or SQLite's `YYYY-MM-DD HH:MM:SS` as UTC); `None` when
+/// either does not parse. `julianday` keeps only milliseconds.
+pub(crate) fn after(a: &str, b: &str) -> Option<bool> {
+    let instant = |t: &str| {
+        chrono::DateTime::parse_from_rfc3339(t)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .ok()
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f")
+                    .ok()
+                    .map(|t| t.and_utc())
+            })
+    };
+    Some(instant(a)? > instant(b)?)
 }
 
 /// SQL functions every query may rely on, registered as part of opening a
@@ -948,6 +974,16 @@ fn register_functions(conn: &Connection) -> Result<(), StorageError> {
             let subject = ctx.get::<Option<String>>(1)?.unwrap_or_default();
             let object = ctx.get::<Option<String>>(2)?.unwrap_or_default();
             Ok(says(&text, &subject) && says(&text, &object))
+        },
+    )?;
+    conn.create_scalar_function(
+        "engram_after",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let a = ctx.get::<Option<String>>(0)?.unwrap_or_default();
+            let b = ctx.get::<Option<String>>(1)?.unwrap_or_default();
+            Ok(after(&a, &b))
         },
     )?;
     Ok(())
@@ -6772,7 +6808,26 @@ mod tests {
         assert!(says("tested for HIV.", "hiv"));
         assert!(!says("cleared the archive", "hiv"));
         assert!(!says("Anabel called", "Ana"));
+        assert!(!says("Anaïs called", "Ana"));
         assert!(!says("anything", "   "));
+        // No spaces between words: neighbours are not part of the name.
+        let zh = "李明服用metoprolol 50 mg。周五复诊。";
+        assert!(says(zh, "李明") && says(zh, "metoprolol 50 mg"));
+    }
+
+    #[test]
+    fn after_compares_instants_at_full_precision_whatever_the_spelling() {
+        let revision = "2026-10-30T00:00:00.123100+00:00";
+        assert_eq!(after(revision, "2026-10-30T00:00:00.123Z"), Some(true));
+        assert_eq!(
+            after(revision, "2026-10-30T00:00:00.123200+00:00"),
+            Some(false)
+        );
+        assert_eq!(
+            after("2026-10-30T02:00:00+02:00", "2026-10-29 23:59:59"),
+            Some(true)
+        );
+        assert_eq!(after("yesterday", revision), None);
     }
 
     /// A changed memory keeps a fact visible while its text still says it,
@@ -6841,6 +6896,37 @@ mod tests {
             )
             .unwrap();
         assert!(store.visible_facts(&[bare.id]).unwrap().is_empty());
+
+        // A revision 0.1 ms BEFORE the fact was written is not a change since
+        // it, even though the structured object is not literally in the text.
+        let mut later = test_fact(&store, "Bo", "takes_medication", "metoprolol 50mg");
+        later.created_at = chrono::DateTime::parse_from_rfc3339("2026-10-30T00:00:00.123200+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.insert_fact(&later).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET content = 'Bo takes metoprolol 50 mg.' WHERE id = ?1",
+                params![later.source_memory_id.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events(id, ts, actor, kind, subject_id, payload)
+                 VALUES (?1, '2026-10-30T00:00:00.123100+00:00', 'test', 'memory.revised', ?2,
+                         '{\"content_hash\":\"new\",\"prev_content_hash\":\"old\"}')",
+                params![
+                    Uuid::new_v4().to_string(),
+                    later.source_memory_id.to_string()
+                ],
+            )
+            .unwrap();
+        assert!(store
+            .visible_facts(&[later.id])
+            .unwrap()
+            .contains(&later.id));
     }
 
     #[test]
