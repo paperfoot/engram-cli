@@ -197,7 +197,14 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     } else {
         Some(diary.as_str())
     };
-    let surface = surface_conflicts(&ctx.store, scope.as_deref(), conflict_diary, &query, 10)?;
+    let surface = surface_conflicts(
+        &ctx.store,
+        scope.as_deref(),
+        conflict_diary,
+        &query,
+        10,
+        include_expired,
+    )?;
     let conflicts = surface.items;
     let conflicts_overridden = conflicts
         .iter()
@@ -510,12 +517,19 @@ pub struct ConflictSurface {
 /// Takes `&SqliteStore` rather than `&AppContext` (D9) so the daemon can call
 /// it from a pooled reader, and takes `diary` because the version that did not
 /// leaked one diary's conflicts into another's recall.
+///
+/// Prints no value a reader may no longer see: a fact from a memory that was
+/// forgotten, has expired (unless `include_expired`) or was edited since is
+/// never shown. Forget and edit close a fact but keep its text, and an open
+/// conflict row outlives both, so without this check recall printed a
+/// forgotten value back as a `retracted` or `contested` entry.
 pub fn surface_conflicts(
     store: &SqliteStore,
     kb: Option<&str>,
     diary: Option<&str>,
     query: &str,
     limit: usize,
+    include_expired: bool,
 ) -> Result<ConflictSurface, CliError> {
     let terms = query_terms(query);
     if terms.is_empty() {
@@ -525,6 +539,19 @@ pub fn surface_conflicts(
         });
     }
     let facts = store.facts_matching_terms(kb, diary, &terms, 20)?;
+    let contested = store.open_conflicts_matching_terms(kb, diary, &terms, limit)?;
+    let open_total = store.count_open_conflicts_matching_terms(kb, diary, &terms)?;
+    let named: Vec<uuid::Uuid> = facts
+        .iter()
+        .flat_map(|f| [Some(f.id), f.closed_by.or(f.superseded_by)])
+        .flatten()
+        .chain(
+            contested
+                .iter()
+                .flat_map(|(_, new_f, old_f)| [new_f.id, old_f.id]),
+        )
+        .collect();
+    let visible = store.visible_facts(&named, include_expired)?;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for f in facts {
@@ -532,7 +559,7 @@ pub fn surface_conflicts(
         // user STOPPED — closed interval, no successor — never surfaced here
         // and the store went on answering as if it were current. `is_open_fact`
         // is the one definition of "still asserted".
-        if engram_core::interval::is_open_fact(&f) {
+        if engram_core::interval::is_open_fact(&f) || !visible.contains(&f.id) {
             continue;
         }
         if !seen.insert(f.id) {
@@ -541,8 +568,13 @@ pub fn surface_conflicts(
         // A fact closed because the state ENDED has no successor, and printing
         // an empty `new_object` as though it did is the stopped-medication bug
         // inverted. Follow `closed_by` first (it names whatever closed the
-        // interval), then the compat `superseded_by`.
-        let successor = f.closed_by.or(f.superseded_by);
+        // interval), then the compat `superseded_by`. A successor the reader
+        // may no longer see is withheld: the entry still says this value is
+        // not current, without the value that replaced it.
+        let successor = f
+            .closed_by
+            .or(f.superseded_by)
+            .filter(|id| visible.contains(id));
         let new_object = match successor {
             Some(id) => store.get_fact(id)?.map(|nf| nf.object),
             None => None,
@@ -565,11 +597,17 @@ pub fn surface_conflicts(
         }));
     }
 
+    let closed_rows = out.len() as i64;
+
     // Contested: open conflicts touching the query. Both values are active;
-    // report both rather than silently returning one side.
-    let contested = store.open_conflicts_matching_terms(kb, diary, &terms, limit)?;
-    let open_total = store.count_open_conflicts_matching_terms(kb, diary, &terms)?;
+    // report both rather than silently returning one side. A pair with a
+    // side the reader may no longer see is no longer a live question.
+    let mut hidden = 0i64;
     for (row, new_f, old_f) in contested {
+        if !(visible.contains(&new_f.id) && visible.contains(&old_f.id)) {
+            hidden += 1;
+            continue;
+        }
         let safety = pair_is_safety(&new_f, &old_f);
         let suggested = read_surface::suggested_action_for(row.suggested.as_deref(), safety);
         let rendered = respond::conflicts(&[respond::ConflictInput {
@@ -607,10 +645,10 @@ pub fn surface_conflicts(
     // The closed-interval half is a bounded scan with no counting query, so
     // its rows count once; the contested half reports its true backlog. A
     // caller that sees `conflicts_returned: 3, conflicts_total: 953` knows
-    // there is a queue behind the page — the number nobody had before.
-    let closed_rows = out.len() as i64 - (open_total.min(limit as i64));
+    // there is a queue behind the page — the number nobody had before. Pairs
+    // withheld from this page are not counted as waiting behind it.
     Ok(ConflictSurface {
-        total: closed_rows.max(0) + open_total,
+        total: closed_rows + (open_total - hidden).max(0),
         items: out,
     })
 }

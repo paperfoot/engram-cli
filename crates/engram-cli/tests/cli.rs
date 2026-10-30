@@ -1731,6 +1731,80 @@ fn slot_last_writer_wins_supersedes_and_recall_reports_update() {
     );
 }
 
+/// Forget and edit close a fact but keep its text, and an open conflict row
+/// outlives both. Recall's conflicts list must not print that text back.
+#[test]
+fn recall_conflicts_never_print_a_forgotten_or_edited_away_value() {
+    let (tmp, _cmd) = with_isolated_home();
+    let recall = |query: &str| -> String {
+        let out = cmd_in(&tmp)
+            .args(["recall", query, "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8_lossy(&out).into_owned()
+    };
+
+    // Forget one side of a contested pair.
+    remember_with_facts(
+        &tmp,
+        "Ana takes atorvastatin 10 mg.",
+        r#"[{"subject":"Ana","predicate":"takes_medication","object":"atorvastatin 10 mg"}]"#,
+        "assisted",
+    );
+    let second = remember_with_facts(
+        &tmp,
+        "Ana takes atorvastatin 20 mg.",
+        r#"[{"subject":"Ana","predicate":"takes_medication","object":"atorvastatin 20 mg"}]"#,
+        "strict",
+    );
+    let before = recall("atorvastatin");
+    assert!(
+        before.contains("\"contested\"") && before.contains("20 mg"),
+        "the pair must be contested before the forget: {before}"
+    );
+    let handle = second["data"]["handle"].as_str().unwrap().to_string();
+    json_cmd(&tmp, &["forget", &handle, "--confirm"]);
+    let after = recall("atorvastatin");
+    assert!(
+        !after.contains("20 mg"),
+        "a forgotten value came back: {after}"
+    );
+
+    // Edit away the value that superseded another.
+    remember_with_facts(
+        &tmp,
+        "Bruno lives in Porto.",
+        r#"[{"subject":"Bruno","predicate":"lives_in","object":"Porto"}]"#,
+        "assisted",
+    );
+    let moved = remember_with_facts(
+        &tmp,
+        "Bruno lives in Lisbon.",
+        r#"[{"subject":"Bruno","predicate":"lives_in","object":"Lisbon"}]"#,
+        "assisted",
+    );
+    let superseded_by = |out: &str, value: Value| {
+        let v: Value = serde_json::from_str(out).unwrap();
+        v["data"]["conflicts"].as_array().unwrap().iter().any(|c| {
+            c["status"] == "superseded" && c["old_object"] == "Porto" && c["new_object"] == value
+        })
+    };
+    let before = recall("where does Bruno live");
+    assert!(superseded_by(&before, json!("Lisbon")), "{before}");
+    let handle = moved["data"]["handle"].as_str().unwrap().to_string();
+    json_cmd(&tmp, &["edit", &handle, "--content", "Bruno likes tea."]);
+    let after = recall("where does Bruno live");
+    assert!(
+        !after.contains("Lisbon"),
+        "an edited-away value came back: {after}"
+    );
+    // The older value is still reported as not current.
+    assert!(superseded_by(&after, Value::Null), "{after}");
+}
+
 /// THE ASSERTION WAS THE BUG (spec-fact-semantics §5.41, CLP-1).
 ///
 /// This test used to demand that two DIFFERENT allergies on one person queue a

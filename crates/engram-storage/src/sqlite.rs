@@ -4783,6 +4783,105 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// The facts among `ids` a reader may still see: the memory each was
+    /// extracted from is not forgotten, not expired (unless `include_expired`;
+    /// recall's own rule) and not edited since the fact was written.
+    ///
+    /// Forget and edit close a fact but keep its text, and an open conflict
+    /// row outlives both, so recall's conflicts list asks here before it
+    /// prints a value. Otherwise a forgotten value comes back as a
+    /// `retracted` or `contested` entry.
+    pub fn visible_facts(
+        &self,
+        ids: &[Uuid],
+        include_expired: bool,
+    ) -> Result<std::collections::HashSet<Uuid>, StorageError> {
+        let mut out = std::collections::HashSet::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let marks = (2..ids.len() + 2)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The expiry test is `expired_memory_ids`' own predicate, so a fact
+        // is hidden exactly when recall hides its passage.
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT f.id, f.created_at, m.id,
+                    m.valid_until IS NOT NULL AND datetime(m.valid_until) < datetime(?1)
+             FROM facts f JOIN memories m ON m.id = f.source_memory_id
+             WHERE m.deleted = 0 AND f.id IN ({marks})"
+        ))?;
+        let mut binds: Vec<String> = vec![chrono::Utc::now().to_rfc3339()];
+        binds.extend(ids.iter().map(Uuid::to_string));
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let memories: Vec<&String> = rows.iter().map(|(_, _, m, _)| m).collect();
+        let revisions = self.revision_times(&memories)?;
+        let instant = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc))
+        };
+        for (fact, created, memory, expired) in rows {
+            if expired && !include_expired {
+                continue;
+            }
+            // Instants, not strings or whole seconds: an edit can follow its
+            // remember within the same second. A time that does not parse
+            // counts as an edit, because hiding a value is the safe mistake.
+            let edited_since = revisions.get(&memory).is_some_and(|times| {
+                times.iter().any(|t| match (instant(t), instant(&created)) {
+                    (Some(edit), Some(made)) => edit > made,
+                    _ => true,
+                })
+            });
+            if !edited_since {
+                if let Ok(id) = Uuid::parse_str(&fact) {
+                    out.insert(id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// When each of `memory_ids` had its content edited (`memory.revised`).
+    fn revision_times(
+        &self,
+        memory_ids: &[&String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, StorageError> {
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        if memory_ids.is_empty() {
+            return Ok(out);
+        }
+        let marks = (2..memory_ids.len() + 2)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT subject_id, ts FROM events WHERE kind = ?1 AND subject_id IN ({marks})"
+        ))?;
+        let mut binds: Vec<&str> = vec![engram_core::events::EventKind::MemoryRevised.as_str()];
+        binds.extend(memory_ids.iter().map(|m| m.as_str()));
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (memory, ts) = row?;
+            out.entry(memory).or_default().push(ts);
+        }
+        Ok(out)
+    }
+
     /// Look up a single fact by id (for pairing superseded → superseding).
     pub fn get_fact(&self, id: Uuid) -> Result<Option<engram_core::types::Fact>, StorageError> {
         self.conn

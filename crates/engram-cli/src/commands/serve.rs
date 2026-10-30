@@ -1733,6 +1733,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
         daemon_diary(req_diary.clone()).as_deref(),
         &req.query,
         10,
+        req.include_expired.unwrap_or(false),
     )?;
     resp["data"]["conflicts"] = json!(conflicts.items);
     resp["data"]["metadata"]["conflicts_total"] = json!(conflicts.total);
