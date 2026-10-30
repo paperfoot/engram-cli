@@ -905,11 +905,14 @@ impl RelevanceJudge {
         }))
     }
 
-    /// How many candidates to retrieve for a recall of `top_k`: the reranked
-    /// pool (`rerank_top_n`) up to [`RELEVANCE_MAX_POOL`], so misses can be
-    /// refilled from it.
+    /// How many candidates to retrieve for a recall of `top_k`: the whole
+    /// reranked pool (`rerank_top_n`), so misses can be refilled from it and
+    /// the per-document cap scans as far as it did without a judge. The walk
+    /// judges at most [`RELEVANCE_MAX_POOL`] of them; the rest fill unjudged.
+    /// Cutting the pool to that bound first could return fewer results than
+    /// a judge-free recall: 200 passages from one document left two results.
     pub fn pool(top_k: usize, rerank_top_n: usize) -> usize {
-        top_k.max(rerank_top_n.min(RELEVANCE_MAX_POOL))
+        top_k.max(rerank_top_n)
     }
 
     /// Walk the reranked pool `results` in batches, one judge request each,
@@ -1933,6 +1936,30 @@ mod tests {
         assert_eq!(report.judged, 0);
         assert!(!report.abstained);
         assert!(report.error.is_some());
+    }
+
+    /// Shadow never returns fewer results than a judge-free recall: the
+    /// pool reaches past one crowded document to the rest of the reranked
+    /// candidates, as the cap did without a judge.
+    #[tokio::test]
+    async fn shadow_fills_the_page_past_a_crowded_document() {
+        assert_eq!(RelevanceJudge::pool(10, 300), 300);
+        let store = SqliteStore::open_in_memory().unwrap();
+        let crowded = Uuid::new_v4();
+        let mut results: Vec<HybridResult> = (0..RelevanceJudge::pool(10, 300))
+            .map(|i| {
+                let mut r = result("chunk", "personal", &format!("passage {i}"));
+                let doc = if i < 200 { crowded } else { Uuid::new_v4() };
+                r.citations = vec![SourceCitation {
+                    document_id: Some(doc),
+                    ..citation(None, None)
+                }];
+                r
+            })
+            .collect();
+        let judge = stub_judge(JudgeMode::Shadow, "0.9");
+        judge.apply(&store, "q", &mut results, 10).await;
+        assert_eq!(results.len(), 10);
     }
 
     /// With the cap deferred to the judge, it still holds: at most
