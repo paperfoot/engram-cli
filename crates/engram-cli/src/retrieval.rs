@@ -459,6 +459,13 @@ pub fn update_line(c: &engram_storage::FactChange) -> String {
             c.was,
             at.format("%Y-%m-%d")
         ),
+        engram_storage::FactChangeKind::Disputed { values } => format!(
+            "{} {}: changed since (was {}), now disputed between {}; `engram facts conflicts --open` lists it",
+            c.subject,
+            c.predicate,
+            c.was,
+            values.join(" and ")
+        ),
     }
 }
 
@@ -501,6 +508,12 @@ pub fn update_json(c: &engram_storage::FactChange) -> serde_json::Value {
         }
         engram_storage::FactChangeKind::Ended { at } => {
             v["ended"] = serde_json::json!(at.to_rfc3339());
+        }
+        engram_storage::FactChangeKind::Disputed { values } => {
+            v["disputed"] = serde_json::json!(values);
+            if let Some(id) = c.current_fact_id {
+                v["current_fact_handle"] = serde_json::json!(format!("fact:{id}"));
+            }
         }
     }
     v

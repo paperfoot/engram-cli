@@ -910,6 +910,9 @@ pub enum FactChangeKind {
     },
     /// The state ended and nothing replaced it.
     Ended { at: chrono::DateTime<chrono::Utc> },
+    /// It changed, but what holds now is under an open conflict: the newest
+    /// value first, then its rivals.
+    Disputed { values: Vec<String> },
 }
 
 /// The fact projection, in `parse_fact_row` order. Written once so a `SELECT`
@@ -3676,13 +3679,15 @@ impl SqliteStore {
     ///   carries another scope's facts;
     /// - a fact written before the memory's last edit (compared as instants)
     ///   describes text that is gone, so it is skipped;
-    /// - a supersession chain must end at an OPEN fact that no open conflict
-    ///   disputes; a closed, corrected, retracted or contested newest value
-    ///   says nothing;
-    /// - "ended" needs the authority the safety gate itself demands — the text
-    ///   said so, or a person decided (explicit_end, caller, replayed_caller)
-    ///   — and no open fact with the same value. A heuristic or refused
-    ///   proposal never reads as an ending, whatever happens to the original.
+    /// - a supersession chain must end at an OPEN fact; a closed, corrected or
+    ///   retracted newest value says nothing;
+    /// - every successor's memory must be live and unexpired;
+    /// - a newest value under an open conflict is reported as disputed, with
+    ///   its rivals, never as settled and never dropped;
+    /// - "ended" needs a close the safety gate itself allows (`may_close`):
+    ///   for a safety relation an explicit end or a person's decision, so a
+    ///   heuristic or refused proposal never reads as an ending — and no open
+    ///   fact with the same value.
     pub fn fact_changes_for_memories(&self, ids: &[Uuid]) -> Result<Vec<FactChange>, StorageError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -3729,11 +3734,14 @@ impl SqliteStore {
             if f.kb != kb || f.diary != diary {
                 return Ok(false);
             }
+            // Live and unexpired, as default recall itself requires: a value
+            // from a forgotten or expired memory is not "what holds now".
             Ok(self
                 .conn
                 .query_row(
-                    "SELECT 1 FROM memories WHERE id = ?1 AND kb = ?2 AND diary = ?3",
-                    params![f.source_memory_id.to_string(), kb, diary],
+                    "SELECT 1 FROM memories WHERE id = ?1 AND kb = ?2 AND diary = ?3
+                       AND deleted = 0 AND (valid_until IS NULL OR valid_until > ?4)",
+                    params![f.source_memory_id.to_string(), kb, diary, chrono::Utc::now().to_rfc3339()],
                     |_| Ok(()),
                 )
                 .optional()?
@@ -3765,31 +3773,54 @@ impl SqliteStore {
                 if !clean || current.valid_until.is_some() || current.superseded_by.is_some() {
                     continue;
                 }
-                let contested: bool = self
-                    .conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM fact_conflict_queue
-                           WHERE status = 'open' AND (new_fact_id = ?1 OR old_fact_id = ?1))",
-                        params![current.id.to_string()],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(true);
-                if contested {
-                    continue;
+                // An open conflict on the newest value: the change is real,
+                // what holds now is not settled — say exactly that.
+                let mut rivals: Vec<String> = Vec::new();
+                {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT o.object FROM fact_conflict_queue q
+                         JOIN facts o ON o.id = CASE WHEN q.new_fact_id = ?1 THEN q.old_fact_id ELSE q.new_fact_id END
+                         WHERE q.status = 'open' AND (q.new_fact_id = ?1 OR q.old_fact_id = ?1)",
+                    )?;
+                    for v in stmt.query_map(params![current.id.to_string()], |r| r.get::<_, String>(0))? {
+                        let v = v?;
+                        if !rivals.contains(&v) {
+                            rivals.push(v);
+                        }
+                    }
                 }
-                (
-                    FactChangeKind::Now {
-                        value: current.object.clone(),
-                        since: current.valid_from.unwrap_or(current.created_at),
-                    },
-                    Some(current.id),
-                )
+                if !rivals.is_empty() {
+                    let mut values = vec![current.object.clone()];
+                    values.extend(rivals);
+                    (FactChangeKind::Disputed { values }, Some(current.id))
+                } else {
+                    (
+                        FactChangeKind::Now {
+                            value: current.object.clone(),
+                            since: current.valid_from.unwrap_or(current.created_at),
+                        },
+                        Some(current.id),
+                    )
+                }
             } else {
-                let authorised = matches!(
-                    old.close_authority.as_deref(),
-                    Some("explicit_end" | "caller" | "replayed_caller")
-                );
-                if !authorised {
+                // Exactly the safety gate's rule: a safety relation ends only on
+                // an explicit end or a person's decision; any other relation on
+                // whatever authority closed it.
+                let authority = match old.close_authority.as_deref() {
+                    Some("explicit_end") => engram_core::interval::CloseAuthority::ExplicitEnd,
+                    Some("caller") => engram_core::interval::CloseAuthority::Caller { actor: String::new() },
+                    Some("replayed_caller") => engram_core::interval::CloseAuthority::ReplayedCaller {
+                        decided_at: chrono::Utc::now(),
+                    },
+                    Some("successor_interval") => engram_core::interval::CloseAuthority::SuccessorInterval,
+                    _ => engram_core::interval::CloseAuthority::Heuristic { rule: "stored" },
+                };
+                let spec = engram_core::relations::relation_spec(&engram_core::relations::canonical_relation(
+                    &old.predicate,
+                ));
+                if engram_core::interval::may_close(&spec, &authority)
+                    != engram_core::interval::CloseVerdict::Allow
+                {
                     continue;
                 }
                 let still_open: bool = self
@@ -7964,12 +7995,16 @@ mod present_tense_tests {
     }
 
     fn fact(s: &SqliteStore, object: &str, diary: &str) -> Fact {
+        fact_p(s, "lives_in", object, diary)
+    }
+
+    fn fact_p(s: &SqliteStore, predicate: &str, object: &str, diary: &str) -> Fact {
         let f = Fact {
             id: Uuid::new_v4(),
             source_memory_id: Uuid::parse_str(M).unwrap(),
             subject: "Ana".into(),
             subject_norm: "ana".into(),
-            predicate: "lives_in".into(),
+            predicate: predicate.into(),
             object: object.into(),
             object_norm: object.to_lowercase(),
             confidence: 1.0,
@@ -8072,13 +8107,47 @@ mod present_tense_tests {
     }
 
     #[test]
-    fn a_heuristic_stop_never_reads_as_an_ending_even_after_the_original_goes() {
+    fn a_heuristic_stop_on_a_safety_fact_never_reads_as_an_ending() {
         let s = store();
-        let kept = fact(&s, "Porto", "default");
-        let proposal = fact(&s, "Porto", "default");
+        let kept = fact_p(&s, "takes_medication", "metformin", "default");
+        let proposal = fact_p(&s, "takes_medication", "metformin", "default");
         close_by(&s, &proposal, "stopped", "heuristic");
         close_by(&s, &kept, "retracted_source", "caller");
         assert!(changes(&s).is_empty(), "a refused proposal is not evidence of an end");
+    }
+
+    #[test]
+    fn an_ordinary_relation_ends_on_the_authority_that_closed_it() {
+        let s = store();
+        let lisbon = fact(&s, "Lisbon", "default");
+        close_by(&s, &lisbon, "stopped", "heuristic");
+        assert!(matches!(changes(&s)[0].change, FactChangeKind::Ended { .. }), "moved out of Lisbon");
+    }
+
+    #[test]
+    fn a_successor_from_a_forgotten_or_expired_memory_is_not_what_holds_now() {
+        for gone in ["deleted = 1", "valid_until = '2001-01-01T00:00:00+00:00'"] {
+            let s = store();
+            let other = "33333333-3333-4333-8333-333333333333";
+            let now = Utc::now().to_rfc3339();
+            s.conn
+                .execute_batch(&format!(
+                    "INSERT INTO memories(id, content, created_at, importance, emotional_weight, access_count,
+                         stability, source_json, diary, tags_json, deleted, kb)
+                     VALUES ('{other}', 'Ana moved to Paris.', '{now}', 5, 0, 0, 1.0, '{{\"type\":\"user\"}}',
+                             'default', '[]', 0, 'kb');"
+                ))
+                .unwrap();
+            let london = fact(&s, "London", "default");
+            let paris = fact(&s, "Paris", "default");
+            s.conn
+                .execute("UPDATE facts SET source_memory_id = ?1 WHERE id = ?2", params![other, paris.id.to_string()])
+                .unwrap();
+            supersede(&s, &london, &paris);
+            assert_eq!(changes(&s).len(), 1, "live successor: the line is there");
+            s.conn.execute_batch(&format!("UPDATE memories SET {gone} WHERE id = '{other}'")).unwrap();
+            assert!(changes(&s).is_empty(), "{gone}: Paris is not what holds now");
+        }
     }
 
     #[test]
@@ -8117,7 +8186,12 @@ mod present_tense_tests {
                 params![Uuid::new_v4().to_string(), gamma.id.to_string(), beta.id.to_string(), Utc::now().to_rfc3339()],
             )
             .unwrap();
-        assert!(changes(&s).is_empty());
+        let c = changes(&s);
+        assert_eq!(c.len(), 1, "the change is still reported");
+        assert!(
+            matches!(&c[0].change, FactChangeKind::Disputed { values } if values == &vec!["Beta".to_string(), "Gamma".to_string()]),
+            "{c:?}"
+        );
     }
 
     #[test]
