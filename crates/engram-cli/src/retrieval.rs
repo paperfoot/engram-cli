@@ -604,6 +604,27 @@ pub struct RecallOutcome {
     pub stats: RecallStats,
     /// Wall time of each stage, for the `engram::timing` log line.
     pub timings: StageTimings,
+    /// The relevance judge's answers for the whole rerank pool, when it ran
+    /// alongside the rerank; each result already carries its own.
+    pub prejudged: Option<Prejudged>,
+}
+
+/// The relevance judge's verdicts on a whole rerank pool, asked while the
+/// pool was being reranked. [`RelevanceJudge::apply`]'s walk goes down the
+/// reranked order exactly as before but reads these instead of asking.
+#[derive(Debug, Clone, Default)]
+pub struct Prejudged {
+    /// P(answers) by candidate index (`r<i>`); `None` when unanswered.
+    answers: Vec<Option<f32>>,
+    response: Option<JudgeResponse>,
+    /// Why there are no answers (failure or deadline): the metadata note.
+    error: Option<String>,
+}
+
+impl Prejudged {
+    fn relevance(&self, index: usize) -> Option<f32> {
+        self.answers.get(index).copied().flatten()
+    }
 }
 
 /// Wall time per recall stage, in milliseconds. Logged, never part of the
@@ -753,6 +774,9 @@ pub struct RelevanceJudge {
     mode: JudgeMode,
     judge: Box<dyn Judge>,
     deadline: std::time::Duration,
+    /// Judge the rerank pool alongside the rerank (see
+    /// [`RelevanceJudge::window`]) rather than walking it afterwards.
+    concurrent: bool,
 }
 
 /// The whole relevance call, retries included, gets this long. The judge
@@ -760,6 +784,29 @@ pub struct RelevanceJudge {
 /// an outage used to hold every already-retrieved recall for ~16.5 s. Past
 /// the deadline the results are returned unjudged, as on a judge error.
 pub const RELEVANCE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// [`RELEVANCE_DEADLINE`], or `ENGRAM_RELEVANCE_DEADLINE_MS` (a tuning and
+/// evaluation knob: a deadline the walk never hits is how the two judging
+/// orders are compared like for like).
+fn relevance_deadline() -> std::time::Duration {
+    std::env::var("ENGRAM_RELEVANCE_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map_or(RELEVANCE_DEADLINE, std::time::Duration::from_millis)
+}
+
+/// Whether the relevance judge runs alongside the rerank (default) or
+/// after it, in sequential batches (`ENGRAM_RELEVANCE_WINDOW=off`, kept for
+/// comparison).
+fn relevance_window() -> bool {
+    !std::env::var("ENGRAM_RELEVANCE_WINDOW").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
 
 /// Candidates per judge request. With the judge active, recall hands it the
 /// whole reranked pool and it walks down it in batches (the first covers
@@ -825,7 +872,8 @@ impl RelevanceJudge {
             site_judge(JudgeSite::Relevance, offline)?.map(|(mode, judge)| RelevanceJudge {
                 mode,
                 judge,
-                deadline: RELEVANCE_DEADLINE,
+                deadline: relevance_deadline(),
+                concurrent: relevance_window(),
             }),
         )
     }
@@ -860,6 +908,66 @@ impl RelevanceJudge {
         results: &mut Vec<HybridResult>,
         top_k: usize,
     ) -> RelevanceReport {
+        self.walk(store, query, results, top_k, None).await
+    }
+
+    /// The most candidates the walk for a page of `top_k` may judge.
+    pub fn bound(top_k: usize) -> usize {
+        top_k.max(RELEVANCE_MAX_POOL)
+    }
+
+    /// Judge a whole rerank pool at once: `(id, text, date)` per candidate.
+    /// One [`ask_batched`] call, its parts in parallel, under the deadline
+    /// the walk has. Returns the verdicts and the call's wall time.
+    async fn window(
+        &self,
+        query: &str,
+        pool: &[(String, String, Option<String>)],
+    ) -> (Prejudged, f64) {
+        let started = std::time::Instant::now();
+        let passages: Vec<RelevancePassage<'_>> = pool
+            .iter()
+            .map(|(id, text, date)| RelevancePassage {
+                id: id.clone(),
+                text: text.as_str(),
+                date: date.clone(),
+            })
+            .collect();
+        let request = relevance_request(query, &passages);
+        let call = ask_batched(self.judge.as_ref(), &request);
+        let mut out = Prejudged::default();
+        match tokio::time::timeout(self.deadline, call).await {
+            Ok(Ok(response)) => {
+                out.answers = pool
+                    .iter()
+                    .map(|(id, _, _)| {
+                        // A probability outside [0, 1] is a provider fault.
+                        response.noul(id).ok().filter(|p| (0.0..=1.0).contains(p))
+                    })
+                    .collect();
+                out.response = Some(response);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("relevance judge failed; results returned unjudged: {e}");
+                out.error = Some(format!("relevance judge failed; results are unjudged: {e}"));
+            }
+            Err(_) => out.error = Some(self.late()),
+        }
+        (out, ms_since(started))
+    }
+
+    /// [`Self::apply`], reading `prejudged` verdicts when the pool was
+    /// judged alongside the rerank. The walk is the same either way, batch
+    /// by batch, so it keeps, drops and refills exactly the candidates it
+    /// would have; only where its answers come from differs.
+    async fn walk(
+        &self,
+        store: &SqliteStore,
+        query: &str,
+        results: &mut Vec<HybridResult>,
+        top_k: usize,
+        mut prejudged: Option<Prejudged>,
+    ) -> RelevanceReport {
         let mut report = RelevanceReport {
             mode: self.mode,
             floor: RELEVANCE_FLOOR,
@@ -871,8 +979,12 @@ impl RelevanceJudge {
             error: None,
             response: None,
         };
+        // The whole window's cost goes to the ledger: it was paid for.
+        if let Some(p) = prejudged.as_mut() {
+            report.response = p.response.take();
+        }
         let deadline = tokio::time::Instant::now() + self.deadline;
-        let limit = top_k.max(RELEVANCE_MAX_POOL);
+        let limit = Self::bound(top_k);
         let cap = max_per_doc();
         let mut per_doc: HashMap<Uuid, usize> = HashMap::new();
         let full = |r: &HybridResult, per_doc: &HashMap<Uuid, usize>| {
@@ -884,7 +996,7 @@ impl RelevanceJudge {
         let mut unanswered: Vec<HybridResult> = Vec::new();
         let mut asked = 0usize;
         while kept.len() < top_k && asked < limit {
-            if tokio::time::Instant::now() >= deadline {
+            if prejudged.is_none() && tokio::time::Instant::now() >= deadline {
                 report.error = Some(self.late());
                 break;
             }
@@ -900,11 +1012,17 @@ impl RelevanceJudge {
             if batch.is_empty() {
                 break;
             }
-            match self
-                .judge_batch(store, query, &mut batch, asked, deadline)
-                .await
-            {
-                Ok(response) => merge_response(&mut report.response, response),
+            let answered = match &prejudged {
+                // Each result already carries its verdict.
+                Some(p) => p.error.clone().map_or(Ok(None), Err),
+                None => self
+                    .judge_batch(store, query, &mut batch, asked, deadline)
+                    .await
+                    .map(Some),
+            };
+            match answered {
+                Ok(Some(response)) => merge_response(&mut report.response, response),
+                Ok(None) => {}
                 Err(error) => {
                     report.error = Some(error);
                     unanswered = batch;
@@ -1090,19 +1208,26 @@ pub async fn run_recall(
         params.top_k = RelevanceJudge::pool(top_k, params.rerank_top_n);
         params.defer_doc_cap = true;
     }
-    let mut outcome = hybrid_recall(
+    let mut outcome = retrieve(
         store,
         backends.embedder.as_ref(),
         backends.reranker.as_deref(),
         params,
+        judge.map(|j| (j, top_k)),
     )
     .await?;
     let retrieved_any = !outcome.results.is_empty();
     let relevance = match judge {
         Some(judge) => {
             let judging = std::time::Instant::now();
-            let report = judge.apply(store, query, &mut outcome.results, top_k).await;
-            outcome.timings.judge_ms = ms_since(judging);
+            let prejudged = outcome.prejudged.take();
+            let concurrent = prejudged.is_some();
+            let report = judge
+                .walk(store, query, &mut outcome.results, top_k, prejudged)
+                .await;
+            if !concurrent {
+                outcome.timings.judge_ms = ms_since(judging);
+            }
             Some(report)
         }
         None => None,
@@ -1119,6 +1244,23 @@ pub async fn hybrid_recall<E, R>(
     embedder: &E,
     reranker: Option<&R>,
     params: HybridParams<'_>,
+) -> Result<RecallOutcome, crate::error::CliError>
+where
+    E: Embedder + ?Sized,
+    R: Reranker + ?Sized,
+{
+    retrieve(store, embedder, reranker, params, None).await
+}
+
+/// [`hybrid_recall`], optionally judging the rerank pool WHILE it is
+/// reranked (see [`RelevanceJudge::window`]). `judge` carries the caller's
+/// page size, which bounds what the walk could ever judge.
+async fn retrieve<E, R>(
+    store: &SqliteStore,
+    embedder: &E,
+    reranker: Option<&R>,
+    params: HybridParams<'_>,
+    judge: Option<(&RelevanceJudge, usize)>,
 ) -> Result<RecallOutcome, crate::error::CliError>
 where
     E: Embedder + ?Sized,
@@ -1297,6 +1439,7 @@ where
             notes,
             stats,
             timings,
+            prejudged: None,
         });
     }
 
@@ -1338,22 +1481,57 @@ where
             notes,
             stats,
             timings,
+            prejudged: None,
         });
     }
 
     // Rerank the full candidate pool (not just top_k) so the diversity cap
     // below has enough material to spread results across distinct documents.
     let rerank_limit = rerank_candidates.len();
-    let stage = std::time::Instant::now();
-    let reranked = if let Some(r) = reranker {
-        r.rerank(params.query, &rerank_candidates, rerank_limit)
-            .await?
-    } else {
-        let pt = PassthroughReranker;
-        pt.rerank(params.query, &rerank_candidates, rerank_limit)
-            .await?
+    let rerank = async {
+        let stage = std::time::Instant::now();
+        let reranked = if let Some(r) = reranker {
+            r.rerank(params.query, &rerank_candidates, rerank_limit)
+                .await
+        } else {
+            let pt = PassthroughReranker;
+            pt.rerank(params.query, &rerank_candidates, rerank_limit)
+                .await
+        };
+        (reranked, ms_since(stage))
     };
-    timings.rerank_ms = ms_since(stage);
+    // The relevance judge used to wait for the rerank and then walk its
+    // order in sequential batches of ten, one round trip each, against a
+    // 1.5 s deadline that deep walks hit. When the whole pool fits the
+    // walk's bound, every candidate it could ever reach is judged now, in
+    // parallel requests alongside the rerank, and the walk then reads the
+    // answers instead of asking (see `Prejudged`).
+    let window = judge.filter(|(judge, top_k)| {
+        judge.concurrent && rerank_candidates.len() <= RelevanceJudge::bound(*top_k)
+    });
+    let (reranked, prejudged) = match window {
+        Some((judge, _)) => {
+            let passages: Vec<(String, String, Option<String>)> = candidate_ids
+                .iter()
+                .zip(&rerank_candidates)
+                .enumerate()
+                .map(|(i, (id, c))| {
+                    let memory = chunk_index.get(id).map(|chunk| chunk.memory_id);
+                    (format!("r{i}"), c.text.clone(), memory_date(store, memory))
+                })
+                .collect();
+            let ((reranked, rerank_ms), (prejudged, judge_ms)) =
+                tokio::join!(rerank, judge.window(params.query, &passages));
+            timings.rerank_ms = rerank_ms;
+            timings.judge_ms = judge_ms;
+            (reranked?, Some(prejudged))
+        }
+        None => {
+            let (reranked, rerank_ms) = rerank.await;
+            timings.rerank_ms = rerank_ms;
+            (reranked?, None)
+        }
+    };
     let stage = std::time::Instant::now();
 
     let max_per_doc = max_per_doc();
@@ -1412,7 +1590,9 @@ where
             citations,
             sources,
             provenance,
-            relevance: None,
+            relevance: prejudged
+                .as_ref()
+                .and_then(|p| p.relevance(r.original_index)),
         });
     }
 
@@ -1435,6 +1615,7 @@ where
         notes,
         stats,
         timings,
+        prejudged,
     })
 }
 
@@ -1535,7 +1716,98 @@ mod tests {
             mode,
             judge: Box::new(engram_llm::judge::stub::StubJudge::parse(spec).unwrap()),
             deadline: RELEVANCE_DEADLINE,
+            concurrent: true,
         }
+    }
+
+    /// Judging the whole pool up front (alongside the rerank) must keep,
+    /// drop, refill and report exactly what the sequential walk does: same
+    /// survivors in the same order, same verdicts, same counts, for every
+    /// page size, with documents filling up and some passages unanswered.
+    #[tokio::test]
+    async fn the_prejudged_walk_matches_the_sequential_walk() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let docs: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let pool: Vec<HybridResult> = (0..60)
+            .map(|i| {
+                let word = match i % 5 {
+                    0 | 3 => "keep",
+                    1 => "lost",
+                    _ => "miss",
+                };
+                let mut r = result("chunk", "personal", &format!("{word} {i}"));
+                if i % 4 != 0 {
+                    r.citations = vec![SourceCitation {
+                        document_id: Some(docs[i % 3]),
+                        ..citation(None, None)
+                    }];
+                }
+                r
+            })
+            .collect();
+        // "lost" has no rule and no "*": the judge leaves it unanswered.
+        let spec = r#"{"keep": 0.9, "miss": 0.05}"#;
+        for top_k in [1usize, 3, 10, 25] {
+            let judge = stub_judge(JudgeMode::On, spec);
+            let mut sequential = pool.clone();
+            let want = judge.apply(&store, "q", &mut sequential, top_k).await;
+
+            let window: Vec<(String, String, Option<String>)> = pool
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (format!("r{i}"), r.content.clone(), None))
+                .collect();
+            let (prejudged, _) = judge.window("q", &window).await;
+            let mut concurrent = pool.clone();
+            for (i, r) in concurrent.iter_mut().enumerate() {
+                r.relevance = prejudged.relevance(i);
+            }
+            let got = judge
+                .walk(&store, "q", &mut concurrent, top_k, Some(prejudged))
+                .await;
+
+            let view = |rs: &[HybridResult]| -> Vec<(String, Option<f32>)> {
+                rs.iter()
+                    .map(|r| (r.content.clone(), r.relevance))
+                    .collect()
+            };
+            assert_eq!(view(&concurrent), view(&sequential), "top_k {top_k}");
+            assert_eq!(
+                (got.judged, got.dropped, got.kept_on_prefix, got.abstained),
+                (
+                    want.judged,
+                    want.dropped,
+                    want.kept_on_prefix,
+                    want.abstained
+                ),
+                "top_k {top_k}"
+            );
+            assert_eq!(got.top_relevance, want.top_relevance, "top_k {top_k}");
+            assert!(got.error.is_none() && want.error.is_none());
+        }
+    }
+
+    /// A window the judge could not answer leaves the page unjudged, as a
+    /// failed first batch does, and says why.
+    #[tokio::test]
+    async fn a_failed_window_returns_the_page_unjudged() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut results: Vec<HybridResult> = (0..20)
+            .map(|i| result("chunk", "personal", &format!("passage {i}")))
+            .collect();
+        let judge = stub_judge(JudgeMode::On, "0.01");
+        let prejudged = Prejudged {
+            error: Some("relevance judge failed; results are unjudged: down".into()),
+            ..Prejudged::default()
+        };
+        let report = judge
+            .walk(&store, "q", &mut results, 10, Some(prejudged))
+            .await;
+        assert_eq!(results.len(), 10);
+        assert!(results.iter().all(|r| r.relevance.is_none()));
+        assert_eq!(report.judged, 0);
+        assert!(!report.abstained);
+        assert!(report.error.is_some());
     }
 
     /// With the cap deferred to the judge, it still holds: at most
@@ -1622,6 +1894,7 @@ mod tests {
             mode: JudgeMode::On,
             judge: Box::new(engram_llm::judge::stub::StubJudge::parse("0.01").unwrap()),
             deadline: std::time::Duration::ZERO,
+            concurrent: true,
         };
         let report = judge.apply(&store, "anything", &mut results, 10).await;
         assert_eq!(report.judged, 0);
@@ -1717,6 +1990,7 @@ mod tests {
             mode: JudgeMode::On,
             judge: Box::new(MissThenHang(Default::default())),
             deadline: std::time::Duration::from_millis(50),
+            concurrent: true,
         };
         let report = judge.apply(&store, "anything", &mut results, 10).await;
         assert_eq!(report.judged, 10);
@@ -1745,6 +2019,7 @@ mod tests {
             mode: JudgeMode::On,
             judge: Box::new(Hanging),
             deadline: std::time::Duration::from_millis(50),
+            concurrent: true,
         };
         let started = std::time::Instant::now();
         let report = judge
