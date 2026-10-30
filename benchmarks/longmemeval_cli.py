@@ -288,9 +288,13 @@ def judge_one(templates, q, a):
         return {'qid': q['qid'], 'failure': a['failure']}
     key = 'abstention' if q['abstention'] else (q['type'] if q['type'] in templates else 'default')
     prompt = templates[key].format(q['question'], q['answer'], a['text'])
-    res = chat(JUDGE_MODEL, [{'role': 'user', 'content': prompt}], max_tokens=10)
+    # The judge model may reason before its one-word verdict: a tight token
+    # cap returns an empty, truncated answer, which must not read as "no".
+    res = chat(JUDGE_MODEL, [{'role': 'user', 'content': prompt}], max_tokens=1000)
     if res.get('failure'):
         return {'qid': q['qid'], 'failure': 'judge ' + res['failure']}
+    if res.get('finish') != 'stop':
+        return {'qid': q['qid'], 'failure': f"judge finish={res.get('finish')}"}
     verdict = (res.get('text') or '').strip().lower()
     if not (verdict.startswith('yes') or verdict.startswith('no')):
         return {'qid': q['qid'], 'failure': f'judge said {verdict[:20]!r}'}
@@ -300,10 +304,17 @@ def judge_one(templates, q, a):
 def answer(args):
     qs = {q['qid']: q for q in jload(f'{WORK}/questions.json')}
     recalls = jload(f'{WORK}/runs/{args.cond}/recall.json')
-    templates = official_templates()
     with cf.ThreadPoolExecutor(args.workers) as ex:
         answers = list(ex.map(lambda r: answer_one(qs[r['qid']], r), recalls))
     jdump(f'{WORK}/runs/{args.cond}/answers.json', answers)
+    judge(args)
+
+
+def judge(args):
+    """Score saved answers; re-runnable without asking the answerer again."""
+    qs = {q['qid']: q for q in jload(f'{WORK}/questions.json')}
+    answers = jload(f'{WORK}/runs/{args.cond}/answers.json')
+    templates = official_templates()
     with cf.ThreadPoolExecutor(args.workers) as ex:
         verdicts = list(ex.map(lambda a: judge_one(templates, qs[a['qid']], a), answers))
     jdump(f'{WORK}/runs/{args.cond}/verdicts.json', verdicts)
@@ -388,9 +399,11 @@ def main():
     p = sub.add_parser('recall'); p.add_argument('--bin', required=True); p.add_argument('--cond', required=True)
     p.add_argument('--top-k', type=int, default=0); p.add_argument('--workers', type=int, default=8)
     p = sub.add_parser('answer'); p.add_argument('--cond', required=True); p.add_argument('--workers', type=int, default=8)
+    p = sub.add_parser('judge'); p.add_argument('--cond', required=True); p.add_argument('--workers', type=int, default=8)
     p = sub.add_parser('report'); p.add_argument('--conds', required=True)
     args = ap.parse_args()
-    {'prepare': prepare, 'build': build, 'recall': recall, 'answer': answer, 'report': report}[args.cmd](args)
+    {'prepare': prepare, 'build': build, 'recall': recall, 'answer': answer, 'judge': judge,
+     'report': report}[args.cmd](args)
 
 
 if __name__ == '__main__':
