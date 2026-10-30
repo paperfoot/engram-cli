@@ -602,6 +602,60 @@ pub struct RecallOutcome {
     /// an empty answer that can say "I scored 0 chunks in kb `personal`" is a
     /// scoping diagnosis, and one that cannot is a shrug.
     pub stats: RecallStats,
+    /// Wall time of each stage, for the `engram::timing` log line.
+    pub timings: StageTimings,
+}
+
+/// Wall time per recall stage, in milliseconds. Logged, never part of the
+/// response: `RUST_LOG=engram::timing=info` prints one line per recall, so a
+/// latency regression can be pinned to the stage that caused it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageTimings {
+    /// Chunk scan, expiry and the embedding-metadata guard.
+    pub scan_ms: f64,
+    /// Query embedding (a network call under a cloud profile).
+    pub embed_ms: f64,
+    /// Cosine over every in-scope chunk.
+    pub dense_ms: f64,
+    /// FTS5 BM25.
+    pub lexical_ms: f64,
+    /// RRF fusion and the text fetch for the rerank pool.
+    pub fuse_ms: f64,
+    /// Cohere rerank (or the passthrough).
+    pub rerank_ms: f64,
+    /// The relevance judge's walk.
+    pub judge_ms: f64,
+    /// Citations, dates and result assembly.
+    pub assemble_ms: f64,
+}
+
+impl StageTimings {
+    /// One `engram::timing` line for a finished recall on `surface`.
+    pub fn log(&self, surface: &str, total_ms: f64) {
+        tracing::info!(
+            target: "engram::timing",
+            surface,
+            total_ms = round_ms(total_ms),
+            scan_ms = round_ms(self.scan_ms),
+            embed_ms = round_ms(self.embed_ms),
+            dense_ms = round_ms(self.dense_ms),
+            lexical_ms = round_ms(self.lexical_ms),
+            fuse_ms = round_ms(self.fuse_ms),
+            rerank_ms = round_ms(self.rerank_ms),
+            judge_ms = round_ms(self.judge_ms),
+            assemble_ms = round_ms(self.assemble_ms),
+            "recall stages"
+        );
+    }
+}
+
+fn round_ms(ms: f64) -> f64 {
+    (ms * 10.0).round() / 10.0
+}
+
+/// Milliseconds since `t`.
+pub fn ms_since(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1_000.0
 }
 
 #[derive(Debug, Clone)]
@@ -1023,6 +1077,8 @@ where
     let until = params.filters.until.map(|t| t.to_rfc3339());
 
     let mut notes = RecallNotes::default();
+    let mut timings = StageTimings::default();
+    let stage = std::time::Instant::now();
 
     let mut source_map: HashMap<Uuid, HashSet<RetrievalSource>> = HashMap::new();
     let mut runs: Vec<Vec<RankedHit>> = Vec::new();
@@ -1107,11 +1163,15 @@ where
         kbs_searched: kbs_in_scope,
         ..RecallStats::default()
     };
+    timings.scan_ms = ms_since(stage);
 
     {
+        let stage = std::time::Instant::now();
         let q_emb = embedder
             .embed_one(params.query, TaskMode::RetrievalQuery)
             .await?;
+        timings.embed_ms = ms_since(stage);
+        let stage = std::time::Instant::now();
         let query = QueryVector::new(&q_emb);
         let mut dense_scored: Vec<(Uuid, f32)> = Vec::new();
         for chunk in &chunks {
@@ -1128,8 +1188,10 @@ where
         let dense_run = ranked_run(&dense_scored, RetrievalSource::Dense, params.rerank_top_n);
         mark_sources(&mut source_map, &dense_run);
         runs.push(dense_run);
+        timings.dense_ms = ms_since(stage);
     }
 
+    let stage = std::time::Instant::now();
     let fts_q = build_fts_query(params.query);
     if !fts_q.is_empty() {
         // The expiry cutoff is applied IN SQL, before the LIMIT: a
@@ -1170,15 +1232,18 @@ where
         mark_sources(&mut source_map, &lexical_run);
         runs.push(lexical_run);
     }
+    timings.lexical_ms = ms_since(stage);
 
     if runs.is_empty() {
         return Ok(RecallOutcome {
             results: Vec::new(),
             notes,
             stats,
+            timings,
         });
     }
 
+    let stage = std::time::Instant::now();
     let fused = reciprocal_rank_fusion(&runs, params.rrf_k);
     // Recorded BEFORE the rerank truncation: `total` on a ranked read means
     // "candidates the ranking chose from", and taking it after the trim would
@@ -1209,17 +1274,20 @@ where
         }
     }
 
+    timings.fuse_ms = ms_since(stage);
     if rerank_candidates.is_empty() {
         return Ok(RecallOutcome {
             results: Vec::new(),
             notes,
             stats,
+            timings,
         });
     }
 
     // Rerank the full candidate pool (not just top_k) so the diversity cap
     // below has enough material to spread results across distinct documents.
     let rerank_limit = rerank_candidates.len();
+    let stage = std::time::Instant::now();
     let reranked = if let Some(r) = reranker {
         r.rerank(params.query, &rerank_candidates, rerank_limit)
             .await?
@@ -1228,6 +1296,8 @@ where
         pt.rerank(params.query, &rerank_candidates, rerank_limit)
             .await?
     };
+    timings.rerank_ms = ms_since(stage);
+    let stage = std::time::Instant::now();
 
     let max_per_doc = max_per_doc();
 
@@ -1292,17 +1362,22 @@ where
     // Every passage carries when it happened, so an agent can tell the old
     // value from the new one. A failed lookup leaves the date unknown rather
     // than failing the read.
-    let memory_ids: Vec<Uuid> = results.iter().filter_map(|r| r.provenance.memory_id).collect();
+    let memory_ids: Vec<Uuid> = results
+        .iter()
+        .filter_map(|r| r.provenance.memory_id)
+        .collect();
     if let Ok(dates) = store.memory_dates(&memory_ids) {
         for r in &mut results {
             r.provenance.observed_at = r.provenance.memory_id.and_then(|m| dates.get(&m).copied());
         }
     }
+    timings.assemble_ms = ms_since(stage);
 
     Ok(RecallOutcome {
         results,
         notes,
         stats,
+        timings,
     })
 }
 
@@ -1790,8 +1865,15 @@ mod tests {
                 .with_timezone(&chrono::Utc),
         );
         let ctx = render_answer_context(&vec![r, result("chunk", "personal", "undated")]);
-        assert!(ctx.contains(" date=\"2026-03-01\">\nAna moved to Lisbon."), "{ctx}");
-        assert_eq!(ctx.matches(" date=").count(), 1, "no date is invented: {ctx}");
+        assert!(
+            ctx.contains(" date=\"2026-03-01\">\nAna moved to Lisbon."),
+            "{ctx}"
+        );
+        assert_eq!(
+            ctx.matches(" date=").count(),
+            1,
+            "no date is invented: {ctx}"
+        );
     }
 
     #[test]

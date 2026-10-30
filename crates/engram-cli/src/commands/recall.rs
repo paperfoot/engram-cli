@@ -141,13 +141,16 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     let mut results = outcome.results;
     let notes = outcome.notes;
     let stats = outcome.stats;
+    let mut timings = outcome.timings;
     let fused_any = !results.is_empty();
 
     // Judged before the layer budget, so the budget is spent on passages
     // that answer the query rather than on the ones they displaced.
     let relevance = match &relevance_judge {
         Some(judge) => {
+            let judging = Instant::now();
             let report = judge.apply(&ctx.store, &query, &mut results, top_k).await;
+            timings.judge_ms = crate::retrieval::ms_since(judging);
             if let Some(response) = &report.response {
                 crate::judge::record_judge_usage(
                     ctx,
@@ -303,6 +306,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         )?;
     }
 
+    timings.log("cli", crate::retrieval::ms_since(start));
     let mut meta = Metadata {
         elapsed_ms: start.elapsed().as_millis() as u64,
         ..Default::default()

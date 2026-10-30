@@ -1569,6 +1569,7 @@ fn daemon_diary(diary: Option<String>) -> Option<String> {
 }
 
 async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Value, CliError> {
+    let start = std::time::Instant::now();
     let req: RecallRequest = serde_json::from_str(body)?;
     // An empty query is refused BEFORE any provider or budget work, exactly as
     // `engram recall ""` is (exit 3 -> HTTP 400). It used to fall through to
@@ -1624,7 +1625,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
         params,
     )
     .await?;
-    let (results, notes) = (outcome.results, outcome.notes);
+    let (results, notes, timings) = (outcome.results, outcome.notes, outcome.timings);
     // Same layer contract as `engram recall`: the token budget only trims what
     // exceeds the caller's own top_k, so a layer can never return FEWER results
     // than were asked for. Reported so a caller can see which budget applied.
@@ -1742,6 +1743,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
     if let Some(note) = backends.embedder.degradation_note() {
         resp["data"]["metadata"]["embedder_degraded"] = serde_json::json!(note);
     }
+    timings.log("daemon", crate::retrieval::ms_since(start));
     Ok(resp)
 }
 
