@@ -2453,7 +2453,7 @@ const DOCTOR_FLAGS: &[FlagSpec] = &[
         ty: Ty::Bool,
         default: Some("false"),
         required: false,
-        doc: "also require an OpenRouter key for `ok`",
+        doc: "also require an extraction key (Anthropic or OpenRouter) for `ok`",
     },
     FlagSpec {
         name: "integrity",
@@ -2670,7 +2670,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         path: "remember",
         aliases: &[],
-        summary: "Store a new memory, extracting facts by default when an OpenRouter key resolves.",
+        summary: "Store a new memory, extracting facts by default when an Anthropic or OpenRouter key resolves.",
         destructive: false,
         requires: &[],
         opens_store: true,
@@ -3043,7 +3043,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         statuses: &["success", "error"],
         exit_codes: &[0, 1, 2, 3, 4],
         rules: &[
-            "This spends real money: one LLM call per unprocessed memory. Pair an unscoped sweep with --dry-run or --limit, and expect exit 2 with no OpenRouter key and exit 4 at a `engram budget` cap.",
+            "This spends real money: one LLM call per unprocessed memory. Pair an unscoped sweep with --dry-run or --limit, and expect exit 2 with no Anthropic or OpenRouter key and exit 4 at a `engram budget` cap.",
             "It is idempotent — memories with facts or an extraction marker are skipped — so a --limit'ed run resumes where the last one stopped.",
             "An `edit` that reported `reextraction: \"pending\"` is exactly what this command is for.",
             "KNOWN GAP: without a Gemini key the new facts' vectors are embedded with the 64-dim offline stub, silently; there is no --offline guard here yet.",
@@ -3745,7 +3745,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         exit_codes: &[0, 1],
         rules: &[
             "Branch on `ok`, not on `gemini`: a configured key can sit at zero credits. `ok: false` is still exit 0.",
-            "Each configured key costs one tiny live call (a Gemini embed, an OpenRouter key/credits read, a one-document Cohere rerank = one search unit, a one-question TypeSafe judge call). Follow `next_steps` when anything is not ok: each entry names the command or URL that fixes it.",
+            "Each configured key costs one tiny live call (a Gemini embed, a one-token Anthropic message, an OpenRouter key/credits read, a one-document Cohere rerank = one search unit, a one-question TypeSafe judge call). Follow `next_steps` when anything is not ok: each entry names the command or URL that fixes it.",
         ],
         examples: &["engram config check --json"],
     },
@@ -3774,7 +3774,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         statuses: &["success", "error"],
         exit_codes: &[0, 1],
         rules: &[
-            "`ok: false` is still exit 0: read the sub-objects for which check failed. `ok` needs Gemini and Cohere keys present (OpenRouter too under --compiler), every chunk on the cloud Gemini embedding profile, port 8768 free, a clean integrity report when --integrity ran, and no judge setting error (an invalid ENGRAM_JUDGE_* or judge.* mode, a malformed ENGRAM_JUDGE_STUB, or a config.toml that does not parse).",
+            "`ok: false` is still exit 0: read the sub-objects for which check failed. `ok` needs Gemini and Cohere keys present (an Anthropic or OpenRouter key too under --compiler), every chunk on the cloud Gemini embedding profile, port 8768 free, a clean integrity report when --integrity ran, and no judge setting error (an invalid ENGRAM_JUDGE_* or judge.* mode, a malformed ENGRAM_JUDGE_STUB, or a config.toml that does not parse).",
             "An offline store (stub vectors) reports `embedding.consistent: false`, and a running `engram serve` reports `daemon.available: false`; both make `ok` false without anything being broken.",
             "No network call is made. `engram config check` live-probes the keys.",
             "Integrity residue is healed by `engram repair` (facts of deleted memories, derived rows in KBs with no memories) and `engram kb repair` (unregistered_kbs). Orphan chunks and duplicate source documents are reported only.",
@@ -4043,7 +4043,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         path: "usage",
         aliases: &[],
-        summary: "Recorded provider usage (Gemini embeds, Cohere reranks, OpenRouter calls), grouped by provider, operation and model, with estimated cost.",
+        summary: "Recorded provider usage (Gemini embeds, Cohere reranks, Anthropic and OpenRouter calls), grouped by provider, operation and model, with estimated cost.",
         destructive: false,
         requires: &[],
         opens_store: true,
@@ -4066,7 +4066,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         statuses: &["success", "error"],
         exit_codes: &[0, 1],
         rules: &[
-            "Costs are local estimates, not invoices: Gemini tokens are chars/4, Cohere is priced only when ENGRAM_COHERE_RERANK_USD_PER_SEARCH is set, and OpenRouter calls record tokens but no cost.",
+            "Costs are local estimates, not invoices: Gemini tokens are chars/4, Cohere is priced only when ENGRAM_COHERE_RERANK_USD_PER_SEARCH is set, and Anthropic and OpenRouter calls record tokens but no cost.",
         ],
         examples: &["engram usage --since 2026-09-01 --json"],
     },
@@ -4097,7 +4097,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         exit_codes: &[0, 1],
         rules: &[
             "A paid call checks its KB's budget and the global one first; at a cap it is `rate_limited` (exit 4). ENGRAM_BUDGET_ENFORCE=off overrides for one run.",
-            "Only estimated cost counts, so OpenRouter spend (no local price) never reaches a cap.",
+            "Only estimated cost counts, so Anthropic and OpenRouter spend (no local price) never reaches a cap.",
         ],
         examples: &["engram budget show --json"],
     },

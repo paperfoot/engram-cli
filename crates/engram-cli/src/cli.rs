@@ -70,7 +70,7 @@ pub enum Command {
         kb: String,
 
         /// Skip LLM-based fact extraction + contradiction detection.
-        /// Extraction is ON by default whenever an OpenRouter key resolves;
+        /// Extraction is ON by default whenever an Anthropic or OpenRouter key resolves;
         /// use this for bulk/low-value writes you don't want facts from.
         /// `--no-facts` is accepted as the older spelling.
         #[arg(long, visible_alias = "no-facts")]
@@ -664,7 +664,7 @@ pub enum MemoryCommand {
         #[arg(long, default_value = "default")]
         kb: String,
         /// Skip LLM-based fact extraction + contradiction detection.
-        /// Extraction is ON by default whenever an OpenRouter key resolves.
+        /// Extraction is ON by default whenever an Anthropic or OpenRouter key resolves.
         #[arg(long, visible_alias = "no-facts")]
         no_extract_facts: bool,
         /// Deprecated: extraction is the default; still forces extraction
@@ -1049,7 +1049,7 @@ Examples:
     /// Idempotent: memories that already have facts (or an extraction marker)
     /// are skipped, so re-running costs nothing. Oldest first, so a `--limit`ed
     /// run advances chronologically and the next run resumes after it.
-    /// One LLM call per memory — needs an OpenRouter key (exit 2 without one)
+    /// One LLM call per memory — needs an Anthropic or OpenRouter key (exit 2 without one)
     /// and respects `engram budget` guardrails.
     #[command(after_long_help = "\
 Examples:

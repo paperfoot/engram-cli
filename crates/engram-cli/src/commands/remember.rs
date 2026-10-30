@@ -2,7 +2,7 @@
 //! extract the personal facts inside it.
 //!
 //! Facts enter through two doors: LLM extraction, which now runs on every
-//! `remember` whenever an OpenRouter key resolves, or `--facts-json` (the
+//! `remember` whenever an Anthropic or OpenRouter key resolves, or `--facts-json` (the
 //! caller supplies triples directly, no LLM). `--no-extract-facts` opts out.
 //! With no key, extraction is skipped *loudly* — the envelope says so and
 //! points at `facts backfill` — because a silently dormant fact layer is how
@@ -79,7 +79,7 @@ enum ExtractionStatus {
     Disabled,
     /// `--facts-json`: the caller already knows the triples, so no LLM call.
     CallerSupplied,
-    /// No OpenRouter key resolved — the loud skip.
+    /// No extraction key resolved — the loud skip.
     SkippedNoKey,
     /// Identical content was already stored: the extractor saw it then (or
     /// `facts backfill` still will), so the duplicate costs no LLM call.
@@ -279,7 +279,10 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // nothing, so a zero spend cap must not block it — a free operation
     // failing with a budget error is a new failure mode with no money
     // behind it.
-    let extraction_may_spend = !no_extract_facts && crate::fact_llm::may_spend();
+    // Mirrors the extraction branch below: --facts-json alone calls no model.
+    let extraction_may_spend = !no_extract_facts
+        && (facts_json.is_none() || force_extract_facts)
+        && crate::fact_llm::may_spend();
     if write_embedder.cloud
         || extraction_may_spend
         || grounding.is_some()

@@ -885,24 +885,31 @@ pub const CURRENT_VERSION: i32 = 14;
 /// languages and a test pins them equal.
 pub(crate) const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND superseded_by IS NULL)";
 
-/// SQL that is true when fact `alias` may still be shown to a reader: the
-/// memory it came from is not forgotten, and its content has not changed
-/// since the fact was written.
+/// SQL that is true when fact `alias` may still be shown to a reader: its
+/// memory is not forgotten, and the memory still says it — either its content
+/// has not changed since the fact was written, or the current text still
+/// contains the fact's subject and object.
 ///
 /// Forget and edit close a fact but keep its text, and an open conflict row
-/// outlives both, so recall's conflicts list filters on this. An edit that
-/// leaves the content as it was (its `memory.revised` hashes match) keeps
-/// the memory's facts open and visible. Times compare through `julianday`,
-/// which reads the offset but only the milliseconds, so a revision in the
-/// same millisecond as the fact counts as later, and one whose time does not
-/// parse counts as a change: hiding a value is the safe mistake.
+/// outlives both, so recall's conflicts list filters on this: a value is
+/// printed only while its memory still holds it. An edit that leaves the
+/// content as it was (matching `memory.revised` hashes) is no change; one
+/// whose payload has no hashes is. A same-millisecond tie, which `julianday`
+/// cannot order, falls back to the RFC 3339 strings, and a time that does not
+/// parse counts as later: hiding a value is the safe mistake. `+ve.kind`
+/// keeps the planner on the per-memory event index.
 pub(crate) fn fact_visible_sql(alias: &str) -> String {
     format!(
-        "EXISTS (SELECT 1 FROM memories vm WHERE vm.id = {alias}.source_memory_id AND vm.deleted = 0) \
-         AND NOT EXISTS (SELECT 1 FROM events ve WHERE ve.subject_id = {alias}.source_memory_id \
-             AND ve.kind = '{kind}' \
-             AND json_extract(ve.payload, '$.content_hash') IS NOT json_extract(ve.payload, '$.prev_content_hash') \
-             AND COALESCE(julianday(ve.ts) >= julianday({alias}.created_at), 1))",
+        "EXISTS (SELECT 1 FROM memories vm \
+             WHERE vm.id = {alias}.source_memory_id AND vm.deleted = 0 \
+               AND (NOT EXISTS (SELECT 1 FROM events ve \
+                        WHERE ve.subject_id = vm.id AND +ve.kind = '{kind}' \
+                          AND CASE WHEN json_valid(ve.payload) THEN COALESCE(json_extract(ve.payload, '$.content_hash') \
+                                  = json_extract(ve.payload, '$.prev_content_hash'), 0) ELSE 0 END = 0 \
+                          AND COALESCE(julianday(ve.ts) > julianday({alias}.created_at) \
+                              OR (julianday(ve.ts) = julianday({alias}.created_at) AND ve.ts > {alias}.created_at), 1)) \
+                    OR (instr(lower(vm.content), {alias}.subject_norm) > 0 \
+                        AND instr(lower(vm.content), {alias}.object_norm) > 0)))",
         kind = engram_core::events::EventKind::MemoryRevised.as_str()
     )
 }
@@ -6715,6 +6722,47 @@ mod tests {
             .facts_matching_terms(None, None, &["40".to_string()], 20)
             .unwrap()
             .is_empty());
+    }
+
+    /// A changed memory keeps a fact visible while its text still says it,
+    /// and a revision that names no hashes is a change, not a no-op.
+    #[test]
+    fn a_changed_memory_shows_only_what_its_text_still_says() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let kept = test_fact(&store, "Ana", "takes_medication", "metoprolol 50 mg");
+        store.insert_fact(&kept).unwrap();
+        store
+            .update_memory(
+                kept.source_memory_id,
+                Some("Ana takes metoprolol 50 mg. Her appointment moved to Friday."),
+                None,
+            )
+            .unwrap();
+        assert!(store.visible_facts(&[kept.id]).unwrap().contains(&kept.id));
+
+        let bare = test_fact(&store, "Leo", "takes_medication", "warfarin");
+        store.insert_fact(&bare).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET content = 'Leo moved.' WHERE id = ?1",
+                params![bare.source_memory_id.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events(id, ts, actor, kind, subject_id, payload)
+                 VALUES (?1, ?2, 'test', 'memory.revised', ?3, ?4)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339(),
+                    bare.source_memory_id.to_string(),
+                    format!(r#"{{"memory_id":"{}"}}"#, bare.source_memory_id),
+                ],
+            )
+            .unwrap();
+        assert!(store.visible_facts(&[bare.id]).unwrap().is_empty());
     }
 
     #[test]

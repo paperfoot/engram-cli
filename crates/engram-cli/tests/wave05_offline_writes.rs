@@ -372,6 +372,30 @@ fn a_zero_spend_cap_does_not_block_a_stubbed_write_with_an_anthropic_key() {
     assert_eq!(v["data"]["stored"], true, "{v}");
 }
 
+/// Review finding (Codex): `--facts-json` alone calls no model, yet an
+/// Anthropic key made the cap refuse it.
+#[test]
+fn a_zero_spend_cap_does_not_block_caller_supplied_facts() {
+    let tmp = home();
+    run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &["budget", "set", "--kb", "capped", "--daily-usd", "0"],
+    );
+    let v = run_json(
+        cloud_cmd_in(tmp.path()).env("ANTHROPIC_API_KEY", "sk-ant-test-not-a-key"),
+        &[
+            "remember",
+            "Ana takes metformin.",
+            "--kb",
+            "capped",
+            "--offline",
+            "--facts-json",
+            r#"[{"subject":"Ana","predicate":"takes_medication","object":"metformin"}]"#,
+        ],
+    );
+    assert_eq!(v["data"]["stored"], true, "{v}");
+}
+
 /// Same rule on `edit`: an --offline re-embed spends nothing, so the cap
 /// cannot block it.
 #[test]

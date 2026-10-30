@@ -1808,6 +1808,44 @@ fn recall_conflicts_never_print_a_forgotten_or_edited_away_value() {
     assert!(superseded_by(&after, Value::Null), "{after}");
 }
 
+/// An edit that leaves a value in the text leaves its question open: the
+/// value is still readable, so its contested pair stays listed.
+#[test]
+fn an_edit_that_keeps_a_value_keeps_its_contested_pair() {
+    let (tmp, _cmd) = with_isolated_home();
+    remember_with_facts(
+        &tmp,
+        "Ana takes metoprolol 25 mg.",
+        r#"[{"subject":"Ana","predicate":"takes_medication","object":"metoprolol 25 mg"}]"#,
+        "assisted",
+    );
+    let second = remember_with_facts(
+        &tmp,
+        "Ana takes metoprolol 50 mg.",
+        r#"[{"subject":"Ana","predicate":"takes_medication","object":"metoprolol 50 mg"}]"#,
+        "strict",
+    );
+    let handle = second["data"]["handle"].as_str().unwrap().to_string();
+    json_cmd(
+        &tmp,
+        &[
+            "edit",
+            &handle,
+            "--content",
+            "Ana takes metoprolol 50 mg. Her appointment moved to Friday.",
+        ],
+    );
+    let v = json_cmd(&tmp, &["recall", "metoprolol"]);
+    assert!(
+        v["data"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["status"] == "contested"),
+        "{v}"
+    );
+}
+
 /// An expired memory is withheld, not gone (`--include-expired` brings it
 /// back), so its side of an unresolved pair stays listed: hiding it would make
 /// the other value look settled when nobody settled it.
