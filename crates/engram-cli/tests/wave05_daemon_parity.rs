@@ -159,13 +159,16 @@ fn post(port: u16, path: &str, body: &str) -> (u16, Value) {
     request(port, "POST", path, Some(body)).expect("daemon answers")
 }
 
-/// The `content` of every returned result.
+/// The text of every returned passage, read from `answer_context` — the one
+/// copy both surfaces print (results[] repeats it only with `full`).
 fn contents(body: &Value) -> Vec<String> {
-    body["data"]["results"]
-        .as_array()
-        .expect("results[]")
-        .iter()
-        .map(|r| r["content"].as_str().unwrap_or_default().to_string())
+    let ctx = body["data"]["answer_context"].as_str().expect("answer_context");
+    ctx.split("<engram-result ")
+        .skip(1)
+        .filter_map(|el| {
+            let body = el.split_once(">\n")?.1;
+            Some(body.split("\n</engram-result>").next()?.to_string())
+        })
         .collect()
 }
 

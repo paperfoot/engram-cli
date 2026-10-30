@@ -134,6 +134,7 @@ fn an_offline_ingest_records_the_stub_metadata_remember_offline_does() {
             "personal",
             "--profile",
             "offline",
+            "--full",
         ],
     );
     let results = found["data"]["results"].as_array().expect("results");

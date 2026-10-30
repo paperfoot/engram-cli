@@ -463,10 +463,11 @@ fn remember_then_recall_roundtrip() {
     assert_eq!(v["status"], "success");
     let results = v["data"]["results"].as_array().expect("results array");
     assert!(!results.is_empty());
-    assert!(results[0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("Rapamycin"));
+    assert!(contents(&v)[0].contains("Rapamycin"));
+    assert!(
+        results[0].get("content").is_none(),
+        "the text is printed once, in answer_context"
+    );
 }
 
 #[test]
@@ -1239,10 +1240,7 @@ fn memory_aliases_roundtrip_and_skip_extraction_loudly_without_a_key() {
         .clone();
     let found = parse_stdout(&search_out);
     assert_eq!(found["status"], "success");
-    assert!(found["data"]["results"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("integrity repair"));
+    assert!(contents(&found)[0].contains("integrity repair"));
 }
 
 #[test]
@@ -2052,12 +2050,16 @@ fn run_json(cmd: &mut Command, args: &[&str]) -> Value {
     parse_stdout(&out)
 }
 
+/// The text of every returned passage, read from `answer_context` — the one
+/// copy recall prints (results[] repeats it only under --full).
 fn contents(v: &Value) -> Vec<String> {
-    v["data"]["results"]
-        .as_array()
-        .expect("results array")
-        .iter()
-        .map(|r| r["content"].as_str().unwrap_or_default().to_string())
+    let ctx = v["data"]["answer_context"].as_str().unwrap_or_default();
+    ctx.split("<engram-result ")
+        .skip(1)
+        .filter_map(|el| {
+            let body = el.split_once(">\n")?.1;
+            Some(body.split("\n</engram-result>").next()?.to_string())
+        })
         .collect()
 }
 
@@ -2352,15 +2354,6 @@ fn event_time_is_persisted_and_scopes_recall_since_until() {
     );
 
     assert_eq!(recent["data"]["event_time"], "2026-06-01T00:00:00+00:00");
-
-    let contents = |v: &Value| -> Vec<String> {
-        v["data"]["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["content"].as_str().unwrap_or_default().to_string())
-            .collect()
-    };
 
     // --since after the old event: only the recent memory survives, even
     // though both rows were created seconds ago.

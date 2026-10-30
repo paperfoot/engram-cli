@@ -192,6 +192,11 @@ pub enum Command {
         /// count is reported under `metadata.expiry` — never dropped silently.
         #[arg(long)]
         include_expired: bool,
+
+        /// Also repeat each passage's text in `results[].content`. The text is
+        /// always in `answer_context`; by default it is printed once.
+        #[arg(long)]
+        full: bool,
     },
 
     /// Ingest a file or directory into the memory store.
@@ -723,6 +728,10 @@ pub enum MemoryCommand {
         /// as `recall --include-expired`.
         #[arg(long)]
         include_expired: bool,
+        /// Also repeat each passage's text in `results[].content`. Same flag
+        /// as `recall --full`.
+        #[arg(long)]
+        full: bool,
     },
     /// Update a memory by UUID.
     Update {

@@ -333,7 +333,7 @@ fn the_element_body_is_byte_identical_to_the_result_content() {
     let v = post_ok(
         daemon.port,
         "/v1/recall",
-        "{\"query\":\"wombatledger spacing note\",\"profile\":\"offline\"}",
+        "{\"query\":\"wombatledger spacing note\",\"profile\":\"offline\",\"full\":true}",
     );
     let content = v["data"]["results"][0]["content"]
         .as_str()

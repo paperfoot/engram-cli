@@ -79,12 +79,12 @@ fn a_proposed_lesson_has_no_recallable_twin() {
         dir.path(),
         &["recall", "corrected minutes after", "--profile", "offline"],
     );
-    let hits = v["data"]["results"].as_array().cloned().unwrap_or_default();
+    // The text is printed once, in answer_context.
     assert!(
-        hits.iter().all(|h| !h["content"]
+        !v["data"]["answer_context"]
             .as_str()
             .unwrap_or("")
-            .contains("Re-read what you are about to store")),
+            .contains("Re-read what you are about to store"),
         "an unconfirmed proposal reached recall: {v}"
     );
 }
