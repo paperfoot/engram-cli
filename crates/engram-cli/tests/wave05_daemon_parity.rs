@@ -188,10 +188,49 @@ fn assert_blank_query_refused(status: u16, body: &Value) {
 const UNUSED_KEY: &str = "fake-key-not-used-because-the-guard-blocks-first";
 
 #[test]
-fn daemon_recall_runs_the_relevance_judge_as_the_cli_does() {
-    // `/v1/recall` used to skip the relevance judge entirely: an agent over
-    // HTTP got the unjudged top ten that `engram recall` filters. The stub
-    // judge beats every key, so nothing leaves the machine.
+fn daemon_recall_annotates_relevance_and_drops_nothing_by_default() {
+    // `/v1/recall` never ran the relevance judge. It now runs it in
+    // `shadow` unless the mode was set explicitly: every result carries its
+    // probability and the daemon's result set is unchanged. The stub judge
+    // beats every key, so nothing leaves the machine.
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    seed(
+        tmp.path(),
+        &[
+            "remember",
+            "The harbour office opens at nine on weekdays.",
+            "--kb",
+            "judge",
+            "--no-facts",
+        ],
+    );
+    let query = "{\"query\":\"harbour office hours\",\"profile\":\"offline\"}";
+    let stub = [
+        ("ENGRAM_JUDGE_STUB", "0.01"),
+        ("TYPESAFE_API_KEY", "ts-test-not-a-key"),
+    ];
+    let daemon = start_daemon(tmp.path(), &stub);
+    let (status, body) = post(daemon.port, "/v1/recall", query);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["status"], "success", "{body}");
+    assert_eq!(
+        body["data"]["metadata"]["relevance"]["mode"], "shadow",
+        "{body}"
+    );
+    let results = body["data"]["results"].as_array().expect("results");
+    assert!(!results.is_empty(), "{body}");
+    assert!(
+        results
+            .iter()
+            .all(|r| r["relevance"].as_f64() == Some(0.01)),
+        "{body}"
+    );
+}
+
+#[test]
+fn daemon_recall_honours_an_explicit_relevance_mode() {
+    // `judge.relevance = on`, set on purpose, drops on the daemon exactly
+    // as on the CLI.
     let tmp = tempfile::tempdir().expect("tmp dir");
     seed(
         tmp.path(),
@@ -209,6 +248,7 @@ fn daemon_recall_runs_the_relevance_judge_as_the_cli_does() {
     let stub = [
         ("ENGRAM_JUDGE_STUB", "0.01"),
         ("TYPESAFE_API_KEY", "ts-test-not-a-key"),
+        ("ENGRAM_JUDGE_RELEVANCE", "on"),
     ];
     let daemon = start_daemon(tmp.path(), &stub);
     let (status, body) = post(daemon.port, "/v1/recall", query);
@@ -224,6 +264,7 @@ fn daemon_recall_runs_the_relevance_judge_as_the_cli_does() {
     let stub = [
         ("ENGRAM_JUDGE_STUB", "0.9"),
         ("TYPESAFE_API_KEY", "ts-test-not-a-key"),
+        ("ENGRAM_JUDGE_RELEVANCE", "on"),
     ];
     let daemon = start_daemon(tmp.path(), &stub);
     let (status, body) = post(daemon.port, "/v1/recall", query);

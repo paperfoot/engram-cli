@@ -896,6 +896,24 @@ impl RelevanceJudge {
         self.mode
     }
 
+    /// The relevance judge for `engramd`'s `/v1/recall`: the CLI's, except
+    /// that a DEFAULTED `on` becomes `shadow` (every result carries its
+    /// P(answers), nothing is dropped). The daemon never ran the judge, and
+    /// on LongMemEval (311 questions, full pipeline) dropping cost answer
+    /// accuracy 88% -> 74%, mostly on temporal questions whose evidence is
+    /// spread over passages that do not answer alone; `shadow` returned the
+    /// daemon's exact result set on all 311. Setting `judge.relevance` (or
+    /// `ENGRAM_JUDGE_RELEVANCE`) explicitly is honoured as on the CLI.
+    pub fn resolve_for_daemon(offline: bool) -> Result<Option<Self>, crate::error::CliError> {
+        let explicit = crate::judge::mode_is_set(JudgeSite::Relevance);
+        Ok(Self::resolve(offline)?.map(|mut judge| {
+            if judge.mode == JudgeMode::On && !explicit {
+                judge.mode = JudgeMode::Shadow;
+            }
+            judge
+        }))
+    }
+
     /// How many candidates to retrieve for a recall of `top_k`: the reranked
     /// pool (`rerank_top_n`) up to [`RELEVANCE_MAX_POOL`], so misses can be
     /// refilled from it.

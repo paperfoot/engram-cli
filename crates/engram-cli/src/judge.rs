@@ -173,14 +173,26 @@ pub fn typesafe_consented() -> bool {
 /// Why `site` has the mode it has, for `config show`, `config check` and
 /// `doctor`: set by env, set in config, or which default applies.
 pub fn mode_source(site: JudgeSite) -> String {
-    if std::env::var(site.env_var()).is_ok_and(|v| !v.trim().is_empty()) {
+    if mode_set_by_env(site) {
         return format!("set by {}", site.env_var());
     }
-    if matches!(config::config_value(site.config_key()), Ok(Some(toml::Value::String(s))) if !s.trim().is_empty())
-    {
+    if mode_set_in_config(site) {
         return format!("set by {} in config.toml", site.config_key());
     }
     default_why(site, typesafe_consented())
+}
+
+/// True when `site`'s mode was chosen (env or config), not defaulted.
+pub fn mode_is_set(site: JudgeSite) -> bool {
+    mode_set_by_env(site) || mode_set_in_config(site)
+}
+
+fn mode_set_by_env(site: JudgeSite) -> bool {
+    std::env::var(site.env_var()).is_ok_and(|v| !v.trim().is_empty())
+}
+
+fn mode_set_in_config(site: JudgeSite) -> bool {
+    matches!(config::config_value(site.config_key()), Ok(Some(toml::Value::String(s))) if !s.trim().is_empty())
 }
 
 fn default_why(site: JudgeSite, consented: bool) -> String {

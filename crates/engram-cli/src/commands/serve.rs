@@ -1609,7 +1609,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
     // asked what it is rather than being hardcoded here.
     // Resolved before any paid call, as on the CLI: a bad `judge.relevance`
     // fails the request with nothing spent.
-    let relevance_judge = RelevanceJudge::resolve(profile == RetrievalProfile::Offline)?;
+    let relevance_judge = RelevanceJudge::resolve_for_daemon(profile == RetrievalProfile::Offline)?;
     let backends = resolve_retrieval_backends(store, profile, scope.as_deref())?;
     let params = HybridParams {
         query: &req.query,
