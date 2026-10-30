@@ -888,16 +888,17 @@ pub(crate) const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND super
 /// SQL that is true when fact `alias` may still be shown to a reader: its
 /// memory is not forgotten, and the memory still says it — either its content
 /// has not changed since the fact was written, or the current text still
-/// contains the fact's subject and object.
+/// states the fact's subject and object ([`says`]).
 ///
 /// Forget and edit close a fact but keep its text, and an open conflict row
 /// outlives both, so recall's conflicts list filters on this: a value is
 /// printed only while its memory still holds it. An edit that leaves the
 /// content as it was (matching `memory.revised` hashes) is no change; one
-/// whose payload has no hashes is. A same-millisecond tie, which `julianday`
-/// cannot order, falls back to the RFC 3339 strings, and a time that does not
-/// parse counts as later: hiding a value is the safe mistake. `+ve.kind`
-/// keeps the planner on the per-memory event index.
+/// whose payload has no hashes is. A revision in the same millisecond as the
+/// fact (all `julianday` can resolve) or with a time that does not parse
+/// counts as later: hiding a value is the safe mistake, and a fact extracted
+/// from the new text still passes on the text. `+ve.kind` keeps the planner
+/// on the per-memory event index.
 pub(crate) fn fact_visible_sql(alias: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM memories vm \
@@ -906,12 +907,50 @@ pub(crate) fn fact_visible_sql(alias: &str) -> String {
                         WHERE ve.subject_id = vm.id AND +ve.kind = '{kind}' \
                           AND CASE WHEN json_valid(ve.payload) THEN COALESCE(json_extract(ve.payload, '$.content_hash') \
                                   = json_extract(ve.payload, '$.prev_content_hash'), 0) ELSE 0 END = 0 \
-                          AND COALESCE(julianday(ve.ts) > julianday({alias}.created_at) \
-                              OR (julianday(ve.ts) = julianday({alias}.created_at) AND ve.ts > {alias}.created_at), 1)) \
-                    OR (instr(lower(vm.content), {alias}.subject_norm) > 0 \
-                        AND instr(lower(vm.content), {alias}.object_norm) > 0)))",
+                          AND COALESCE(julianday(ve.ts) >= julianday({alias}.created_at), 1)) \
+                    OR engram_says(vm.content, {alias}.subject, {alias}.object)))",
         kind = engram_core::events::EventKind::MemoryRevised.as_str()
     )
+}
+
+/// True when `text` states `needle` as a whole phrase: both lowercased the
+/// Unicode way and with whitespace runs collapsed, the match bounded by
+/// non-alphanumerics or the ends. SQLite's `lower()` folds only ASCII, and a
+/// bare substring test finds "hiv" inside "archive".
+pub(crate) fn says(text: &str, needle: &str) -> bool {
+    let fold = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let (text, needle) = (fold(text), fold(needle));
+    if needle.is_empty() {
+        return false;
+    }
+    text.match_indices(&needle).any(|(at, m)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + m.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// SQL functions every query may rely on, registered as part of opening a
+/// store so no caller can forget them.
+fn register_functions(conn: &Connection) -> Result<(), StorageError> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "engram_says",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let text = ctx.get::<Option<String>>(0)?.unwrap_or_default();
+            let subject = ctx.get::<Option<String>>(1)?.unwrap_or_default();
+            let object = ctx.get::<Option<String>>(2)?.unwrap_or_default();
+            Ok(says(&text, &subject) && says(&text, &object))
+        },
+    )?;
+    Ok(())
 }
 
 /// The fact projection, in `parse_fact_row` order. Written once so a `SELECT`
@@ -956,6 +995,7 @@ pub(crate) const FACT_COLUMN_COUNT: usize = 22;
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let conn = Connection::open(path.as_ref())?;
+        register_functions(&conn)?;
         // Standard performance pragmas.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -1011,6 +1051,7 @@ impl SqliteStore {
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
+        register_functions(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
             conn,
@@ -6724,6 +6765,16 @@ mod tests {
             .is_empty());
     }
 
+    #[test]
+    fn says_matches_whole_phrases_after_unicode_folding() {
+        assert!(says("Ana takes metoprolol  50 mg.", "metoprolol 50 mg"));
+        assert!(says("ÉLODIE called.", "Élodie"));
+        assert!(says("tested for HIV.", "hiv"));
+        assert!(!says("cleared the archive", "hiv"));
+        assert!(!says("Anabel called", "Ana"));
+        assert!(!says("anything", "   "));
+    }
+
     /// A changed memory keeps a fact visible while its text still says it,
     /// and a revision that names no hashes is a change, not a no-op.
     #[test]
@@ -6739,6 +6790,33 @@ mod tests {
             )
             .unwrap();
         assert!(store.visible_facts(&[kept.id]).unwrap().contains(&kept.id));
+
+        // Unicode case folding: SQLite's lower() would miss this name.
+        let accented = test_fact(&store, "Élodie", "takes_medication", "metoprolol 25 mg");
+        store.insert_fact(&accented).unwrap();
+        store
+            .update_memory(
+                accented.source_memory_id,
+                Some("ÉLODIE takes metoprolol 25 mg; appointment on Friday."),
+                None,
+            )
+            .unwrap();
+        assert!(store
+            .visible_facts(&[accented.id])
+            .unwrap()
+            .contains(&accented.id));
+
+        // Whole words: an edited-away "HIV" is not still said by "archive".
+        let short = test_fact(&store, "Ana", "diagnosed_with", "HIV");
+        store.insert_fact(&short).unwrap();
+        store
+            .update_memory(
+                short.source_memory_id,
+                Some("Ana cleared her archive."),
+                None,
+            )
+            .unwrap();
+        assert!(store.visible_facts(&[short.id]).unwrap().is_empty());
 
         let bare = test_fact(&store, "Leo", "takes_medication", "warfarin");
         store.insert_fact(&bare).unwrap();

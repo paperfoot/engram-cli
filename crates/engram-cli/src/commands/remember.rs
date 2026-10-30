@@ -279,8 +279,16 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // nothing, so a zero spend cap must not block it — a free operation
     // failing with a budget error is a new failure mode with no money
     // behind it.
-    // Mirrors the extraction branch below: --facts-json alone calls no model.
-    let extraction_may_spend = !no_extract_facts
+    // Identical content returns early below without extracting, so it is
+    // looked up first; --facts-json alone calls no model either. Both mirror
+    // the branches that decide whether extraction runs.
+    let duplicate = if allow_duplicate {
+        None
+    } else {
+        ctx.store.find_duplicate_memory(&kb, &diary, &content)?
+    };
+    let extraction_may_spend = duplicate.is_none()
+        && !no_extract_facts
         && (facts_json.is_none() || force_extract_facts)
         && crate::fact_llm::may_spend();
     if write_embedder.cloud
@@ -296,131 +304,129 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     // Dedup: saving an identical fact into the same (kb, diary) is a no-op
     // rather than a second row + a second embedding charge. Opt out with
     // --allow-duplicate if you truly want a second copy.
-    if !allow_duplicate {
-        if let Some(existing) = ctx.store.find_duplicate_memory(&kb, &diary, &content)? {
-            // VALIDATION BEFORE ANY PERSISTENCE. `--valid-until` on identical
-            // content expires the EXISTING copy — the natural way to expire
-            // content already stored — and the impossible-interval check runs
-            // against the STORED row's event time (never overridable by this
-            // invocation's --event-time: the stored row is the one being
-            // expired), BEFORE the caller-facts batch below can commit. A
-            // rejected command must reject whole: exit 3 with one fact
-            // already persisted is a half-write behind an error (gate
-            // round 3).
-            let stored_times = ctx.store.memory_times(existing)?;
-            if let Some(vu) = valid_until {
-                if let Some(et) = stored_times.and_then(|(event, _)| event).or(event_time) {
-                    if vu < et {
-                        return Err(CliError::BadInput(format!(
-                            "--valid-until ({vu}) is before the memory's event time \
-                             ({et}): the memory would expire before it happened"
-                        )));
-                    }
+    if let Some(existing) = duplicate {
+        // VALIDATION BEFORE ANY PERSISTENCE. `--valid-until` on identical
+        // content expires the EXISTING copy — the natural way to expire
+        // content already stored — and the impossible-interval check runs
+        // against the STORED row's event time (never overridable by this
+        // invocation's --event-time: the stored row is the one being
+        // expired), BEFORE the caller-facts batch below can commit. A
+        // rejected command must reject whole: exit 3 with one fact
+        // already persisted is a half-write behind an error (gate
+        // round 3).
+        let stored_times = ctx.store.memory_times(existing)?;
+        if let Some(vu) = valid_until {
+            if let Some(et) = stored_times.and_then(|(event, _)| event).or(event_time) {
+                if vu < et {
+                    return Err(CliError::BadInput(format!(
+                        "--valid-until ({vu}) is before the memory's event time \
+                         ({et}): the memory would expire before it happened"
+                    )));
                 }
             }
-            // The CONTENT is already stored; the caller's triples may not be.
-            // A `remember --facts-json` whose batch failed is retried with the
-            // identical command, and returning here would report success while
-            // dropping those triples a second time — the retry the failure
-            // message promises has to be the retry that works. Extraction is
-            // deliberately NOT run here: this path costs no LLM call, as before.
-            let mut outcome = FactWriteOutcome::default();
-            let mut caller_batch_committed = false;
-            if !caller_facts.is_empty() {
-                // Epoch, never now, when the existing memory vanished under
-                // us (concurrent forget): a fabricated "now" would date these
-                // facts newest-in-store and win recency supersession — the
-                // same rule memory_times itself applies to unreadable dates.
-                let (stored_event, stored_created) = ctx
-                    .store
-                    .memory_times(existing)?
-                    .unwrap_or((None, chrono::DateTime::UNIX_EPOCH));
-                let plan = FactBatchPlan {
-                    memory_id: existing,
-                    kb: &kb,
-                    diary: &diary,
-                    memory_time: MemoryTime {
-                        event_time: event_time.or(stored_event),
-                        created_at: stored_created,
-                    },
-                    autonomy,
-                    adjudicator,
-                    embedder: write_embedder.embedder.as_ref(),
-                    facts: &caller_facts,
-                    marker: None,
-                    source_text: &content,
-                    grounding: grounding.as_ref(),
-                    // The caller asserted these, on the retry path exactly as
-                    // on the first run: dedup must not downgrade provenance.
-                    source_kind: SourceKind::UserStated,
-                };
-                if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
-                    return Err(facts_json_failure(failure, existing, &kb));
-                }
-                caller_batch_committed = true;
-            }
-            // Validated above, before anything persisted; apply it now.
-            let mut validity_updated = false;
-            if let Some(vu) = valid_until {
-                validity_updated = ctx.store.set_memory_valid_until(existing, vu)?;
-            }
-            let facts_source_kind = facts_source_kind(caller_batch_committed, false);
-            // `chunks` and `fact_extraction` are always-present in the
-            // published schema; this envelope used to omit both. The flags
-            // keep their main-path meaning; otherwise extraction was skipped
-            // because the content is not new.
-            let status = if no_extract_facts {
-                ExtractionStatus::Disabled
-            } else if facts_json.is_some() && !force_extract_facts {
-                ExtractionStatus::CallerSupplied
-            } else {
-                ExtractionStatus::SkippedDuplicate
-            };
-            let mut meta = Metadata::default();
-            meta.add("deduplicated", true);
-            meta.add("chunks_stored", 0);
-            meta.add("fact_extraction", status.as_str());
-            meta.add("existing_id", existing.to_string());
-            if validity_updated {
-                meta.add("valid_until_updated", true);
-            }
-            // The dedup path answers with SOMEONE ELSE'S id, which is exactly
-            // where a bare uuid is most likely to be copied into the next
-            // command — so it carries the typed handle too.
-            meta.add("handle", crate::commands::memory::render_handle(existing));
-            meta.add("facts_added", outcome.added);
-            meta.add("facts_source_kind", facts_source_kind);
-            for (name, counts) in outcome.counters() {
-                meta.add(name, counts);
-            }
-            let mut data = json!({
-                    "id": existing.to_string(),
-                    "handle": crate::commands::memory::render_handle(existing),
-                    "stored": false,
-                    "deduplicated": true,
-                    "valid_until_updated": validity_updated,
-                    "chunks": 0,
-                    "kb": kb,
-                    "fact_extraction": status.as_str(),
-                    "facts_added": outcome.added,
-                    "facts_source_kind": facts_source_kind,
-                    "facts_deduped": outcome.deduped,
-                    "conflicts": outcome.conflicts,
-                    "adjudication_needed": outcome.queued,
-                    "date_parse_warnings": outcome.date_warnings,
-                    "plan_notes": outcome.plan_notes,
-                    "reason": "identical content already stored in this kb/diary; nothing re-embedded",
-            });
-            with_grounding(&mut data, outcome.grounding);
-            print_success(ctx.format, data, meta, |data| {
-                println!(
-                    "Duplicate of {existing} — nothing re-stored ({} facts attached, use \
-                         --allow-duplicate to force a second memory)",
-                    data["facts_added"]
-                )
-            });
-            return Ok(());
         }
+        // The CONTENT is already stored; the caller's triples may not be.
+        // A `remember --facts-json` whose batch failed is retried with the
+        // identical command, and returning here would report success while
+        // dropping those triples a second time — the retry the failure
+        // message promises has to be the retry that works. Extraction is
+        // deliberately NOT run here: this path costs no LLM call, as before.
+        let mut outcome = FactWriteOutcome::default();
+        let mut caller_batch_committed = false;
+        if !caller_facts.is_empty() {
+            // Epoch, never now, when the existing memory vanished under
+            // us (concurrent forget): a fabricated "now" would date these
+            // facts newest-in-store and win recency supersession — the
+            // same rule memory_times itself applies to unreadable dates.
+            let (stored_event, stored_created) = ctx
+                .store
+                .memory_times(existing)?
+                .unwrap_or((None, chrono::DateTime::UNIX_EPOCH));
+            let plan = FactBatchPlan {
+                memory_id: existing,
+                kb: &kb,
+                diary: &diary,
+                memory_time: MemoryTime {
+                    event_time: event_time.or(stored_event),
+                    created_at: stored_created,
+                },
+                autonomy,
+                adjudicator,
+                embedder: write_embedder.embedder.as_ref(),
+                facts: &caller_facts,
+                marker: None,
+                source_text: &content,
+                grounding: grounding.as_ref(),
+                // The caller asserted these, on the retry path exactly as
+                // on the first run: dedup must not downgrade provenance.
+                source_kind: SourceKind::UserStated,
+            };
+            if let Err(failure) = persist_facts(ctx, plan, &mut outcome).await {
+                return Err(facts_json_failure(failure, existing, &kb));
+            }
+            caller_batch_committed = true;
+        }
+        // Validated above, before anything persisted; apply it now.
+        let mut validity_updated = false;
+        if let Some(vu) = valid_until {
+            validity_updated = ctx.store.set_memory_valid_until(existing, vu)?;
+        }
+        let facts_source_kind = facts_source_kind(caller_batch_committed, false);
+        // `chunks` and `fact_extraction` are always-present in the
+        // published schema; this envelope used to omit both. The flags
+        // keep their main-path meaning; otherwise extraction was skipped
+        // because the content is not new.
+        let status = if no_extract_facts {
+            ExtractionStatus::Disabled
+        } else if facts_json.is_some() && !force_extract_facts {
+            ExtractionStatus::CallerSupplied
+        } else {
+            ExtractionStatus::SkippedDuplicate
+        };
+        let mut meta = Metadata::default();
+        meta.add("deduplicated", true);
+        meta.add("chunks_stored", 0);
+        meta.add("fact_extraction", status.as_str());
+        meta.add("existing_id", existing.to_string());
+        if validity_updated {
+            meta.add("valid_until_updated", true);
+        }
+        // The dedup path answers with SOMEONE ELSE'S id, which is exactly
+        // where a bare uuid is most likely to be copied into the next
+        // command — so it carries the typed handle too.
+        meta.add("handle", crate::commands::memory::render_handle(existing));
+        meta.add("facts_added", outcome.added);
+        meta.add("facts_source_kind", facts_source_kind);
+        for (name, counts) in outcome.counters() {
+            meta.add(name, counts);
+        }
+        let mut data = json!({
+                "id": existing.to_string(),
+                "handle": crate::commands::memory::render_handle(existing),
+                "stored": false,
+                "deduplicated": true,
+                "valid_until_updated": validity_updated,
+                "chunks": 0,
+                "kb": kb,
+                "fact_extraction": status.as_str(),
+                "facts_added": outcome.added,
+                "facts_source_kind": facts_source_kind,
+                "facts_deduped": outcome.deduped,
+                "conflicts": outcome.conflicts,
+                "adjudication_needed": outcome.queued,
+                "date_parse_warnings": outcome.date_warnings,
+                "plan_notes": outcome.plan_notes,
+                "reason": "identical content already stored in this kb/diary; nothing re-embedded",
+        });
+        with_grounding(&mut data, outcome.grounding);
+        print_success(ctx.format, data, meta, |data| {
+            println!(
+                "Duplicate of {existing} — nothing re-stored ({} facts attached, use \
+                     --allow-duplicate to force a second memory)",
+                data["facts_added"]
+            )
+        });
+        return Ok(());
     }
 
     let now = Utc::now();

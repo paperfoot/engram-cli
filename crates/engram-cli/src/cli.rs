@@ -345,7 +345,7 @@ Examples:
 
     /// Diagnose configuration, keys, schema, embeddings, and daemon port.
     Doctor {
-        /// Also require OpenRouter (fact extraction).
+        /// Also require an extraction key (Anthropic or OpenRouter).
         #[arg(long)]
         compiler: bool,
         /// Include store lifecycle checks for stale derived memory artifacts.

@@ -43,7 +43,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "functions"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -396,6 +396,34 @@ fn a_zero_spend_cap_does_not_block_caller_supplied_facts() {
     assert_eq!(v["data"]["stored"], true, "{v}");
 }
 
+/// Review finding (Codex): identical content returns early without
+/// extracting, yet with an Anthropic key the cap refused the repeat.
+#[test]
+fn a_zero_spend_cap_does_not_block_a_duplicate_write() {
+    let tmp = home();
+    let text = "A note written twice.";
+    run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &[
+            "remember",
+            text,
+            "--kb",
+            "capped",
+            "--offline",
+            "--no-extract-facts",
+        ],
+    );
+    run_json(
+        &mut cloud_cmd_in(tmp.path()),
+        &["budget", "set", "--kb", "capped", "--daily-usd", "0"],
+    );
+    let v = run_json(
+        cloud_cmd_in(tmp.path()).env("ANTHROPIC_API_KEY", "sk-ant-test-not-a-key"),
+        &["remember", text, "--kb", "capped", "--offline"],
+    );
+    assert_eq!(v["data"]["deduplicated"], true, "{v}");
+}
+
 /// Same rule on `edit`: an --offline re-embed spends nothing, so the cap
 /// cannot block it.
 #[test]
