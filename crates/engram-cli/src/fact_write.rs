@@ -1908,7 +1908,9 @@ fn record_judgement(
 /// Why a judge gave no verdict, as a stable word for the envelope.
 fn failure_reason(e: &JudgeError) -> &'static str {
     match e {
-        JudgeError::Transport { .. } | JudgeError::Status { .. } => "judge_unreachable",
+        JudgeError::Transport { .. }
+        | JudgeError::Status { .. }
+        | JudgeError::DeadlineExceeded => "judge_unreachable",
         JudgeError::InvalidResponse { .. }
         | JudgeError::MissingAnswer { .. }
         | JudgeError::WrongAnswerType { .. } => "not_a_verdict",

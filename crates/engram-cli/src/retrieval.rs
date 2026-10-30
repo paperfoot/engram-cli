@@ -16,7 +16,8 @@ use engram_llm::judge::questions::{
     relevance_request, RelevancePassage, RELEVANCE_FLOOR, RELEVANCE_PASSAGE_CHARS,
 };
 use engram_llm::judge::{
-    ask_batched, wire_decimal, Judge, JudgeResponse, BATCH_CONCURRENCY, MAX_QUESTIONS_PER_REQUEST,
+    ask_batched, ask_batched_until, wire_decimal, Judge, JudgeError, JudgeResponse,
+    BATCH_CONCURRENCY, MAX_QUESTIONS_PER_REQUEST,
 };
 use engram_rerank::cohere::CohereReranker;
 use engram_rerank::{passthrough::PassthroughReranker, RerankCandidate, Reranker};
@@ -621,6 +622,10 @@ pub struct Prejudged {
     response: Option<JudgeResponse>,
     /// Why there are no answers (failure or deadline): the metadata note.
     error: Option<String>,
+    /// Some candidates went unanswered (a part failed or ran past the
+    /// deadline) while others were judged: reported, never a reason to
+    /// discard the answers that did arrive.
+    note: Option<String>,
 }
 
 impl Prejudged {
@@ -966,10 +971,13 @@ impl RelevanceJudge {
             })
             .collect();
         let request = relevance_request(query, &passages);
-        let call = ask_batched(self.judge.as_ref(), &request);
+        // The deadline applies per part: a slow part leaves only its own
+        // candidates unjudged, and the parts that answered in time count.
+        let deadline = tokio::time::Instant::now() + self.deadline;
+        let call = ask_batched_until(self.judge.as_ref(), &request, Some(deadline));
         let mut out = Prejudged::default();
-        match tokio::time::timeout(self.deadline, call).await {
-            Ok(Ok(response)) => {
+        match call.await {
+            Ok((response, part_failed)) => {
                 out.answers = pool
                     .iter()
                     .map(|(id, _, _)| {
@@ -977,13 +985,25 @@ impl RelevanceJudge {
                         response.noul(id).ok().filter(|p| (0.0..=1.0).contains(p))
                     })
                     .collect();
+                // A part that failed or ran late leaves its candidates
+                // unjudged, and says so; a question the provider skipped
+                // is unanswered exactly as in the sequential walk.
+                if let Some(e) = part_failed {
+                    let missing = out.answers.iter().filter(|a| a.is_none()).count();
+                    tracing::warn!("part of the relevance judge failed: {e}");
+                    out.note = Some(format!(
+                        "relevance judge answered {} of {} candidates; the rest are unjudged: {e}",
+                        pool.len() - missing,
+                        pool.len()
+                    ));
+                }
                 out.response = Some(response);
             }
-            Ok(Err(e)) => {
+            Err(JudgeError::DeadlineExceeded) => out.error = Some(self.late()),
+            Err(e) => {
                 tracing::warn!("relevance judge failed; results returned unjudged: {e}");
                 out.error = Some(format!("relevance judge failed; results are unjudged: {e}"));
             }
-            Err(_) => out.error = Some(self.late()),
         }
         (out, ms_since(started))
     }
@@ -1014,6 +1034,7 @@ impl RelevanceJudge {
         // The whole window's cost goes to the ledger: it was paid for.
         if let Some(p) = prejudged.as_mut() {
             report.response = p.response.take();
+            report.error = p.note.take();
         }
         let deadline = tokio::time::Instant::now() + self.deadline;
         let limit = Self::bound(top_k);
@@ -2093,6 +2114,70 @@ mod tests {
                 unreachable!("the deadline fires first")
             })
         }
+    }
+
+    /// Answers every part at 0.9 except the one holding `r64`, which hangs.
+    struct SlowSecondPart;
+
+    impl Judge for SlowSecondPart {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn model_id(&self) -> &str {
+            "slow-second-part"
+        }
+
+        fn ask<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            request: &'life1 engram_llm::judge::JudgeRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<JudgeResponse, engram_llm::judge::JudgeError>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            let slow = request.questions.iter().any(|(id, _)| id == "r64");
+            let fast = engram_llm::judge::stub::StubJudge::parse("0.9").unwrap();
+            Box::pin(async move {
+                if !slow {
+                    return fast.ask(request).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                unreachable!("the deadline fires first")
+            })
+        }
+    }
+
+    /// One part of the window runs past the deadline: the part that
+    /// answered keeps its verdicts, and only the slow part's candidates are
+    /// left unjudged. A timeout around the whole call used to discard both.
+    #[tokio::test]
+    async fn a_slow_part_of_the_window_keeps_the_answers_that_arrived() {
+        let judge = RelevanceJudge {
+            mode: JudgeMode::On,
+            judge: Box::new(SlowSecondPart),
+            deadline: std::time::Duration::from_millis(50),
+            concurrent: true,
+            ranks: false,
+        };
+        let pool: Vec<(String, String, Option<String>)> = (0..70)
+            .map(|i| (format!("r{i}"), format!("passage {i}"), None))
+            .collect();
+        let started = std::time::Instant::now();
+        let (prejudged, _) = judge.window("q", &pool).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(prejudged.error.is_none(), "{:?}", prejudged.error);
+        assert!(prejudged.note.is_some());
+        assert!((0..64).all(|i| prejudged.relevance(i) == Some(0.9)));
+        assert!((64..70).all(|i| prejudged.relevance(i).is_none()));
     }
 
     /// The deadline hits after a page of misses: what the judge never saw

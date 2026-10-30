@@ -402,6 +402,10 @@ pub enum JudgeError {
     #[error("judge gave no answer for question `{id}`")]
     MissingAnswer { id: String },
 
+    /// The caller's deadline passed before this request answered.
+    #[error("judge did not answer before the deadline")]
+    DeadlineExceeded,
+
     #[error("judge answer for question `{id}` is a {actual}, expected a {expected}")]
     WrongAnswerType {
         id: String,
@@ -485,14 +489,32 @@ pub async fn ask_batched(
     judge: &dyn Judge,
     request: &JudgeRequest,
 ) -> Result<JudgeResponse, JudgeError> {
+    ask_batched_until(judge, request, None)
+        .await
+        .map(|(response, _)| response)
+}
+
+/// [`ask_batched`] under a deadline that applies to each part: a part still
+/// unanswered at `deadline` fails with [`JudgeError::DeadlineExceeded`] and
+/// leaves only its own ids unanswered, while every part that answered in
+/// time keeps its answers. A timeout around the whole call threw away the
+/// parts that had already answered. Alongside the merged answers comes the
+/// first failed part's error, when some parts failed and others answered.
+pub async fn ask_batched_until(
+    judge: &dyn Judge,
+    request: &JudgeRequest,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(JudgeResponse, Option<JudgeError>), JudgeError> {
     request.validate()?;
     let parts = split_request(request);
     if parts.len() == 1 {
-        return judge.ask(&parts[0]).await;
+        return ask_until(judge, &parts[0], deadline)
+            .await
+            .map(|response| (response, None));
     }
     let started = Instant::now();
     let results: Vec<Result<JudgeResponse, JudgeError>> = stream::iter(parts.iter())
-        .map(|part| judge.ask(part))
+        .map(|part| ask_until(judge, part, deadline))
         .buffered(BATCH_CONCURRENCY)
         .collect()
         .await;
@@ -521,9 +543,23 @@ pub async fn ask_batched(
     match merged {
         Some(mut m) => {
             m.latency_ms = started.elapsed().as_millis() as u64;
-            Ok(m)
+            Ok((m, first_error))
         }
         None => Err(first_error.expect("at least one part ran")),
+    }
+}
+
+/// One request, failing with [`JudgeError::DeadlineExceeded`] at `deadline`.
+async fn ask_until(
+    judge: &dyn Judge,
+    part: &JudgeRequest,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<JudgeResponse, JudgeError> {
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at, judge.ask(part))
+            .await
+            .unwrap_or(Err(JudgeError::DeadlineExceeded)),
+        None => judge.ask(part).await,
     }
 }
 
