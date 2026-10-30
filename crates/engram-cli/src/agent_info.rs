@@ -145,7 +145,8 @@ fn manifest() -> Value {
         "env_overrides": {
             "GEMINI_API_KEY": "Google Gemini embedding key (required for hybrid retrieval)",
             "COHERE_API_KEY": "Cohere rerank key (optional, improves R@1)",
-            "OPENROUTER_API_KEY": "Fact extraction (on by default in remember / memory add) and the judge's fallback route (TypeSafe JEV via OpenRouter). Config: keys.openrouter.",
+            "ANTHROPIC_API_KEY": "Fact extraction (on by default in remember / memory add) with Claude Haiku 5.5, used ahead of OPENROUTER_API_KEY. Config: keys.anthropic.",
+            "OPENROUTER_API_KEY": "Fact extraction when no Anthropic key is set, and the judge's fallback route (TypeSafe JEV via OpenRouter). Config: keys.openrouter.",
             "TYPESAFE_API_KEY": "Optional. TypeSafe JEV judge key; the preferred judge route (direct API). Without it the judge goes through OPENROUTER_API_KEY. Used only by judge sites set to shadow or on. Config: keys.typesafe.",
             "ENGRAM_JUDGE_*": "Judge sites (TypeSafe JEV, a calibrated yes/no judge). Each site's mode, the route, warnings and errors are reported by `config show`, `config check` and `doctor`; an invalid value is exit 2 on any command that reads it and makes `doctor` ok false. Consent: a site sends memory text only with a TypeSafe key or its own explicit shadow|on (an OpenRouter key alone is not consent). judge.dedupe is reported only.",
             "ENGRAM_JUDGE_GROUNDING": "off|shadow|on, default off. on: remember / memory add / facts backfill drop an EXTRACTED medication, allergy or diagnosis the memory does not support (listed in data.facts_grounding; re-supply true ones with --facts-json; caller facts are never sent to the judge or dropped). shadow: judge asked and counted, nothing changes. A judge error falls back to today's rules. Sends memory text to TypeSafe. Config: judge.grounding.",
@@ -153,7 +154,7 @@ fn manifest() -> Value {
             "ENGRAM_JUDGE_DEDUPE": "off|shadow|on, default off. Reported only in this build (no command consults it). Config: judge.dedupe.",
             "ENGRAM_JUDGE_RELEVANCE": "off|shadow|on; default on only with a TypeSafe key (an OpenRouter key alone: off unless set). Never under --profile offline. recall asks, in one request, whether each returned passage helps answer the query: each result carries `relevance` (P, 0-1) and metadata.relevance reports { mode, floor, judged, dropped, top_relevance, abstained }. on: results below the floor (0.15) are dropped (one over 2,000 chars is judged on its prefix and kept: relevance_on_prefix); when none clears it recall returns verdict no_match with absence.reason no_candidate_above_cutoff (top_score = best P, threshold = the floor). shadow: scored, nothing dropped. A judge error or 1.5 s timeout returns results unjudged with metadata.relevance.error. Sends the returned passages and the query to TypeSafe. Config: judge.relevance.",
             "ENGRAM_JUDGE_STUB": "Test seam: a scripted offline judge (a JSON number, or an object mapping an instruction substring to an answer, \"*\" fallback). Beats every key, --offline and ENGRAM_BENCH_FORCE_STUB. Never set in production.",
-            "ENGRAM_COMPILER_EXTRACTION_MODEL": "Fact extraction model slug (default openai/gpt-6.1-terra at low reasoning effort)",
+            "ENGRAM_COMPILER_EXTRACTION_MODEL": "Fact extraction model override: a vendor/model slug goes to OpenRouter, a bare id (claude-...) to Anthropic. Default: claude-haiku-5-5 at medium effort with an Anthropic key, else openai/gpt-6.1-terra at low",
             "ENGRAM_RRF_K": "RRF smoothing constant (default: 60)",
             "ENGRAM_COHERE_RERANK_USD_PER_SEARCH": "Optional local price for usage cost estimates; Cohere usage is recorded as search units by default",
             "ENGRAM_INGEST_REQUIRE_SCOPE": "Directory safety gate. Default true: unscoped directory ingest requires --all, --dry-run, --include/--exclude, or --max-files.",
@@ -232,7 +233,7 @@ fn manifest() -> Value {
             "remember": [
                 "File personal facts under --kb personal, work/company facts under --kb business, project context under the project's own KB. Writing to a KB registers it.",
                 "Set --event-time for anything dated — birthdays, anniversaries, when a decision was made. Without it the memory is only findable by content, never by time.",
-                "Check `fact_extraction` in the response. `skipped_no_openrouter_key` means no facts were captured: either configure the key or run `engram facts backfill` later. A `failed*` status also leaves work for backfill.",
+                "Check `fact_extraction` in the response. `skipped_no_openrouter_key` means no facts were captured because no extraction key is set (Anthropic or OpenRouter): configure one or run `engram facts backfill` later. A `failed*` status also leaves work for backfill.",
                 "Never write with `--diary '*'` — it is a read-side wildcard and every write path rejects it with exit 3.",
                 "Handle `adjudication_needed` rather than ignoring it — you have the conversation context the resolver lacks.",
                 "If a write exits 2 saying no Gemini key is configured, do not reach for --offline just to make it pass: a store holding both stub and cloud vectors is what makes `recall` refuse later. Configure the key, or use --offline deliberately for a store you keep offline."
@@ -262,7 +263,11 @@ fn manifest() -> Value {
         "providers": {
             "embeddings": ["gemini-embedding-2 (cloud, 1536 dims)", "stub (offline, deterministic)"],
             "rerankers": ["cohere/rerank-v4.0-pro (cloud)", "passthrough (none)"],
-            "fact_extraction_default": engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL
+            "fact_extraction_default": format!(
+                "{} (Anthropic key), else {} (OpenRouter key)",
+                engram_llm::anthropic::DEFAULT_EXTRACTION_MODEL,
+                engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL
+            )
         },
         "daemon_api": {
             "base": "http://127.0.0.1:8768",

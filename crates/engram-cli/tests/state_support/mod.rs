@@ -29,6 +29,7 @@ pub fn engram(store: &std::path::Path) -> Command {
         "GEMINI_API_KEY_FALLBACKS",
         "COHERE_API_KEY",
         "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
         "TYPESAFE_API_KEY",
         "ENGRAM_JUDGE_STUB",
         "ENGRAM_JUDGE_GROUNDING",

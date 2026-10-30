@@ -25,6 +25,7 @@ pub const LOW_CREDIT_USD: f64 = 1.0;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const OPENROUTER_KEY_URL: &str = "https://openrouter.ai/api/v1/key";
 const OPENROUTER_CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
 const COHERE_RERANK_URL: &str = "https://api.cohere.com/v2/rerank";
@@ -32,6 +33,7 @@ const COHERE_RERANK_URL: &str = "https://api.cohere.com/v2/rerank";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Gemini,
+    Anthropic,
     OpenRouter,
     Cohere,
     TypeSafe,
@@ -41,6 +43,7 @@ impl Provider {
     fn name(self) -> &'static str {
         match self {
             Self::Gemini => "gemini",
+            Self::Anthropic => "anthropic",
             Self::OpenRouter => "openrouter",
             Self::Cohere => "cohere",
             Self::TypeSafe => "typesafe",
@@ -50,9 +53,10 @@ impl Provider {
     fn role(self) -> &'static str {
         match self {
             Self::Gemini => "embeddings for every write and cloud recall",
-            Self::OpenRouter => {
-                "fact extraction on remember, the judge's OpenRouter route"
+            Self::Anthropic => {
+                "fact extraction on remember with Claude Haiku 5.5, ahead of OpenRouter"
             }
+            Self::OpenRouter => "fact extraction on remember, the judge's OpenRouter route",
             Self::Cohere => "rerank in cloud_quality recall",
             Self::TypeSafe => "the optional judge, direct route (judge sites default off)",
         }
@@ -61,7 +65,8 @@ impl Provider {
     fn degrades(self) -> &'static str {
         match self {
             Self::Gemini => "without a serving key, remember/ingest refuse to write (exit 2) and cloud recall is refused; only --offline / --profile offline stub vectors work",
-            Self::OpenRouter => "remember stores memories without facts (fact_extraction: skipped_no_openrouter_key, or failed when the key is broken), and a shadow/on judge site has no route unless TypeSafe is keyed",
+            Self::Anthropic => "unset: fact extraction goes through OpenRouter, or with no OpenRouter key remember stores memories without facts (fact_extraction: skipped_no_openrouter_key); keyed but broken: remember stores memories without facts (fact_extraction: failed), because a keyed Anthropic route never falls back to OpenRouter",
+            Self::OpenRouter => "with no Anthropic key, remember stores memories without facts (fact_extraction: skipped_no_openrouter_key, or failed when the key is broken); a shadow/on judge site has no route unless TypeSafe is keyed",
             Self::Cohere => "unset: recall runs unreranked (reranker passthrough, lower precision); a broken key makes recall fail unless ENGRAM_RERANK_PROVIDER=none",
             Self::TypeSafe => "unset: nothing, and a shadow/on judge site routes through OpenRouter; keyed but broken: every judged call on a shadow/on site fails, because a keyed TypeSafe route never falls back to OpenRouter",
         }
@@ -78,6 +83,7 @@ impl Provider {
     fn console(self) -> &'static str {
         match self {
             Self::Gemini => "https://aistudio.google.com/apikey",
+            Self::Anthropic => "https://platform.claude.com/settings/billing",
             Self::OpenRouter => "https://openrouter.ai/settings/credits",
             Self::Cohere => "https://dashboard.cohere.com/billing",
             Self::TypeSafe => "https://console.typesafe.ai/keys",
@@ -185,7 +191,8 @@ fn round_cents(v: f64) -> f64 {
 
 #[derive(Debug, Clone)]
 pub struct ProviderStatus {
-    /// `gemini`, `gemini_fallback_1`, …, `openrouter`, `cohere`, `typesafe`.
+    /// `gemini`, `gemini_fallback_1`, …, `anthropic`, `openrouter`, `cohere`,
+    /// `typesafe`.
     pub name: String,
     pub provider: Provider,
     pub required: bool,
@@ -278,6 +285,12 @@ fn slots() -> Vec<Slot> {
             key: Some(key),
         });
     }
+    out.push(slot(
+        "anthropic",
+        Provider::Anthropic,
+        "ANTHROPIC_API_KEY",
+        "keys.anthropic",
+    ));
     out.push(slot(
         "openrouter",
         Provider::OpenRouter,
@@ -414,8 +427,16 @@ pub fn advise(statuses: &mut [ProviderStatus], judge_active: bool) {
         .iter()
         .find(|s| s.is_fallback() && s.live == Live::Ok)
         .map(|s| s.name.trim_start_matches("gemini_fallback_").to_string());
+    let openrouter_keyed = statuses
+        .iter()
+        .any(|s| s.provider == Provider::OpenRouter && s.source != "unset");
     for s in statuses.iter_mut() {
-        let (severity, fix) = judge_one(s, serving_fallback.as_deref(), judge_active);
+        let (severity, fix) = judge_one(
+            s,
+            serving_fallback.as_deref(),
+            judge_active,
+            openrouter_keyed,
+        );
         s.severity = severity;
         s.fix = fix;
     }
@@ -425,6 +446,7 @@ fn judge_one(
     s: &ProviderStatus,
     serving_fallback: Option<&str>,
     judge_active: bool,
+    openrouter_keyed: bool,
 ) -> (Severity, Option<String>) {
     let p = s.provider;
     if s.source == "unset" {
@@ -436,9 +458,25 @@ fn judge_one(
                     p.console()
                 )),
             ),
-            Provider::OpenRouter => (
+            // Extraction needs one of the two keys; the warning sits on the
+            // preferred one so a store with neither shows it once.
+            Provider::Anthropic if openrouter_keyed => (
+                Severity::Ok,
+                Some(format!(
+                    "optional: get a key at {} and run `engram config set keys.anthropic <key>` to extract facts with Claude Haiku 5.5 instead of OpenRouter",
+                    key_page(p)
+                )),
+            ),
+            Provider::Anthropic => (
                 Severity::Warning,
-                Some("get a key at https://openrouter.ai/settings/keys and run `engram config set keys.openrouter <key>`; then `engram facts backfill --kb <kb>` extracts facts for memories stored without them".into()),
+                Some(format!(
+                    "no fact-extraction key: get one at {} and run `engram config set keys.anthropic <key>` (or use an OpenRouter key: `engram config set keys.openrouter <key>`); then `engram facts backfill --kb <kb>` extracts facts for memories stored without them",
+                    key_page(p)
+                )),
+            ),
+            Provider::OpenRouter => (
+                Severity::Ok,
+                Some("optional with an Anthropic key: get a key at https://openrouter.ai/settings/keys and run `engram config set keys.openrouter <key>` for OpenRouter extraction models and the judge's OpenRouter route".into()),
             ),
             Provider::Cohere => (
                 Severity::Warning,
@@ -599,6 +637,7 @@ fn failure_fix(s: &ProviderStatus) -> String {
 fn key_page(p: Provider) -> &'static str {
     match p {
         Provider::Gemini => "https://aistudio.google.com/apikey",
+        Provider::Anthropic => "https://platform.claude.com/settings/keys",
         Provider::OpenRouter => "https://openrouter.ai/settings/keys",
         Provider::Cohere => "https://dashboard.cohere.com/api-keys",
         Provider::TypeSafe => "https://console.typesafe.ai/keys",
@@ -641,6 +680,9 @@ pub fn live_from_http(provider: Provider, status: u16, body: &str) -> Live {
         // Gemini answers a bad key with 400 + reason API_KEY_INVALID; any
         // other 400 is not a key problem.
         400 if provider == Provider::Gemini && body.contains("API_KEY_INVALID") => Live::Invalid,
+        // Anthropic documents a 402 billing_error; an empty prepaid balance
+        // has also come back as a 400 saying so.
+        400 if provider == Provider::Anthropic && body.contains("credit balance") => Live::NoCredit,
         401 => Live::Invalid,
         402 => Live::NoCredit,
         403 => Live::Denied,
@@ -699,6 +741,7 @@ async fn probe(client: &reqwest::Client, provider: Provider, key: &str) -> Probe
         _ => {
             let req = match provider {
                 Provider::Gemini => gemini_probe(client, key),
+                Provider::Anthropic => anthropic_probe(client, key),
                 Provider::Cohere => cohere_probe(client, key),
                 _ => typesafe_probe(client, key),
             };
@@ -778,6 +821,20 @@ fn gemini_probe(client: &reqwest::Client, key: &str) -> reqwest::RequestBuilder 
         "content": {"parts": [{"text": "probe"}]},
         "outputDimensionality": 8,
     }))
+}
+
+/// A one-token message to the extraction model: about $0.000002, and unlike
+/// the free models list it fails when the account has no credit.
+fn anthropic_probe(client: &reqwest::Client, key: &str) -> reqwest::RequestBuilder {
+    client
+        .post(ANTHROPIC_MESSAGES_URL)
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": engram_llm::anthropic::DEFAULT_EXTRACTION_MODEL,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "probe"}],
+        }))
 }
 
 fn openrouter_get(client: &reqwest::Client, url: &str, key: &str) -> reqwest::RequestBuilder {
@@ -864,13 +921,21 @@ mod tests {
             live_from_http(Gemini, 429, r#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#),
             Live::QuotaExhausted
         );
-        for p in [OpenRouter, Cohere, TypeSafe] {
+        assert_eq!(
+            live_from_http(
+                Anthropic,
+                400,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#
+            ),
+            Live::NoCredit
+        );
+        for p in [Anthropic, OpenRouter, Cohere, TypeSafe] {
             assert_eq!(live_from_http(p, 401, ""), Live::Invalid);
             assert_eq!(live_from_http(p, 402, ""), Live::NoCredit);
             assert_eq!(live_from_http(p, 403, ""), Live::Denied);
             assert_eq!(live_from_http(p, 429, ""), Live::QuotaExhausted);
             assert_eq!(live_from_http(p, 503, ""), Live::ProbeError);
-            // Only Gemini reads the 400 body.
+            // Only Gemini and Anthropic read the 400 body.
             assert_eq!(live_from_http(p, 400, "API_KEY_INVALID"), Live::ProbeError);
         }
     }
@@ -956,6 +1021,36 @@ mod tests {
     }
 
     #[test]
+    fn a_store_without_an_extraction_key_is_warned_once_on_the_anthropic_row() {
+        let unset = |name: &str, p: Provider| {
+            let mut s = status(name, p, Live::NotProbed);
+            s.source = "unset";
+            s
+        };
+        let mut neither = vec![
+            unset("anthropic", Provider::Anthropic),
+            unset("openrouter", Provider::OpenRouter),
+        ];
+        advise(&mut neither, false);
+        assert_eq!(neither[0].severity, Severity::Warning);
+        assert!(neither[0]
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("keys.openrouter"));
+        assert_eq!(neither[1].severity, Severity::Ok);
+        assert_eq!(next_steps(&neither).len(), 1);
+
+        // An OpenRouter key extracts, so a missing Anthropic key is optional.
+        let mut openrouter_only = vec![
+            unset("anthropic", Provider::Anthropic),
+            status("openrouter", Provider::OpenRouter, Live::NotProbed),
+        ];
+        advise(&mut openrouter_only, false);
+        assert_eq!(openrouter_only[0].severity, Severity::Ok);
+    }
+
+    #[test]
     fn a_broken_typesafe_key_is_an_error_once_a_judge_site_is_live() {
         // A keyed TypeSafe route never falls back to OpenRouter.
         for (active, want) in [(false, Severity::Warning), (true, Severity::Error)] {
@@ -1037,6 +1132,7 @@ mod tests {
     fn every_failure_state_carries_a_next_step() {
         for p in [
             Provider::Gemini,
+            Provider::Anthropic,
             Provider::OpenRouter,
             Provider::Cohere,
             Provider::TypeSafe,
@@ -1069,6 +1165,7 @@ mod tests {
         let c = reqwest::Client::new();
         for req in [
             gemini_probe(&c, key),
+            anthropic_probe(&c, key),
             openrouter_get(&c, OPENROUTER_KEY_URL, key),
             openrouter_get(&c, OPENROUTER_CREDITS_URL, key),
             cohere_probe(&c, key),

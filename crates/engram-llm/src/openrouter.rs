@@ -207,11 +207,11 @@ const MAX_ERROR_BODY_CHARS: usize = 200;
 
 /// The provider's own diagnosis, extracted from the STRUCTURED error field —
 /// never the raw body. OpenRouter (and every OpenAI-shaped provider behind
-/// it) wraps failures as `{"error":{"message":...}}`; that message is the
-/// whole diagnosis ("No auth credentials found", "not a valid model ID"). A
-/// raw-head cap was not enough: a 4xx validation failure can echo the request
-/// back, the request carries the memory being read, and 200 characters of
-/// echo is still an echo. So the error string carries only the parsed message
+/// it) wraps failures as `{"error":{"message":...}}`, and so does Anthropic;
+/// that message is the whole diagnosis ("No auth credentials found", "not a
+/// valid model ID"). A raw-head cap was not enough: a 4xx validation failure
+/// can echo the request back, the request carries the memory being read, and
+/// 200 characters of echo is still an echo. So the error string carries only the parsed message
 /// field (bounded), and an unparseable body is withheld entirely — its full
 /// text goes to `tracing::debug` for operators who opt in with RUST_LOG.
 fn provider_error_message(body: &str) -> Option<String> {
@@ -230,14 +230,14 @@ fn provider_error_message(body: &str) -> Option<String> {
 }
 
 /// The message a non-2xx response renders into.
-fn status_error_message(status: reqwest::StatusCode, body: &str) -> String {
+pub(crate) fn status_error_message(status: reqwest::StatusCode, body: &str) -> String {
     match provider_error_message(body) {
         Some(msg) => format!("status {status}: {msg}"),
         None => {
             tracing::debug!(
                 %status,
                 body_bytes = body.len(),
-                "openrouter non-2xx body withheld from the error: {body}"
+                "provider non-2xx body withheld from the error: {body}"
             );
             format!(
                 "status {status}: provider body withheld ({} bytes, not a structured error; \
@@ -258,7 +258,7 @@ fn status_error_message(status: reqwest::StatusCode, body: &str) -> String {
 /// so dropping a "preview" alone would still copy a slice of the answer.
 /// Category, position and size are what a decode failure is actually diagnosed
 /// from — the same rule engram-graph applies to fact JSON.
-fn decode_failure_message(e: &serde_json::Error, body_len: usize) -> String {
+pub(crate) fn decode_failure_message(e: &serde_json::Error, body_len: usize) -> String {
     format!(
         "decode failed: {} error at line {} column {} ({body_len} bytes of model output withheld)",
         classify_json_error(e),

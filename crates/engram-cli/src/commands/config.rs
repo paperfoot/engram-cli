@@ -85,9 +85,13 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
 
     let gemini_source = describe_key_source("GEMINI_API_KEY", &file_cfg, "keys.gemini");
     let cohere_source = describe_key_source("COHERE_API_KEY", &file_cfg, "keys.cohere");
+    let anthropic_source = describe_key_source("ANTHROPIC_API_KEY", &file_cfg, "keys.anthropic");
     let openrouter_source = describe_key_source("OPENROUTER_API_KEY", &file_cfg, "keys.openrouter");
     let typesafe_source = describe_key_source("TYPESAFE_API_KEY", &file_cfg, "keys.typesafe");
     let chunking = crate::commands::chunks::resolve_policy();
+    // What remember would call: the override when set, else Haiku with an
+    // Anthropic key, else the OpenRouter default.
+    let (extraction_provider, extraction_model) = crate::fact_llm::route();
 
     print_success(
         ctx.format,
@@ -103,6 +107,7 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
                     .map(|k| mask_key(k))
                     .collect::<Vec<_>>(),
                 "cohere": cohere_source,
+                "anthropic": anthropic_source,
                 "openrouter": openrouter_source,
                 "typesafe": typesafe_source,
             },
@@ -140,11 +145,8 @@ pub fn show(ctx: &AppContext) -> Result<(), CliError> {
                 "prompt_format": engram_embed::gemini::PROMPT_FORMAT,
             },
             "compiler": {
-                "extraction_model": resolve_setting(
-                    "ENGRAM_COMPILER_EXTRACTION_MODEL",
-                    "compiler.extraction_model",
-                    engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL,
-                ),
+                "extraction_provider": extraction_provider.name(),
+                "extraction_model": extraction_model,
                 "synthesis_model": resolve_setting(
                     "ENGRAM_COMPILER_SYNTHESIS_MODEL",
                     "compiler.synthesis_model",

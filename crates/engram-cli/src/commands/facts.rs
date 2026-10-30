@@ -1166,7 +1166,7 @@ pub async fn backfill(
     for (i, (memory_kb, memory)) in queue.iter().enumerate() {
         if llm.is_live() {
             ctx.store.record_usage_event(
-                "openrouter",
+                llm.provider(),
                 "facts_backfill_extract",
                 Some(&model),
                 Some(memory_kb),

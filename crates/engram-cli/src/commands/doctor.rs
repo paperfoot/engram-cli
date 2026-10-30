@@ -11,6 +11,8 @@ use std::net::TcpListener;
 pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliError> {
     let gemini = crate::commands::config::resolve_secret("GEMINI_API_KEY", "keys.gemini").is_some();
     let cohere = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere").is_some();
+    let anthropic =
+        crate::commands::config::resolve_secret("ANTHROPIC_API_KEY", "keys.anthropic").is_some();
     let openrouter =
         crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter").is_some();
     let typesafe =
@@ -35,11 +37,10 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
         None
     };
 
-    let extraction_model = crate::commands::config::resolve_setting(
-        "ENGRAM_COMPILER_EXTRACTION_MODEL",
-        "compiler.extraction_model",
-        engram_llm::openrouter::DEFAULT_EXTRACTION_MODEL,
-    );
+    // The route `remember` would take, keyed or not: a missing key is
+    // reported by `extraction_key`, not by a different model.
+    let (extraction_provider, extraction_model) = crate::fact_llm::route();
+    let extraction_keyed = crate::fact_llm::key_configured();
     let synthesis_model = crate::commands::config::resolve_setting(
         "ENGRAM_COMPILER_SYNTHESIS_MODEL",
         "compiler.synthesis_model",
@@ -48,7 +49,7 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
 
     let ok = gemini
         && cohere
-        && (!compiler || openrouter)
+        && (!compiler || extraction_keyed)
         && schema_version >= 4
         && embedding_consistent
         && daemon_port_available
@@ -62,6 +63,7 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
             "keys": {
                 "gemini": if gemini { "present" } else { "missing" },
                 "cohere": if cohere { "present" } else { "missing" },
+                "anthropic": if anthropic { "present" } else { "missing" },
                 "openrouter": if openrouter { "present" } else { "missing" },
                 "typesafe": if typesafe { "present" } else { "missing" },
                 // Presence is not health: a key can sit at zero prepaid
@@ -81,8 +83,10 @@ pub fn run(ctx: &AppContext, compiler: bool, integrity: bool) -> Result<(), CliE
             },
             "compiler": {
                 "llm_requested": compiler,
-                "openrouter_required": compiler,
+                "openrouter_required": compiler && extraction_provider == crate::fact_llm::Provider::OpenRouter,
+                "extraction_provider": extraction_provider.name(),
                 "extraction_model": extraction_model,
+                "extraction_key": if extraction_keyed { "present" } else { "missing" },
                 "synthesis_model": synthesis_model,
             },
             "judge": judge,

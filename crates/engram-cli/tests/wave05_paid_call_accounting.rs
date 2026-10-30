@@ -27,6 +27,7 @@ fn point_at_home(cmd: &mut Command, home: &std::path::Path) {
     cmd.env_remove("GEMINI_API_KEY");
     cmd.env_remove("COHERE_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
+    cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("TYPESAFE_API_KEY");
     cmd.env_remove("GEMINI_API_KEY_FALLBACKS");
     cmd.env_remove("ENGRAM_JUDGE_STUB");

@@ -52,7 +52,7 @@ fn with_every_key_unset_both_surfaces_name_each_provider_and_its_fix() {
             .collect();
         assert_eq!(
             names,
-            ["gemini", "openrouter", "cohere", "typesafe"],
+            ["gemini", "anthropic", "openrouter", "cohere", "typesafe"],
             "{args:?}"
         );
         for p in providers(&v) {
@@ -70,6 +70,9 @@ fn with_every_key_unset_both_surfaces_name_each_provider_and_its_fix() {
         }
         assert_eq!(by_name(&v, "gemini")["severity"], "error", "{args:?}");
         assert_eq!(by_name(&v, "gemini")["required"], true, "{args:?}");
+        // No extraction key: one warning, on the preferred provider.
+        assert_eq!(by_name(&v, "anthropic")["severity"], "warning", "{args:?}");
+        assert_eq!(by_name(&v, "openrouter")["severity"], "ok", "{args:?}");
         let steps = v["data"]["next_steps"].as_array().expect("next_steps");
         assert!(
             steps[0].as_str().unwrap().starts_with("gemini (error): "),

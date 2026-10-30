@@ -272,16 +272,14 @@ pub async fn run(ctx: &AppContext, args: RememberArgs) -> Result<(), CliError> {
     };
 
     // The KB budget guards PAID calls: cloud embedding, LLM extraction /
-    // adjudication (which run whenever an OpenRouter key resolves and
+    // adjudication (which run whenever an extraction key resolves and
     // --no-extract-facts was not passed), and the grounding judge (resolved
     // only when grounding is shadow/on and a judge is reachable, and it
     // grounds --facts-json batches too). A fully offline write spends
     // nothing, so a zero spend cap must not block it — a free operation
     // failing with a budget error is a new failure mode with no money
     // behind it.
-    let extraction_may_spend = !no_extract_facts
-        && crate::commands::config::resolve_secret("OPENROUTER_API_KEY", "keys.openrouter")
-            .is_some();
+    let extraction_may_spend = !no_extract_facts && crate::fact_llm::key_configured();
     if write_embedder.cloud
         || extraction_may_spend
         || grounding.is_some()
@@ -909,7 +907,7 @@ async fn extract_into(
     let model = llm.model();
     if llm.is_live() {
         if let Err(e) = ctx.store.record_usage_event(
-            "openrouter",
+            llm.provider(),
             "remember_fact_extract",
             Some(&model),
             Some(kb),
@@ -968,7 +966,7 @@ mod tests {
         assert!(ExtractionStatus::CallerSupplied.note("personal").is_none());
 
         let skipped = ExtractionStatus::SkippedNoKey.note("personal").unwrap();
-        assert!(skipped.contains("OPENROUTER_API_KEY"));
+        assert!(skipped.contains("ANTHROPIC_API_KEY") && skipped.contains("OPENROUTER_API_KEY"));
         assert!(skipped.contains("facts backfill"));
 
         let failed = ExtractionStatus::Failed("429 rate limited".into())

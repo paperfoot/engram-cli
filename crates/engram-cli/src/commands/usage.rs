@@ -122,7 +122,7 @@ pub fn run(ctx: &AppContext, kb: Option<String>, since: Option<String>) -> Resul
             "notes": [
                 "Gemini embedding tokens are estimated locally as chars/4 because the embedding REST response does not expose billed token counts in this client path.",
                 "Cohere rerank usage is tracked as search_units. Set ENGRAM_COHERE_RERANK_USD_PER_SEARCH to add local cost estimates.",
-                "OpenRouter extraction/synthesis prompt/completion tokens are recorded when the provider response includes usage; costs are not estimated locally because model pricing varies by route."
+                "Fact-extraction calls (Anthropic or OpenRouter) and synthesis are recorded per call under their provider; costs are not estimated locally because model pricing varies by route."
             ]
         }),
         meta,

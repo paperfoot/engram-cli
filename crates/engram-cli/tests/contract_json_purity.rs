@@ -50,6 +50,7 @@ fn bare_cmd_in(home: &Path) -> Command {
     cmd.env_remove("GEMINI_API_KEY");
     cmd.env_remove("COHERE_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
+    cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("TYPESAFE_API_KEY");
     cmd.env_remove("GEMINI_API_KEY_FALLBACKS");
     cmd.env_remove("ENGRAM_JUDGE_STUB");

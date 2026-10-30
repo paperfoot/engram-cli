@@ -7,6 +7,7 @@
 //!  - Judging answer correctness vs gold (LLM-as-judge)
 //!  - Computing RAGAS metrics (faithfulness, relevance, etc.)
 
+pub mod anthropic;
 pub mod error;
 pub mod judge;
 pub mod openrouter;
