@@ -930,14 +930,16 @@ pub(crate) fn says(text: &str, needle: &str) -> bool {
     }
     // A letter or digit that would run into its neighbour: every digit, and
     // every letter except those of scripts written without spaces (Thai, Lao,
-    // Myanmar, Khmer, Hangul, and CJK through Yi, compatibility ideographs and
-    // the supplementary ideograph planes). Fullwidth Latin keeps its edges.
+    // Myanmar, Khmer, Hangul, CJK through Yi, compatibility ideographs,
+    // halfwidth katakana and the supplementary ideograph planes). Fullwidth
+    // Latin keeps its edges.
     let spaced = |c: char| {
         c.is_numeric()
             || (c.is_alphabetic()
                 && !matches!(c as u32,
                     0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1100..=0x11FF | 0x1780..=0x17FF
-                    | 0x2E80..=0xA4CF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0x20000..=0x3FFFF))
+                    | 0x2E80..=0xA4CF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF66..=0xFF9F
+                    | 0x20000..=0x3FFFF))
     };
     let first = needle.chars().next().is_some_and(spaced);
     let last = needle.chars().next_back().is_some_and(spaced);
@@ -6823,6 +6825,7 @@ mod tests {
         // Fullwidth Latin and digits in any script keep their edges.
         assert!(!says("Ana cleared the ａｒｃｈｉｖｅ.", "ＨＩＶ"));
         assert!(!says("๑๕๐ mg metoprolol", "๕๐ mg metoprolol"));
+        assert!(says("ﾀﾅｶはﾍﾟﾆｼﾘﾝｱﾚﾙｷﾞｰ。金曜再診。", "ﾍﾟﾆｼﾘﾝ"));
     }
 
     #[test]
