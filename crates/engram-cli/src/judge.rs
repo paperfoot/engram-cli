@@ -135,7 +135,12 @@ impl JudgeSite {
     /// other site, and every site without consent, is off.
     pub fn default_mode(self, consented: bool) -> JudgeMode {
         match self {
-            JudgeSite::Relevance | JudgeSite::Adjudicate if consented => JudgeMode::On,
+            JudgeSite::Adjudicate if consented => JudgeMode::On,
+            // Scored, never dropped: dropping below the floor cost answer
+            // accuracy 88% -> 74% on LongMemEval (311 questions), mostly on
+            // temporal questions whose evidence is spread over passages that
+            // do not answer alone. `on` remains one setting away.
+            JudgeSite::Relevance if consented => JudgeMode::Shadow,
             _ => JudgeMode::Off,
         }
     }
@@ -182,11 +187,6 @@ pub fn mode_source(site: JudgeSite) -> String {
     default_why(site, typesafe_consented())
 }
 
-/// True when `site`'s mode was chosen (env or config), not defaulted.
-pub fn mode_is_set(site: JudgeSite) -> bool {
-    mode_set_by_env(site) || mode_set_in_config(site)
-}
-
 fn mode_set_by_env(site: JudgeSite) -> bool {
     std::env::var(site.env_var()).is_ok_and(|v| !v.trim().is_empty())
 }
@@ -202,7 +202,12 @@ fn default_why(site: JudgeSite, consented: bool) -> String {
             "default on: a TypeSafe key is configured, which opts into TypeSafe judging; \
              `engram config set {key} off` stops it"
         ),
-        _ if site.default_mode(true) == JudgeMode::On => format!(
+        JudgeMode::Shadow => format!(
+            "default shadow: a TypeSafe key is configured, which opts into TypeSafe judging; \
+             results are scored and none dropped. `engram config set {key} on` drops those \
+             below the floor; `engram config set {key} off` stops it"
+        ),
+        _ if site.default_mode(true) != JudgeMode::Off => format!(
             "default off: no TypeSafe key is configured, and an OpenRouter key alone is not \
              consent to send memory text to TypeSafe; `engram config set {key} on` opts in \
              through either key"
@@ -521,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn relevance_defaults_on_only_when_typesafe_itself_is_configured() {
+    fn relevance_defaults_to_shadow_only_when_typesafe_itself_is_configured() {
         let site = JudgeSite::Relevance;
         // Only an OpenRouter key (set for extraction): no consent, off.
         assert_eq!(
@@ -532,10 +537,10 @@ mod tests {
             mode_from(site, Some(" "), no_file, || false).unwrap(),
             JudgeMode::Off
         );
-        // A TypeSafe key is consent: on.
+        // A TypeSafe key is consent: shadow (scored, nothing dropped).
         assert_eq!(
             mode_from(site, None, no_file, || true).unwrap(),
-            JudgeMode::On
+            JudgeMode::Shadow
         );
         // An explicit setting works through either route.
         for m in ["on", "shadow"] {
@@ -553,7 +558,7 @@ mod tests {
         );
         let site = JudgeSite::Relevance;
         assert!(default_why(site, false).starts_with("default off: no TypeSafe key"));
-        assert!(default_why(site, true).starts_with("default on"));
+        assert!(default_why(site, true).starts_with("default shadow"));
         assert!(default_why(JudgeSite::Grounding, true).starts_with("default off"));
     }
 
@@ -600,15 +605,16 @@ mod tests {
     }
 
     #[test]
-    fn relevance_alone_defaults_on_and_off_still_turns_it_off() {
+    fn relevance_alone_defaults_to_shadow_and_off_still_turns_it_off() {
         assert_eq!(
             mode_ts(JudgeSite::Relevance, None, no_file).unwrap(),
-            JudgeMode::On
+            JudgeMode::Shadow
         );
         assert_eq!(
             mode_ts(JudgeSite::Relevance, Some(" "), no_file).unwrap(),
-            JudgeMode::On
+            JudgeMode::Shadow
         );
+        assert!(default_why(JudgeSite::Relevance, true).starts_with("default shadow"));
         assert_eq!(
             mode_ts(JudgeSite::Relevance, Some("off"), no_file).unwrap(),
             JudgeMode::Off
@@ -625,7 +631,7 @@ mod tests {
         for site in [JudgeSite::Grounding, JudgeSite::Dedupe] {
             assert_eq!(mode_ts(site, None, no_file).unwrap(), JudgeMode::Off);
         }
-        // The adjudicator follows the same consent rule as relevance.
+        // The adjudicator follows the same consent rule, and defaults on.
         let adj = JudgeSite::Adjudicate;
         assert_eq!(mode_ts(adj, None, no_file).unwrap(), JudgeMode::On);
         assert_eq!(

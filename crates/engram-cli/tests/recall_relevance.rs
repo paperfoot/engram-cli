@@ -2,7 +2,7 @@
 //!
 //! Fused and reranked scores are ranks: a query about something the store
 //! never heard of used to come back as `verdict: results` with its nearest
-//! neighbours. The relevance judge (`judge.relevance`, default on) scores
+//! neighbours. The relevance judge (`judge.relevance`, default shadow) scores
 //! each returned passage in one request; under `on` the ones below the floor
 //! are dropped and an all-dropped recall is `no_match` with reason
 //! `no_candidate_above_cutoff`. A judge that gives no answer changes nothing.
@@ -64,13 +64,33 @@ fn contents(v: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Shadow by default: an unknown subject comes back scored, nothing
+/// dropped. Dropping cost answer accuracy in evaluation, so only an
+/// explicit `on` filters.
 #[test]
-fn on_by_default_an_unknown_subject_is_no_match_below_the_cutoff() {
+fn shadow_by_default_scores_without_dropping() {
     let tmp = seeded();
     let v = recall(
         tmp.path(),
         "What is Rosalie's blood type?",
         None,
+        Some("0.01"),
+    );
+    assert_eq!(v["data"]["verdict"], "results", "{v}");
+    assert_eq!(contents(&v).len(), 2, "{v}");
+    let meta = &v["metadata"]["relevance"];
+    assert_eq!(meta["mode"], "shadow", "{v}");
+    assert_eq!(meta["dropped"], 0, "{v}");
+    assert_eq!(meta["abstained"], false, "{v}");
+}
+
+#[test]
+fn on_an_unknown_subject_is_no_match_below_the_cutoff() {
+    let tmp = seeded();
+    let v = recall(
+        tmp.path(),
+        "What is Rosalie's blood type?",
+        Some("on"),
         Some("0.01"),
     );
     assert_eq!(v["data"]["verdict"], "no_match", "{v}");
@@ -141,7 +161,7 @@ fn a_judge_that_gives_no_answer_changes_nothing() {
 #[test]
 fn off_or_no_judge_keeps_todays_recall() {
     let tmp = seeded();
-    // No key and no stub: the default-on site has no judge to ask.
+    // No key and no stub: the site has no judge to ask.
     let v = recall(tmp.path(), "What is Rosalie's blood type?", None, None);
     assert_eq!(v["data"]["verdict"], "results", "{v}");
     assert!(v["metadata"].get("relevance").is_none(), "{v}");
@@ -183,10 +203,10 @@ fn the_judge_sees_the_memory_date() {
 }
 
 /// An OpenRouter key was set for extraction; it is not consent to send
-/// recalled passages to TypeSafe. Only a TypeSafe key turns the default on,
+/// recalled passages to TypeSafe. Only a TypeSafe key turns the default to shadow,
 /// and `config show` says which default applies.
 #[test]
-fn only_a_typesafe_key_turns_relevance_on_by_default() {
+fn only_a_typesafe_key_turns_relevance_shadow_by_default() {
     let tmp = store();
     let show = |env: (&str, &str)| {
         let mut cmd = engram(tmp.path());
@@ -213,13 +233,13 @@ fn only_a_typesafe_key_turns_relevance_on_by_default() {
     );
     let v = show(("TYPESAFE_API_KEY", "ts-test"));
     let j = &v["data"]["judge"];
-    assert_eq!(j["relevance"], "on", "{v}");
+    assert_eq!(j["relevance"], "shadow", "{v}");
     assert_eq!(j["adjudicate"], "on", "{v}");
     assert!(
         j["relevance_source"]
             .as_str()
             .unwrap()
-            .starts_with("default on"),
+            .starts_with("default shadow"),
         "{v}"
     );
     // An explicit setting opts in through the OpenRouter route.
