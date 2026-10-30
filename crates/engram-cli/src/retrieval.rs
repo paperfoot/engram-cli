@@ -179,10 +179,8 @@ pub fn resolve_retrieval_backends(
     // Past the guard above, `cloud_embedder` is exactly the old
     // `profile != Offline && !force_stub` conjunction — a stub read never buys a
     // paid reranker.
-    let use_cohere = cloud_embedder
-        && cohere_key.is_some()
-        && !crate::commands::config::rerank_disabled()
-        && !judge_ranks();
+    let use_cohere =
+        cloud_embedder && cohere_key.is_some() && !crate::commands::config::rerank_disabled();
 
     let embedder: Box<dyn Embedder> = match choice {
         EmbedderChoice::Cloud(key) => Box::new(cloud_gemini(key)),
@@ -784,9 +782,6 @@ pub struct RelevanceJudge {
     /// Judge the rerank pool alongside the rerank (see
     /// [`RelevanceJudge::window`]) rather than walking it afterwards.
     concurrent: bool,
-    /// EXPERIMENT (`ENGRAM_RECALL_RANKER=jev`): order the pool by the
-    /// judge's P(answers) instead of a Cohere rerank.
-    ranks: bool,
 }
 
 /// The whole relevance call, retries included, gets this long. The judge
@@ -816,14 +811,6 @@ fn relevance_window() -> bool {
             "off" | "0" | "false" | "no"
         )
     })
-}
-
-/// EXPERIMENT, off by default: `ENGRAM_RECALL_RANKER=jev` ranks the fused
-/// pool by the relevance judge's P(answers) and skips the Cohere rerank, so
-/// a recall waits on one provider call after the embedding instead of two.
-/// Kept behind a variable until an evaluation says it ranks as well.
-pub fn judge_ranks() -> bool {
-    std::env::var("ENGRAM_RECALL_RANKER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("jev"))
 }
 
 /// Candidates per judge request. With the judge active, recall hands it the
@@ -892,7 +879,6 @@ impl RelevanceJudge {
                 judge,
                 deadline: relevance_deadline(),
                 concurrent: relevance_window(),
-                ranks: judge_ranks(),
             }),
         )
     }
@@ -1264,7 +1250,7 @@ pub async fn warm_provider_connections() {
         }
     };
     let rerank = async {
-        let off = crate::commands::config::rerank_disabled() || judge_ranks();
+        let off = crate::commands::config::rerank_disabled();
         if let Some(key) = crate::commands::config::resolve_secret("COHERE_API_KEY", "keys.cohere")
             .filter(|_| !off)
         {
@@ -1650,16 +1636,7 @@ where
                 tokio::join!(rerank, judge.window(params.query, &passages));
             timings.rerank_ms = rerank_ms;
             timings.judge_ms = judge_ms;
-            let mut reranked = reranked?;
-            if judge.ranks && prejudged.error.is_none() {
-                // Highest P(answers) first; unanswered last; ties keep the
-                // fused order (the sort is stable).
-                reranked.sort_by(|a, b| {
-                    let pa = prejudged.relevance(a.original_index);
-                    let pb = prejudged.relevance(b.original_index);
-                    pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
+            let reranked = reranked?;
             (reranked, Some(prejudged))
         }
         None => {
@@ -1853,7 +1830,6 @@ mod tests {
             judge: Box::new(engram_llm::judge::stub::StubJudge::parse(spec).unwrap()),
             deadline: RELEVANCE_DEADLINE,
             concurrent: true,
-            ranks: false,
         }
     }
 
@@ -2032,7 +2008,6 @@ mod tests {
             judge: Box::new(engram_llm::judge::stub::StubJudge::parse("0.01").unwrap()),
             deadline: std::time::Duration::ZERO,
             concurrent: true,
-            ranks: false,
         };
         let report = judge.apply(&store, "anything", &mut results, 10).await;
         assert_eq!(report.judged, 0);
@@ -2166,7 +2141,6 @@ mod tests {
             judge: Box::new(SlowSecondPart),
             deadline: std::time::Duration::from_millis(50),
             concurrent: true,
-            ranks: false,
         };
         let pool: Vec<(String, String, Option<String>)> = (0..70)
             .map(|i| (format!("r{i}"), format!("passage {i}"), None))
@@ -2193,7 +2167,6 @@ mod tests {
             judge: Box::new(MissThenHang(Default::default())),
             deadline: std::time::Duration::from_millis(50),
             concurrent: true,
-            ranks: false,
         };
         let report = judge.apply(&store, "anything", &mut results, 10).await;
         assert_eq!(report.judged, 10);
@@ -2223,7 +2196,6 @@ mod tests {
             judge: Box::new(Hanging),
             deadline: std::time::Duration::from_millis(50),
             concurrent: true,
-            ranks: false,
         };
         let started = std::time::Instant::now();
         let report = judge
