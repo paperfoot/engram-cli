@@ -319,7 +319,7 @@ pub struct HybridResult {
 /// Identifier of the answer-context envelope, reported by `engram agent-info`
 /// so a reader can tell which frame it is parsing. Bump it if the shape ever
 /// changes; do not change the shape without bumping it.
-pub const ANSWER_CONTEXT_FORMAT: &str = "engram-result/1";
+pub const ANSWER_CONTEXT_FORMAT: &str = "engram-result/2";
 
 /// The one-line warning that opens every non-empty answer context. Kept on a
 /// single line so the envelope stays line-parseable, and ASCII-only so no
@@ -369,13 +369,22 @@ where
                     .or_else(|| c.chunk_id.map(|id| id.to_string()))
             })
             .unwrap_or_else(|| r.id.to_string());
+        // When the passage happened (its memory's event time, else when it
+        // was stored): the one attribute that lets a reader prefer the newer
+        // of two passages that disagree.
+        let date = r
+            .provenance
+            .observed_at
+            .map(|t| format!(" date=\"{}\"", t.format("%Y-%m-%d")))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "<engram-result n=\"{}\" kind=\"{}\" kb=\"{}\" id=\"{}\" source=\"{}\">\n{}\n</engram-result>\n",
+            "<engram-result n=\"{}\" kind=\"{}\" kb=\"{}\" id=\"{}\" source=\"{}\"{}>\n{}\n</engram-result>\n",
             i + 1,
             escape_attr(&r.kind),
             escape_attr(&r.kb),
             escape_attr(&r.id.to_string()),
             escape_attr(&citation),
+            date,
             escape_engram_tags(r.content.trim()),
         ));
     }
@@ -1280,6 +1289,16 @@ where
         });
     }
 
+    // Every passage carries when it happened, so an agent can tell the old
+    // value from the new one. A failed lookup leaves the date unknown rather
+    // than failing the read.
+    let memory_ids: Vec<Uuid> = results.iter().filter_map(|r| r.provenance.memory_id).collect();
+    if let Ok(dates) = store.memory_dates(&memory_ids) {
+        for r in &mut results {
+            r.provenance.observed_at = r.provenance.memory_id.and_then(|m| dates.get(&m).copied());
+        }
+    }
+
     Ok(RecallOutcome {
         results,
         notes,
@@ -1760,6 +1779,19 @@ mod tests {
             1,
             "{ctx}"
         );
+    }
+
+    #[test]
+    fn a_dated_passage_says_when_it_happened() {
+        let mut r = result("chunk", "personal", "Ana moved to Lisbon.");
+        r.provenance.observed_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-03-01T09:30:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let ctx = render_answer_context(&vec![r, result("chunk", "personal", "undated")]);
+        assert!(ctx.contains(" date=\"2026-03-01\">\nAna moved to Lisbon."), "{ctx}");
+        assert_eq!(ctx.matches(" date=").count(), 1, "no date is invented: {ctx}");
     }
 
     #[test]

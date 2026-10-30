@@ -3640,6 +3640,37 @@ impl SqliteStore {
             .map_err(StorageError::from)
     }
 
+    /// When each memory happened — its event time, else when it was stored —
+    /// so a reader can tell an old passage from a new one. Unknown ids are
+    /// simply absent from the map.
+    pub fn memory_dates(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, chrono::DateTime<chrono::Utc>>, StorageError> {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let marks = vec!["?"; ids.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, COALESCE(event_time, created_at) FROM memories WHERE id IN ({marks})"
+        ))?;
+        let params: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (id, at) = row?;
+            let (Ok(id), Some(at)) = (Uuid::parse_str(&id), at) else {
+                continue;
+            };
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&at) {
+                out.insert(id, t.with_timezone(&chrono::Utc));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn citations_for_chunk(&self, chunk_id: Uuid) -> Result<Vec<SourceCitation>, StorageError> {
         // A chunk cites its document/section/source as a whole. Precise char
         // spans belong to individual claims (see citations_for_claim), not to
