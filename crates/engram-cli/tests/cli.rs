@@ -3143,6 +3143,51 @@ fn a_passage_whose_fact_changed_says_what_holds_now() {
     assert!(updates.iter().any(|x| x["now"] == "Lisbon" && x["was"] == "Porto"), "{full}");
 }
 
+/// The conflicts list never prints a forgotten value, and a recorded stop is
+/// not trimmed away with the superseded history.
+#[test]
+fn conflicts_show_only_visible_facts_and_keep_recorded_stops() {
+    let (tmp, _) = with_isolated_home();
+    let remember = |text: &str, facts: &str, extra: &[&str]| -> Value {
+        let mut args = vec!["remember", text, "--kb", "p", "--facts-json", facts, "--offline"];
+        args.extend_from_slice(extra);
+        json_cmd(&tmp, &args)
+    };
+    remember("Ana takes atorvastatin 10 mg.", r#"[{"subject":"Ana","predicate":"takes_medication","object":"atorvastatin 10 mg"}]"#, &[]);
+    let second = remember(
+        "Ana takes atorvastatin 20 mg.",
+        r#"[{"subject":"Ana","predicate":"takes_medication","object":"atorvastatin 20 mg"}]"#,
+        &["--autonomy", "strict"],
+    );
+    let v = json_cmd(&tmp, &["recall", "atorvastatin", "--profile", "offline"]);
+    assert!(v["data"]["conflicts"].as_array().unwrap().iter().any(|c| c["status"] == "contested"), "{v}");
+    let handle = second["data"]["handle"].as_str().unwrap().to_string();
+    json_cmd(&tmp, &["forget", &handle, "--confirm"]);
+    let out = cmd_in(&tmp)
+        .args(["recall", "atorvastatin", "--profile", "offline", "--full", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        !String::from_utf8_lossy(&out).contains("20 mg"),
+        "a forgotten value must not come back through conflicts"
+    );
+
+    remember("Leo takes metformin.", r#"[{"subject":"Leo","predicate":"takes_medication","object":"metformin"}]"#, &["--event-time", "2024-01-01"]);
+    remember(
+        "Leo stopped metformin in May.",
+        r#"[{"subject":"Leo","predicate":"takes_medication","object":"metformin","state":"ended","valid_until":"2026-05-01"}]"#,
+        &["--event-time", "2026-03-01"],
+    );
+    let v = json_cmd(&tmp, &["recall", "Leo metformin", "--profile", "offline"]);
+    assert!(
+        v["data"]["conflicts"].as_array().unwrap().iter().any(|c| c["status"] == "ended"),
+        "a recorded stop stays in the default list: {v}"
+    );
+}
+
 /// FINDING 5 (major): `remember --event-time` accepts `YYYY-MM-DD` and its help
 /// says it drives `recall --since/--until`, but the reader was RFC3339-only, so
 /// the documented round-trip exited 3. A date-only bound now brackets the whole

@@ -3679,6 +3679,56 @@ impl SqliteStore {
             .map_err(StorageError::from)
     }
 
+    /// The facts among `ids` a reader may still see: the memory each came
+    /// from is live and unexpired, and has not been edited since the fact was
+    /// written (an edit removes the text the fact quoted). Used to keep
+    /// forgotten or edited-away values out of recall's conflicts.
+    pub fn visible_facts(&self, ids: &[Uuid]) -> Result<std::collections::HashSet<Uuid>, StorageError> {
+        let mut out = std::collections::HashSet::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let marks = vec!["?"; ids.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT f.id, f.created_at, m.valid_until,
+                    (SELECT MAX(e.ts) FROM events e WHERE e.subject_id = m.id AND e.kind = 'memory.revised')
+             FROM facts f JOIN memories m ON m.id = f.source_memory_id
+             WHERE f.id IN ({marks}) AND m.deleted = 0"
+        ))?;
+        let params: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let instant = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc))
+        };
+        let now = chrono::Utc::now();
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, created, until, revised) = row?;
+            let expired = until.as_deref().is_some_and(|u| instant(u).map_or(true, |u| u <= now));
+            // MAX(ts) over strings is only a candidate; the comparison that
+            // decides is between instants.
+            let edited_after = revised
+                .as_deref()
+                .and_then(instant)
+                .zip(instant(&created))
+                .is_some_and(|(edit, made)| made < edit);
+            if !expired && !edited_after {
+                if let Ok(id) = Uuid::parse_str(&id) {
+                    out.insert(id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// What has changed since each memory was written: its facts that were
     /// later superseded or ended, each followed to the value that holds now.
     ///
@@ -3698,7 +3748,9 @@ impl SqliteStore {
     /// - "ended" needs a close the safety gate itself allows (`may_close`):
     ///   for a safety relation an explicit end or a person's decision, so a
     ///   heuristic or refused proposal never reads as an ending — and no open
-    ///   fact with the same value.
+    ///   fact with the same value. An event's end is not reported (events end
+    ///   by their nature), nor an end the passage itself states or one still
+    ///   to come: only an end after the memory's own date and before now.
     pub fn fact_changes_for_memories(&self, ids: &[Uuid]) -> Result<Vec<FactChange>, StorageError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -3729,7 +3781,8 @@ impl SqliteStore {
             }
         }
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {cols} FROM facts f JOIN memories m ON m.id = f.source_memory_id
+            "SELECT {cols}, COALESCE(m.event_time, m.created_at) FROM facts f
+             JOIN memories m ON m.id = f.source_memory_id
              WHERE f.source_memory_id IN ({marks})
                AND f.kb = m.kb AND f.diary = m.diary
                AND (f.superseded_by IS NOT NULL
@@ -3737,8 +3790,17 @@ impl SqliteStore {
              ORDER BY f.source_memory_id, f.created_at, f.id",
             cols = fact_columns("f.")
         ))?;
-        let closed: Vec<engram_core::types::Fact> = stmt
-            .query_map(rusqlite::params_from_iter(params.iter()), parse_fact_row)?
+        // Each fact with the date of the memory it came from: an ending is
+        // news only if it falls after that date.
+        let closed: Vec<(engram_core::types::Fact, Option<chrono::DateTime<chrono::Utc>>)> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                let at: Option<String> = r.get(22)?;
+                Ok((
+                    parse_fact_row(r)?,
+                    at.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc)),
+                ))
+            })?
             .collect::<Result<_, _>>()?;
         drop(stmt);
         let in_scope = |f: &engram_core::types::Fact, kb: &str, diary: &str| -> Result<bool, StorageError> {
@@ -3766,7 +3828,7 @@ impl SqliteStore {
             })
         };
         let mut out = Vec::new();
-        for old in closed {
+        for (old, memory_date) in closed {
             if revised.get(&old.source_memory_id).is_some_and(|edit| old.created_at < *edit) {
                 continue;
             }
@@ -3823,23 +3885,60 @@ impl SqliteStore {
                             }
                         }
                     }
+                    let now = chrono::Utc::now();
                     let from = current.valid_from.unwrap_or(current.created_at);
                     let change = if !rivals.is_empty() {
                         let mut values = vec![current.object.clone()];
                         values.extend(rivals);
-                        FactChangeKind::Disputed { values }
-                    } else if from > chrono::Utc::now() {
-                        FactChangeKind::Scheduled {
-                            value: current.object.clone(),
-                            from,
-                        }
+                        (FactChangeKind::Disputed { values }, Some(current.id))
+                    } else if from <= now {
+                        (
+                            FactChangeKind::Now {
+                                value: current.object.clone(),
+                                since: from,
+                            },
+                            Some(current.id),
+                        )
                     } else {
-                        FactChangeKind::Now {
-                            value: current.object.clone(),
-                            since: from,
+                        // The newest value starts later. What holds today is
+                        // the last value in the chain already in force; if
+                        // none is, the passage's own value holds until the
+                        // FIRST successor starts.
+                        let mut in_force: Option<engram_core::types::Fact> = None;
+                        let mut first_future: Option<engram_core::types::Fact> = None;
+                        let mut at = old.superseded_by;
+                        let mut guard = std::collections::HashSet::new();
+                        while let Some(id) = at {
+                            if !guard.insert(id) {
+                                break;
+                            }
+                            let Some(f) = self.get_fact(id)? else { break };
+                            if f.valid_from.unwrap_or(f.created_at) <= now {
+                                in_force = Some(f.clone());
+                            } else if first_future.is_none() {
+                                first_future = Some(f.clone());
+                            }
+                            at = f.superseded_by;
+                        }
+                        match (in_force, first_future) {
+                            (Some(f), _) => (
+                                FactChangeKind::Now {
+                                    value: f.object.clone(),
+                                    since: f.valid_from.unwrap_or(f.created_at),
+                                },
+                                Some(f.id),
+                            ),
+                            (None, Some(f)) => (
+                                FactChangeKind::Scheduled {
+                                    value: f.object.clone(),
+                                    from: f.valid_from.unwrap_or(f.created_at),
+                                },
+                                Some(f.id),
+                            ),
+                            (None, None) => (retired, None),
                         }
                     };
-                    (change, Some(current.id))
+                    change
                 }
             } else {
                 // Exactly the safety gate's rule: a safety relation ends only on
@@ -3862,18 +3961,40 @@ impl SqliteStore {
                 {
                     continue;
                 }
-                let still_open: bool = self
-                    .conn
-                    .query_row(
-                        &format!(
-                            "SELECT EXISTS(SELECT 1 FROM facts WHERE kb = ?1 AND diary = ?2
-                               AND subject_norm = ?3 AND predicate = ?4 AND object_norm = ?5
-                               AND {OPEN_INTERVAL_PREDICATE})"
-                        ),
+                // An event ends by its nature; "the conference ended" under the
+                // passage that describes it tells a reader nothing.
+                if old.fact_type == engram_core::types::FactType::Event {
+                    continue;
+                }
+                // News only if it ended after the passage was written and has
+                // already ended: an end the passage itself states ("Fauvism
+                // flourished until 1908") or one still to come is not a change.
+                let ended_at = old.valid_until.unwrap_or(old.created_at);
+                if memory_date.is_some_and(|m| ended_at <= m) || ended_at > chrono::Utc::now() {
+                    continue;
+                }
+                // Still current if an open fact with the same value is already
+                // in force; a restart that only begins in the future does not
+                // undo today's stop.
+                let starts: Vec<Option<String>> = {
+                    let mut stmt = self.conn.prepare(&format!(
+                        "SELECT valid_from FROM facts WHERE kb = ?1 AND diary = ?2
+                           AND subject_norm = ?3 AND predicate = ?4 AND object_norm = ?5
+                           AND {OPEN_INTERVAL_PREDICATE}"
+                    ))?;
+                    let rows = stmt.query_map(
                         params![old.kb, old.diary, old.subject_norm, old.predicate, old.object_norm],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(true);
+                        |r| r.get::<_, Option<String>>(0),
+                    )?;
+                    rows.collect::<Result<_, _>>()?
+                };
+                let now = chrono::Utc::now();
+                let still_open = starts.iter().any(|from| match from {
+                    None => true,
+                    Some(t) => chrono::DateTime::parse_from_rfc3339(t)
+                        .map(|t| t.with_timezone(&chrono::Utc) <= now)
+                        .unwrap_or(true),
+                });
                 if still_open {
                     continue;
                 }
@@ -8285,6 +8406,36 @@ mod present_tense_tests {
             matches!(line.change, FactChangeKind::Retired { since } if since.format("%Y-%m-%d").to_string() == "2026-03-01"),
             "{line:?}"
         );
+    }
+
+    #[test]
+    fn a_future_value_at_the_end_of_a_chain_leaves_todays_value_current() {
+        let s = store();
+        let porto = fact(&s, "Porto", "default");
+        let lisbon = fact(&s, "Lisbon", "default");
+        let madrid = fact(&s, "Madrid", "default");
+        s.conn
+            .execute("UPDATE facts SET valid_from = '2030-01-01T00:00:00+00:00' WHERE id = ?1", params![madrid.id.to_string()])
+            .unwrap();
+        supersede(&s, &porto, &lisbon);
+        supersede(&s, &lisbon, &madrid);
+        let c = changes(&s);
+        let line = c.iter().find(|c| c.fact_id == porto.id).unwrap();
+        assert!(matches!(&line.change, FactChangeKind::Now { value, .. } if value == "Lisbon"), "{line:?}");
+        assert_eq!(line.current_fact_id, Some(lisbon.id));
+    }
+
+    #[test]
+    fn a_restart_that_begins_later_does_not_undo_todays_stop() {
+        let s = store();
+        let metformin = fact_p(&s, "takes_medication", "metformin", "default");
+        close(&s, &metformin, "stopped");
+        let restart = fact_p(&s, "takes_medication", "metformin", "default");
+        s.conn
+            .execute("UPDATE facts SET valid_from = '2030-01-01T00:00:00+00:00' WHERE id = ?1", params![restart.id.to_string()])
+            .unwrap();
+        let c = changes(&s);
+        assert!(c.iter().any(|c| c.fact_id == metformin.id && matches!(c.change, FactChangeKind::Ended { .. })), "{c:?}");
     }
 
     #[test]

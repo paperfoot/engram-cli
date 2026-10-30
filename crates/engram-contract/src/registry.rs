@@ -566,7 +566,7 @@ const RECALL_DATA: &[FieldSpec] = &[
     FieldSpec {
         name: "conflicts",
         ty: Ty::Array(&Ty::Object),
-        doc: "UNRESOLVED contradictions touching the query (`contested`: both values listed). Do not pick one silently: run the `resolve` object (program + args), or `resolve_command` if you shell out. What changed since a returned passage is under it (engram-update); --full adds the `superseded` history",
+        doc: "UNRESOLVED contradictions touching the query (`contested`: both values listed), recorded stops (`ended`) and any safety-relation change; only entries whose facts are still visible. Do not pick a contested value silently: run the `resolve` object (program + args). What changed since a returned passage is under it (engram-update); --full adds the `superseded` history",
         always: true,
     },
     FieldSpec {

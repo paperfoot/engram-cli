@@ -1742,15 +1742,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
     )?;
     // As the CLI: unresolved contradictions only, the superseded history
     // with `full`; what changed since a returned passage is under it.
-    let items: Vec<serde_json::Value> = if full {
-        conflicts.items
-    } else {
-        conflicts
-            .items
-            .into_iter()
-            .filter(|c| c["status"] == json!("contested"))
-            .collect()
-    };
+    let items = crate::commands::recall::shown_conflicts(store, conflicts.items, full);
     resp["data"]["conflicts"] = json!(items);
     resp["data"]["metadata"]["conflicts_total"] = json!(conflicts.total);
     // Presence IS the signal: skill.md tells agents the field appears only in

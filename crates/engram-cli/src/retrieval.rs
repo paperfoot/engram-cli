@@ -362,6 +362,7 @@ where
     I: IntoIterator<Item = &'a HybridResult>,
 {
     let mut out = String::new();
+    let mut annotated: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for (i, r) in results.into_iter().enumerate() {
         if i == 0 {
             out.push_str(ANSWER_CONTEXT_NOTICE);
@@ -401,9 +402,13 @@ where
             date,
             escape_engram_tags(r.content.trim()),
         ));
+        // A memory's changes are told once, under its first passage: a long
+        // memory split into several chunks must not repeat the same lines.
+        let first_for_memory = r.provenance.memory_id.is_some_and(|m| annotated.insert(m));
         let changes = r
             .provenance
             .memory_id
+            .filter(|_| first_for_memory)
             .and_then(|m| updates.get(&m))
             .map(Vec::as_slice)
             .unwrap_or_default();

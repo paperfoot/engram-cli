@@ -202,15 +202,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
     // passage (engram-update). The list keeps what is still UNRESOLVED; the
     // history of superseded values, matched on query words and mostly about
     // passages nobody returned, comes back with --full.
-    let conflicts: Vec<Value> = if full {
-        surface.items
-    } else {
-        surface
-            .items
-            .into_iter()
-            .filter(|c| c["status"] == json!("contested"))
-            .collect()
-    };
+    let conflicts = shown_conflicts(&ctx.store, surface.items, full);
     let conflicts_overridden = conflicts
         .iter()
         .filter(|c| c["suggested_action_overridden"] == json!(true))
@@ -513,6 +505,48 @@ pub fn request_shape(
         has_window,
         has_diary_filter,
     })
+}
+
+/// Which conflict entries recall prints. By default: what is still
+/// UNRESOLVED (`contested`), every recorded stop (`ended` — a stopped
+/// medication must not vanish with the rest of the history), and any entry on
+/// a safety relation; --full adds the superseded history.
+/// Always, and in both modes: an entry is printed only if every fact it names
+/// is still visible — its memory live, unexpired and not edited since — and a
+/// contested pair only while both sides are open. A forgotten or edited-away
+/// value never reaches the reader through the conflicts list.
+pub fn shown_conflicts(store: &SqliteStore, items: Vec<Value>, full: bool) -> Vec<Value> {
+    let fact_ids = |c: &Value| -> Vec<uuid::Uuid> {
+        [
+            c.pointer("/new/id"),
+            c.pointer("/old/id"),
+            c.get("new_fact_id"),
+            c.get("old_fact_id"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter_map(|s| uuid::Uuid::parse_str(s.trim_start_matches("fact:")).ok())
+        .collect()
+    };
+    let all: Vec<uuid::Uuid> = items.iter().flat_map(|c| fact_ids(c)).collect();
+    let visible = store.visible_facts(&all).unwrap_or_default();
+    items
+        .into_iter()
+        .filter(|c| {
+            full || c["status"] == json!("contested")
+                || c["status"] == json!("ended")
+                || c["safety"] == json!(true)
+                || c["predicate"].as_str().is_some_and(|p| {
+                    engram_core::relations::is_safety_slot(&engram_core::relations::canonical_relation(p))
+                })
+        })
+        .filter(|c| fact_ids(c).iter().all(|id| visible.contains(id)))
+        .filter(|c| {
+            c["status"] != json!("contested")
+                || (c.pointer("/new/open") == Some(&json!(true)) && c.pointer("/old/open") == Some(&json!(true)))
+        })
+        .collect()
 }
 
 /// The conflicts array plus the size of the backlog it was drawn from.
