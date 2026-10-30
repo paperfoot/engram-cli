@@ -170,7 +170,7 @@ fn manifest() -> Value {
             "GEMINI_API_KEY_FALLBACKS": "Comma-separated fallback Gemini keys, tried in order when the active key answers 429 (quota/credits) or 403 (revoked) — rotation happens before any backoff, and the charged-usage accounting is unaffected because a refused call is never billed. Config equivalent: `keys.gemini_fallbacks`. Verify the whole chain with `engram config check` (live per-key probe: ok | quota_or_credits_depleted | invalid_or_revoked).",
             "ENGRAM_DEFAULT_KB": "Pin reads to one KB when no --kb is given. Unset (the default) means recall spans every KB. Same as config `retrieval.default_kb`.",
             "ENGRAM_EMBEDDER": "NOT IMPLEMENTED — nothing reads this. To READ with the offline stub pass --profile offline (or \"profile\": \"offline\" over the API); to WRITE with it pass --offline to remember/memory add/edit/memory update/reindex/ingest/chunks repair. A cloud read or any write with no GEMINI_API_KEY is exit 2. The sole override is the test hook ENGRAM_BENCH_FORCE_STUB with a truthy value (1/true); 0, false or empty leaves cloud semantics intact on both sides.",
-            "ENGRAM_COHERE_RERANK_MODEL": "Override the Cohere rerank model slug (default rerank-v4.0-pro; e.g. rerank-v4.0-fast).",
+            "ENGRAM_COHERE_RERANK_MODEL": "Override the Cohere rerank model slug (default rerank-v5.0-pro; e.g. rerank-v5.0-fast).",
             "ENGRAM_RERANK_PROVIDER": "Production values: cohere (default when COHERE_API_KEY is set) or none (disable reranking explicitly, e.g. Cohere billing failure — retrieval then returns hybrid-fused order). zerank2 is recognized by `bench` only, never by recall/research/serve.",
             "ENGRAM_LME_SPLIT": "LongMemEval split: s|oracle (default: s)"
         },
@@ -262,7 +262,7 @@ fn manifest() -> Value {
         "cache_path": engram_storage::paths::cache_dir_peek().to_string_lossy(),
         "providers": {
             "embeddings": ["gemini-embedding-2 (cloud, 1536 dims)", "stub (offline, deterministic)"],
-            "rerankers": ["cohere/rerank-v4.0-pro (cloud)", "passthrough (none)"],
+            "rerankers": ["cohere/rerank-v5.0-pro (cloud)", "passthrough (none)"],
             "fact_extraction_default": format!(
                 "{} (Anthropic key), else {} (OpenRouter key)",
                 engram_llm::anthropic::DEFAULT_EXTRACTION_MODEL,
@@ -330,7 +330,7 @@ fn manifest() -> Value {
             "store_flag": "`engramd --store <dir>` takes the same flag as the CLI and roots the daemon at the same directory. Two processes on two different stores is the failure this closes: the daemon is the single writer for ITS store."
         },
         "retrieval_profiles": {
-            "cloud_quality": { "embedder": "gemini-embedding-2", "dims": 1536, "lexical": "FTS5 BM25", "reranker": "cohere/rerank-v4.0-pro", "rerank_top_n": 200 },
+            "cloud_quality": { "embedder": "gemini-embedding-2", "dims": 1536, "lexical": "FTS5 BM25", "reranker": "cohere/rerank-v5.0-pro", "rerank_top_n": 200 },
             "fast": { "embedder": "gemini-embedding-2", "dims": 1536, "rerank_top_n": 20 },
             "offline": { "embedder": "stub", "lexical": "FTS5 BM25", "reranker": "none", "rerank_top_n": 50 }
         },

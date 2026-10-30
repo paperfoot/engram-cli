@@ -121,7 +121,7 @@ engram usage --kb ageing-biology --json
 engram budget set --kb ageing-biology --daily-usd 5 --monthly-usd 100
 ```
 
-Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25 and Cohere `rerank-v4.0-pro` when configured. The reranker sees a wide candidate pool (`cloud_quality` default 200, tunable via `ENGRAM_RERANK_CANDIDATES`), and the returned results are capped to at most N chunks per source document (default 2, tunable via `ENGRAM_RERANK_MAX_PER_DOC`; `0` = legacy/unlimited) so a few near-duplicate passages from one document cannot crowd out other sources. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
+Default `cloud_quality` recall uses Gemini Embedding 2 at 1536 dimensions, FTS5 BM25 and Cohere `rerank-v5.0-pro` when configured. The reranker sees a wide candidate pool (`cloud_quality` default 200, tunable via `ENGRAM_RERANK_CANDIDATES`), and the returned results are capped to at most N chunks per source document (default 2, tunable via `ENGRAM_RERANK_MAX_PER_DOC`; `0` = legacy/unlimited) so a few near-duplicate passages from one document cannot crowd out other sources. Existing legacy embeddings are refused during recall until you run `engram reindex --kb <name>` or explicitly pass `--allow-mixed-embeddings`.
 
 `engram usage` summarizes recorded cloud usage by provider, operation, model, KB, estimated input/output tokens, Cohere search units, and estimated cost. Gemini embedding token counts use a local chars/4 estimate. Cohere is tracked as `search_units`; set `ENGRAM_COHERE_RERANK_USD_PER_SEARCH` if you want local dollar estimates. `engram budget` sets local daily/monthly guardrails that are **enforced**: before any paid embed/rerank/LLM call, `recall`, `ingest` and `remember` check recorded spend against the cap and refuse with exit code 4 when it's reached (override for one run with `ENGRAM_BUDGET_ENFORCE=off`). The gate reads recorded usage *estimates*; provider invoices remain the source of truth.
 
@@ -210,7 +210,7 @@ Dense    FTS5
  (k=60, deterministic tiebreak)
           │
           ▼
- Cohere Rerank 4 (rerank-v4.0-pro,
+ Cohere Rerank 5 (rerank-v5.0-pro,
  env-overridable; or passthrough/offline)
           │
           ▼
@@ -241,7 +241,7 @@ Cargo workspace layout:
 | `engram-core` (`paperfoot-engram-core` on crates.io) | Pure types, fusion (RRF), memory layers, temporal validity. Zero I/O. |
 | `engram-storage` (`paperfoot-engram-storage`) | SQLite source of truth + FTS5 + chunk-embedding BLOBs + KB and fact tables. |
 | `engram-embed` (`paperfoot-engram-embed`) | `Embedder` trait + Gemini Embed 2 (batch + single) + deterministic offline stub. |
-| `engram-rerank` (`paperfoot-engram-rerank`) | `Reranker` trait + Cohere Rerank 4 (default `rerank-v4.0-pro`, env-overridable) + passthrough. |
+| `engram-rerank` (`paperfoot-engram-rerank`) | `Reranker` trait + Cohere Rerank 5 (default `rerank-v5.0-pro`, env-overridable) + passthrough. |
 | `engram-ingest` (`paperfoot-engram-ingest`) | Mining modes: papers (PDF + section-aware), takeaways, conversations, repos, general, auto. |
 | `engram-graph` (`paperfoot-engram-graph`) | The fact-extraction prompt, predicate normalisation and fact semantics. |
 | `engram-bench` (`paperfoot-engram-bench`) | Hallucination-resistance harness: LitQA2 (precision-with-abstention), BEIR-sci (nDCG@10), BioGen CSR + ALCE citation P/R, RAGAS faithfulness, plus LongMemEval / LoCoMo-Plus retrieval+QA and the strict LLM judge. |

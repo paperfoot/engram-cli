@@ -1,13 +1,15 @@
-//! Cohere Rerank client (Rerank 4 by default).
+//! Cohere Rerank client (Rerank 5 by default).
 
 use crate::{RerankCandidate, RerankError, RerankedResult, Reranker};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-/// Default Cohere Rerank model: Rerank 4 ("pro") — the current state-of-the-art
-/// multilingual reranker (32K context), succeeding rerank-v3.5. Override per
-/// process with `ENGRAM_COHERE_RERANK_MODEL` (e.g. `rerank-v4.0-fast`).
-pub const DEFAULT_MODEL: &str = "rerank-v4.0-pro";
+/// Default Cohere Rerank model: Rerank 5 ("pro"), Cohere's newest reranker,
+/// succeeding rerank-v4.0-pro. Same request; its scores are calibrated more
+/// sharply (unrelated passages near 0) and it bills input tokens rather than
+/// search units. Override per process with `ENGRAM_COHERE_RERANK_MODEL`
+/// (e.g. `rerank-v5.0-fast`, or `rerank-v4.0-pro` to go back).
+pub const DEFAULT_MODEL: &str = "rerank-v5.0-pro";
 const ENDPOINT: &str = "https://api.cohere.com/v2/rerank";
 
 /// Resolve the rerank model, honouring the `ENGRAM_COHERE_RERANK_MODEL`
