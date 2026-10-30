@@ -466,6 +466,21 @@ pub fn update_line(c: &engram_storage::FactChange) -> String {
             c.was,
             values.join(" and ")
         ),
+        engram_storage::FactChangeKind::Scheduled { value, from } => format!(
+            "{} {}: {} until {}, then {}",
+            c.subject,
+            c.predicate,
+            c.was,
+            from.format("%Y-%m-%d"),
+            value
+        ),
+        engram_storage::FactChangeKind::Retired { since } => format!(
+            "{} {} {}: no longer current (since {})",
+            c.subject,
+            c.predicate,
+            c.was,
+            since.format("%Y-%m-%d")
+        ),
     }
 }
 
@@ -514,6 +529,15 @@ pub fn update_json(c: &engram_storage::FactChange) -> serde_json::Value {
             if let Some(id) = c.current_fact_id {
                 v["current_fact_handle"] = serde_json::json!(format!("fact:{id}"));
             }
+        }
+        engram_storage::FactChangeKind::Scheduled { value, from } => {
+            v["scheduled"] = serde_json::json!({ "value": value, "from": from.to_rfc3339() });
+            if let Some(id) = c.current_fact_id {
+                v["current_fact_handle"] = serde_json::json!(format!("fact:{id}"));
+            }
+        }
+        engram_storage::FactChangeKind::Retired { since } => {
+            v["retired"] = serde_json::json!(since.to_rfc3339());
         }
     }
     v

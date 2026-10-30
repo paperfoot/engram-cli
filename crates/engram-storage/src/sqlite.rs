@@ -911,8 +911,17 @@ pub enum FactChangeKind {
     /// The state ended and nothing replaced it.
     Ended { at: chrono::DateTime<chrono::Utc> },
     /// It changed, but what holds now is under an open conflict: the newest
-    /// value first, then its rivals.
+    /// value first, then its rivals (only open ones visible in this scope).
     Disputed { values: Vec<String> },
+    /// A recorded successor takes over in the future; until then the passage
+    /// still holds.
+    Scheduled {
+        value: String,
+        from: chrono::DateTime<chrono::Utc>,
+    },
+    /// No longer current since `since` (the old fact's own close), and the
+    /// successor cannot be shown: hidden, forgotten, expired, closed itself.
+    Retired { since: chrono::DateTime<chrono::Utc> },
 }
 
 /// The fact projection, in `parse_fact_row` order. Written once so a `SELECT`
@@ -3679,11 +3688,13 @@ impl SqliteStore {
     ///   carries another scope's facts;
     /// - a fact written before the memory's last edit (compared as instants)
     ///   describes text that is gone, so it is skipped;
-    /// - a supersession chain must end at an OPEN fact; a closed, corrected or
-    ///   retracted newest value says nothing;
+    /// - when the newest value cannot be shown truthfully — out of scope,
+    ///   forgotten, expired, closed itself, or a cycle — the line says only
+    ///   that the old value is no longer current, dated by its own record;
+    /// - a newest value that starts in the future is reported as scheduled;
     /// - every successor's memory must be live and unexpired;
     /// - a newest value under an open conflict is reported as disputed, with
-    ///   its rivals, never as settled and never dropped;
+    ///   its rivals that are open and visible here, never as settled;
     /// - "ended" needs a close the safety gate itself allows (`may_close`):
     ///   for a safety relation an explicit end or a person's decision, so a
     ///   heuristic or refused proposal never reads as an ending — and no open
@@ -3736,16 +3747,23 @@ impl SqliteStore {
             }
             // Live and unexpired, as default recall itself requires: a value
             // from a forgotten or expired memory is not "what holds now".
-            Ok(self
+            // Expiry is compared as an instant: imports keep offsets.
+            let row: Option<Option<String>> = self
                 .conn
                 .query_row(
-                    "SELECT 1 FROM memories WHERE id = ?1 AND kb = ?2 AND diary = ?3
-                       AND deleted = 0 AND (valid_until IS NULL OR valid_until > ?4)",
-                    params![f.source_memory_id.to_string(), kb, diary, chrono::Utc::now().to_rfc3339()],
-                    |_| Ok(()),
+                    "SELECT valid_until FROM memories
+                     WHERE id = ?1 AND kb = ?2 AND diary = ?3 AND deleted = 0",
+                    params![f.source_memory_id.to_string(), kb, diary],
+                    |r| r.get(0),
                 )
-                .optional()?
-                .is_some())
+                .optional()?;
+            Ok(match row {
+                None => false,
+                Some(None) => true,
+                Some(Some(until)) => chrono::DateTime::parse_from_rfc3339(&until)
+                    .map(|t| t.with_timezone(&chrono::Utc) > chrono::Utc::now())
+                    .unwrap_or(false),
+            })
         };
         let mut out = Vec::new();
         for old in closed {
@@ -3753,6 +3771,11 @@ impl SqliteStore {
                 continue;
             }
             let (change, current_fact_id) = if old.superseded_by.is_some() {
+                // The old fact's own record of when it stopped being current:
+                // the only thing that may be said when the successor cannot be.
+                let retired = FactChangeKind::Retired {
+                    since: old.superseded_at.or(old.valid_until).unwrap_or(old.created_at),
+                };
                 // Walk to the newest value; a visited set ends any cycle.
                 let mut current = old.clone();
                 let mut seen = std::collections::HashSet::from([old.id]);
@@ -3771,36 +3794,52 @@ impl SqliteStore {
                     }
                 }
                 if !clean || current.valid_until.is_some() || current.superseded_by.is_some() {
-                    continue;
-                }
-                // An open conflict on the newest value: the change is real,
-                // what holds now is not settled — say exactly that.
-                let mut rivals: Vec<String> = Vec::new();
-                {
-                    let mut stmt = self.conn.prepare(
-                        "SELECT o.object FROM fact_conflict_queue q
-                         JOIN facts o ON o.id = CASE WHEN q.new_fact_id = ?1 THEN q.old_fact_id ELSE q.new_fact_id END
-                         WHERE q.status = 'open' AND (q.new_fact_id = ?1 OR q.old_fact_id = ?1)",
-                    )?;
-                    for v in stmt.query_map(params![current.id.to_string()], |r| r.get::<_, String>(0))? {
-                        let v = v?;
-                        if !rivals.contains(&v) {
-                            rivals.push(v);
+                    // Hidden, forgotten, expired, closed or cyclic: the old
+                    // value is still retired, and nothing about its successor
+                    // is revealed.
+                    (retired, None)
+                } else {
+                    // Open conflicts on the newest value, counting only rivals
+                    // that are open and visible in this scope.
+                    let mut rivals: Vec<String> = Vec::new();
+                    let rival_ids: Vec<String> = {
+                        let mut stmt = self.conn.prepare(
+                            "SELECT CASE WHEN new_fact_id = ?1 THEN old_fact_id ELSE new_fact_id END
+                             FROM fact_conflict_queue
+                             WHERE status = 'open' AND (new_fact_id = ?1 OR old_fact_id = ?1)",
+                        )?;
+                        let rows = stmt.query_map(params![current.id.to_string()], |r| r.get::<_, String>(0))?;
+                        rows.collect::<Result<_, _>>()?
+                    };
+                    for id in rival_ids {
+                        let Ok(id) = Uuid::parse_str(&id) else { continue };
+                        if let Some(r) = self.get_fact(id)? {
+                            if r.valid_until.is_none()
+                                && r.superseded_by.is_none()
+                                && in_scope(&r, &old.kb, &old.diary)?
+                                && !rivals.contains(&r.object)
+                            {
+                                rivals.push(r.object.clone());
+                            }
                         }
                     }
-                }
-                if !rivals.is_empty() {
-                    let mut values = vec![current.object.clone()];
-                    values.extend(rivals);
-                    (FactChangeKind::Disputed { values }, Some(current.id))
-                } else {
-                    (
+                    let from = current.valid_from.unwrap_or(current.created_at);
+                    let change = if !rivals.is_empty() {
+                        let mut values = vec![current.object.clone()];
+                        values.extend(rivals);
+                        FactChangeKind::Disputed { values }
+                    } else if from > chrono::Utc::now() {
+                        FactChangeKind::Scheduled {
+                            value: current.object.clone(),
+                            from,
+                        }
+                    } else {
                         FactChangeKind::Now {
                             value: current.object.clone(),
-                            since: current.valid_from.unwrap_or(current.created_at),
-                        },
-                        Some(current.id),
-                    )
+                            since: from,
+                        }
+                    };
+                    (change, Some(current.id))
                 }
             } else {
                 // Exactly the safety gate's rule: a safety relation ends only on
@@ -8146,8 +8185,32 @@ mod present_tense_tests {
             supersede(&s, &london, &paris);
             assert_eq!(changes(&s).len(), 1, "live successor: the line is there");
             s.conn.execute_batch(&format!("UPDATE memories SET {gone} WHERE id = '{other}'")).unwrap();
-            assert!(changes(&s).is_empty(), "{gone}: Paris is not what holds now");
+            let c = changes(&s);
+            assert!(matches!(c[0].change, FactChangeKind::Retired { .. }), "{gone}: {c:?}");
+            assert!(!format!("{c:?}").contains("Paris"), "{gone}: Paris is not what holds now");
         }
+        // An expiry written with an offset is compared as an instant.
+        let s = store();
+        let other = "44444444-4444-4444-8444-444444444444";
+        let past = (Utc::now() - chrono::Duration::minutes(30))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        s.conn
+            .execute_batch(&format!(
+                "INSERT INTO memories(id, content, created_at, importance, emotional_weight, access_count,
+                     stability, source_json, diary, tags_json, deleted, kb, valid_until)
+                 VALUES ('{other}', 'Ana moved to Paris.', '{now}', 5, 0, 0, 1.0, '{{\"type\":\"user\"}}',
+                         'default', '[]', 0, 'kb', '{past}');"
+            ))
+            .unwrap();
+        let london = fact(&s, "London", "default");
+        let paris = fact(&s, "Paris", "default");
+        s.conn
+            .execute("UPDATE facts SET source_memory_id = ?1 WHERE id = ?2", params![other, paris.id.to_string()])
+            .unwrap();
+        supersede(&s, &london, &paris);
+        assert!(!format!("{:?}", changes(&s)).contains("Paris"), "expired at {past}");
     }
 
     #[test]
@@ -8169,7 +8232,10 @@ mod present_tense_tests {
             .execute("UPDATE facts SET source_memory_id = ?1 WHERE id = ?2", params![other, secret.id.to_string()])
             .unwrap();
         supersede(&s, &porto, &secret);
-        assert!(changes(&s).is_empty(), "a successor sourced to a private memory must not print");
+        let c = changes(&s);
+        assert_eq!(c.len(), 1);
+        assert!(matches!(c[0].change, FactChangeKind::Retired { .. }), "{c:?}");
+        assert!(!format!("{c:?}").contains("Secret Street"), "the private value must not print");
     }
 
     #[test]
@@ -8192,6 +8258,45 @@ mod present_tense_tests {
             matches!(&c[0].change, FactChangeKind::Disputed { values } if values == &vec!["Beta".to_string(), "Gamma".to_string()]),
             "{c:?}"
         );
+        // A rival whose fact was closed (its memory forgotten or edited) is
+        // not shown, and with no visible rival the value is simply current.
+        close_by(&s, &gamma, "retracted_source", "caller");
+        let c = changes(&s);
+        assert!(matches!(&c[0].change, FactChangeKind::Now { value, .. } if value == "Beta"), "{c:?}");
+        assert!(!format!("{c:?}").contains("Gamma"));
+    }
+
+    #[test]
+    fn a_stopped_replacement_still_retires_the_original_without_borrowing_its_date() {
+        let s = store();
+        let ten = fact_p(&s, "takes_medication", "atorvastatin 10 mg", "default");
+        let twenty = fact_p(&s, "takes_medication", "atorvastatin 20 mg", "default");
+        supersede(&s, &ten, &twenty);
+        s.conn
+            .execute(
+                "UPDATE facts SET superseded_at = '2026-03-01T00:00:00+00:00' WHERE id = ?1",
+                params![ten.id.to_string()],
+            )
+            .unwrap();
+        close_by(&s, &twenty, "stopped", "explicit_end");
+        let c = changes(&s);
+        let line = c.iter().find(|c| c.fact_id == ten.id).expect("the 10 mg passage keeps a warning");
+        assert!(
+            matches!(line.change, FactChangeKind::Retired { since } if since.format("%Y-%m-%d").to_string() == "2026-03-01"),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn a_successor_that_starts_later_is_scheduled_not_current() {
+        let s = store();
+        let porto = fact(&s, "Porto", "default");
+        let lisbon = fact(&s, "Lisbon", "default");
+        s.conn
+            .execute("UPDATE facts SET valid_from = '2030-01-01T00:00:00+00:00' WHERE id = ?1", params![lisbon.id.to_string()])
+            .unwrap();
+        supersede(&s, &porto, &lisbon);
+        assert!(matches!(&changes(&s)[0].change, FactChangeKind::Scheduled { value, .. } if value == "Lisbon"));
     }
 
     #[test]
@@ -8227,19 +8332,21 @@ mod present_tense_tests {
     }
 
     #[test]
-    fn a_chain_ending_in_a_closed_value_or_a_cycle_says_nothing() {
+    fn a_chain_ending_in_a_closed_value_or_a_cycle_only_retires_the_old_value() {
         let s = store();
         let porto = fact(&s, "Porto", "default");
         let lisbon = fact(&s, "Lisbon", "default");
         supersede(&s, &porto, &lisbon);
         close(&s, &lisbon, "corrected");
-        assert!(changes(&s).iter().all(|c| c.fact_id != porto.id), "Porto must not 'end' on Lisbon's date");
+        let c = changes(&s);
+        let porto_line = c.iter().find(|c| c.fact_id == porto.id).expect("Porto is still retired");
+        assert!(matches!(porto_line.change, FactChangeKind::Retired { .. }), "not 'ended' on Lisbon's date");
 
         let s = store();
         let a = fact(&s, "Porto", "default");
         let b = fact(&s, "Lisbon", "default");
         supersede(&s, &a, &b);
         supersede(&s, &b, &a);
-        assert!(changes(&s).is_empty());
+        assert!(changes(&s).iter().all(|c| matches!(c.change, FactChangeKind::Retired { .. })));
     }
 }
