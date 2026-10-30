@@ -3670,27 +3670,33 @@ impl SqliteStore {
     /// What has changed since each memory was written: its facts that were
     /// later superseded or ended, each followed to the value that holds now.
     ///
-    /// Only a supersession or a stop counts. A fact closed because its memory
-    /// was edited (`corrected`) or forgotten (`retracted_source`) describes
-    /// text that is no longer there, so it says nothing about the passage a
-    /// reader is looking at. A successor in another diary or KB ends the
-    /// chain: the line must not carry one diary's facts into another's read.
-    pub fn fact_changes_for_memories(
-        &self,
-        ids: &[Uuid],
-        per_memory: usize,
-    ) -> Result<Vec<FactChange>, StorageError> {
-        if ids.is_empty() || per_memory == 0 {
+    /// Only what can be said truthfully is returned:
+    /// - the fact must belong to the memory's own KB and diary, and so must
+    ///   every successor — a line never carries another scope's facts;
+    /// - a fact written before the memory's last edit describes text that is
+    ///   gone (an edit closes only open facts), so it is skipped;
+    /// - a supersession chain must end at an OPEN fact; a chain whose newest
+    ///   value was itself closed, corrected or retracted says nothing;
+    /// - "ended" needs a stop (`close_reason = stopped`) and no open fact with
+    ///   the same value: a cessation the safety gate refused leaves the
+    ///   original open, and is not reported as ended.
+    pub fn fact_changes_for_memories(&self, ids: &[Uuid]) -> Result<Vec<FactChange>, StorageError> {
+        if ids.is_empty() {
             return Ok(Vec::new());
         }
         let marks = vec!["?"; ids.len()].join(", ");
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {cols} FROM facts
-             WHERE source_memory_id IN ({marks})
-               AND (superseded_by IS NOT NULL
-                    OR (valid_until IS NOT NULL AND COALESCE(close_reason, '') IN ('stopped', 'superseded')))
-             ORDER BY source_memory_id, created_at, id",
-            cols = fact_columns("")
+            "SELECT {cols} FROM facts f JOIN memories m ON m.id = f.source_memory_id
+             WHERE f.source_memory_id IN ({marks})
+               AND f.kb = m.kb AND f.diary = m.diary
+               AND (f.superseded_by IS NOT NULL
+                    OR (f.valid_until IS NOT NULL AND COALESCE(f.close_reason, '') = 'stopped'))
+               AND f.created_at >= COALESCE(
+                    (SELECT MAX(e.ts) FROM events e
+                     WHERE e.subject_id = f.source_memory_id AND e.kind = 'memory.revised'),
+                    '')
+             ORDER BY f.source_memory_id, f.created_at, f.id",
+            cols = fact_columns("f.")
         ))?;
         let params: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
         let closed: Vec<engram_core::types::Fact> = stmt
@@ -3698,50 +3704,59 @@ impl SqliteStore {
             .collect::<Result<_, _>>()?;
         drop(stmt);
         let mut out = Vec::new();
-        let mut taken: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
         for old in closed {
-            let n = taken.entry(old.source_memory_id).or_default();
-            if *n >= per_memory {
-                continue;
-            }
-            // Walk the supersession chain to its end, at most a few hops.
-            let mut current = old.clone();
-            let mut hops = 0;
-            while let Some(next) = current.superseded_by {
-                if hops == 8 {
-                    break;
-                }
-                match self.get_fact(next)? {
-                    Some(f) if f.diary == old.diary && f.kb == old.kb => current = f,
-                    _ => break,
-                }
-                hops += 1;
-            }
-            let change = if current.id != old.id && current.superseded_by.is_none() {
-                if current.valid_until.is_none() {
-                    FactChangeKind::Now {
-                        value: current.object.clone(),
-                        since: current.valid_from.unwrap_or(current.created_at),
+            let change = if old.superseded_by.is_some() {
+                // Walk to the newest value; a visited set ends any cycle.
+                let mut current = old.clone();
+                let mut seen = std::collections::HashSet::from([old.id]);
+                let mut clean = true;
+                while let Some(next) = current.superseded_by {
+                    if !seen.insert(next) {
+                        clean = false;
+                        break;
                     }
-                } else {
-                    FactChangeKind::Ended {
-                        at: current.valid_until.unwrap_or(current.created_at),
+                    match self.get_fact(next)? {
+                        Some(f) if f.diary == old.diary && f.kb == old.kb => current = f,
+                        _ => {
+                            clean = false;
+                            break;
+                        }
                     }
                 }
-            } else if old.superseded_by.is_none() && old.valid_until.is_some() {
+                if !clean || current.valid_until.is_some() || current.superseded_by.is_some() {
+                    continue;
+                }
+                FactChangeKind::Now {
+                    value: current.object.clone(),
+                    since: current.valid_from.unwrap_or(current.created_at),
+                }
+            } else {
+                let still_open: bool = self
+                    .conn
+                    .query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM facts WHERE kb = ?1 AND diary = ?2
+                               AND subject_norm = ?3 AND predicate = ?4 AND object_norm = ?5
+                               AND {OPEN_INTERVAL_PREDICATE})"
+                        ),
+                        params![old.kb, old.diary, old.subject_norm, old.predicate, old.object_norm],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(true);
+                if still_open {
+                    continue;
+                }
                 FactChangeKind::Ended {
                     at: old.valid_until.unwrap_or(old.created_at),
                 }
-            } else {
-                // A chain that left the diary or KB, or ran too long: nothing
-                // honest to say about the present.
-                continue;
             };
-            *n += 1;
             out.push(FactChange {
                 memory_id: old.source_memory_id,
                 fact_id: old.id,
-                current_fact_id: (current.id != old.id).then_some(current.id),
+                current_fact_id: match &change {
+                    FactChangeKind::Now { .. } => old.superseded_by,
+                    FactChangeKind::Ended { .. } => None,
+                },
                 subject: old.subject.clone(),
                 predicate: old.predicate.clone(),
                 was: old.object.clone(),
@@ -7861,5 +7876,150 @@ mod tests {
             matches!(&err, StorageError::NotFound(m) if m.contains("no longer exists")),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod present_tense_tests {
+    use super::*;
+    use chrono::Utc;
+    use engram_core::types::{Fact, FactType, SourceKind};
+
+    const M: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn store() -> SqliteStore {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now().to_rfc3339();
+        s.conn
+            .execute_batch(&format!(
+                "INSERT OR IGNORE INTO knowledge_bases(name, created_at, updated_at) VALUES ('kb', '{now}', '{now}');
+                 INSERT INTO memories(id, content, created_at, importance, emotional_weight, access_count,
+                     stability, source_json, diary, tags_json, deleted, kb)
+                 VALUES ('{M}', 'Ana lives in Porto.', '{now}', 5, 0, 0, 1.0, '{{\"type\":\"user\"}}',
+                         'default', '[]', 0, 'kb');"
+            ))
+            .unwrap();
+        s
+    }
+
+    fn fact(s: &SqliteStore, object: &str, diary: &str) -> Fact {
+        let f = Fact {
+            id: Uuid::new_v4(),
+            source_memory_id: Uuid::parse_str(M).unwrap(),
+            subject: "Ana".into(),
+            subject_norm: "ana".into(),
+            predicate: "lives_in".into(),
+            object: object.into(),
+            object_norm: object.to_lowercase(),
+            confidence: 1.0,
+            created_at: Utc::now(),
+            superseded_by: None,
+            superseded_at: None,
+            diary: diary.into(),
+            fact_type: FactType::default(),
+            valid_from: None,
+            valid_until: None,
+            resolution: None,
+            source_kind: SourceKind::UserStated,
+            confirmations: 0,
+            closed_by: None,
+            close_reason: None,
+            close_authority: None,
+            kb: "kb".into(),
+        };
+        s.with_tx(|t| t.insert_fact_row(&f)).unwrap();
+        f
+    }
+
+    fn supersede(s: &SqliteStore, old: &Fact, new: &Fact) {
+        s.conn
+            .execute(
+                "UPDATE facts SET superseded_by = ?1, superseded_at = ?2 WHERE id = ?3",
+                params![new.id.to_string(), Utc::now().to_rfc3339(), old.id.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn close(s: &SqliteStore, f: &Fact, reason: &str) {
+        s.conn
+            .execute(
+                "UPDATE facts SET valid_until = ?1, close_reason = ?2 WHERE id = ?3",
+                params![Utc::now().to_rfc3339(), reason, f.id.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn changes(s: &SqliteStore) -> Vec<FactChange> {
+        s.fact_changes_for_memories(&[Uuid::parse_str(M).unwrap()]).unwrap()
+    }
+
+    #[test]
+    fn a_superseded_value_reports_what_holds_now_and_a_stop_reports_its_end() {
+        let s = store();
+        let porto = fact(&s, "Porto", "default");
+        let lisbon = fact(&s, "Lisbon", "default");
+        supersede(&s, &porto, &lisbon);
+        let c = changes(&s);
+        assert_eq!(c.len(), 1);
+        assert!(matches!(&c[0].change, FactChangeKind::Now { value, .. } if value == "Lisbon"));
+
+        let s = store();
+        let porto = fact(&s, "Porto", "default");
+        close(&s, &porto, "stopped");
+        assert!(matches!(changes(&s)[0].change, FactChangeKind::Ended { .. }));
+    }
+
+    #[test]
+    fn another_diarys_fact_never_reaches_the_line() {
+        let s = store();
+        let porto = fact(&s, "Porto", "private");
+        let lisbon = fact(&s, "Lisbon", "private");
+        supersede(&s, &porto, &lisbon);
+        assert!(changes(&s).is_empty(), "a private fact on a default-diary memory");
+    }
+
+    #[test]
+    fn a_fact_from_before_the_memorys_last_edit_is_gone_text() {
+        let s = store();
+        let porto = fact(&s, "Porto", "default");
+        let lisbon = fact(&s, "Lisbon", "default");
+        supersede(&s, &porto, &lisbon);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.conn
+            .execute(
+                "INSERT INTO events(id, ts, actor, kind, subject_id, payload)
+                 VALUES (?1, ?2, 'test', 'memory.revised', ?3, '{}')",
+                params![Uuid::new_v4().to_string(), Utc::now().to_rfc3339(), M],
+            )
+            .unwrap();
+        assert!(changes(&s).is_empty(), "'was Porto' would print removed text");
+    }
+
+    #[test]
+    fn a_refused_cessation_is_not_reported_as_ended() {
+        let s = store();
+        // The safety gate kept the original open and stored the proposal as a
+        // closed point interval: the same value is still current.
+        let _kept = fact(&s, "Porto", "default");
+        let proposal = fact(&s, "Porto", "default");
+        close(&s, &proposal, "stopped");
+        assert!(changes(&s).is_empty());
+    }
+
+    #[test]
+    fn a_chain_ending_in_a_closed_value_or_a_cycle_says_nothing() {
+        let s = store();
+        let porto = fact(&s, "Porto", "default");
+        let lisbon = fact(&s, "Lisbon", "default");
+        supersede(&s, &porto, &lisbon);
+        close(&s, &lisbon, "corrected");
+        assert!(changes(&s).iter().all(|c| c.fact_id != porto.id), "Porto must not 'end' on Lisbon's date");
+
+        let s = store();
+        let a = fact(&s, "Porto", "default");
+        let b = fact(&s, "Lisbon", "default");
+        supersede(&s, &a, &b);
+        supersede(&s, &b, &a);
+        assert!(changes(&s).is_empty());
     }
 }

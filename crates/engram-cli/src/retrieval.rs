@@ -401,17 +401,38 @@ where
             date,
             escape_engram_tags(r.content.trim()),
         ));
-        for change in r
+        let changes = r
             .provenance
             .memory_id
             .and_then(|m| updates.get(&m))
-            .into_iter()
-            .flatten()
-        {
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        // Safety facts (medications, allergies, diagnoses) are always shown;
+        // the rest up to UPDATES_PER_PASSAGE, then a line that says how many
+        // more there are, so nothing is hidden silently.
+        let mut shown = 0;
+        let mut more = 0;
+        for change in changes {
+            let safety = engram_core::relations::is_safety_slot(
+                &engram_core::relations::canonical_relation(&change.predicate),
+            );
+            if !safety && shown >= UPDATES_PER_PASSAGE {
+                more += 1;
+                continue;
+            }
+            if !safety {
+                shown += 1;
+            }
             out.push_str(&format!(
                 "<engram-update n=\"{}\">{}</engram-update>\n",
                 i + 1,
                 escape_engram_tags(&update_line(change)),
+            ));
+        }
+        if more > 0 {
+            out.push_str(&format!(
+                "<engram-update n=\"{}\">{more} more change(s) to this passage's facts: recall --full lists them in results[].updates</engram-update>\n",
+                i + 1,
             ));
         }
     }
@@ -441,9 +462,12 @@ pub fn update_line(c: &engram_storage::FactChange) -> String {
     }
 }
 
+/// Update lines printed per passage before the rest are summarised in one
+/// "N more" line. Safety facts are never counted against it.
+pub const UPDATES_PER_PASSAGE: usize = 3;
+
 /// What has changed since each returned passage was written, keyed by memory.
-/// At most three lines per passage; a failed lookup says nothing rather than
-/// failing the read.
+/// A failed lookup says nothing rather than failing the read.
 pub fn present_tense<'a, I>(
     store: &SqliteStore,
     results: I,
@@ -453,7 +477,7 @@ where
 {
     let ids: Vec<Uuid> = results.into_iter().filter_map(|r| r.provenance.memory_id).collect();
     let mut out: HashMap<Uuid, Vec<engram_storage::FactChange>> = HashMap::new();
-    for change in store.fact_changes_for_memories(&ids, 3).unwrap_or_default() {
+    for change in store.fact_changes_for_memories(&ids).unwrap_or_default() {
         out.entry(change.memory_id).or_default().push(change);
     }
     out
@@ -1870,6 +1894,29 @@ mod tests {
             1,
             "{ctx}"
         );
+    }
+
+    #[test]
+    fn safety_updates_are_never_capped_and_the_rest_say_how_many_more() {
+        let memory = Uuid::new_v4();
+        let mut r = result("chunk", "personal", "Old note.");
+        r.provenance.memory_id = Some(memory);
+        let change = |predicate: &str, was: &str| engram_storage::FactChange {
+            memory_id: memory,
+            fact_id: Uuid::new_v4(),
+            current_fact_id: None,
+            subject: "Ana".into(),
+            predicate: predicate.into(),
+            was: was.into(),
+            change: engram_storage::FactChangeKind::Ended { at: chrono::Utc::now() },
+        };
+        let mut list: Vec<_> = (0..5).map(|i| change("uses", &format!("tool{i}"))).collect();
+        list.extend((0..4).map(|i| change("takes_medication", &format!("drug{i}"))));
+        let updates = HashMap::from([(memory, list)]);
+        let ctx = render_answer_context_with(&vec![r], &updates);
+        assert_eq!(ctx.matches("takes_medication").count(), 4, "every safety change shown: {ctx}");
+        assert_eq!(ctx.matches(" uses tool").count(), UPDATES_PER_PASSAGE, "{ctx}");
+        assert!(ctx.contains("2 more change(s) to this passage's facts"), "{ctx}");
     }
 
     #[test]
