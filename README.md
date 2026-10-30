@@ -51,7 +51,7 @@ engram config set keys.gemini $GEMINI_API_KEY   # embeddings (free tier works)
 engram skill install                            # teaches Claude Code, Codex and Gemini CLI to use it
 ```
 
-Optional: `keys.cohere` adds reranking and `keys.openrouter` adds automatic fact extraction. `engram config check` validates the keys you set. For a keyless trial, `--offline` uses a local stub embedder: fine for testing, not for real recall.
+Optional: `keys.cohere` adds reranking, and `keys.anthropic` (Claude Haiku 5.5) or `keys.openrouter` adds automatic fact extraction. `engram config check` validates the keys you set. For a keyless trial, `--offline` uses a local stub embedder: fine for testing, not for real recall.
 
 ## How agents use it
 
