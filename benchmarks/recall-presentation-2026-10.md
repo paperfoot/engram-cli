@@ -22,7 +22,7 @@ Three changes to what `engram recall` prints, each one commit, measured with
   verdicts (4 temporal, 2 knowledge-update).
 
 ## Results (accuracy %, 95% Wilson interval)
-| type | n | A baseline | B one copy | C + dates | D + present tense (final, fb777e2) |
+| type | n | A baseline | B one copy | C + dates | D + present tense |
 |---|---|---|---|---|---|
 | knowledge-update | 78 | 70.5 (60–79) | 71.8 | 87.2 | **88.5 (80–94)** |
 | temporal-reasoning | 133 | 43.6 (35–52) | 44.4 | 82.0 | **81.8 (74–87)** |
@@ -40,13 +40,18 @@ Paired gains and losses, exact McNemar:
   (scope checked at every hop, an ending only on the authority the safety gate demands, no
   disputed values), present-tense lines fired in 2 of 311 recalls here, because extraction
   rarely records a clean supersession.
-- **D vs A:** +68 / −2 (p < 0.001). Final arm: 310 compared, one answer call failed and was
-  excluded.
+- **D vs A:** +68 / −2 (p < 0.001). 310 compared; one answer call failed and was excluded.
+- **Later review fixes:** these narrowed the update lines (each memory annotated once; no
+  event ends; no ends the passage itself states; only facts a reader may still see). The
+  shipped build prints exactly what the measured arm D printed on 309 of 311 questions, so its
+  numbers stand. The remaining 2 differ by six duplicate lines removed and one true "ended"
+  note added. Re-answering was not possible because the eval's OpenRouter account ran out of
+  credit.
 
 ## On a real store (40 real recall queries, copy of the owner's store, local only)
-- **Output size:** mean output fell from 29.3 KB to 21.9 KB (−25%), with retrieval identical
-  on 40 of 40 queries.
-- **Present-tense lines:** fired on 36 of 40 recalls, flagging 140 of 400 returned passages.
+- **Output size:** mean output fell from 29.3 KB to 21.2 KB (−27.5%), with retrieval
+  identical on 40 of 40 queries.
+- **Present-tense lines:** fired on 36 of 40 recalls, flagging 142 of 400 returned passages.
 - **Data quality:** 1,309 of 1,517 historical supersessions are on many-valued relations and
   were decided by older adjudicators. Present tense surfaces them under the passage they
   concern; a JEV re-check of those old decisions is the next data-quality step.
