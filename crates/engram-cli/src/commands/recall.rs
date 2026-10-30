@@ -236,7 +236,12 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             "score": round_score(r.score),
             "rerank_score": r.rerank_score.map(round_score),
             "kb": r.kb,
-            "citations": r.citations.iter().map(|c| json!({
+            // A citation's ids are already in provenance and its label is the
+            // element's `source`; only a page or section adds anything, so by
+            // default a citation is printed only when it carries one.
+            "citations": r.citations.iter()
+                .filter(|c| full || c.page.is_some() || c.section.is_some())
+                .map(|c| json!({
                 "document_id": c.document_id.map(|id: uuid::Uuid| id.to_string()),
                 "chunk_id": c.chunk_id.map(|id: uuid::Uuid| id.to_string()),
                 "page": c.page,
@@ -245,7 +250,8 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             })).collect::<Vec<_>>(),
             "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
             });
-            if let Some(changes) = r.provenance.memory_id.and_then(|m| updates.get(&m)) {
+            // The update lines are in answer_context; --full repeats them here.
+            if let Some(changes) = r.provenance.memory_id.and_then(|m| updates.get(&m)).filter(|_| full) {
                 v["updates"] = json!(changes
                     .iter()
                     .map(crate::retrieval::update_json)

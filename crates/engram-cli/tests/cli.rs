@@ -3122,8 +3122,10 @@ fn a_passage_whose_fact_changed_says_what_holds_now() {
     );
     assert!(ctx.contains("atorvastatin: ended 2026-05-01"), "{ctx}");
     assert!(ctx.contains("date=\"2024-02-01\""), "{ctx}");
-    let updates = &v["data"]["results"][0]["updates"];
-    assert!(updates.as_array().is_some_and(|u| u.iter().any(|x| x["now"] == "Lisbon")), "{v}");
+    assert!(
+        v["data"]["results"][0].get("updates").is_none(),
+        "the update lines are printed once, in answer_context: {v}"
+    );
     assert!(
         v["data"]["conflicts"].as_array().unwrap().iter().all(|c| c["status"] == "contested"),
         "only unresolved contradictions by default: {v}"
@@ -3136,6 +3138,9 @@ fn a_passage_whose_fact_changed_says_what_holds_now() {
         full["data"]["conflicts"].as_array().unwrap().iter().any(|c| c["status"] == "superseded"),
         "--full keeps the superseded history: {full}"
     );
+    let updates = full["data"]["results"].as_array().unwrap().iter()
+        .filter_map(|r| r["updates"].as_array()).flatten().collect::<Vec<_>>();
+    assert!(updates.iter().any(|x| x["now"] == "Lisbon" && x["was"] == "Porto"), "{full}");
 }
 
 /// FINDING 5 (major): `remember --event-time` accepts `YYYY-MM-DD` and its help

@@ -1697,7 +1697,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
                     "citations": r.citations,
                     "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
                 });
-                if let Some(changes) = r.provenance.memory_id.and_then(|m| updates.get(&m)) {
+                if let Some(changes) = r.provenance.memory_id.and_then(|m| updates.get(&m)).filter(|_| full) {
                     v["updates"] = json!(changes.iter().map(crate::retrieval::update_json).collect::<Vec<_>>());
                 }
                 // One copy on the wire, as the CLI: the text is in
