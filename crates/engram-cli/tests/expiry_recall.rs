@@ -44,15 +44,17 @@ fn run_json(home: &tempfile::TempDir, args: &[&str]) -> Value {
     serde_json::from_slice(&out).expect("valid JSON on stdout")
 }
 
+/// Every returned passage, read from `answer_context` — the one copy recall
+/// prints (results[] repeats it only under --full).
 fn result_contents(v: &Value) -> Vec<String> {
-    v["data"]["results"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| r["content"].as_str().map(str::to_string))
-                .collect()
+    let ctx = v["data"]["answer_context"].as_str().unwrap_or_default();
+    ctx.split("<engram-result ")
+        .skip(1)
+        .filter_map(|el| {
+            let body = el.split_once(">\n")?.1;
+            Some(body.split("\n</engram-result>").next()?.to_string())
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The core contract: expired memories leave default recall, visibly, and

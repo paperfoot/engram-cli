@@ -1592,6 +1592,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
     let since = parse_bound_param(req.since.as_deref(), DayBound::Start)?;
     let until = parse_bound_param(req.until.as_deref(), DayBound::End)?;
     let top_k = req.top_k.unwrap_or(10);
+    let full = req.full.unwrap_or(false);
     let rerank_candidates = req
         .rerank_top_n
         .unwrap_or_else(|| profile.default_rerank_top_n());
@@ -1685,16 +1686,23 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
             // `layered` is a Vec<&HybridResult>; `.iter()` would hand the
             // renderer `&&HybridResult`, so copy the references out.
             "answer_context": render_answer_context(layered.iter().copied()),
-            "results": layered.iter().map(|r| json!({
-                "id": r.id.to_string(),
-                "kind": r.kind,
-                "score": r.score,
-                "rerank_score": r.rerank_score,
-                "kb": r.kb,
-                "content": r.content,
-                "citations": r.citations,
-                "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
-            })).collect::<Vec<_>>(),
+            "results": layered.iter().map(|r| {
+                let mut v = json!({
+                    "id": r.id.to_string(),
+                    "kind": r.kind,
+                    "score": r.score,
+                    "rerank_score": r.rerank_score,
+                    "kb": r.kb,
+                    "citations": r.citations,
+                    "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
+                });
+                // One copy on the wire, as the CLI: the text is in
+                // `answer_context`; `full` repeats it here.
+                if full {
+                    v["content"] = json!(r.content);
+                }
+                v
+            }).collect::<Vec<_>>(),
             "metadata": {
                 "profile": profile.as_str(),
                 "embed_model": backends.embed_model,
@@ -1893,6 +1901,9 @@ struct RecallRequest {
     until: Option<String>,
     /// Same contract as `recall --include-expired` (CLI/daemon parity).
     include_expired: Option<bool>,
+    /// Repeat each passage's text in `results[].content`, as `recall --full`.
+    #[serde(default)]
+    full: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

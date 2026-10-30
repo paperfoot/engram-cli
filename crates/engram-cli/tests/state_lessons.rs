@@ -244,12 +244,11 @@ fn the_twin_is_recallable_and_tagged_procedural() {
         !hits.is_empty(),
         "a lesson nobody can recall is a silo: {v}"
     );
-    let found = hits.iter().any(|h| {
-        h["content"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Ask the caller before superseding")
-    });
+    // The text is printed once, in answer_context.
+    let found = v["data"]["answer_context"]
+        .as_str()
+        .unwrap_or("")
+        .contains("Ask the caller before superseding");
     assert!(found, "the lesson twin is not in recall: {v}");
 }
 

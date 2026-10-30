@@ -51,12 +51,16 @@ fn recall(store: &Path, query: &str, mode: Option<&str>, judge: Option<&str>) ->
     run_json(&mut cmd, &["recall", query])
 }
 
+/// Every returned passage, read from `answer_context` — the one copy recall
+/// prints (results[] repeats it only under --full).
 fn contents(v: &Value) -> Vec<String> {
-    v["data"]["results"]
-        .as_array()
-        .expect("results array")
-        .iter()
-        .map(|r| r["content"].as_str().unwrap_or_default().to_string())
+    let ctx = v["data"]["answer_context"].as_str().unwrap_or_default();
+    ctx.split("<engram-result ")
+        .skip(1)
+        .filter_map(|el| {
+            let body = el.split_once(">\n")?.1;
+            Some(body.split("\n</engram-result>").next()?.to_string())
+        })
         .collect()
 }
 

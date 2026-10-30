@@ -153,6 +153,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             since,
             until,
             include_expired,
+            full,
         } => {
             commands::recall::run(
                 &ctx,
@@ -170,6 +171,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                     since,
                     until,
                     include_expired,
+                    full,
                     alias: "recall",
                 },
             )
@@ -377,6 +379,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 since,
                 until,
                 include_expired,
+                full,
             } => {
                 // One code path with `recall`, one envelope, one set of
                 // fields. The defaults that still differ (layer, rerank depth,
@@ -398,6 +401,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                         since,
                         until,
                         include_expired,
+                        full,
                         alias: "memory search",
                     },
                 )

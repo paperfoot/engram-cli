@@ -41,6 +41,9 @@ pub struct RecallArgs {
     pub until: Option<String>,
     /// `--include-expired`: admit memories whose `valid_until` has passed.
     pub include_expired: bool,
+    /// `--full`: repeat each passage's text in `results[].content`. Without
+    /// it the text is printed once, in `answer_context`.
+    pub full: bool,
     /// Which spelling the caller used, reported as `metadata.command_alias`
     /// (blessed by D2). It changes NO behaviour; it makes a transcript
     /// traceable to the surface that produced it.
@@ -67,6 +70,7 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         since,
         until,
         include_expired,
+        full,
         alias,
     } = args;
     if query.trim().is_empty() {
@@ -218,7 +222,6 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             "score": round_score(r.score),
             "rerank_score": r.rerank_score.map(round_score),
             "kb": r.kb,
-            "content": r.content,
             "citations": r.citations.iter().map(|c| json!({
                 "document_id": c.document_id.map(|id: uuid::Uuid| id.to_string()),
                 "chunk_id": c.chunk_id.map(|id: uuid::Uuid| id.to_string()),
@@ -228,6 +231,12 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             })).collect::<Vec<_>>(),
             "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
             });
+            // One copy on the wire: the text is in `answer_context`, quoted.
+            // Repeating it here doubled every recall an agent reads. The
+            // human view prints from it, so it stays there.
+            if full || ctx.format == crate::output::OutputFormat::Human {
+                v["content"] = json!(r.content);
+            }
             // Present only when the relevance judge answered for this row.
             if let Some(p) = r.relevance {
                 v["relevance"] = json!(engram_llm::judge::wire_decimal(p));
