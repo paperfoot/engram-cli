@@ -3653,19 +3653,29 @@ impl SqliteStore {
         }
         let marks = vec!["?"; ids.len()].join(", ");
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, COALESCE(event_time, created_at) FROM memories WHERE id IN ({marks})"
+            "SELECT id, event_time, created_at FROM memories WHERE id IN ({marks})"
         ))?;
         let params: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
         })?;
+        let parse = |t: Option<String>| {
+            t.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+        };
         for row in rows {
-            let (id, at) = row?;
-            let (Ok(id), Some(at)) = (Uuid::parse_str(&id), at) else {
+            let (id, event_time, created_at) = row?;
+            let Ok(id) = Uuid::parse_str(&id) else {
                 continue;
             };
-            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&at) {
-                out.insert(id, t.with_timezone(&chrono::Utc));
+            // Parsed first, then the fallback: an import can carry an empty
+            // or unreadable event_time beside a valid stored date.
+            if let Some(at) = parse(event_time).or_else(|| parse(created_at)) {
+                out.insert(id, at);
             }
         }
         Ok(out)
@@ -7750,5 +7760,31 @@ mod tests {
             matches!(&err, StorageError::NotFound(m) if m.contains("no longer exists")),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod memory_dates_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_event_time_falls_back_to_the_stored_date() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let ok = "55555555-5555-4555-8555-555555555555";
+        let empty = "66666666-6666-4666-8666-666666666666";
+        s.conn
+            .execute_batch(&format!(
+                "INSERT OR IGNORE INTO knowledge_bases(name, created_at, updated_at) VALUES ('kb', '2026-03-02T12:00:00Z', '2026-03-02T12:00:00Z');
+                 INSERT INTO memories(id, content, created_at, event_time, importance, emotional_weight, access_count,
+                     stability, source_json, diary, tags_json, deleted, kb)
+                 VALUES ('{ok}', 'a', '2026-03-02T12:00:00Z', '2024-01-01T00:00:00Z', 5, 0, 0, 1.0, '{{}}', 'default', '[]', 0, 'kb'),
+                        ('{empty}', 'b', '2026-03-02T12:00:00Z', '', 5, 0, 0, 1.0, '{{}}', 'default', '[]', 0, 'kb');"
+            ))
+            .unwrap();
+        let d = s
+            .memory_dates(&[Uuid::parse_str(ok).unwrap(), Uuid::parse_str(empty).unwrap()])
+            .unwrap();
+        assert_eq!(d[&Uuid::parse_str(ok).unwrap()].format("%Y-%m-%d").to_string(), "2024-01-01");
+        assert_eq!(d[&Uuid::parse_str(empty).unwrap()].format("%Y-%m-%d").to_string(), "2026-03-02");
     }
 }
