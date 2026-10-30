@@ -77,7 +77,6 @@ pub const ERROR_CODE: &[&str] = &[
     "malformed_json",
 ];
 pub const FACT_EXTRACTION: &[&str] = &[
-    "queued",
     "ran",
     "ran_stub",
     "disabled",
