@@ -1326,7 +1326,19 @@ pub async fn run_recall(
         params,
         judge.map(|j| (j, top_k)),
     );
-    let ((), outcome) = tokio::join!(warm, retrieval);
+    // The probes are best effort and must never hold a finished recall: a
+    // provider that stalls HEAD while answering POST would otherwise keep
+    // completed results back for the probe's whole timeout. Retrieval wins
+    // the race; whatever probe is still in flight is dropped with it.
+    tokio::pin!(warm, retrieval);
+    let mut warming = true;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            outcome = &mut retrieval => break outcome,
+            () = &mut warm, if warming => warming = false,
+        }
+    };
     let mut outcome = outcome?;
     let retrieved_any = !outcome.results.is_empty();
     let relevance = match judge {
@@ -2089,6 +2101,92 @@ mod tests {
                 unreachable!("the deadline fires first")
             })
         }
+    }
+
+    /// A reranker whose connection probe never returns.
+    struct StalledProbe;
+
+    impl Reranker for StalledProbe {
+        fn name(&self) -> &'static str {
+            "stalled-probe"
+        }
+
+        fn rerank<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            query: &'life1 str,
+            candidates: &'life2 [RerankCandidate],
+            top_k: usize,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<engram_rerank::RerankedResult>,
+                            engram_rerank::RerankError,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            PassthroughReranker.rerank(query, candidates, top_k)
+        }
+
+        fn preconnect<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(tokio::time::sleep(std::time::Duration::from_secs(60)))
+        }
+    }
+
+    /// A connection probe that stalls must not hold a finished recall back:
+    /// retrieval wins and the probe is dropped.
+    #[tokio::test]
+    async fn a_stalled_connection_probe_never_delays_the_recall() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let embedder = StubEmbedder::default();
+        let backends = RetrievalBackends {
+            embed_model: embedder.model(),
+            embed_dims: embedder.dimensions(),
+            prompt_format: embedder.prompt_format().to_string(),
+            embedder: Box::new(embedder),
+            reranker: Some(Box::new(StalledProbe)),
+            cloud_embedder: false,
+            reranker_label: "stalled-probe".into(),
+            cohere_model: String::new(),
+        };
+        let params = HybridParams {
+            query: "anything",
+            top_k: 10,
+            rrf_k: 60.0,
+            rerank_top_n: 20,
+            filters: Filters {
+                diary: None,
+                kb: None,
+                since: None,
+                until: None,
+                include_expired: false,
+            },
+            mode: RecallMode::Evidence,
+            allow_mixed_embeddings: false,
+            defer_doc_cap: false,
+        };
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_recall(&store, &backends, None, params),
+        )
+        .await
+        .expect("the recall finished without waiting for the probe")
+        .unwrap();
+        assert!(run.outcome.results.is_empty());
     }
 
     /// Answers every part at 0.9 except the one holding `r64`, which hangs.
