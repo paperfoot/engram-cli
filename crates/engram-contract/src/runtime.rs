@@ -27,7 +27,7 @@ impl RuntimeContext<'_> {
             data_path: "<data>/db.sqlite",
             vector_path: "<data>/vectors",
             cache_path: "<cache>",
-            answer_context_format: "engram-result/2",
+            answer_context_format: "engram-result/3",
             extraction_model: "<extraction-model>",
             synthesis_model: "<synthesis-model>",
         }

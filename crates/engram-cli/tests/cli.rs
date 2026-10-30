@@ -1713,21 +1713,20 @@ fn slot_last_writer_wins_supersedes_and_recall_reports_update() {
     assert_eq!(conflicts[0]["new_object"], "Lisbon");
     assert_eq!(conflicts[0]["resolution"], "slot_lww");
 
-    // recall surfaces the resolved update.
-    let out = cmd_in(&tmp)
-        .args(["recall", "where does Ana live", "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let v = parse_stdout(&out);
+    // recall surfaces the resolved update: under the old passage by default,
+    // and as the superseded record with --full.
+    let v = json_cmd(&tmp, &["recall", "where does Ana live"]);
+    let ctx = v["data"]["answer_context"].as_str().unwrap();
+    if ctx.contains("Porto") {
+        assert!(ctx.contains("now Lisbon"), "the old passage must say what holds now: {ctx}");
+    }
+    let v = json_cmd(&tmp, &["recall", "where does Ana live", "--full"]);
     let recall_conflicts = v["data"]["conflicts"].as_array().unwrap();
     assert!(
         recall_conflicts.iter().any(|c| c["status"] == "superseded"
             && c["old_object"] == "Porto"
             && c["new_object"] == "Lisbon"),
-        "recall must report the superseded value: {recall_conflicts:?}"
+        "recall --full must report the superseded value: {recall_conflicts:?}"
     );
 }
 
@@ -3077,6 +3076,65 @@ fn people_show_across_every_kb_merges_instead_of_dropping_kbs() {
     assert!(
         merged > single,
         "merged mentions ({merged}) must exceed a single KB's ({single})"
+    );
+}
+
+/// Present tense: a passage whose fact has since changed is followed by what
+/// holds now, so an agent reading the old passage cannot act on the old value.
+/// The superseded history stays out of `conflicts` unless --full asks for it.
+#[test]
+fn a_passage_whose_fact_changed_says_what_holds_now() {
+    let (tmp, _) = with_isolated_home();
+    for (text, date, facts) in [
+        (
+            "Ana lives in Porto, in a flat near the river. Bob takes atorvastatin daily.",
+            "2024-02-01",
+            r#"[{"subject":"Ana","predicate":"lives_in","object":"Porto"},
+                {"subject":"Bob","predicate":"takes_medication","object":"atorvastatin"}]"#,
+        ),
+        (
+            "Ana moved to Lisbon for the new job. Bob stopped atorvastatin in May.",
+            "2026-03-01",
+            r#"[{"subject":"Ana","predicate":"lives_in","object":"Lisbon"},
+                {"subject":"Bob","predicate":"takes_medication","object":"atorvastatin",
+                 "state":"ended","valid_until":"2026-05-01"}]"#,
+        ),
+    ] {
+        cmd_in(&tmp)
+            .args([
+                "remember", text, "--kb", "personal", "--event-time", date, "--facts-json", facts,
+                "--offline", "--json",
+            ])
+            .assert()
+            .success();
+    }
+    let v = json_cmd(
+        &tmp,
+        &["recall", "Porto flat near the river", "--profile", "offline"],
+    );
+    let ctx = v["data"]["answer_context"].as_str().unwrap();
+    let porto = ctx.find("Ana lives in Porto").expect("the old passage is returned");
+    let update = ctx[porto..].find("<engram-update").map(|i| porto + i).expect("an update line");
+    assert!(
+        ctx[update..].starts_with("<engram-update n=\"")
+            && ctx[update..].contains("Ana lives_in: now Lisbon (since 2026-03-01), was Porto"),
+        "{ctx}"
+    );
+    assert!(ctx.contains("atorvastatin: ended 2026-05-01"), "{ctx}");
+    assert!(ctx.contains("date=\"2024-02-01\""), "{ctx}");
+    let updates = &v["data"]["results"][0]["updates"];
+    assert!(updates.as_array().is_some_and(|u| u.iter().any(|x| x["now"] == "Lisbon")), "{v}");
+    assert!(
+        v["data"]["conflicts"].as_array().unwrap().iter().all(|c| c["status"] == "contested"),
+        "only unresolved contradictions by default: {v}"
+    );
+    let full = json_cmd(
+        &tmp,
+        &["recall", "Porto flat near the river", "--profile", "offline", "--full"],
+    );
+    assert!(
+        full["data"]["conflicts"].as_array().unwrap().iter().any(|c| c["status"] == "superseded"),
+        "--full keeps the superseded history: {full}"
     );
 }
 

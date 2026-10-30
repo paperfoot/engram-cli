@@ -7,7 +7,7 @@ use crate::output::{print_envelope, round_score, Metadata, Scope, Verdict};
 use crate::read_surface::{self, RequestShape};
 use crate::respond;
 use crate::retrieval::{
-    hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
+    hybrid_recall, resolve_kb_scope, resolve_retrieval_backends, Filters,
     HybridParams, RecallMode, RelevanceJudge, RetrievalProfile,
 };
 use chrono::{DateTime, Utc};
@@ -198,7 +198,19 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
         Some(diary.as_str())
     };
     let surface = surface_conflicts(&ctx.store, scope.as_deref(), conflict_diary, &query, 10)?;
-    let conflicts = surface.items;
+    // What changed since a returned passage was written now sits under that
+    // passage (engram-update). The list keeps what is still UNRESOLVED; the
+    // history of superseded values, matched on query words and mostly about
+    // passages nobody returned, comes back with --full.
+    let conflicts: Vec<Value> = if full {
+        surface.items
+    } else {
+        surface
+            .items
+            .into_iter()
+            .filter(|c| c["status"] == json!("contested"))
+            .collect()
+    };
     let conflicts_overridden = conflicts
         .iter()
         .filter(|c| c["suggested_action_overridden"] == json!(true))
@@ -206,7 +218,9 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
 
     // `layered` is a Vec<&HybridResult>; `.iter()` would hand the renderer
     // `&&HybridResult`, so copy the references out.
-    let answer_context = render_answer_context(layered.iter().copied());
+    let updates = crate::retrieval::present_tense(&ctx.store, layered.iter().copied());
+    let answer_context =
+        crate::retrieval::render_answer_context_with(layered.iter().copied(), &updates);
     let results_json: Vec<_> = layered
         .iter()
         .map(|r| {
@@ -231,6 +245,12 @@ pub async fn run(ctx: &AppContext, args: RecallArgs) -> Result<(), CliError> {
             })).collect::<Vec<_>>(),
             "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
             });
+            if let Some(changes) = r.provenance.memory_id.and_then(|m| updates.get(&m)) {
+                v["updates"] = json!(changes
+                    .iter()
+                    .map(crate::retrieval::update_json)
+                    .collect::<Vec<_>>());
+            }
             // One copy on the wire: the text is in `answer_context`, quoted.
             // Repeating it here doubled every recall an agent reads. The
             // human view prints from it, so it stays there.

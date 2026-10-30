@@ -35,6 +35,7 @@ pub use migrate_v10::MigrationV10Report;
 pub use rebuild::RebuildReport;
 pub use sqlite::{
     ChunkExportRow, ChunkRecord, ClaimRecord, DocumentExportRow, DocumentRecord, EntityRecord,
+    FactChange, FactChangeKind,
     FactExportRow, KbExportRow, KnowledgeBase, MemoryExportRow, RelationRecord, SourceCitation,
     SqliteStore, StoredChunkEmbedding, WikiPageRecord,
 };

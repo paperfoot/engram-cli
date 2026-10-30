@@ -24,7 +24,7 @@ use crate::engine::Core;
 use crate::error::CliError;
 use crate::respond;
 use crate::retrieval::{
-    hybrid_recall, render_answer_context, resolve_kb_scope, resolve_retrieval_backends, Filters,
+    hybrid_recall, resolve_kb_scope, resolve_retrieval_backends, Filters,
     HybridParams, RecallMode, RetrievalProfile,
 };
 use chrono::{DateTime, Utc};
@@ -1678,6 +1678,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
     } else {
         "success"
     };
+    let updates = crate::retrieval::present_tense(store, layered.iter().copied());
     let mut resp = json!({
         "version": "1",
         "status": status,
@@ -1685,7 +1686,7 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
             "status": status,
             // `layered` is a Vec<&HybridResult>; `.iter()` would hand the
             // renderer `&&HybridResult`, so copy the references out.
-            "answer_context": render_answer_context(layered.iter().copied()),
+            "answer_context": crate::retrieval::render_answer_context_with(layered.iter().copied(), &updates),
             "results": layered.iter().map(|r| {
                 let mut v = json!({
                     "id": r.id.to_string(),
@@ -1696,6 +1697,9 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
                     "citations": r.citations,
                     "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
                 });
+                if let Some(changes) = r.provenance.memory_id.and_then(|m| updates.get(&m)) {
+                    v["updates"] = json!(changes.iter().map(crate::retrieval::update_json).collect::<Vec<_>>());
+                }
                 // One copy on the wire, as the CLI: the text is in
                 // `answer_context`; `full` repeats it here.
                 if full {
@@ -1734,7 +1738,18 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
         &req.query,
         10,
     )?;
-    resp["data"]["conflicts"] = json!(conflicts.items);
+    // As the CLI: unresolved contradictions only, the superseded history
+    // with `full`; what changed since a returned passage is under it.
+    let items: Vec<serde_json::Value> = if full {
+        conflicts.items
+    } else {
+        conflicts
+            .items
+            .into_iter()
+            .filter(|c| c["status"] == json!("contested"))
+            .collect()
+    };
+    resp["data"]["conflicts"] = json!(items);
     resp["data"]["metadata"]["conflicts_total"] = json!(conflicts.total);
     // Presence IS the signal: skill.md tells agents the field appears only in
     // affected responses, so a healthy daemon must OMIT it — `json!` would

@@ -301,6 +301,9 @@ fn a_superseded_fact_surfaces_in_recall_as_closed() {
             "personal",
             "--profile",
             "offline",
+            // The superseded history is listed with --full; by default what
+            // changed sits under the passage it changed.
+            "--full",
         ],
     );
     let closed: Vec<&Value> = v["data"]["conflicts"]

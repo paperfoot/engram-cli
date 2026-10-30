@@ -885,6 +885,33 @@ pub const CURRENT_VERSION: i32 = 14;
 /// languages and a test pins them equal.
 pub(crate) const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND superseded_by IS NULL)";
 
+/// A fact of a returned passage that has changed since the passage was
+/// written, as recall reports it under that passage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactChange {
+    pub memory_id: Uuid,
+    /// The fact the passage produced, now closed.
+    pub fact_id: Uuid,
+    /// The fact that holds now, when the change is a newer value.
+    pub current_fact_id: Option<Uuid>,
+    pub subject: String,
+    pub predicate: String,
+    /// The value the passage stated.
+    pub was: String,
+    pub change: FactChangeKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FactChangeKind {
+    /// A newer value holds, since `since`.
+    Now {
+        value: String,
+        since: chrono::DateTime<chrono::Utc>,
+    },
+    /// The state ended and nothing replaced it.
+    Ended { at: chrono::DateTime<chrono::Utc> },
+}
+
 /// The fact projection, in `parse_fact_row` order. Written once so a `SELECT`
 /// and its parser cannot drift: a wrong column offset mis-parses silently,
 /// which is how a fact's `object` ends up in its `subject_norm`.
@@ -3638,6 +3665,90 @@ impl SqliteStore {
         let rows = stmt.query_map(params![claim_id.to_string()], parse_citation_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
+    }
+
+    /// What has changed since each memory was written: its facts that were
+    /// later superseded or ended, each followed to the value that holds now.
+    ///
+    /// Only a supersession or a stop counts. A fact closed because its memory
+    /// was edited (`corrected`) or forgotten (`retracted_source`) describes
+    /// text that is no longer there, so it says nothing about the passage a
+    /// reader is looking at. A successor in another diary or KB ends the
+    /// chain: the line must not carry one diary's facts into another's read.
+    pub fn fact_changes_for_memories(
+        &self,
+        ids: &[Uuid],
+        per_memory: usize,
+    ) -> Result<Vec<FactChange>, StorageError> {
+        if ids.is_empty() || per_memory == 0 {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; ids.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {cols} FROM facts
+             WHERE source_memory_id IN ({marks})
+               AND (superseded_by IS NOT NULL
+                    OR (valid_until IS NOT NULL AND COALESCE(close_reason, '') IN ('stopped', 'superseded')))
+             ORDER BY source_memory_id, created_at, id",
+            cols = fact_columns("")
+        ))?;
+        let params: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let closed: Vec<engram_core::types::Fact> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), parse_fact_row)?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        let mut out = Vec::new();
+        let mut taken: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+        for old in closed {
+            let n = taken.entry(old.source_memory_id).or_default();
+            if *n >= per_memory {
+                continue;
+            }
+            // Walk the supersession chain to its end, at most a few hops.
+            let mut current = old.clone();
+            let mut hops = 0;
+            while let Some(next) = current.superseded_by {
+                if hops == 8 {
+                    break;
+                }
+                match self.get_fact(next)? {
+                    Some(f) if f.diary == old.diary && f.kb == old.kb => current = f,
+                    _ => break,
+                }
+                hops += 1;
+            }
+            let change = if current.id != old.id && current.superseded_by.is_none() {
+                if current.valid_until.is_none() {
+                    FactChangeKind::Now {
+                        value: current.object.clone(),
+                        since: current.valid_from.unwrap_or(current.created_at),
+                    }
+                } else {
+                    FactChangeKind::Ended {
+                        at: current.valid_until.unwrap_or(current.created_at),
+                    }
+                }
+            } else if old.superseded_by.is_none() && old.valid_until.is_some() {
+                FactChangeKind::Ended {
+                    at: old.valid_until.unwrap_or(old.created_at),
+                }
+            } else {
+                // A chain that left the diary or KB, or ran too long: nothing
+                // honest to say about the present.
+                continue;
+            };
+            *n += 1;
+            out.push(FactChange {
+                memory_id: old.source_memory_id,
+                fact_id: old.id,
+                current_fact_id: (current.id != old.id).then_some(current.id),
+                subject: old.subject.clone(),
+                predicate: old.predicate.clone(),
+                was: old.object.clone(),
+                change,
+            });
+        }
+        Ok(out)
     }
 
     /// When each memory happened — its event time, else when it was stored —
