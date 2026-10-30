@@ -3671,41 +3671,80 @@ impl SqliteStore {
     /// later superseded or ended, each followed to the value that holds now.
     ///
     /// Only what can be said truthfully is returned:
-    /// - the fact must belong to the memory's own KB and diary, and so must
-    ///   every successor — a line never carries another scope's facts;
-    /// - a fact written before the memory's last edit describes text that is
-    ///   gone (an edit closes only open facts), so it is skipped;
-    /// - a supersession chain must end at an OPEN fact; a chain whose newest
-    ///   value was itself closed, corrected or retracted says nothing;
-    /// - "ended" needs a stop (`close_reason = stopped`) and no open fact with
-    ///   the same value: a cessation the safety gate refused leaves the
-    ///   original open, and is not reported as ended.
+    /// - every fact on the walk must belong to the returned memory's KB and
+    ///   diary, by its own fields AND its source memory's — a line never
+    ///   carries another scope's facts;
+    /// - a fact written before the memory's last edit (compared as instants)
+    ///   describes text that is gone, so it is skipped;
+    /// - a supersession chain must end at an OPEN fact that no open conflict
+    ///   disputes; a closed, corrected, retracted or contested newest value
+    ///   says nothing;
+    /// - "ended" needs the authority the safety gate itself demands — the text
+    ///   said so, or a person decided (explicit_end, caller, replayed_caller)
+    ///   — and no open fact with the same value. A heuristic or refused
+    ///   proposal never reads as an ending, whatever happens to the original.
     pub fn fact_changes_for_memories(&self, ids: &[Uuid]) -> Result<Vec<FactChange>, StorageError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let marks = vec!["?"; ids.len()].join(", ");
+        let params: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        // The last edit of each memory, as an instant.
+        let mut revised: std::collections::HashMap<Uuid, chrono::DateTime<chrono::Utc>> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT subject_id, ts FROM events
+                 WHERE kind = 'memory.revised' AND subject_id IN ({marks})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, ts) = row?;
+                let (Ok(id), Ok(ts)) = (Uuid::parse_str(&id), chrono::DateTime::parse_from_rfc3339(&ts)) else {
+                    continue;
+                };
+                let ts = ts.with_timezone(&chrono::Utc);
+                let e = revised.entry(id).or_insert(ts);
+                if ts > *e {
+                    *e = ts;
+                }
+            }
+        }
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {cols} FROM facts f JOIN memories m ON m.id = f.source_memory_id
              WHERE f.source_memory_id IN ({marks})
                AND f.kb = m.kb AND f.diary = m.diary
                AND (f.superseded_by IS NOT NULL
                     OR (f.valid_until IS NOT NULL AND COALESCE(f.close_reason, '') = 'stopped'))
-               AND f.created_at >= COALESCE(
-                    (SELECT MAX(e.ts) FROM events e
-                     WHERE e.subject_id = f.source_memory_id AND e.kind = 'memory.revised'),
-                    '')
              ORDER BY f.source_memory_id, f.created_at, f.id",
             cols = fact_columns("f.")
         ))?;
-        let params: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
         let closed: Vec<engram_core::types::Fact> = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), parse_fact_row)?
             .collect::<Result<_, _>>()?;
         drop(stmt);
+        let in_scope = |f: &engram_core::types::Fact, kb: &str, diary: &str| -> Result<bool, StorageError> {
+            if f.kb != kb || f.diary != diary {
+                return Ok(false);
+            }
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM memories WHERE id = ?1 AND kb = ?2 AND diary = ?3",
+                    params![f.source_memory_id.to_string(), kb, diary],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        };
         let mut out = Vec::new();
         for old in closed {
-            let change = if old.superseded_by.is_some() {
+            if revised.get(&old.source_memory_id).is_some_and(|edit| old.created_at < *edit) {
+                continue;
+            }
+            let (change, current_fact_id) = if old.superseded_by.is_some() {
                 // Walk to the newest value; a visited set ends any cycle.
                 let mut current = old.clone();
                 let mut seen = std::collections::HashSet::from([old.id]);
@@ -3716,7 +3755,7 @@ impl SqliteStore {
                         break;
                     }
                     match self.get_fact(next)? {
-                        Some(f) if f.diary == old.diary && f.kb == old.kb => current = f,
+                        Some(f) if in_scope(&f, &old.kb, &old.diary)? => current = f,
                         _ => {
                             clean = false;
                             break;
@@ -3726,11 +3765,33 @@ impl SqliteStore {
                 if !clean || current.valid_until.is_some() || current.superseded_by.is_some() {
                     continue;
                 }
-                FactChangeKind::Now {
-                    value: current.object.clone(),
-                    since: current.valid_from.unwrap_or(current.created_at),
+                let contested: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM fact_conflict_queue
+                           WHERE status = 'open' AND (new_fact_id = ?1 OR old_fact_id = ?1))",
+                        params![current.id.to_string()],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(true);
+                if contested {
+                    continue;
                 }
+                (
+                    FactChangeKind::Now {
+                        value: current.object.clone(),
+                        since: current.valid_from.unwrap_or(current.created_at),
+                    },
+                    Some(current.id),
+                )
             } else {
+                let authorised = matches!(
+                    old.close_authority.as_deref(),
+                    Some("explicit_end" | "caller" | "replayed_caller")
+                );
+                if !authorised {
+                    continue;
+                }
                 let still_open: bool = self
                     .conn
                     .query_row(
@@ -3746,17 +3807,17 @@ impl SqliteStore {
                 if still_open {
                     continue;
                 }
-                FactChangeKind::Ended {
-                    at: old.valid_until.unwrap_or(old.created_at),
-                }
+                (
+                    FactChangeKind::Ended {
+                        at: old.valid_until.unwrap_or(old.created_at),
+                    },
+                    None,
+                )
             };
             out.push(FactChange {
                 memory_id: old.source_memory_id,
                 fact_id: old.id,
-                current_fact_id: match &change {
-                    FactChangeKind::Now { .. } => old.superseded_by,
-                    FactChangeKind::Ended { .. } => None,
-                },
+                current_fact_id,
                 subject: old.subject.clone(),
                 predicate: old.predicate.clone(),
                 was: old.object.clone(),
@@ -7941,10 +8002,14 @@ mod present_tense_tests {
     }
 
     fn close(s: &SqliteStore, f: &Fact, reason: &str) {
+        close_by(s, f, reason, "explicit_end");
+    }
+
+    fn close_by(s: &SqliteStore, f: &Fact, reason: &str, authority: &str) {
         s.conn
             .execute(
-                "UPDATE facts SET valid_until = ?1, close_reason = ?2 WHERE id = ?3",
-                params![Utc::now().to_rfc3339(), reason, f.id.to_string()],
+                "UPDATE facts SET valid_until = ?1, close_reason = ?2, close_authority = ?3 WHERE id = ?4",
+                params![Utc::now().to_rfc3339(), reason, authority, f.id.to_string()],
             )
             .unwrap();
     }
@@ -8004,6 +8069,87 @@ mod present_tense_tests {
         let proposal = fact(&s, "Porto", "default");
         close(&s, &proposal, "stopped");
         assert!(changes(&s).is_empty());
+    }
+
+    #[test]
+    fn a_heuristic_stop_never_reads_as_an_ending_even_after_the_original_goes() {
+        let s = store();
+        let kept = fact(&s, "Porto", "default");
+        let proposal = fact(&s, "Porto", "default");
+        close_by(&s, &proposal, "stopped", "heuristic");
+        close_by(&s, &kept, "retracted_source", "caller");
+        assert!(changes(&s).is_empty(), "a refused proposal is not evidence of an end");
+    }
+
+    #[test]
+    fn every_hop_must_come_from_a_memory_in_the_same_scope() {
+        let s = store();
+        let other = "22222222-2222-4222-8222-222222222222";
+        let now = Utc::now().to_rfc3339();
+        s.conn
+            .execute_batch(&format!(
+                "INSERT OR IGNORE INTO knowledge_bases(name, created_at, updated_at) VALUES ('private', '{now}', '{now}');
+                 INSERT INTO memories(id, content, created_at, importance, emotional_weight, access_count,
+                     stability, source_json, diary, tags_json, deleted, kb)
+                 VALUES ('{other}', 'secret', '{now}', 5, 0, 0, 1.0, '{{\"type\":\"user\"}}', 'private', '[]', 0, 'private');"
+            ))
+            .unwrap();
+        let porto = fact(&s, "Porto", "default");
+        let secret = fact(&s, "Secret Street", "default");
+        s.conn
+            .execute("UPDATE facts SET source_memory_id = ?1 WHERE id = ?2", params![other, secret.id.to_string()])
+            .unwrap();
+        supersede(&s, &porto, &secret);
+        assert!(changes(&s).is_empty(), "a successor sourced to a private memory must not print");
+    }
+
+    #[test]
+    fn a_disputed_newest_value_is_not_stated_as_settled() {
+        let s = store();
+        let acme = fact(&s, "Acme", "default");
+        let beta = fact(&s, "Beta", "default");
+        let gamma = fact(&s, "Gamma", "default");
+        supersede(&s, &acme, &beta);
+        s.conn
+            .execute(
+                "INSERT INTO fact_conflict_queue(id, new_fact_id, old_fact_id, diary, kb, detector, score, status, created_at)
+                 VALUES (?1, ?2, ?3, 'default', 'kb', 'test', 1.0, 'open', ?4)",
+                params![Uuid::new_v4().to_string(), gamma.id.to_string(), beta.id.to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        assert!(changes(&s).is_empty());
+    }
+
+    #[test]
+    fn a_long_chain_names_its_newest_fact_and_edits_compare_as_instants() {
+        let s = store();
+        let porto = fact(&s, "Porto", "default");
+        let lisbon = fact(&s, "Lisbon", "default");
+        let madrid = fact(&s, "Madrid", "default");
+        supersede(&s, &porto, &lisbon);
+        supersede(&s, &lisbon, &madrid);
+        let c = changes(&s);
+        let porto_line = c.iter().find(|c| c.fact_id == porto.id).expect("Porto's line");
+        assert_eq!(porto_line.current_fact_id, Some(madrid.id));
+        assert!(matches!(&porto_line.change, FactChangeKind::Now { value, .. } if value == "Madrid"));
+
+        // A fact written at 12:00+02:00 (10:00Z) predates an edit at 10:30Z,
+        // though the strings sort the other way.
+        let s = store();
+        let porto = fact(&s, "Porto", "default");
+        let lisbon = fact(&s, "Lisbon", "default");
+        supersede(&s, &porto, &lisbon);
+        s.conn
+            .execute("UPDATE facts SET created_at = '2026-01-01T12:00:00+02:00' WHERE id = ?1", params![porto.id.to_string()])
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO events(id, ts, actor, kind, subject_id, payload)
+                 VALUES (?1, '2026-01-01T10:30:00+00:00', 'test', 'memory.revised', ?2, '{}')",
+                params![Uuid::new_v4().to_string(), M],
+            )
+            .unwrap();
+        assert!(changes(&s).iter().all(|c| c.fact_id != porto.id), "removed text must not print");
     }
 
     #[test]

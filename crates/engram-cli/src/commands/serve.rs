@@ -1694,12 +1694,9 @@ async fn recall_body(store: &SqliteStore, body: &str) -> Result<serde_json::Valu
                     "score": r.score,
                     "rerank_score": r.rerank_score,
                     "kb": r.kb,
-                    // As the CLI: a citation's ids are in provenance and its
-                    // label is the element's source; by default only one with
-                    // a page or section is printed.
-                    "citations": r.citations.iter()
-                        .filter(|c| full || c.page.is_some() || c.section.is_some())
-                        .collect::<Vec<_>>(),
+                    // Unlike the CLI's rows these carry no provenance: the
+                    // citations are the only document ids, so all are kept.
+                    "citations": r.citations,
                     "sources": r.sources.iter().map(|s| format!("{:?}", s).to_lowercase()).collect::<Vec<_>>()
                 });
                 if let Some(changes) = r.provenance.memory_id.and_then(|m| updates.get(&m)).filter(|_| full) {
