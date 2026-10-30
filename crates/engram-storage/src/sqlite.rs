@@ -894,7 +894,7 @@ pub(crate) const OPEN_INTERVAL_PREDICATE: &str = "(valid_until IS NULL AND super
 /// outlives both, so recall's conflicts list filters on this: a value is
 /// printed only while its memory still holds it. An edit that leaves the
 /// content as it was (matching `memory.revised` hashes) is no change; one
-/// whose payload has no hashes is. Times compare exactly ([`after`]); one
+/// whose payload has no hashes is. Times compare exactly ([`at_or_after`]); one
 /// that does not parse counts as later, because hiding a value is the safe
 /// mistake. `+ve.kind` keeps the planner on the per-memory event index.
 pub(crate) fn fact_visible_sql(alias: &str) -> String {
@@ -905,7 +905,7 @@ pub(crate) fn fact_visible_sql(alias: &str) -> String {
                         WHERE ve.subject_id = vm.id AND +ve.kind = '{kind}' \
                           AND CASE WHEN json_valid(ve.payload) THEN COALESCE(json_extract(ve.payload, '$.content_hash') \
                                   = json_extract(ve.payload, '$.prev_content_hash'), 0) ELSE 0 END = 0 \
-                          AND COALESCE(engram_after(ve.ts, {alias}.created_at), 1)) \
+                          AND COALESCE(engram_at_or_after(ve.ts, {alias}.created_at), 1)) \
                     OR engram_says(vm.content, {alias}.subject, {alias}.object)))",
         kind = engram_core::events::EventKind::MemoryRevised.as_str()
     )
@@ -928,11 +928,16 @@ pub(crate) fn says(text: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    // A spaced-script letter or digit, which would run into its neighbour.
+    // A letter or digit that would run into its neighbour: every digit, and
+    // every letter except those of scripts written without spaces (Thai, Lao,
+    // Myanmar, Khmer, Hangul, and CJK through Yi, compatibility ideographs and
+    // the supplementary ideograph planes). Fullwidth Latin keeps its edges.
     let spaced = |c: char| {
-        c.is_alphanumeric()
-            && !matches!(c as u32,
-                0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1100..=0x11FF | 0x1780..=0x17FF | 0x2E80..)
+        c.is_numeric()
+            || (c.is_alphabetic()
+                && !matches!(c as u32,
+                    0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1100..=0x11FF | 0x1780..=0x17FF
+                    | 0x2E80..=0xA4CF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0x20000..=0x3FFFF))
     };
     let first = needle.chars().next().is_some_and(spaced);
     let last = needle.chars().next_back().is_some_and(spaced);
@@ -943,22 +948,24 @@ pub(crate) fn says(text: &str, needle: &str) -> bool {
     })
 }
 
-/// True when instant `a` is strictly later than instant `b`, both read at
-/// full precision whatever their spelling (`Z` or an offset, any number of
-/// fractional digits, or SQLite's `YYYY-MM-DD HH:MM:SS` as UTC); `None` when
-/// either does not parse. `julianday` keeps only milliseconds.
-pub(crate) fn after(a: &str, b: &str) -> Option<bool> {
+/// True when instant `a` is at or after instant `b` (a tie counts: hiding is
+/// the safe mistake), both read at full precision whatever their spelling (`Z`
+/// or an offset, any number of fractional digits, or no offset at all, read
+/// as UTC, with `T` or a space); `None` when either does not parse.
+/// `julianday` keeps only milliseconds.
+pub(crate) fn at_or_after(a: &str, b: &str) -> Option<bool> {
     let instant = |t: &str| {
         chrono::DateTime::parse_from_rfc3339(t)
             .map(|t| t.with_timezone(&chrono::Utc))
             .ok()
             .or_else(|| {
-                chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f")
-                    .ok()
+                ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+                    .iter()
+                    .find_map(|f| chrono::NaiveDateTime::parse_from_str(t, f).ok())
                     .map(|t| t.and_utc())
             })
     };
-    Some(instant(a)? > instant(b)?)
+    Some(instant(a)? >= instant(b)?)
 }
 
 /// SQL functions every query may rely on, registered as part of opening a
@@ -977,13 +984,13 @@ fn register_functions(conn: &Connection) -> Result<(), StorageError> {
         },
     )?;
     conn.create_scalar_function(
-        "engram_after",
+        "engram_at_or_after",
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
             let a = ctx.get::<Option<String>>(0)?.unwrap_or_default();
             let b = ctx.get::<Option<String>>(1)?.unwrap_or_default();
-            Ok(after(&a, &b))
+            Ok(at_or_after(&a, &b))
         },
     )?;
     Ok(())
@@ -6813,21 +6820,37 @@ mod tests {
         // No spaces between words: neighbours are not part of the name.
         let zh = "李明服用metoprolol 50 mg。周五复诊。";
         assert!(says(zh, "李明") && says(zh, "metoprolol 50 mg"));
+        // Fullwidth Latin and digits in any script keep their edges.
+        assert!(!says("Ana cleared the ａｒｃｈｉｖｅ.", "ＨＩＶ"));
+        assert!(!says("๑๕๐ mg metoprolol", "๕๐ mg metoprolol"));
     }
 
     #[test]
-    fn after_compares_instants_at_full_precision_whatever_the_spelling() {
+    fn at_or_after_compares_instants_at_full_precision_whatever_the_spelling() {
         let revision = "2026-10-30T00:00:00.123100+00:00";
-        assert_eq!(after(revision, "2026-10-30T00:00:00.123Z"), Some(true));
         assert_eq!(
-            after(revision, "2026-10-30T00:00:00.123200+00:00"),
+            at_or_after(revision, "2026-10-30T00:00:00.123Z"),
+            Some(true)
+        );
+        assert_eq!(
+            at_or_after(revision, "2026-10-30T00:00:00.123200+00:00"),
             Some(false)
         );
         assert_eq!(
-            after("2026-10-30T02:00:00+02:00", "2026-10-29 23:59:59"),
+            at_or_after("2026-10-30T02:00:00+02:00", "2026-10-29 23:59:59"),
             Some(true)
         );
-        assert_eq!(after("yesterday", revision), None);
+        // A tie counts as an edit; an offset-less `T` time reads as UTC.
+        let tie = "2026-10-30T00:00:00.123Z";
+        assert_eq!(
+            at_or_after(tie, "2026-10-30T00:00:00.123000+00:00"),
+            Some(true)
+        );
+        assert_eq!(
+            at_or_after("2026-10-30T00:00:00Z", "2026-10-30T00:00:01"),
+            Some(false)
+        );
+        assert_eq!(at_or_after("yesterday", revision), None);
     }
 
     /// A changed memory keeps a fact visible while its text still says it,
