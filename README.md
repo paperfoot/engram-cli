@@ -118,7 +118,7 @@ If engram saves your agent from forgetting, give it a star. It helps other peopl
 [![Star on GitHub](https://img.shields.io/github/stars/paperfoot/engram-cli?style=for-the-badge&logo=github&color=yellow&label=Star%20engram)](https://github.com/paperfoot/engram-cli/stargazers)
 [![Follow on X](https://img.shields.io/badge/Follow-@longevityboris-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/longevityboris)
 
-Built by [Boris Djordjevic](https://github.com/longevityboris) at [Paperfoot AI](https://paperfoot.com) · [borisdjordjevic.com](https://borisdjordjevic.com)
+Built by [Boris Djordjevic](https://github.com/longevityboris) at [Paperfoot AI](https://paperfoot.si) · [borisdjordjevic.com](https://borisdjordjevic.com)
 
 MIT licence · Follows the [agent-cli-framework](https://github.com/paperfoot/agent-cli-framework)
 
